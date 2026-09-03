@@ -1,0 +1,23 @@
+[package]
+name = "devcroft"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+async-channel = "2.5"
+gpui-kit = "0.6.0"
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "5988a0b78b4aa804d1c12e66bbfe662bd97d81c0", default-features = false }
+parking_lot = "0.12"
+portable-pty = "0.9"
+
+[profile.dev]
+debug = "limited"
+
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+libghostty-vt = { opt-level = 3 }
+libghostty-vt-sys = { opt-level = 3 }

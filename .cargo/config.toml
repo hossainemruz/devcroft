@@ -1,0 +1,9 @@
+# Build the Ghostty Zig VT core with optimizations even for dev-profile
+# builds. Without this, libghostty-vt-sys sees cargo's DEBUG=true and
+# compiles Zig in Debug mode, making VT parsing ~30x slower (measured at
+# roughly 1 microsecond per byte, so a 10KB redraw blocks the UI thread
+# for about 10ms and makes scrolling stutter). The opt-level overrides in
+# Cargo.toml only affect the Rust FFI wrapper, not the Zig code doing the
+# real terminal work.
+[env]
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"

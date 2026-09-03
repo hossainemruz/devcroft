@@ -1,0 +1,29 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Secrets and local environment
+.env
+.env.*
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Tooling local state
+.direnv/
+.mise.local.toml
+
+# Merge and diff leftovers
+*.orig
+*.rej
+*.bak

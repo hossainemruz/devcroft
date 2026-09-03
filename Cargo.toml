@@ -8,10 +8,16 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0"
 async-channel = "2.5"
+gix = { version = "0.87.1", default-features = false, features = ["parallel", "revision", "sha1", "status"] }
 gpui-kit = "0.6.0"
+ignore = "0.4.33"
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "5988a0b78b4aa804d1c12e66bbfe662bd97d81c0", default-features = false }
 parking_lot = "0.12"
 portable-pty = "0.9"
+similar = "3.2.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [profile.dev]
 debug = "limited"

@@ -2,9 +2,9 @@
 //!
 //! [`TerminalPane`] owns the rendered grid ([`RenderRun`] rows produced by
 //! [`TerminalSession`](crate::session::TerminalSession)) and translates
-//! keyboard, scroll, and focus events into session input. All three tabs
-//! share this implementation; the tab itself only selects the label and the
-//! startup command.
+//! keyboard, scroll, and focus events into session input. Terminal-backed
+//! tabs share this implementation; the tab itself only selects the label
+//! and the startup command.
 
 use std::path::Path;
 

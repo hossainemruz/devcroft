@@ -9,27 +9,30 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
-    Window, div, px, rgb,
+    AnyElement, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, SharedString,
+    Styled, Window, div, px, rgb,
 };
 
 use crate::pane::TerminalPane;
+use crate::review::ReviewView;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceTab {
     Agent,
     Editor,
     Terminal,
+    Review,
 }
 
 impl WorkspaceTab {
-    pub(crate) const ALL: [Self; 3] = [Self::Agent, Self::Editor, Self::Terminal];
+    pub(crate) const ALL: [Self; 4] = [Self::Agent, Self::Editor, Self::Terminal, Self::Review];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Agent => "Agent",
             Self::Editor => "Editor",
             Self::Terminal => "Terminal",
+            Self::Review => "Review",
         }
     }
 
@@ -37,14 +40,21 @@ impl WorkspaceTab {
         match self {
             Self::Agent => Some("opencode"),
             Self::Editor => Some("nvim ."),
-            Self::Terminal => None,
+            Self::Terminal | Self::Review => None,
         }
+    }
+
+    /// Whether the tab hosts a terminal pane. `Review` renders its own
+    /// (currently empty) content instead of spawning a shell.
+    pub(crate) fn has_terminal(self) -> bool {
+        !matches!(self, Self::Review)
     }
 }
 
 pub(crate) struct Workspace {
     active_tab: WorkspaceTab,
-    tabs: Vec<Entity<TerminalPane>>,
+    tabs: Vec<Option<Entity<TerminalPane>>>,
+    review: Entity<ReviewView>,
     project_name: SharedString,
     project_path: SharedString,
 }
@@ -62,16 +72,23 @@ impl Workspace {
         let tabs = WorkspaceTab::ALL
             .into_iter()
             .map(|tab| {
+                if !tab.has_terminal() {
+                    return None;
+                }
                 let cwd = working_directory.clone();
-                cx.new(|cx| TerminalPane::new(tab, &cwd, cx))
+                Some(cx.new(|cx| TerminalPane::new(tab, &cwd, cx)))
             })
             .collect::<Vec<_>>();
-        let initial_focus = tabs[0].read(cx).focus_handle.clone();
-        initial_focus.focus(window, cx);
+        if let Some(Some(initial)) = tabs.first() {
+            initial.read(cx).focus_handle.clone().focus(window, cx);
+        }
+        let review_cwd = working_directory.clone();
+        let review = cx.new(|cx| ReviewView::new(&review_cwd, cx));
 
         Self {
             active_tab: WorkspaceTab::Agent,
             tabs,
+            review,
             project_name: project_name.into(),
             project_path: project_path.into(),
         }
@@ -82,18 +99,31 @@ impl Workspace {
             return;
         };
         self.active_tab = tab;
-        if let Some(pane) = self.tabs.get(index) {
+        if tab == WorkspaceTab::Review {
+            self.review.update(cx, |view, cx| view.activate(cx));
+        }
+        if let Some(Some(pane)) = self.tabs.get(index) {
             let focus_handle = pane.read(cx).focus_handle.clone();
             focus_handle.focus(window, cx);
         }
         cx.notify();
+    }
+
+    fn render_active_content(&self) -> AnyElement {
+        if self.active_tab == WorkspaceTab::Review {
+            return self.review.clone().into_any_element();
+        }
+        match self.tabs.get(self.active_tab as usize).and_then(|tab| tab.clone()) {
+            Some(pane) => pane.into_any_element(),
+            None => div().size_full().into_any_element(),
+        }
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
-        let active_terminal = self.tabs[active_index].clone();
+        let active_content = self.render_active_content();
 
         v_flex()
             .size_full()
@@ -149,7 +179,7 @@ impl Render for Workspace {
                         .border_1()
                         .border_color(rgb(0x292b2b))
                         .bg(rgb(0x090a0a))
-                        .child(active_terminal),
+                        .child(active_content),
                 ),
             )
             .child(
@@ -178,5 +208,8 @@ mod tests {
         assert_eq!(WorkspaceTab::Agent.command(), Some("opencode"));
         assert_eq!(WorkspaceTab::Editor.command(), Some("nvim ."));
         assert_eq!(WorkspaceTab::Terminal.command(), None);
+        assert_eq!(WorkspaceTab::Review.command(), None);
+        assert_eq!(WorkspaceTab::Review.label(), "Review");
+        assert!(!WorkspaceTab::Review.has_terminal());
     }
 }

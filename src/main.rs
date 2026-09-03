@@ -2,6 +2,7 @@ mod fonts;
 mod keys;
 mod metrics;
 mod pane;
+mod review;
 mod session;
 mod workspace;
 

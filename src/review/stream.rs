@@ -18,7 +18,7 @@ use gpui_kit::{
 };
 
 use crate::fonts::TERMINAL_FONT_FAMILY;
-use crate::metrics::TERMINAL_FONT_SIZE;
+use crate::metrics::REVIEW_FONT_SIZE;
 
 use super::ReviewView;
 use super::model::{ChangedFile, FileStatus, Hunk, HunkLine, LineTag, ReviewDiff, UnavailableReason};
@@ -242,7 +242,7 @@ fn line_row(line: &HunkLine) -> AnyElement {
         .overflow_hidden()
         .whitespace_nowrap()
         .font_family(TERMINAL_FONT_FAMILY)
-        .text_size(px(TERMINAL_FONT_SIZE))
+        .text_size(px(REVIEW_FONT_SIZE))
         .line_height(px(ROW_H))
         .when_some(background, |this, color| this.bg(rgb(color)))
         .child(
@@ -282,7 +282,7 @@ fn hunk_header_row(hunk: &Hunk) -> AnyElement {
         .bg(rgb(0x101314))
         .text_color(rgb(0x7d8585))
         .font_family(TERMINAL_FONT_FAMILY)
-        .text_size(px(TERMINAL_FONT_SIZE))
+        .text_size(px(REVIEW_FONT_SIZE))
         .child(format!(
             "@@ -{},{} +{},{} @@",
             hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
@@ -300,7 +300,7 @@ fn collapsed_row(count: u32) -> AnyElement {
         .px_3()
         .text_color(rgb(0x555a5a))
         .font_family(TERMINAL_FONT_FAMILY)
-        .text_size(px(TERMINAL_FONT_SIZE))
+        .text_size(px(REVIEW_FONT_SIZE))
         .child(format!("··· {count} unchanged lines ···"))
         .into_any_element()
 }

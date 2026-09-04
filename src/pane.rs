@@ -22,7 +22,7 @@ use crate::{
         CELL_HEIGHT, CHROME_HEIGHT, INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT,
         TERMINAL_FONT_SIZE, TERMINAL_PADDING, cell_width,
     },
-    session::{RenderRun, TerminalSession},
+    session::{BlockKind, RenderRun, TerminalSession},
     workspace::WorkspaceTab,
 };
 
@@ -210,20 +210,28 @@ impl TerminalPane {
     fn render_row(row: &[RenderRun], index: usize) -> AnyElement {
         let mut text = String::with_capacity(row.iter().map(|run| run.text.len()).sum());
         let mut highlights = Vec::with_capacity(row.len());
+        let mut fills = Vec::new();
         let columns = row.iter().map(|run| run.columns as usize).sum::<usize>();
+        let mut column = 0_usize;
 
         for run in row {
             let start = text.len();
             text.push_str(&run.text);
             let end = text.len();
-            if start == end {
-                continue;
-            }
             let (foreground, background) = if run.style.cursor {
                 (run.style.background, run.style.foreground)
             } else {
                 (run.style.foreground, run.style.background)
             };
+            if let Some(kind) = run.block {
+                // The run's text is spaces (see `RenderRun::block`); paint the
+                // fill as an exact grid-aligned rect over them.
+                fills.push((column, run.columns as usize, kind, foreground));
+            }
+            column += run.columns as usize;
+            if start == end {
+                continue;
+            }
             highlights.push((
                 start..end,
                 HighlightStyle {
@@ -251,7 +259,38 @@ impl TerminalPane {
             .text_size(px(TERMINAL_FONT_SIZE))
             .line_height(px(CELL_HEIGHT))
             .child(StyledText::new(text).with_highlights(highlights))
+            .children(
+                fills
+                    .into_iter()
+                    .map(|(start_column, fill_columns, kind, color)| {
+                        let (x, y, width, height) =
+                            block_fill_bounds(start_column, fill_columns, kind);
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .w(px(width))
+                            .h(px(height))
+                            .bg(rgb(color))
+                    }),
+            )
             .into_any_element()
+    }
+}
+
+/// Grid-aligned pixel bounds `(x, y, width, height)` for a block fill.
+///
+/// The rect edges land exactly on cell boundaries, so consecutive fills tile
+/// seamlessly. Glyph sprites cannot do this: each is antialiased
+/// independently, which darkens every shared boundary.
+fn block_fill_bounds(start_column: usize, columns: usize, kind: BlockKind) -> (f32, f32, f32, f32) {
+    let cell = cell_width();
+    let x = start_column as f32 * cell;
+    let width = columns as f32 * cell;
+    match kind {
+        BlockKind::Upper => (x, 0.0, width, CELL_HEIGHT / 2.0),
+        BlockKind::Lower => (x, CELL_HEIGHT / 2.0, width, CELL_HEIGHT / 2.0),
+        BlockKind::Full => (x, 0.0, width, CELL_HEIGHT),
     }
 }
 
@@ -331,20 +370,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn block_fill_bounds_cover_exact_cell_halves() {
+        let cell = cell_width();
+        assert_eq!(
+            block_fill_bounds(3, 2, BlockKind::Upper),
+            (3.0 * cell, 0.0, 2.0 * cell, CELL_HEIGHT / 2.0)
+        );
+        assert_eq!(
+            block_fill_bounds(0, 1, BlockKind::Lower),
+            (0.0, CELL_HEIGHT / 2.0, cell, CELL_HEIGHT / 2.0)
+        );
+        assert_eq!(
+            block_fill_bounds(5, 4, BlockKind::Full),
+            (5.0 * cell, 0.0, 4.0 * cell, CELL_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn adjacent_block_fills_abut_without_gaps() {
+        // Consecutive fills must tile seamlessly: the end edge of one is
+        // exactly the start edge of the next, so no background shows through.
+        let (x0, _, width0, _) = block_fill_bounds(0, 3, BlockKind::Full);
+        let (x1, _, _, _) = block_fill_bounds(3, 2, BlockKind::Full);
+        assert_eq!(x0 + width0, x1);
+    }
+
+    #[test]
     fn scroll_coalescing_preserves_slow_gesture_travel() {
         let mut remainder = 0.0;
+        let half_line = CELL_HEIGHT / 2.0;
         // Half-line deltas accumulate instead of being dropped or amplified.
-        assert_eq!(coalesce_scroll_lines(&mut remainder, 9.0), 0);
+        assert_eq!(coalesce_scroll_lines(&mut remainder, half_line), 0);
         assert!((remainder - -0.5).abs() < f32::EPSILON);
-        assert_eq!(coalesce_scroll_lines(&mut remainder, 9.0), -1);
+        assert_eq!(coalesce_scroll_lines(&mut remainder, half_line), -1);
         assert!(remainder.abs() < f32::EPSILON);
     }
 
     #[test]
     fn scroll_coalescing_handles_both_directions() {
         let mut remainder = 0.0;
-        assert_eq!(coalesce_scroll_lines(&mut remainder, -9.0), 0);
-        assert_eq!(coalesce_scroll_lines(&mut remainder, -9.0), 1);
+        let half_line = CELL_HEIGHT / 2.0;
+        assert_eq!(coalesce_scroll_lines(&mut remainder, -half_line), 0);
+        assert_eq!(coalesce_scroll_lines(&mut remainder, -half_line), 1);
         assert!(remainder.abs() < f32::EPSILON);
     }
 

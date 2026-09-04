@@ -57,6 +57,41 @@ pub(crate) struct RenderRun {
     pub(crate) text: gpui_kit::SharedString,
     pub(crate) columns: u16,
     pub(crate) style: CellStyle,
+    /// Block fills (`▀▄█`) are painted as solid rects instead of shaped text.
+    ///
+    /// Adjacent block glyphs carry continuous ink across cell boundaries, but
+    /// GPU text renders each glyph as an independently antialiased sprite, so
+    /// every shared boundary darkens slightly and solid fills (the opencode
+    /// logo, its input-box border) render beaded instead of seamless like in
+    /// Ghostty. Marking the run lets the view substitute a space (which keeps
+    /// the cell advance but contributes no ink) and paint an exact,
+    /// grid-aligned rect in the run's foreground color instead.
+    pub(crate) block: Option<BlockKind>,
+}
+
+/// Half/full-cell block fills that must tile seamlessly across columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BlockKind {
+    /// `▀`: foreground fills the upper half of the cells.
+    Upper,
+    /// `▄`: foreground fills the lower half of the cells.
+    Lower,
+    /// `█`: foreground fills the whole cells.
+    Full,
+}
+
+/// Classifies a cell's emitted text as a paintable block fill.
+///
+/// Only exact single-character cells qualify; anything else (including
+/// grapheme clusters that merely contain these codepoints) falls back to
+/// ordinary text shaping.
+fn block_kind(text: &str) -> Option<BlockKind> {
+    match text {
+        "▀" => Some(BlockKind::Upper),
+        "▄" => Some(BlockKind::Lower),
+        "█" => Some(BlockKind::Full),
+        _ => None,
+    }
 }
 
 pub(crate) struct TerminalSession {
@@ -136,7 +171,7 @@ impl TerminalSession {
             INITIAL_COLS,
             INITIAL_ROWS,
             cell_width().round() as u32,
-            CELL_HEIGHT as u32,
+            CELL_HEIGHT.round() as u32,
         )?;
         terminal
             .on_pty_write({
@@ -154,7 +189,7 @@ impl TerminalSession {
                         rows,
                         columns,
                         cell_width: cell_width().round() as u32,
-                        cell_height: CELL_HEIGHT as u32,
+                        cell_height: CELL_HEIGHT.round() as u32,
                     })
                 }
             })?
@@ -216,8 +251,12 @@ impl TerminalSession {
             pixel_width: (cols as f32 * cell_width()) as u16,
             pixel_height: (rows as f32 * CELL_HEIGHT) as u16,
         })?;
-        self.terminal
-            .resize(cols, rows, cell_width().round() as u32, CELL_HEIGHT as u32)?;
+        self.terminal.resize(
+            cols,
+            rows,
+            cell_width().round() as u32,
+            CELL_HEIGHT.round() as u32,
+        )?;
         Ok(())
     }
 
@@ -287,7 +326,7 @@ impl TerminalSession {
                     screen_width: viewport_width.max(1.) as u32,
                     screen_height: viewport_height.max(1.) as u32,
                     cell_width: cell_width().round() as u32,
-                    cell_height: CELL_HEIGHT as u32,
+                    cell_height: CELL_HEIGHT.round() as u32,
                     padding_top: padding_top as u32,
                     padding_bottom: (viewport_height - padding_top - grid_height).max(0.) as u32,
                     padding_right: (viewport_width - padding_left - grid_width).max(0.) as u32,
@@ -395,6 +434,15 @@ impl TerminalSession {
     }
 
     pub(crate) fn snapshot(&mut self) -> Result<Option<Vec<Vec<RenderRun>>>> {
+        // Respect synchronized output (DEC 2026): applications such as opencode
+        // wrap each frame in begin/end sync so capable terminals present it
+        // atomically. Presenting mid-frame dirty state shows torn intermediates
+        // (logo/status-bar flicker) that Ghostty itself never displays. Defer
+        // until the closing sequence; the pending dirty state accumulates and
+        // the next post-sync snapshot presents the complete frame at once.
+        if self.terminal.mode(Mode::SYNC_OUTPUT)? {
+            return Ok(None);
+        }
         let snapshot = self.render_state.update(&self.terminal)?;
         if snapshot.dirty()? == Dirty::Clean {
             // Nothing changed since the rows currently on screen were built.
@@ -412,7 +460,7 @@ impl TerminalSession {
 
         while let Some(row) = row_iterator.next() {
             let mut runs: Vec<RenderRun> = Vec::new();
-            let mut current_style: Option<CellStyle> = None;
+            let mut current: Option<(CellStyle, Option<BlockKind>)> = None;
             let mut current_text = String::new();
             let mut current_columns = 0_u16;
             let mut cell_iterator = self.cell_iterator.update(row)?;
@@ -460,27 +508,38 @@ impl TerminalSession {
                     cursor: cursor
                         .is_some_and(|position| position.x == column && position.y == row_index),
                 };
-                if current_style == Some(style) {
-                    current_text.push_str(&grapheme);
+                let kind = block_kind(&grapheme);
+                // Block fills are emitted as spaces so the view paints them as
+                // rects (see `RenderRun::block`); the space keeps the cell
+                // advance while contributing no glyph ink.
+                let emitted = if kind.is_some() {
+                    " "
+                } else {
+                    grapheme.as_str()
+                };
+                if current == Some((style, kind)) {
+                    current_text.push_str(emitted);
                     current_columns += 1;
                 } else {
-                    if let Some(previous_style) = current_style.replace(style) {
+                    if let Some((previous_style, previous_kind)) = current.replace((style, kind)) {
                         runs.push(RenderRun {
                             text: std::mem::take(&mut current_text).into(),
                             columns: current_columns,
                             style: previous_style,
+                            block: previous_kind,
                         });
                     }
-                    current_text.push_str(&grapheme);
+                    current_text.push_str(emitted);
                     current_columns = 1;
                 }
                 column += 1;
             }
-            if let Some(style) = current_style {
+            if let Some((style, kind)) = current {
                 runs.push(RenderRun {
                     text: current_text.into(),
                     columns: current_columns,
                     style,
+                    block: kind,
                 });
             }
             row.set_dirty(false)?;
@@ -501,4 +560,104 @@ fn default_shell() -> PathBuf {
 
 fn color_value(color: RgbColor) -> u32 {
     ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks in the contract `snapshot()` relies on: DEC 2026 toggles
+    /// `Mode::SYNC_OUTPUT`, and skipping `RenderState::update` while sync is
+    /// active does not lose content — the post-sync update still presents the
+    /// complete frame. `snapshot()` returns `Ok(None)` (keep cached rows)
+    /// while sync is active for exactly this reason.
+    #[test]
+    fn synchronized_output_buffers_a_frame_until_sync_end() {
+        let mut terminal = Terminal::new(20, 5).unwrap();
+        let mut render_state = RenderState::new().unwrap();
+
+        terminal.vt_write(b"\x1b[?2026h");
+        assert!(
+            terminal.mode(Mode::SYNC_OUTPUT).unwrap(),
+            "DECSET 2026 should enter synchronized-output mode"
+        );
+
+        // Partial frame content written inside sync; snapshot() would defer
+        // here, so deliberately perform no render-state update yet.
+        terminal.vt_write(b"hello");
+        terminal.vt_write(b" world");
+
+        terminal.vt_write(b"\x1b[?2026l");
+        assert!(
+            !terminal.mode(Mode::SYNC_OUTPUT).unwrap(),
+            "DECRST 2026 should leave synchronized-output mode"
+        );
+
+        // One post-sync update presents the whole buffered frame.
+        let snapshot = render_state.update(&terminal).unwrap();
+        assert_ne!(snapshot.dirty().unwrap(), Dirty::Clean);
+
+        let mut row_iterator_store = RowIterator::new().unwrap();
+        let mut row_iterator = row_iterator_store.update(&snapshot).unwrap();
+        let row = row_iterator.next().expect("first row should exist");
+        let mut cell_iterator_store = CellIterator::new().unwrap();
+        let mut cell_iterator = cell_iterator_store.update(row).unwrap();
+        let mut text = String::new();
+        let mut grapheme = String::new();
+        while let Some(cell) = cell_iterator.next() {
+            grapheme.clear();
+            if cell.graphemes_len().unwrap() > 0 {
+                cell.graphemes_utf8(&mut grapheme).unwrap();
+                text.push_str(&grapheme);
+            } else {
+                text.push(' ');
+            }
+        }
+        assert!(
+            text.starts_with("hello world"),
+            "buffered frame should present complete content, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn block_kind_classifies_only_exact_fill_cells() {
+        assert_eq!(block_kind("▀"), Some(BlockKind::Upper));
+        assert_eq!(block_kind("▄"), Some(BlockKind::Lower));
+        assert_eq!(block_kind("█"), Some(BlockKind::Full));
+        assert_eq!(block_kind(" "), None);
+        assert_eq!(block_kind(""), None);
+        assert_eq!(block_kind("▀̲"), None);
+        assert_eq!(block_kind("─"), None);
+    }
+
+    /// Block fills must split into their own runs with space text so the view
+    /// can paint them as rects: `▀▄█` fed side by side become three runs.
+    #[test]
+    fn block_fills_split_into_marked_space_runs() {
+        let cwd = std::env::temp_dir();
+        let (mut session, _output) =
+            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
+                .expect("spawning a shell for the block-fill test");
+        // Only these bytes are fed, so the snapshot is fully determined by
+        // them regardless of any shell output waiting in the channel.
+        session.feed("▀▄█".as_bytes());
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("fresh content should present a frame");
+        let first: Vec<(String, u16, Option<BlockKind>)> = rows[0]
+            .iter()
+            .take(3)
+            .map(|run| (run.text.to_string(), run.columns, run.block))
+            .collect();
+        assert_eq!(
+            first,
+            vec![
+                (" ".to_string(), 1, Some(BlockKind::Upper)),
+                (" ".to_string(), 1, Some(BlockKind::Lower)),
+                (" ".to_string(), 1, Some(BlockKind::Full)),
+            ]
+        );
+        session._child.kill().ok();
+    }
 }

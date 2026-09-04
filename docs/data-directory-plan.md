@@ -1,6 +1,6 @@
 # Data directory plan (Rust rewrite)
 
-Status: decided, not yet implemented. Single user, experimental; no migration from the Electron app and no multi-device upgrade path to preserve. Electron used capital `Devcroft` (`~/.config/Devcroft/device.json`); the Rust build uses lowercase `devcroft` everywhere below.
+Status: implemented in `src/data/` (items 1–4 below, with tests); item 5 intentionally skipped (no migration owed — fresh `git init`); item 6 is the `SyncOutcome::reload_required` contract plus `load_workspace`, with Home/Tasks/Review projection wiring to follow those surfaces. Single user, experimental; no migration from the Electron app and no multi-device upgrade path to preserve. Electron used capital `Devcroft` (`~/.config/Devcroft/device.json`); the Rust build uses lowercase `devcroft` everywhere below.
 
 ## Decisions
 

@@ -1496,6 +1496,8 @@ dependencies = [
  "libghostty-vt",
  "parking_lot",
  "portable-pty",
+ "serde",
+ "serde_json",
  "similar",
  "tempfile",
 ]

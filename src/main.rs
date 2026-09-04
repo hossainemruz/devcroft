@@ -1,3 +1,10 @@
+/// Data-directory foundation (`docs/data-directory-plan.md`): root
+/// resolution, device store, first-run init, portable-only sync.
+/// Startup consumes resolution/init/device-load today; sync, origin, and
+/// workspace loading gain UI consumers with Home/Tasks/Review, so the
+/// not-yet-wired surface is allow-listed until then — tests cover it now.
+#[allow(dead_code, unused_imports)]
+mod data;
 mod fonts;
 mod keys;
 mod metrics;
@@ -13,11 +20,32 @@ use gpui_kit::{AppContext as _, Styled as _, WindowBounds, WindowOptions, px, si
 use crate::{fonts::load_terminal_fonts, workspace::Workspace};
 
 fn main() -> Result<()> {
+    // App-owned data root: resolve, `mkdir -p`, and first-run init
+    // `portable/` (see `docs/data-directory-plan.md`). Failures stay
+    // non-fatal — the terminal tabs remain usable without persisted state.
+    let device = match data::ensure_ready(None) {
+        Ok(root) => match data::DeviceStore::new(&root).load() {
+            Ok(state) => Some(state),
+            Err(error) => {
+                eprintln!("devcroft: device state unavailable: {error:#}");
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!("devcroft: data directory unavailable: {error:#}");
+            None
+        }
+    };
+    let theme_mode = device
+        .as_ref()
+        .and_then(|state| state.theme.as_deref())
+        .map_or(ThemeMode::Dark, theme_mode_from_name);
+
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
-        Theme::change(ThemeMode::Dark, None, cx);
+        Theme::change(theme_mode, None, cx);
 
         let options = WindowOptions {
             titlebar: Some(gpui_kit::TitlebarOptions {
@@ -39,4 +67,13 @@ fn main() -> Result<()> {
         .detach();
     });
     Ok(())
+}
+
+/// Stored theme name to [`ThemeMode`]. Unknown or absent values keep the
+/// default dark theme; the tolerance matches `device.json`'s read defaults.
+fn theme_mode_from_name(name: &str) -> ThemeMode {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "light" => ThemeMode::Light,
+        _ => ThemeMode::Dark,
+    }
 }

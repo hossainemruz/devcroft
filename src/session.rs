@@ -284,6 +284,18 @@ impl TerminalSession {
         Ok(self.terminal.viewport_active()?)
     }
 
+    /// Whether wheel input is forwarded to the application instead of moving
+    /// the local viewport. Mirrors the branching in [`Self::scroll`] so
+    /// callers can pre-scale deltas for the application path.
+    pub(crate) fn app_handles_scroll(&self) -> Result<bool> {
+        if self.terminal.is_mouse_tracking()? {
+            return Ok(true);
+        }
+        Ok(self.terminal.mode(Mode::ALT_SCREEN_SAVE)?
+            || self.terminal.mode(Mode::ALT_SCREEN)?
+            || self.terminal.mode(Mode::ALT_SCREEN_LEGACY)?)
+    }
+
     pub(crate) fn scroll(
         &mut self,
         lines: isize,
@@ -340,7 +352,12 @@ impl TerminalSession {
             } else {
                 MouseButton::Five
             };
-            let repetitions = lines.unsigned_abs().clamp(1, 12);
+            // Pace application input: one wheel event forwards at most a few
+            // presses even when the gesture carries more lines. Sustained
+            // motion keeps arriving as further events, while a single coarse
+            // event can no longer queue a redraw storm — nvim answers every
+            // press with a full ~2KB redraw and does not coalesce them.
+            let repetitions = lines.unsigned_abs().clamp(1, 3);
             let mut encoded = Vec::with_capacity(repetitions * 64);
             let mut event_bytes = [0_u8; 128];
             for _ in 0..repetitions {
@@ -366,8 +383,10 @@ impl TerminalSession {
             || self.terminal.mode(Mode::ALT_SCREEN_LEGACY)?;
         if alternate_screen {
             let sequence = if lines < 0 { b"\x1b[A" } else { b"\x1b[B" };
-            let mut encoded = Vec::with_capacity(lines.unsigned_abs().min(12) * sequence.len());
-            for _ in 0..lines.unsigned_abs().clamp(1, 12) {
+            // Same pacing as the mouse path above: at most a few keys per
+            // wheel event so one coarse event cannot flood the application.
+            let mut encoded = Vec::with_capacity(lines.unsigned_abs().min(3) * sequence.len());
+            for _ in 0..lines.unsigned_abs().clamp(1, 3) {
                 encoded.extend_from_slice(sequence);
             }
             self.write_input(&encoded)?;

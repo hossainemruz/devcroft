@@ -12,8 +12,8 @@ use gpui_kit::component::v_flex;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, ScrollWheelEvent,
-    SharedString, Styled, StyledText, UnderlineStyle, Window, div, px, rgb,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, Styled, StyledText, UnderlineStyle, Window, div, px, rgb,
 };
 
 use crate::{
@@ -71,8 +71,13 @@ impl TerminalPane {
                 while let Ok(first) = output.recv().await {
                     if this
                         .update(cx, |pane, cx| {
-                            pane.process_output(first, &output);
-                            cx.notify();
+                            // Re-rendering reshapes every row, so only notify
+                            // when the visible frame actually changed.
+                            // Otherwise a scroll storm of pass-through batches
+                            // burns the main thread reshaping identical rows.
+                            if pane.process_output(first, &output) {
+                                cx.notify();
+                            }
                         })
                         .is_err()
                     {
@@ -86,24 +91,38 @@ impl TerminalPane {
         pane
     }
 
-    fn process_output(&mut self, first: Vec<u8>, output: &async_channel::Receiver<Vec<u8>>) {
+    /// Feeds pending PTY output and rebuilds the cached rows.
+    ///
+    /// Returns whether anything the view paints changed (rows or error), so
+    /// callers can skip redundant re-renders.
+    fn process_output(
+        &mut self,
+        first: Vec<u8>,
+        output: &async_channel::Receiver<Vec<u8>>,
+    ) -> bool {
+        let error_before = self.error.clone();
         let Some(session) = self.session.as_mut() else {
-            return;
+            return false;
         };
         session.feed(&first);
         while let Ok(bytes) = output.try_recv() {
             session.feed(&bytes);
         }
+        let mut changed = false;
         match session.snapshot() {
             Ok(Some(rows)) => {
                 self.rows = rows;
                 self.error = None;
+                changed = true;
             }
             // The render state reports no changes, so the cached rows are
             // still current.
             Ok(None) => self.error = None,
             Err(error) => self.error = Some(format!("Terminal render error: {error:#}").into()),
         }
+        // A fresh frame always repaints; otherwise only an error transition
+        // (appearing, clearing, or changing text) needs a re-render.
+        changed || self.error != error_before
     }
 
     fn resize_for_window(&mut self, window: &Window) {
@@ -170,16 +189,43 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta = event.delta.pixel_delta(px(CELL_HEIGHT)).y.as_f32();
-        let lines = coalesce_scroll_lines(&mut self.scroll_remainder, delta);
-        if lines == 0 {
-            // Not enough finger travel for a whole line yet. The remainder is
-            // kept so the gesture stays smooth instead of either dropping the
-            // movement or flooding the application with one line per event.
-            return;
-        }
         if let Some(session) = self.session.as_mut() {
+            let error_before = self.error.clone();
             let viewport = window.viewport_size();
+            // Terminal applications scale each forwarded press themselves
+            // (e.g. nvim `mousescroll`), so undo the platform UI multiplier
+            // for the application path (see APP_SCROLL_DIVISOR). The local
+            // viewport keeps the multiplied travel to match GUI scroll speed.
+            let app = session.app_handles_scroll().unwrap_or(false);
+            let travel_px = match event.delta {
+                ScrollDelta::Pixels(delta) => {
+                    let pixels = delta.y.as_f32();
+                    if app {
+                        pixels / APP_SCROLL_DIVISOR
+                    } else {
+                        pixels
+                    }
+                }
+                ScrollDelta::Lines(delta) => {
+                    let lines = if app {
+                        // Same-value division is exact, so one notch always
+                        // yields exactly one line (one press) instead of
+                        // accumulating float error across notches.
+                        delta.y / APP_SCROLL_DIVISOR
+                    } else {
+                        delta.y
+                    };
+                    lines * CELL_HEIGHT
+                }
+            };
+            let lines = coalesce_scroll_lines(&mut self.scroll_remainder, travel_px);
+            if lines == 0 {
+                // Not enough finger travel for a whole line yet. The remainder is
+                // kept so the gesture stays smooth instead of either dropping the
+                // movement or flooding the application with one line per event.
+                return;
+            }
+            let mut changed = false;
             match session.scroll(
                 lines,
                 event.position.x.as_f32(),
@@ -192,16 +238,22 @@ impl TerminalPane {
                     Ok(Some(rows)) => {
                         self.rows = rows;
                         self.error = None;
+                        changed = true;
                     }
                     Ok(None) => self.error = None,
                     Err(error) => {
                         self.error = Some(format!("Terminal scroll error: {error:#}").into())
                     }
                 },
+                // The application handles the scroll and redraws through the
+                // output task; repainting now would only reshape unchanged
+                // rows while its redraw is still in flight.
                 Ok(false) => self.error = None,
                 Err(error) => self.error = Some(format!("Terminal scroll error: {error:#}").into()),
             }
-            cx.notify();
+            if changed || self.error != error_before {
+                cx.notify();
+            }
             cx.stop_propagation();
             window.prevent_default();
         }
@@ -350,6 +402,17 @@ impl Render for TerminalPane {
     }
 }
 
+/// Platform UI scroll multiplier to undo before forwarding scroll input to a
+/// terminal application.
+///
+/// The Linux backend reports one wheel notch as `Lines(±3.0)` (its internal
+/// `SCROLL_LINES`) and triples trackpad pixel deltas the same way, matching
+/// GUI scrollview conventions. Terminal applications scale each press
+/// themselves (nvim `mousescroll` defaults to 3 lines), so forwarding the
+/// multiplied travel scrolls ~3x further per rotation than other terminals.
+/// Keep in sync with `SCROLL_LINES` in gpui-pre-linux.
+const APP_SCROLL_DIVISOR: f32 = 3.0;
+
 /// Converts a vertical wheel delta in pixels into whole scroll lines,
 /// carrying sub-line movement in `remainder` for the next event.
 ///
@@ -368,6 +431,21 @@ fn coalesce_scroll_lines(remainder: &mut f32, delta_pixels_y: f32) -> isize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_scroll_scales_one_notch_to_one_line() {
+        // The backend reports one wheel notch as Lines(±3.0); undoing the UI
+        // factor leaves exactly one line, i.e. one press per notch like other
+        // terminals. Each step below is exact in f32 (same-value division,
+        // scaling by one, same-value division), so no travel leaks into the
+        // remainder across notches regardless of font size.
+        let mut remainder = 0.0;
+        let notch_px = (3.0 / APP_SCROLL_DIVISOR) * CELL_HEIGHT;
+        assert_eq!(coalesce_scroll_lines(&mut remainder, notch_px), -1);
+        assert!(remainder.abs() < f32::EPSILON);
+        assert_eq!(coalesce_scroll_lines(&mut remainder, -notch_px), 1);
+        assert!(remainder.abs() < f32::EPSILON);
+    }
 
     #[test]
     fn block_fill_bounds_cover_exact_cell_halves() {

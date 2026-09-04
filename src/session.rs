@@ -21,7 +21,7 @@ use libghostty_vt::{
         self, Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder,
         Event as MouseEvent,
     },
-    render::{CellIterator, Dirty, RenderState, RowIterator},
+    render::{CellIterator, Dirty, RenderState, RowIteration, RowIterator},
     screen::CellWide,
     style::RgbColor,
     terminal::{
@@ -107,6 +107,17 @@ pub(crate) struct TerminalSession {
     grid_size: Arc<Mutex<(u16, u16)>>,
     master: Box<dyn MasterPty + Send>,
     _child: Box<dyn Child + Send + Sync>,
+    /// Last presented grid. Snapshots rebuild only dirty rows (plus rows the
+    /// cursor entered or left, whose highlight state row dirtiness does not
+    /// cover) and clone the rest from here, so a picker step that rewrites a
+    /// handful of rows no longer pays a full-grid rebuild.
+    cached_rows: Vec<Vec<RenderRun>>,
+    /// Terminal defaults the unstyled cells of `cached_rows` were built with.
+    /// A palette change without row dirtiness still invalidates the cache.
+    cached_defaults: Option<(u32, u32)>,
+    /// Viewport cursor cell of `cached_rows`, to force-rebuild rows the
+    /// cursor entered or left.
+    last_cursor: Option<(u16, u16)>,
 }
 
 impl TerminalSession {
@@ -234,6 +245,9 @@ impl TerminalSession {
                 grid_size,
                 master: pair.master,
                 _child: child,
+                cached_rows: Vec::new(),
+                cached_defaults: None,
+                last_cursor: None,
             },
             output,
         ))
@@ -472,101 +486,143 @@ impl TerminalSession {
         let default_foreground = color_value(colors.foreground);
         let default_background = color_value(colors.background);
         let row_count = snapshot.rows()? as usize;
+        let cursor_cell = cursor.map(|position| (position.x, position.y));
+
+        // Reuse cached rows unless the grid shape, the defaults unstyled
+        // cells inherit, or a row's own content changed. The cursor row is
+        // rebuilt whenever the cursor entered or left it, since cursor
+        // movement alone does not dirty rows.
+        let full_rebuild = row_count != self.cached_rows.len()
+            || self.cached_defaults != Some((default_foreground, default_background));
         let mut rows = Vec::with_capacity(row_count);
         let mut row_iterator = self.row_iterator.update(&snapshot)?;
         let mut row_index = 0_u16;
         let mut grapheme = String::with_capacity(8);
 
         while let Some(row) = row_iterator.next() {
-            let mut runs: Vec<RenderRun> = Vec::new();
-            let mut current: Option<(CellStyle, Option<BlockKind>)> = None;
-            let mut current_text = String::new();
-            let mut current_columns = 0_u16;
-            let mut cell_iterator = self.cell_iterator.update(row)?;
-            let mut column = 0_u16;
-            while let Some(cell) = cell_iterator.next() {
-                grapheme.clear();
-                if cell.graphemes_len()? > 0 {
-                    cell.graphemes_utf8(&mut grapheme)?;
-                } else if !matches!(
-                    cell.raw_cell()?.wide()?,
-                    CellWide::SpacerTail | CellWide::SpacerHead
-                ) {
-                    grapheme.push(' ');
-                }
-
-                // Cells without explicit styling use the terminal defaults,
-                // which avoids color and style lookups for empty regions.
-                let (foreground, background, bold, italic, underline) = if cell.has_styling()? {
-                    let mut foreground = cell
-                        .fg_color()?
-                        .map(color_value)
-                        .unwrap_or(default_foreground);
-                    let mut background = cell
-                        .bg_color()?
-                        .map(color_value)
-                        .unwrap_or(default_background);
-                    let style = cell.style()?;
-                    let bold = style.bold;
-                    let italic = style.italic;
-                    let underline = style.underline != libghostty_vt::style::Underline::None;
-                    if style.inverse {
-                        std::mem::swap(&mut foreground, &mut background);
-                    }
-                    (foreground, background, bold, italic, underline)
-                } else {
-                    (default_foreground, default_background, false, false, false)
-                };
-
-                let style = CellStyle {
-                    foreground,
-                    background,
-                    bold,
-                    italic,
-                    underline,
-                    cursor: cursor
-                        .is_some_and(|position| position.x == column && position.y == row_index),
-                };
-                let kind = block_kind(&grapheme);
-                // Block fills are emitted as spaces so the view paints them as
-                // rects (see `RenderRun::block`); the space keeps the cell
-                // advance while contributing no glyph ink.
-                let emitted = if kind.is_some() {
-                    " "
-                } else {
-                    grapheme.as_str()
-                };
-                if current == Some((style, kind)) {
-                    current_text.push_str(emitted);
-                    current_columns += 1;
-                } else {
-                    if let Some((previous_style, previous_kind)) = current.replace((style, kind)) {
-                        runs.push(RenderRun {
-                            text: std::mem::take(&mut current_text).into(),
-                            columns: current_columns,
-                            style: previous_style,
-                            block: previous_kind,
-                        });
-                    }
-                    current_text.push_str(emitted);
-                    current_columns = 1;
-                }
-                column += 1;
+            let cursor_touched = Some(row_index) == self.last_cursor.map(|(_, y)| y)
+                || cursor_cell.is_some_and(|(_, y)| y == row_index);
+            if !full_rebuild && !cursor_touched && !row.dirty()? {
+                rows.push(self.cached_rows[row_index as usize].clone());
+            } else {
+                rows.push(Self::build_row(
+                    &mut self.cell_iterator,
+                    row,
+                    cursor_cell,
+                    default_foreground,
+                    default_background,
+                    row_index,
+                    &mut grapheme,
+                )?);
+                row.set_dirty(false)?;
             }
-            if let Some((style, kind)) = current {
-                runs.push(RenderRun {
-                    text: current_text.into(),
-                    columns: current_columns,
-                    style,
-                    block: kind,
-                });
-            }
-            row.set_dirty(false)?;
-            rows.push(runs);
             row_index += 1;
         }
         snapshot.set_dirty(Dirty::Clean)?;
+        self.cached_rows = rows.clone();
+        self.cached_defaults = Some((default_foreground, default_background));
+        self.last_cursor = cursor_cell;
         Ok(Some(rows))
+    }
+
+    /// Builds the [`RenderRun`]s for one grid row from the terminal cells.
+    ///
+    /// Takes the cell iterator explicitly (rather than `&mut self`) so the
+    /// snapshot loop can hold the row iterator and the row cache side by
+    /// side: all three are disjoint field borrows.
+    fn build_row<'alloc>(
+        cell_iterator: &mut CellIterator<'alloc>,
+        row: &RowIteration<'alloc, '_>,
+        cursor: Option<(u16, u16)>,
+        default_foreground: u32,
+        default_background: u32,
+        row_index: u16,
+        grapheme: &mut String,
+    ) -> Result<Vec<RenderRun>> {
+        let mut runs: Vec<RenderRun> = Vec::new();
+        let mut current: Option<(CellStyle, Option<BlockKind>)> = None;
+        let mut current_text = String::new();
+        let mut current_columns = 0_u16;
+        let mut cell_iteration = cell_iterator.update(row)?;
+        let mut column = 0_u16;
+        while let Some(cell) = cell_iteration.next() {
+            grapheme.clear();
+            if cell.graphemes_len()? > 0 {
+                cell.graphemes_utf8(grapheme)?;
+            } else if !matches!(
+                cell.raw_cell()?.wide()?,
+                CellWide::SpacerTail | CellWide::SpacerHead
+            ) {
+                grapheme.push(' ');
+            }
+
+            // Cells without explicit styling use the terminal defaults,
+            // which avoids color and style lookups for empty regions.
+            let (foreground, background, bold, italic, underline) = if cell.has_styling()? {
+                let mut foreground = cell
+                    .fg_color()?
+                    .map(color_value)
+                    .unwrap_or(default_foreground);
+                let mut background = cell
+                    .bg_color()?
+                    .map(color_value)
+                    .unwrap_or(default_background);
+                let style = cell.style()?;
+                let bold = style.bold;
+                let italic = style.italic;
+                let underline = style.underline != libghostty_vt::style::Underline::None;
+                if style.inverse {
+                    std::mem::swap(&mut foreground, &mut background);
+                }
+                (foreground, background, bold, italic, underline)
+            } else {
+                (default_foreground, default_background, false, false, false)
+            };
+
+            let style = CellStyle {
+                foreground,
+                background,
+                bold,
+                italic,
+                underline,
+                cursor: cursor
+                    .is_some_and(|position| position.0 == column && position.1 == row_index),
+            };
+            let kind = block_kind(grapheme);
+            // Block fills are emitted as spaces so the view paints them as
+            // rects (see `RenderRun::block`); the space keeps the cell
+            // advance while contributing no glyph ink.
+            let emitted = if kind.is_some() {
+                " "
+            } else {
+                grapheme.as_str()
+            };
+            if current == Some((style, kind)) {
+                current_text.push_str(emitted);
+                current_columns += 1;
+            } else {
+                if let Some((previous_style, previous_kind)) = current.replace((style, kind)) {
+                    runs.push(RenderRun {
+                        text: std::mem::take(&mut current_text).into(),
+                        columns: current_columns,
+                        style: previous_style,
+                        block: previous_kind,
+                    });
+                }
+                current_text.push_str(emitted);
+                current_columns = 1;
+            }
+            column += 1;
+        }
+        if let Some((style, kind)) = current {
+            runs.push(RenderRun {
+                text: current_text.into(),
+                columns: current_columns,
+                style,
+                block: kind,
+            });
+        }
+        Ok(runs)
     }
 }
 
@@ -677,6 +733,83 @@ mod tests {
                 (" ".to_string(), 1, Some(BlockKind::Full)),
             ]
         );
+        session._child.kill().ok();
+    }
+
+    /// Incremental snapshots must stay correct when clean rows are reused:
+    /// overwriting one row keeps the others, and moving the cursor rebuilds
+    /// exactly the rows it entered and left (cursor motion alone does not
+    /// dirty rows, so the old cell must lose its cursor flag).
+    #[test]
+    fn snapshot_reuses_clean_rows_and_tracks_cursor() {
+        let cwd = std::env::temp_dir();
+        let (mut session, _output) =
+            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
+                .expect("spawning a shell for the incremental test");
+        let row_text = |rows: &[Vec<RenderRun>], index: usize| -> String {
+            rows[index].iter().map(|run| run.text.as_ref()).collect()
+        };
+
+        session.feed(b"aaa");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("fresh content should present a frame");
+        assert!(row_text(&rows, 0).starts_with("aaa"));
+
+        // Overwrite the same row: only it rebuilds, the rest is reused.
+        session.feed(b"\rbbb");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("changed row should present a frame");
+        assert!(row_text(&rows, 0).starts_with("bbb"));
+        assert!(rows[0].iter().any(|run| run.style.cursor));
+
+        // Move the cursor down and write: row 0 must lose its cursor flag
+        // even though its text did not change.
+        session.feed(b"\x1b[2;1Hccc");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("cursor move should present a frame");
+        assert!(row_text(&rows, 0).starts_with("bbb"));
+        assert!(
+            rows[0].iter().all(|run| !run.style.cursor),
+            "row 0 should lose the cursor flag, got {:?}",
+            rows[0]
+                .iter()
+                .map(|run| (run.text.to_string(), run.style.cursor))
+                .collect::<Vec<_>>(),
+        );
+        assert!(row_text(&rows, 1).starts_with("ccc"));
+        assert!(rows[1].iter().any(|run| run.style.cursor));
+        session._child.kill().ok();
+    }
+
+    /// A grid-shape change invalidates the row cache: after a resize the
+    /// snapshot presents the new row count instead of stale cached rows.
+    #[test]
+    fn snapshot_rebuilds_after_resize() {
+        let cwd = std::env::temp_dir();
+        let (mut session, _output) =
+            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
+                .expect("spawning a shell for the resize test");
+        session.feed(b"aaa");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("fresh content should present a frame");
+        assert_eq!(rows.len(), crate::metrics::INITIAL_ROWS as usize);
+
+        session
+            .resize(80, 24)
+            .expect("headless resize should succeed");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("resized grid should present a frame");
+        assert_eq!(rows.len(), 24);
         session._child.kill().ok();
     }
 }

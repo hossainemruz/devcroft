@@ -27,3 +27,21 @@ gpui-pre = { opt-level = 3 }
 gpui-pre-platform = { opt-level = 3 }
 libghostty-vt = { opt-level = 3 }
 libghostty-vt-sys = { opt-level = 3 }
+# Per-frame text/render hot path. The terminal reshapes fresh glyph runs on
+# every present (syntax-highlighted redraws), and at dev opt-level 0 the
+# shaping stack alone costs ~10ms per full frame — enough to floor picker
+# navigation at ~20Hz while input arrives at ~30Hz. Optimizing these
+# dependencies costs one-time build minutes and keeps incremental rebuilds
+# fast (the top-level crate stays unoptimized).
+gpui-pre-linux = { opt-level = 3 }
+gpui-pre-wgpu = { opt-level = 3 }
+cosmic-text = { opt-level = 3 }
+swash = { opt-level = 3 }
+skrifa = { opt-level = 3 }
+harfrust = { opt-level = 3 }
+read-fonts = { opt-level = 3 }
+fontdb = { opt-level = 3 }
+unicode-bidi = { opt-level = 3 }
+unicode-linebreak = { opt-level = 3 }
+unicode-script = { opt-level = 3 }
+unicode-segmentation = { opt-level = 3 }

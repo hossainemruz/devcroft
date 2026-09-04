@@ -7,6 +7,7 @@
 //! and the startup command.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::v_flex;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -41,6 +42,11 @@ pub(crate) struct TerminalPane {
     /// the remainder here preserves total finger travel while sending input
     /// at a rate the terminal can keep up with.
     scroll_remainder: f32,
+    /// When the latest frame was presented. Redraw storms pace presents
+    /// through here (see [`TerminalPane::present_paced`]).
+    last_present: Option<Instant>,
+    /// Whether a trailing present flush is already scheduled.
+    flush_armed: bool,
 }
 
 impl TerminalPane {
@@ -53,6 +59,8 @@ impl TerminalPane {
             error: None,
             grid_size: (INITIAL_COLS, INITIAL_ROWS),
             scroll_remainder: 0.0,
+            last_present: None,
+            flush_armed: false,
         };
 
         let output = match TerminalSession::spawn(tab, cwd) {
@@ -71,13 +79,13 @@ impl TerminalPane {
                 while let Ok(first) = output.recv().await {
                     if this
                         .update(cx, |pane, cx| {
-                            // Re-rendering reshapes every row, so only notify
-                            // when the visible frame actually changed.
-                            // Otherwise a scroll storm of pass-through batches
-                            // burns the main thread reshaping identical rows.
-                            if pane.process_output(first, &output) {
-                                cx.notify();
+                            if let Some(session) = pane.session.as_mut() {
+                                session.feed(&first);
+                                while let Ok(bytes) = output.try_recv() {
+                                    session.feed(&bytes);
+                                }
                             }
+                            pane.present_paced(cx);
                         })
                         .is_err()
                     {
@@ -91,38 +99,68 @@ impl TerminalPane {
         pane
     }
 
-    /// Feeds pending PTY output and rebuilds the cached rows.
+    /// Minimum interval between presents during redraw storms.
     ///
-    /// Returns whether anything the view paints changed (rows or error), so
-    /// callers can skip redundant re-renders.
-    fn process_output(
-        &mut self,
-        first: Vec<u8>,
-        output: &async_channel::Receiver<Vec<u8>>,
-    ) -> bool {
-        let error_before = self.error.clone();
-        let Some(session) = self.session.as_mut() else {
-            return false;
-        };
-        session.feed(&first);
-        while let Ok(bytes) = output.try_recv() {
-            session.feed(&bytes);
-        }
-        let mut changed = false;
-        match session.snapshot() {
-            Ok(Some(rows)) => {
-                self.rows = rows;
-                self.error = None;
-                changed = true;
+    /// Full-screen redraws arrive much faster than their snapshot+reshape can
+    /// land (measured ~13ms per heavy frame on the main thread). Presenting
+    /// every batch saturates the main thread, starving input and stuttering
+    /// motion — while pacing too coarsely batches several key repeats into
+    /// one present, which reads as multi-row jumps in pickers (measured:
+    /// 50ms pacing showed ~2.3 rows per present vs one row per present in
+    /// the reference terminal at the same repeat rate). Snapshots now
+    /// rebuild only dirty rows, roughly halving present cost, so 25ms paces
+    /// storms to ~40Hz while tracking a ~30Hz key repeat 1:1. Isolated
+    /// presents stay immediate (see [`present_due`]), so typing and single
+    /// actions gain no latency.
+    const PRESENT_PACE: Duration = Duration::from_millis(25);
+
+    /// Snapshot and repaint unless a present just landed, queuing a trailing
+    /// flush instead. Skipped snapshots lose nothing: dirty state accumulates
+    /// in the terminal and the next snapshot picks it all up at once.
+    fn present_paced(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if !present_due(self.last_present, now) {
+            if !self.flush_armed {
+                self.flush_armed = true;
+                let delay = self
+                    .last_present
+                    .map(|last| Self::PRESENT_PACE.saturating_sub(now.duration_since(last)))
+                    .unwrap_or(Self::PRESENT_PACE);
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    let _ = this.update(cx, |pane, cx| {
+                        pane.flush_armed = false;
+                        pane.present_now(cx);
+                    });
+                })
+                .detach();
             }
-            // The render state reports no changes, so the cached rows are
-            // still current.
-            Ok(None) => self.error = None,
-            Err(error) => self.error = Some(format!("Terminal render error: {error:#}").into()),
+            return;
         }
-        // A fresh frame always repaints; otherwise only an error transition
-        // (appearing, clearing, or changing text) needs a re-render.
-        changed || self.error != error_before
+        self.present_now(cx);
+    }
+
+    /// Snapshot once and repaint on change, recording the present time.
+    fn present_now(&mut self, cx: &mut Context<Self>) {
+        let error_before = self.error.clone();
+        let mut changed = false;
+        if let Some(session) = self.session.as_mut() {
+            match session.snapshot() {
+                Ok(Some(rows)) => {
+                    self.rows = rows;
+                    self.error = None;
+                    changed = true;
+                }
+                // The render state reports no changes, so the cached rows are
+                // still current.
+                Ok(None) => self.error = None,
+                Err(error) => self.error = Some(format!("Terminal render error: {error:#}").into()),
+            }
+        }
+        if changed || self.error != error_before {
+            self.last_present = Some(Instant::now());
+            cx.notify();
+        }
     }
 
     fn resize_for_window(&mut self, window: &Window) {
@@ -145,26 +183,25 @@ impl TerminalPane {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-
         // Re-snapping an already pinned viewport cannot change the visible
         // rows, so skip the eager grid rebuild on the input path. In
         // full-screen applications such as nvim the viewport is always
         // pinned, which previously doubled the snapshot work per keypress.
-        if !session.viewport_active().unwrap_or(true) {
-            session.scroll_to_bottom();
-            match session.snapshot() {
-                Ok(Some(rows)) => {
-                    self.rows = rows;
-                    self.error = None;
-                }
-                Ok(None) => self.error = None,
-                Err(error) => self.error = Some(format!("Terminal render error: {error:#}").into()),
+        // The re-snap itself paces like any other present.
+        let resnap = self.session.as_mut().is_some_and(|session| {
+            if session.viewport_active().unwrap_or(true) {
+                false
+            } else {
+                session.scroll_to_bottom();
+                true
             }
-            cx.notify();
+        });
+        if resnap {
+            self.present_paced(cx);
         }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
 
         let modifiers = event.keystroke.modifiers;
         if modifiers.platform && event.keystroke.key.eq_ignore_ascii_case("v") {
@@ -225,34 +262,33 @@ impl TerminalPane {
                 // movement or flooding the application with one line per event.
                 return;
             }
-            let mut changed = false;
-            match session.scroll(
+            let scrolled = session.scroll(
                 lines,
                 event.position.x.as_f32(),
                 event.position.y.as_f32(),
                 event.modifiers,
                 viewport.width.as_f32(),
                 viewport.height.as_f32(),
-            ) {
-                Ok(true) => match session.snapshot() {
-                    Ok(Some(rows)) => {
-                        self.rows = rows;
-                        self.error = None;
-                        changed = true;
-                    }
-                    Ok(None) => self.error = None,
-                    Err(error) => {
-                        self.error = Some(format!("Terminal scroll error: {error:#}").into())
-                    }
-                },
+            );
+            match scrolled {
+                // Local viewport scrolls repaint through the paced path like
+                // everything else; the snapshot work is identical.
+                Ok(true) => self.present_paced(cx),
                 // The application handles the scroll and redraws through the
                 // output task; repainting now would only reshape unchanged
                 // rows while its redraw is still in flight.
-                Ok(false) => self.error = None,
-                Err(error) => self.error = Some(format!("Terminal scroll error: {error:#}").into()),
-            }
-            if changed || self.error != error_before {
-                cx.notify();
+                Ok(false) => {
+                    self.error = None;
+                    if self.error != error_before {
+                        cx.notify();
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(format!("Terminal scroll error: {error:#}").into());
+                    if self.error != error_before {
+                        cx.notify();
+                    }
+                }
             }
             cx.stop_propagation();
             window.prevent_default();
@@ -413,6 +449,13 @@ impl Render for TerminalPane {
 /// Keep in sync with `SCROLL_LINES` in gpui-pre-linux.
 const APP_SCROLL_DIVISOR: f32 = 3.0;
 
+/// Whether a present is due given the last one. Pure helper so the storm
+/// cadence is unit-testable without a window: the first present is always
+/// due, then at most one per [`TerminalPane::PRESENT_PACE`].
+fn present_due(last_present: Option<Instant>, now: Instant) -> bool {
+    last_present.is_none_or(|last| now.duration_since(last) >= TerminalPane::PRESENT_PACE)
+}
+
 /// Converts a vertical wheel delta in pixels into whole scroll lines,
 /// carrying sub-line movement in `remainder` for the next event.
 ///
@@ -445,6 +488,25 @@ mod tests {
         assert!(remainder.abs() < f32::EPSILON);
         assert_eq!(coalesce_scroll_lines(&mut remainder, -notch_px), 1);
         assert!(remainder.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn storm_pacing_defers_presents_within_interval() {
+        use std::time::Duration;
+
+        let now = Instant::now();
+        // The first present is always due: typing and single actions gain no
+        // latency from pacing.
+        assert!(present_due(None, now));
+        // Back-to-back redraws wait out the interval; the trailing flush
+        // presents the latest frame instead.
+        assert!(!present_due(Some(now), now));
+        assert!(!present_due(
+            Some(now),
+            now + TerminalPane::PRESENT_PACE - Duration::from_millis(1)
+        ));
+        assert!(present_due(Some(now), now + TerminalPane::PRESENT_PACE));
+        assert!(present_due(Some(now), now + Duration::from_secs(1)));
     }
 
     #[test]

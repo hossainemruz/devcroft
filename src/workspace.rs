@@ -161,6 +161,10 @@ impl Workspace {
     }
 
     fn focus_active_pane(&self, window: &mut Window, cx: &mut App) {
+        if self.active_tab == WorkspaceTab::Review {
+            self.review.read(cx).focus_handle.clone().focus(window, cx);
+            return;
+        }
         if let Some(Some(pane)) = self.tabs.get(self.active_tab as usize) {
             let focus_handle = pane.read(cx).focus_handle.clone();
             focus_handle.focus(window, cx);

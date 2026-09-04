@@ -477,10 +477,6 @@ impl TerminalSession {
             return Ok(None);
         }
         let snapshot = self.render_state.update(&self.terminal)?;
-        if snapshot.dirty()? == Dirty::Clean {
-            // Nothing changed since the rows currently on screen were built.
-            return Ok(None);
-        }
         let colors = snapshot.colors()?;
         let cursor = snapshot.cursor_viewport()?;
         let default_foreground = color_value(colors.foreground);
@@ -494,6 +490,17 @@ impl TerminalSession {
         // movement alone does not dirty rows.
         let full_rebuild = row_count != self.cached_rows.len()
             || self.cached_defaults != Some((default_foreground, default_background));
+        // Line editors (the shell, opencode's input) reposition the cursor
+        // with cursor-addressing sequences that change no cells, so the
+        // render state stays clean. Without this check the early return
+        // below swallows pure cursor moves and the visible cursor freezes —
+        // while full-screen apps such as nvim redraw cells on every move
+        // and keep working. The loop's `cursor_touched` rebuild then
+        // repaints exactly the rows the cursor entered or left.
+        if snapshot.dirty()? == Dirty::Clean && !full_rebuild && cursor_cell == self.last_cursor {
+            // Nothing changed since the rows currently on screen were built.
+            return Ok(None);
+        }
         let mut rows = Vec::with_capacity(row_count);
         let mut row_iterator = self.row_iterator.update(&snapshot)?;
         let mut row_index = 0_u16;
@@ -810,6 +817,64 @@ mod tests {
             .expect("snapshot should succeed")
             .expect("resized grid should present a frame");
         assert_eq!(rows.len(), 24);
+        session._child.kill().ok();
+    }
+
+    /// A pure cursor move (no cell changes) must still present a frame.
+    ///
+    /// Line editors such as the shell and opencode's input reposition the
+    /// cursor with cursor-addressing sequences instead of redrawing cells,
+    /// so the render state stays clean. Swallowing that frame freezes the
+    /// visible cursor and reads as broken left/right navigation, while
+    /// full-screen apps such as nvim redraw on every move and keep working.
+    #[test]
+    fn snapshot_presents_pure_cursor_moves() {
+        let cwd = std::env::temp_dir();
+        let (mut session, _output) =
+            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
+                .expect("spawning a shell for the cursor-move test");
+        // Only these bytes are fed, so the snapshot is fully determined by
+        // them regardless of any shell output waiting in the channel.
+        let cursor_column = |rows: &[Vec<RenderRun>]| -> usize {
+            let mut column = 0_usize;
+            for run in &rows[0] {
+                if run.style.cursor {
+                    return column;
+                }
+                column += run.columns as usize;
+            }
+            panic!("row 0 should carry the cursor flag");
+        };
+        let row_text = |rows: &[Vec<RenderRun>]| -> String {
+            rows[0].iter().map(|run| run.text.as_ref()).collect()
+        };
+
+        session.feed(b"abc");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("fresh content should present a frame");
+        assert!(row_text(&rows).starts_with("abc"));
+        assert_eq!(cursor_column(&rows), 3);
+
+        // Cursor back one: no cell changes, but the frame must present so
+        // the visible cursor follows.
+        session.feed(b"\x1b[D");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("a pure cursor move should present a frame");
+        assert!(row_text(&rows).starts_with("abc"));
+        assert_eq!(cursor_column(&rows), 2);
+
+        // A settled grid presents nothing, so idle frames stay free.
+        assert!(
+            session
+                .snapshot()
+                .expect("snapshot should succeed")
+                .is_none(),
+            "a settled grid should present no frame"
+        );
         session._child.kill().ok();
     }
 }

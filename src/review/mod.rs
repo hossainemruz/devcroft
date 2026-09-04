@@ -26,10 +26,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement, InteractiveElement, MouseButton,
-    ParentElement, Render, ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window,
-    div, img, px, rgb, uniform_list,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollStrategy, SharedString,
+    Styled, UniformListScrollHandle, Window, div, img, px, rgb, uniform_list,
 };
+
+use crate::command_palette::ToggleCommandPalette;
 
 use self::git::{ReviewScope, load_review, suggest_base_branch};
 use self::model::ReviewDiff;
@@ -61,6 +63,7 @@ pub(crate) struct LoadedReview {
 }
 
 pub(crate) struct ReviewView {
+    pub(crate) focus_handle: FocusHandle,
     cwd: PathBuf,
     scope_tab: ScopeTab,
     base_branch: String,
@@ -92,6 +95,7 @@ impl ReviewView {
         let base_branch =
             suggest_base_branch(cwd, "origin").unwrap_or_else(|| "main".to_owned());
         let mut view = Self {
+            focus_handle: cx.focus_handle(),
             cwd: cwd.to_owned(),
             scope_tab: ScopeTab::FullDiff,
             base_branch,
@@ -186,6 +190,23 @@ impl ReviewView {
         }
         drop(viewed);
         cx.notify();
+    }
+
+    /// Forward the command-bar toggle to the workspace, mirroring
+    /// `TerminalPane::on_key_down`. The tree/stream children don't swallow
+    /// keys today, but without this any future child that stops propagation
+    /// would silently break `cmd-k` on this tab again. All other keys bubble
+    /// normally (no `prevent_default`/`stop_propagation`) so tree navigation
+    /// and list scrolling keep working.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key.eq_ignore_ascii_case("k")
+            && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
+            && !event.keystroke.modifiers.alt
+        {
+            window.dispatch_action(Box::new(ToggleCommandPalette), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+        }
     }
 
     fn base_label(&self) -> String {
@@ -432,6 +453,8 @@ impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sync scroll before borrowing the diff for the body below.
         self.sync_tree_and_stream(cx);
+        let focus = self.focus_handle.clone();
+        let track = self.focus_handle.clone();
         let body: AnyElement = match &self.state {
             ReviewState::Loading => div()
                 .flex_1()
@@ -529,7 +552,19 @@ impl Render for ReviewView {
             .size_full()
             .bg(rgb(0x090a0a))
             .text_color(rgb(0xe7e7e7))
+            .track_focus(&track)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, _, window, cx| focus.focus(window, cx)),
+            )
+            .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_toolbar(cx))
             .child(body)
+    }
+}
+
+impl Focusable for ReviewView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }

@@ -7,6 +7,7 @@
 mod data;
 mod command_palette;
 mod fonts;
+mod git_status;
 mod keys;
 mod metrics;
 mod pane;

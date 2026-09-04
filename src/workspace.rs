@@ -1,7 +1,7 @@
 //! The workspace shell: tab definitions plus the surrounding chrome
 //! (project header, tab bar, status bar) hosting the active terminal pane.
 
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
 
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, IndexPath, StyledExt as _, WindowExt as _,
@@ -19,9 +19,18 @@ use gpui_kit::{
 
 use crate::command_palette::{GROUPS, PaletteCommand, ToggleCommandPalette, command_at};
 use crate::data::{DataRoot, SyncStatus, SyncTracker, sync_portable_with_tracker};
+use crate::git_status::{GitStatus, load_git_status};
 use crate::metrics::WORKSPACE_HEADER_HEIGHT;
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
+
+/// How often the header re-reads branch/dirty/ahead-behind state.
+///
+/// The poll runs off the main thread and only notifies on change, so the
+/// cadence sets staleness, not frame cost. Two seconds keeps the dirty dot
+/// feeling live after saves without churning full worktree walks on large
+/// checkouts.
+const GIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceTab {
@@ -63,7 +72,7 @@ pub(crate) struct Workspace {
     tabs: Vec<Option<Entity<TerminalPane>>>,
     review: Entity<ReviewView>,
     project_name: SharedString,
-    project_path: SharedString,
+    git_status: GitStatus,
     command_open: bool,
     command_state: Entity<CommandState>,
     data_root: Option<DataRoot>,
@@ -78,7 +87,6 @@ impl Workspace {
             .and_then(|name| name.to_str())
             .unwrap_or("workspace")
             .to_owned();
-        let project_path = working_directory.display().to_string();
 
         let tabs = WorkspaceTab::ALL
             .into_iter()
@@ -96,6 +104,32 @@ impl Workspace {
         let review_cwd = working_directory.clone();
         let review = cx.new(|cx| ReviewView::new(&review_cwd, cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
+        // Poll branch/dirty/ahead-behind off the main thread; the header
+        // repaints only when the snapshot actually changes. The first
+        // iteration loads immediately (so no worktree I/O blocks window
+        // open), then repeats on the interval. The loop ends with the
+        // entity: `update` fails once the workspace is dropped.
+        let poll_dir = working_directory.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let path = poll_dir.clone();
+                let status =
+                    cx.background_spawn(async move { load_git_status(&path) }).await;
+                let dropped = this
+                    .update(cx, |this, cx| {
+                        if this.git_status != status {
+                            this.git_status = status;
+                            cx.notify();
+                        }
+                    })
+                    .is_err();
+                if dropped {
+                    break;
+                }
+                cx.background_executor().timer(GIT_POLL_INTERVAL).await;
+            }
+        })
+        .detach();
         // Resolved here (not passed in) so sync keeps working even if the
         // startup path never persisted device state; failures stay non-fatal
         // and surface as a palette notification instead.
@@ -106,7 +140,7 @@ impl Workspace {
             tabs,
             review,
             project_name: project_name.into(),
-            project_path: project_path.into(),
+            git_status: GitStatus::default(),
             command_open: false,
             command_state,
             data_root,
@@ -295,6 +329,32 @@ impl Workspace {
             None => div().size_full().into_any_element(),
         }
     }
+
+    /// Branch pill for the header: `⎇ <branch>` on a branch, `➦ <short-sha>`
+    /// on a detached HEAD. Long branch names truncate instead of pushing the
+    /// command bar aside.
+    fn render_branch_pill(&self, branch: SharedString) -> impl IntoElement {
+        let glyph = if self.git_status.detached { "➦" } else { "⎇" };
+        h_flex()
+            .gap_1()
+            .items_center()
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x292b2b))
+            .bg(rgb(0x0e0f0f))
+            .text_xs()
+            .child(div().text_color(rgb(0x737878)).child(glyph))
+            .child(
+                div()
+                    .max_w(px(160.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(rgb(0x858989))
+                    .child(branch),
+            )
+    }
 }
 
 /// Leading glyph per palette command. Promote a command to a real GPUI
@@ -344,7 +404,7 @@ impl Render for Workspace {
                     .child(
                         h_flex()
                             .flex_none()
-                            .gap_3()
+                            .gap_2()
                             .items_center()
                             .child(div().text_color(rgb(0x8e9494)).child("‹"))
                             .child(
@@ -353,13 +413,39 @@ impl Render for Workspace {
                                     .font_semibold()
                                     .child(self.project_name.clone()),
                             )
-                            .child(div().text_color(rgb(0x555a5a)).child("/"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x858989))
-                                    .child(self.project_path.clone()),
-                            ),
+                            .when_some(
+                                self.git_status.branch.clone(),
+                                |this, branch| {
+                                    this.child(self.render_branch_pill(branch.into()))
+                                },
+                            )
+                            // Amber dot while staged, unstaged, or untracked
+                            // changes exist; hidden when clean so the steady
+                            // state stays quiet.
+                            .when(self.git_status.dirty, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0xeab308))
+                                        .child("●"),
+                                )
+                            })
+                            .when_some(self.git_status.ahead_label(), |this, ahead| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x858989))
+                                        .child(ahead),
+                                )
+                            })
+                            .when_some(self.git_status.behind_label(), |this, behind| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x858989))
+                                        .child(behind),
+                                )
+                            }),
                     )
                     .child(
                         div()

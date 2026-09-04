@@ -19,6 +19,7 @@ use gpui_kit::{
 
 use crate::{
     fonts::TERMINAL_FONT_FAMILY,
+    command_palette::ToggleCommandPalette,
     metrics::{
         CELL_HEIGHT, CHROME_HEIGHT, INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT,
         TERMINAL_FONT_SIZE, TERMINAL_PADDING, cell_width,
@@ -183,6 +184,21 @@ impl TerminalPane {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The command bar toggle must reach the workspace even while a
+        // terminal has focus: everything below would otherwise be sent to the
+        // pty. Dispatch it as an action (handled by `Workspace`) instead of
+        // terminal input. The global `cmd-k`/`ctrl-k` binding covers every
+        // other focus site, and dispatching here is idempotent with it —
+        // whichever path runs first stops the event.
+        if event.keystroke.key.eq_ignore_ascii_case("k")
+            && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
+            && !event.keystroke.modifiers.alt
+        {
+            window.dispatch_action(Box::new(ToggleCommandPalette), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         // Re-snapping an already pinned viewport cannot change the visible
         // rows, so skip the eager grid rebuild on the input path. In
         // full-screen applications such as nvim the viewport is always

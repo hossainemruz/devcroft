@@ -5,6 +5,7 @@
 /// not-yet-wired surface is allow-listed until then — tests cover it now.
 #[allow(dead_code, unused_imports)]
 mod data;
+mod command_palette;
 mod fonts;
 mod keys;
 mod metrics;
@@ -15,9 +16,9 @@ mod workspace;
 
 use anyhow::{Result, anyhow};
 use gpui_kit::component::{ActiveTheme as _, Root, Theme, ThemeMode};
-use gpui_kit::{AppContext as _, Styled as _, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{AppContext as _, KeyBinding, Styled as _, WindowBounds, WindowOptions, px, size};
 
-use crate::{fonts::load_terminal_fonts, workspace::Workspace};
+use crate::{command_palette::ToggleCommandPalette, fonts::load_terminal_fonts, workspace::Workspace};
 
 fn main() -> Result<()> {
     // App-owned data root: resolve, `mkdir -p`, and first-run init
@@ -44,6 +45,13 @@ fn main() -> Result<()> {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // Global command-bar toggle. The terminal pane also forwards this
+        // keystroke explicitly (see `TerminalPane::on_key_down`), since its
+        // raw key handler would otherwise swallow the event while focused.
+        cx.bind_keys([
+            KeyBinding::new("cmd-k", ToggleCommandPalette, None),
+            KeyBinding::new("ctrl-k", ToggleCommandPalette, None),
+        ]);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
         Theme::change(theme_mode, None, cx);
 

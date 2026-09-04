@@ -4,15 +4,22 @@
 use std::{env, path::PathBuf};
 
 use gpui_kit::component::{
-    StyledExt as _, h_flex,
+    ActiveTheme as _, Icon, IconName, IndexPath, StyledExt as _, WindowExt as _,
+    command::{Command, CommandGroup, CommandItem, CommandState},
+    h_flex,
     tab::{Tab, TabBar},
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, SharedString,
-    Styled, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, IntoElement,
+    InteractiveElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px,
+    rgb,
 };
 
+use crate::command_palette::{GROUPS, PaletteCommand, ToggleCommandPalette, command_at};
+use crate::data::{DataRoot, SyncStatus, SyncTracker, sync_portable_with_tracker};
+use crate::metrics::WORKSPACE_HEADER_HEIGHT;
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
 
@@ -57,6 +64,10 @@ pub(crate) struct Workspace {
     review: Entity<ReviewView>,
     project_name: SharedString,
     project_path: SharedString,
+    command_open: bool,
+    command_state: Entity<CommandState>,
+    data_root: Option<DataRoot>,
+    sync_tracker: SyncTracker,
 }
 
 impl Workspace {
@@ -84,6 +95,11 @@ impl Workspace {
         }
         let review_cwd = working_directory.clone();
         let review = cx.new(|cx| ReviewView::new(&review_cwd, cx));
+        let command_state = cx.new(|cx| CommandState::new(window, cx));
+        // Resolved here (not passed in) so sync keeps working even if the
+        // startup path never persisted device state; failures stay non-fatal
+        // and surface as a palette notification instead.
+        let data_root = crate::data::ensure_ready(None).ok();
 
         Self {
             active_tab: WorkspaceTab::Agent,
@@ -91,6 +107,10 @@ impl Workspace {
             review,
             project_name: project_name.into(),
             project_path: project_path.into(),
+            command_open: false,
+            command_state,
+            data_root,
+            sync_tracker: SyncTracker::default(),
         }
     }
 
@@ -102,11 +122,168 @@ impl Workspace {
         if tab == WorkspaceTab::Review {
             self.review.update(cx, |view, cx| view.activate(cx));
         }
-        if let Some(Some(pane)) = self.tabs.get(index) {
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    fn focus_active_pane(&self, window: &mut Window, cx: &mut App) {
+        if let Some(Some(pane)) = self.tabs.get(self.active_tab as usize) {
             let focus_handle = pane.read(cx).focus_handle.clone();
             focus_handle.focus(window, cx);
         }
+    }
+
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_open {
+            self.close_command_palette(window, cx);
+        } else {
+            self.open_command_palette(window, cx);
+        }
+    }
+
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_open {
+            return;
+        }
+        self.command_open = true;
+        self.command_state.update(cx, |state, cx| {
+            state.set_query("", window, cx);
+        });
+        // `read` borrows `cx`, so clone the handle first: focusing takes the
+        // context mutably.
+        let query_focus = self.command_state.read(cx).focus_handle(cx).clone();
+        query_focus.focus(window, cx);
         cx.notify();
+    }
+
+    fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.command_open {
+            return;
+        }
+        self.command_open = false;
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    /// Run the confirmed palette entry. `index` addresses the model installed
+    /// by the latest `Command` render (before filtering), so it maps back
+    /// through [`command_at`] however the query narrowed the list.
+    fn on_palette_confirm(
+        &mut self,
+        index: IndexPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(command) = command_at(index.section, index.row) else {
+            self.close_command_palette(window, cx);
+            return;
+        };
+        // Every path below leaves the bar closed; `select_tab` focuses and
+        // notifies itself, the other arms do it explicitly.
+        self.command_open = false;
+        match command {
+            PaletteCommand::GoAgent => self.select_tab(0, window, cx),
+            PaletteCommand::GoEditor => self.select_tab(1, window, cx),
+            PaletteCommand::GoTerminal => self.select_tab(2, window, cx),
+            PaletteCommand::GoReview => self.select_tab(3, window, cx),
+            // Placeholders until their views exist: visible and searchable so
+            // the bar advertises the roadmap, honest about doing nothing yet.
+            PaletteCommand::GoHome
+            | PaletteCommand::SwitchRepository
+            | PaletteCommand::OpenSettings => {
+                window.push_notification(format!("{} — coming soon", command.label()), cx);
+                self.focus_active_pane(window, cx);
+                cx.notify();
+            }
+            PaletteCommand::SyncPortable => {
+                if self.sync_tracker.status() == SyncStatus::Syncing {
+                    window.push_notification("Portable sync is already running", cx);
+                } else if self.data_root.is_none() {
+                    window.push_notification("Portable data is unavailable", cx);
+                } else {
+                    window.push_notification("Syncing portable data…", cx);
+                    self.trigger_sync(cx);
+                }
+                self.focus_active_pane(window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Run one portable sync off the main thread. Completion reloads the
+    /// Review projection when the rebase may have moved files (including
+    /// after an error, which can still leave working-tree changes behind)
+    /// and repaints the status bar via the shared [`SyncTracker`].
+    fn trigger_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.data_root.clone() else {
+            return;
+        };
+        let tracker = self.sync_tracker.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { sync_portable_with_tracker(&root, &tracker) })
+                .await;
+            let reload = match &outcome {
+                Ok(outcome) => outcome.reload_required,
+                Err(_) => true,
+            };
+            let _ = this.update(cx, |this, cx| {
+                if reload {
+                    this.review.update(cx, |view, cx| view.reload(cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_command_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = cx.entity().downgrade();
+        let confirm_workspace = workspace.clone();
+        let mut command = Command::new(&self.command_state)
+            .placeholder("Type a command or search…")
+            .on_confirm(move |index, window, cx| {
+                confirm_workspace
+                    .update(cx, |this, cx| this.on_palette_confirm(index, window, cx))
+                    .ok();
+            })
+            .on_cancel(move |window, cx| {
+                workspace
+                    .update(cx, |this, cx| this.close_command_palette(window, cx))
+                    .ok();
+            })
+            .footer(|_, _, cx| {
+                h_flex()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("↑↓ Navigate")
+                    .child("Enter Select")
+                    .child("Esc Close")
+            })
+            .w(px(560.));
+        for (heading, items) in GROUPS {
+            command = command.group(
+                CommandGroup::new().label(heading).items(
+                    items
+                        .iter()
+                        .copied()
+                        .map(|item| {
+                            CommandItem::new()
+                                .label(item.label())
+                                .keywords(item.keywords().iter().copied())
+                                .icon(palette_icon(item))
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+        command
     }
 
     fn render_active_content(&self) -> AnyElement {
@@ -120,25 +297,53 @@ impl Workspace {
     }
 }
 
+/// Leading glyph per palette command. Promote a command to a real GPUI
+/// `Action` (instead of the `on_confirm` path above) when it needs a direct
+/// keybinding: `CommandItem::action` then renders the binding hint for free.
+fn palette_icon(command: PaletteCommand) -> IconName {
+    match command {
+        PaletteCommand::GoAgent => IconName::Bot,
+        PaletteCommand::GoEditor => IconName::FileText,
+        PaletteCommand::GoTerminal => IconName::SquareTerminal,
+        PaletteCommand::GoReview => IconName::Eye,
+        PaletteCommand::GoHome => IconName::LayoutDashboard,
+        PaletteCommand::SwitchRepository => IconName::Folder,
+        PaletteCommand::OpenSettings => IconName::Settings,
+        PaletteCommand::SyncPortable => IconName::RotateCw,
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
         let active_content = self.render_active_content();
+        let sync_status = match self.sync_tracker.status() {
+            SyncStatus::Syncing => "Syncing…",
+            SyncStatus::Error => "Sync error",
+            SyncStatus::Idle => "Devcroft · libghostty-vt",
+        };
 
         v_flex()
+            .relative()
             .size_full()
             .bg(rgb(0x080909))
             .text_color(rgb(0xe7e7e7))
+            .on_action(cx.listener(
+                |this, _: &ToggleCommandPalette, window, cx| {
+                    this.toggle_command_palette(window, cx);
+                },
+            ))
             .child(
                 h_flex()
                     .h(px(58.))
                     .px_4()
+                    .gap_3()
                     .items_center()
-                    .justify_between()
                     .border_b_1()
                     .border_color(rgb(0x292b2b))
                     .child(
                         h_flex()
+                            .flex_none()
                             .gap_3()
                             .items_center()
                             .child(div().text_color(rgb(0x8e9494)).child("‹"))
@@ -157,17 +362,62 @@ impl Render for Workspace {
                             ),
                     )
                     .child(
-                        TabBar::new("workspace-tabs")
-                            .segmented()
-                            .selected_index(active_index)
-                            .on_click(cx.listener(|this, index: &usize, window, cx| {
-                                this.select_tab(*index, window, cx);
-                            }))
-                            .children(
-                                WorkspaceTab::ALL
-                                    .into_iter()
-                                    .map(|tab| Tab::new().label(tab.label())),
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_row()
+                            .justify_center()
+                            .child(
+                                h_flex()
+                                    .w(px(380.))
+                                    .h(px(32.))
+                                    .px_3()
+                                    .gap_2()
+                                    .items_center()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(0x292b2b))
+                                    .bg(rgb(0x0e0f0f))
+                                    .text_xs()
+                                    .text_color(rgb(0x737878))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.toggle_command_palette(window, cx);
+                                        }),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::Search)
+                                            .size(px(14.))
+                                            .text_color(rgb(0x737878)),
+                                    )
+                                    .child(div().flex_1().child("Type a command…"))
+                                    .child(
+                                        div()
+                                            .px_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(0x292b2b))
+                                            .text_color(rgb(0x858989))
+                                            .child("⌘K"),
+                                    ),
                             ),
+                    )
+                    .child(
+                        div().flex_none().child(
+                            TabBar::new("workspace-tabs")
+                                .segmented()
+                                .selected_index(active_index)
+                                .on_click(cx.listener(|this, index: &usize, window, cx| {
+                                    this.select_tab(*index, window, cx);
+                                }))
+                                .children(
+                                    WorkspaceTab::ALL
+                                        .into_iter()
+                                        .map(|tab| Tab::new().label(tab.label())),
+                                ),
+                        ),
                     ),
             )
             .child(
@@ -194,8 +444,46 @@ impl Render for Workspace {
                         self.project_name,
                         self.active_tab.label()
                     ))
-                    .child("Devcroft · libghostty-vt"),
+                    .child(sync_status),
             )
+            .when(self.command_open, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(WORKSPACE_HEADER_HEIGHT))
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.close_command_palette(window, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .size_full()
+                                .bg(rgb(0x000000))
+                                .opacity(0.4),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_center()
+                                .pt(px(8.))
+                                .child(
+                                    div()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _, _, cx| {
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(self.render_command_bar(cx)),
+                                ),
+                        ),
+                )
+            })
     }
 }
 

@@ -21,9 +21,6 @@ pub(crate) const REVIEW_FONT_SIZE: f32 = 13.0;
 /// clipping glyphs or opening seams between rows.
 pub(crate) const CELL_HEIGHT: f32 = TERMINAL_FONT_SIZE * 1.32;
 pub(crate) const TERMINAL_PADDING: f32 = 12.0;
-pub(crate) const CHROME_HEIGHT: f32 = 90.0;
-pub(crate) const CONTENT_PADDING: f32 = 8.0;
-pub(crate) const CONTENT_BORDER: f32 = 1.0;
 pub(crate) const WORKSPACE_HEADER_HEIGHT: f32 = 58.0;
 /// Maximum scroll lines forwarded to the terminal per wheel event.
 ///

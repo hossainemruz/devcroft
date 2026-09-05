@@ -36,8 +36,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::{
     keys::map_key,
     metrics::{
-        CELL_HEIGHT, CONTENT_BORDER, CONTENT_PADDING, INITIAL_COLS, INITIAL_ROWS, TERMINAL_PADDING,
-        WORKSPACE_HEADER_HEIGHT, cell_width,
+        CELL_HEIGHT, INITIAL_COLS, INITIAL_ROWS, TERMINAL_PADDING, WORKSPACE_HEADER_HEIGHT,
+        cell_width,
     },
     workspace::WorkspaceTab,
 };
@@ -334,9 +334,8 @@ impl TerminalSession {
                 mods |= Mods::SUPER;
             }
 
-            let padding_left = CONTENT_PADDING + CONTENT_BORDER + TERMINAL_PADDING;
-            let padding_top =
-                WORKSPACE_HEADER_HEIGHT + CONTENT_PADDING + CONTENT_BORDER + TERMINAL_PADDING;
+            let padding_left = TERMINAL_PADDING;
+            let padding_top = WORKSPACE_HEADER_HEIGHT + TERMINAL_PADDING;
             let (columns, rows) = *self.grid_size.lock();
             let grid_width = columns as f32 * cell_width();
             let grid_height = rows as f32 * CELL_HEIGHT;

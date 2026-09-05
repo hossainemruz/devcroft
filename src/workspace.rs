@@ -1,5 +1,5 @@
 //! The workspace shell: tab definitions plus the surrounding chrome
-//! (project header, tab bar, status bar) hosting the active terminal pane.
+//! (project header and tab bar) hosting the active terminal pane.
 
 use std::{path::Path, time::Duration};
 
@@ -384,11 +384,6 @@ impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
         let active_content = self.render_active_content();
-        let sync_status = match self.sync_tracker.status() {
-            SyncStatus::Syncing => "Syncing…",
-            SyncStatus::Error => "Sync error",
-            SyncStatus::Idle => "Devcroft · libghostty-vt",
-        };
 
         v_flex()
             .relative()
@@ -513,32 +508,7 @@ impl Render for Workspace {
                         ),
                     ),
             )
-            .child(
-                div().flex_1().min_h_0().p_2().child(
-                    div()
-                        .size_full()
-                        .overflow_hidden()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(0x292b2b))
-                        .bg(rgb(0x090a0a))
-                        .child(active_content),
-                ),
-            )
-            .child(
-                h_flex()
-                    .h(px(24.))
-                    .px_4()
-                    .justify_between()
-                    .text_xs()
-                    .text_color(rgb(0x737878))
-                    .child(format!(
-                        "{} · {}",
-                        self.project_name,
-                        self.active_tab.label()
-                    ))
-                    .child(sync_status),
-            )
+            .child(div().flex_1().min_h_0().child(active_content))
             .when(self.command_open, |this| {
                 this.child(
                     div()

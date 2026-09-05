@@ -21,8 +21,8 @@ use crate::{
     fonts::TERMINAL_FONT_FAMILY,
     command_palette::ToggleCommandPalette,
     metrics::{
-        CELL_HEIGHT, CHROME_HEIGHT, INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT,
-        TERMINAL_FONT_SIZE, TERMINAL_PADDING, cell_width,
+        CELL_HEIGHT, INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT,
+        TERMINAL_FONT_SIZE, TERMINAL_PADDING, WORKSPACE_HEADER_HEIGHT, cell_width,
     },
     session::{BlockKind, RenderRun, TerminalSession},
     workspace::WorkspaceTab,
@@ -168,8 +168,10 @@ impl TerminalPane {
         let viewport = window.viewport_size();
         let cell_width = cell_width();
         let width = (viewport.width.as_f32() - TERMINAL_PADDING * 2.0).max(cell_width);
-        let height =
-            (viewport.height.as_f32() - CHROME_HEIGHT - TERMINAL_PADDING * 2.0).max(CELL_HEIGHT);
+        let height = (viewport.height.as_f32()
+            - WORKSPACE_HEADER_HEIGHT
+            - TERMINAL_PADDING * 2.0)
+            .max(CELL_HEIGHT);
         let cols = (width / cell_width).floor() as u16;
         let rows = (height / CELL_HEIGHT).floor() as u16;
         let next = (cols.max(1), rows.max(1));

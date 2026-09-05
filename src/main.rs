@@ -5,6 +5,7 @@
 /// not-yet-wired surface is allow-listed until then — tests cover it now.
 #[allow(dead_code, unused_imports)]
 mod data;
+mod cli;
 mod command_palette;
 mod fonts;
 mod git_status;
@@ -16,12 +17,28 @@ mod session;
 mod workspace;
 
 use anyhow::{Result, anyhow};
+use clap::Parser as _;
 use gpui_kit::component::{ActiveTheme as _, Root, Theme, ThemeMode};
 use gpui_kit::{AppContext as _, KeyBinding, Styled as _, WindowBounds, WindowOptions, px, size};
 
+use crate::cli::{Cli, Command};
 use crate::{command_palette::ToggleCommandPalette, fonts::load_terminal_fonts, workspace::Workspace};
 
 fn main() -> Result<()> {
+    // CLI dispatch happens before any GPUI init so later headless commands
+    // stay fast (see `docs/cli-plan.md`). Phase 0 only has `app`.
+    let cli = Cli::parse();
+    match cli.command {
+        Command::App(args) => run_app(args.checkout),
+    }
+}
+
+/// Boot path for `devcroft app [--checkout <path>]`: the previous `main()`
+/// behavior verbatim, rooted at `--checkout` (or cwd when absent).
+fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
+    // Resolve `--checkout` before touching the GUI so a bad path fails fast
+    // with a runtime error instead of opening a window rooted elsewhere.
+    let working_directory = crate::cli::resolve_working_directory(checkout)?;
     // App-owned data root: resolve, `mkdir -p`, and first-run init
     // `portable/` (see `docs/data-directory-plan.md`). Failures stay
     // non-fatal — the terminal tabs remain usable without persisted state.
@@ -67,7 +84,7 @@ fn main() -> Result<()> {
 
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                let workspace = cx.new(|cx| Workspace::new(window, cx, &working_directory));
                 cx.new(|cx| Root::new(workspace, window, cx).bg(cx.theme().background))
             })
             .map_err(|error| anyhow!("failed to open Devcroft window: {error}"))

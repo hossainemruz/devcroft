@@ -1,7 +1,7 @@
 //! The workspace shell: tab definitions plus the surrounding chrome
 //! (project header, tab bar, status bar) hosting the active terminal pane.
 
-use std::{env, path::PathBuf, time::Duration};
+use std::{path::Path, time::Duration};
 
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, IndexPath, StyledExt as _, WindowExt as _,
@@ -80,8 +80,11 @@ pub(crate) struct Workspace {
 }
 
 impl Workspace {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    pub(crate) fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        working_directory: &Path,
+    ) -> Self {
         let project_name = working_directory
             .file_name()
             .and_then(|name| name.to_str())
@@ -94,14 +97,14 @@ impl Workspace {
                 if !tab.has_terminal() {
                     return None;
                 }
-                let cwd = working_directory.clone();
+                let cwd = working_directory.to_path_buf();
                 Some(cx.new(|cx| TerminalPane::new(tab, &cwd, cx)))
             })
             .collect::<Vec<_>>();
         if let Some(Some(initial)) = tabs.first() {
             initial.read(cx).focus_handle.clone().focus(window, cx);
         }
-        let review_cwd = working_directory.clone();
+        let review_cwd = working_directory.to_path_buf();
         let review = cx.new(|cx| ReviewView::new(&review_cwd, cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         // Poll branch/dirty/ahead-behind off the main thread; the header
@@ -109,7 +112,7 @@ impl Workspace {
         // iteration loads immediately (so no worktree I/O blocks window
         // open), then repeats on the interval. The loop ends with the
         // entity: `update` fails once the workspace is dropped.
-        let poll_dir = working_directory.clone();
+        let poll_dir = working_directory.to_path_buf();
         cx.spawn(async move |this, cx| {
             loop {
                 let path = poll_dir.clone();

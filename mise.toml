@@ -9,8 +9,8 @@ description = "Build Devcroft"
 run = "cargo build"
 
 [tasks.app]
-description = "Run Devcroft"
-run = "cargo run"
+description = "Run Devcroft GUI"
+run = "cargo run -- app"
 
 [tasks.check]
 description = "Run formatting, compilation, and lints"

@@ -17,7 +17,7 @@ The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, 
 ```sh
 mise install
 mise run build
-mise app
+mise run app
 ```
 
 Useful development tasks:

@@ -14,6 +14,7 @@ mod metrics;
 mod pane;
 mod review;
 mod session;
+mod settings;
 mod workspace;
 
 use anyhow::{Result, anyhow};
@@ -59,6 +60,14 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         .as_ref()
         .and_then(|state| state.theme.as_deref())
         .map_or(ThemeMode::Dark, theme_mode_from_name);
+    // Live pane geometry reads this global at render time; Settings edits it
+    // later through the same path. Unknown or absent values keep the default.
+    crate::metrics::set_app_font_size(
+        device
+            .as_ref()
+            .map(|state| state.app_font_size_or_default())
+            .unwrap_or(crate::metrics::DEFAULT_APP_FONT_SIZE),
+    );
 
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {

@@ -21,8 +21,8 @@ use crate::{
     fonts::TERMINAL_FONT_FAMILY,
     command_palette::ToggleCommandPalette,
     metrics::{
-        CELL_HEIGHT, INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT,
-        TERMINAL_FONT_SIZE, TERMINAL_PADDING, WORKSPACE_HEADER_HEIGHT, cell_width,
+        INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT, TERMINAL_PADDING,
+        WORKSPACE_HEADER_HEIGHT, app_font_size, cell_height, cell_width,
     },
     session::{BlockKind, RenderRun, TerminalSession},
     workspace::WorkspaceTab,
@@ -171,9 +171,9 @@ impl TerminalPane {
         let height = (viewport.height.as_f32()
             - WORKSPACE_HEADER_HEIGHT
             - TERMINAL_PADDING * 2.0)
-            .max(CELL_HEIGHT);
+            .max(cell_height());
         let cols = (width / cell_width).floor() as u16;
-        let rows = (height / CELL_HEIGHT).floor() as u16;
+        let rows = (height / cell_height()).floor() as u16;
         let next = (cols.max(1), rows.max(1));
         if next != self.grid_size {
             self.grid_size = next;
@@ -270,7 +270,7 @@ impl TerminalPane {
                     } else {
                         delta.y
                     };
-                    lines * CELL_HEIGHT
+                    lines * cell_height()
                 }
             };
             let lines = coalesce_scroll_lines(&mut self.scroll_remainder, travel_px);
@@ -358,12 +358,12 @@ impl TerminalPane {
         div()
             .id(("terminal-row", index))
             .w(px(cell_width() * columns as f32))
-            .h(px(CELL_HEIGHT))
+            .h(px(cell_height()))
             .flex_none()
             .overflow_hidden()
             .whitespace_nowrap()
-            .text_size(px(TERMINAL_FONT_SIZE))
-            .line_height(px(CELL_HEIGHT))
+            .text_size(px(app_font_size()))
+            .line_height(px(cell_height()))
             .child(StyledText::new(text).with_highlights(highlights))
             .children(
                 fills
@@ -394,9 +394,9 @@ fn block_fill_bounds(start_column: usize, columns: usize, kind: BlockKind) -> (f
     let x = start_column as f32 * cell;
     let width = columns as f32 * cell;
     match kind {
-        BlockKind::Upper => (x, 0.0, width, CELL_HEIGHT / 2.0),
-        BlockKind::Lower => (x, CELL_HEIGHT / 2.0, width, CELL_HEIGHT / 2.0),
-        BlockKind::Full => (x, 0.0, width, CELL_HEIGHT),
+        BlockKind::Upper => (x, 0.0, width, cell_height() / 2.0),
+        BlockKind::Lower => (x, cell_height() / 2.0, width, cell_height() / 2.0),
+        BlockKind::Full => (x, 0.0, width, cell_height()),
     }
 }
 
@@ -482,7 +482,7 @@ fn present_due(last_present: Option<Instant>, now: Instant) -> bool {
 /// line per event, sends far more input than the finger traveled. Coalescing
 /// keeps scrolling smooth without outpacing the application's redraw rate.
 fn coalesce_scroll_lines(remainder: &mut f32, delta_pixels_y: f32) -> isize {
-    let accumulated = (-(delta_pixels_y / CELL_HEIGHT) + *remainder)
+    let accumulated = (-(delta_pixels_y / cell_height()) + *remainder)
         .clamp(-MAX_SCROLL_LINES_PER_EVENT, MAX_SCROLL_LINES_PER_EVENT);
     let lines = accumulated.trunc() as isize;
     *remainder = accumulated - lines as f32;
@@ -501,7 +501,7 @@ mod tests {
         // scaling by one, same-value division), so no travel leaks into the
         // remainder across notches regardless of font size.
         let mut remainder = 0.0;
-        let notch_px = (3.0 / APP_SCROLL_DIVISOR) * CELL_HEIGHT;
+        let notch_px = (3.0 / APP_SCROLL_DIVISOR) * cell_height();
         assert_eq!(coalesce_scroll_lines(&mut remainder, notch_px), -1);
         assert!(remainder.abs() < f32::EPSILON);
         assert_eq!(coalesce_scroll_lines(&mut remainder, -notch_px), 1);
@@ -532,15 +532,15 @@ mod tests {
         let cell = cell_width();
         assert_eq!(
             block_fill_bounds(3, 2, BlockKind::Upper),
-            (3.0 * cell, 0.0, 2.0 * cell, CELL_HEIGHT / 2.0)
+            (3.0 * cell, 0.0, 2.0 * cell, cell_height() / 2.0)
         );
         assert_eq!(
             block_fill_bounds(0, 1, BlockKind::Lower),
-            (0.0, CELL_HEIGHT / 2.0, cell, CELL_HEIGHT / 2.0)
+            (0.0, cell_height() / 2.0, cell, cell_height() / 2.0)
         );
         assert_eq!(
             block_fill_bounds(5, 4, BlockKind::Full),
-            (5.0 * cell, 0.0, 4.0 * cell, CELL_HEIGHT)
+            (5.0 * cell, 0.0, 4.0 * cell, cell_height())
         );
     }
 
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn scroll_coalescing_preserves_slow_gesture_travel() {
         let mut remainder = 0.0;
-        let half_line = CELL_HEIGHT / 2.0;
+        let half_line = cell_height() / 2.0;
         // Half-line deltas accumulate instead of being dropped or amplified.
         assert_eq!(coalesce_scroll_lines(&mut remainder, half_line), 0);
         assert!((remainder - -0.5).abs() < f32::EPSILON);
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn scroll_coalescing_handles_both_directions() {
         let mut remainder = 0.0;
-        let half_line = CELL_HEIGHT / 2.0;
+        let half_line = cell_height() / 2.0;
         assert_eq!(coalesce_scroll_lines(&mut remainder, -half_line), 0);
         assert_eq!(coalesce_scroll_lines(&mut remainder, -half_line), 1);
         assert!(remainder.abs() < f32::EPSILON);

@@ -36,7 +36,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::{
     keys::map_key,
     metrics::{
-        CELL_HEIGHT, INITIAL_COLS, INITIAL_ROWS, TERMINAL_PADDING, WORKSPACE_HEADER_HEIGHT,
+        INITIAL_COLS, INITIAL_ROWS, TERMINAL_PADDING, WORKSPACE_HEADER_HEIGHT, cell_height,
         cell_width,
     },
     workspace::WorkspaceTab,
@@ -131,7 +131,7 @@ impl TerminalSession {
                 rows: INITIAL_ROWS,
                 cols: INITIAL_COLS,
                 pixel_width: (INITIAL_COLS as f32 * cell_width()) as u16,
-                pixel_height: (INITIAL_ROWS as f32 * CELL_HEIGHT) as u16,
+                pixel_height: (INITIAL_ROWS as f32 * cell_height()) as u16,
             })
             .context("opening pseudo-terminal")?;
 
@@ -182,7 +182,7 @@ impl TerminalSession {
             INITIAL_COLS,
             INITIAL_ROWS,
             cell_width().round() as u32,
-            CELL_HEIGHT.round() as u32,
+            cell_height().round() as u32,
         )?;
         terminal
             .on_pty_write({
@@ -200,7 +200,7 @@ impl TerminalSession {
                         rows,
                         columns,
                         cell_width: cell_width().round() as u32,
-                        cell_height: CELL_HEIGHT.round() as u32,
+                        cell_height: cell_height().round() as u32,
                     })
                 }
             })?
@@ -263,13 +263,13 @@ impl TerminalSession {
             rows,
             cols,
             pixel_width: (cols as f32 * cell_width()) as u16,
-            pixel_height: (rows as f32 * CELL_HEIGHT) as u16,
+            pixel_height: (rows as f32 * cell_height()) as u16,
         })?;
         self.terminal.resize(
             cols,
             rows,
             cell_width().round() as u32,
-            CELL_HEIGHT.round() as u32,
+            cell_height().round() as u32,
         )?;
         Ok(())
     }
@@ -338,7 +338,7 @@ impl TerminalSession {
             let padding_top = WORKSPACE_HEADER_HEIGHT + TERMINAL_PADDING;
             let (columns, rows) = *self.grid_size.lock();
             let grid_width = columns as f32 * cell_width();
-            let grid_height = rows as f32 * CELL_HEIGHT;
+            let grid_height = rows as f32 * cell_height();
             self.mouse_event
                 .set_mods(mods)
                 .set_position(mouse::Position {
@@ -351,7 +351,7 @@ impl TerminalSession {
                     screen_width: viewport_width.max(1.) as u32,
                     screen_height: viewport_height.max(1.) as u32,
                     cell_width: cell_width().round() as u32,
-                    cell_height: CELL_HEIGHT.round() as u32,
+                    cell_height: cell_height().round() as u32,
                     padding_top: padding_top as u32,
                     padding_bottom: (viewport_height - padding_top - grid_height).max(0.) as u32,
                     padding_right: (viewport_width - padding_left - grid_width).max(0.) as u32,

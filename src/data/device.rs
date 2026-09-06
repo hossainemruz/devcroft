@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{DataRoot, write_json_atomic};
+use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
 /// Machine-local state: checkout bindings, agent/editor settings,
 /// pins/recents, theme. Never committed.
@@ -30,12 +31,23 @@ pub(crate) struct DeviceState {
     pub(crate) last_tab: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sync_interval_minutes: Option<u64>,
+    /// App-wide font size (General settings). Absent means the default;
+    /// out-of-range values are clamped on read, never rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) app_font_size: Option<f32>,
     /// Unknown fields, preserved across edits where practical.
     #[serde(flatten)]
     pub(crate) extra: HashMap<String, Value>,
 }
 
 impl DeviceState {
+    /// Effective app-wide font size: the stored value clamped to the
+    /// settable range, or the default when unset.
+    pub(crate) fn app_font_size_or_default(&self) -> f32 {
+        self.app_font_size
+            .map_or(DEFAULT_APP_FONT_SIZE, clamp_app_font_size)
+    }
+
     /// Drop legacy selection fields: derived paths are never honored, and
     /// must not linger back into the file on the next save.
     fn scrub_legacy(&mut self) {
@@ -134,6 +146,7 @@ mod tests {
         let mut state = DeviceState {
             theme: Some("dark".to_owned()),
             sync_interval_minutes: Some(15),
+            app_font_size: Some(17.0),
             ..DeviceState::default()
         };
         state
@@ -144,11 +157,37 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.theme.as_deref(), Some("dark"));
         assert_eq!(loaded.sync_interval_minutes, Some(15));
+        assert_eq!(loaded.app_font_size, Some(17.0));
+        assert_eq!(loaded.app_font_size_or_default(), 17.0);
         assert_eq!(loaded.extra.get("futureField"), Some(&json!({"v": [1, 2]})));
 
         // The file itself is two-space JSON with a trailing newline.
         let text = std::fs::read_to_string(store.path()).unwrap();
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn app_font_size_defaults_and_clamps_on_read() {
+        assert_eq!(
+            DeviceState::default().app_font_size_or_default(),
+            crate::metrics::DEFAULT_APP_FONT_SIZE
+        );
+        let huge = DeviceState {
+            app_font_size: Some(99.0),
+            ..DeviceState::default()
+        };
+        assert_eq!(
+            huge.app_font_size_or_default(),
+            crate::metrics::MAX_APP_FONT_SIZE
+        );
+        let tiny = DeviceState {
+            app_font_size: Some(1.0),
+            ..DeviceState::default()
+        };
+        assert_eq!(
+            tiny.app_font_size_or_default(),
+            crate::metrics::MIN_APP_FONT_SIZE
+        );
     }
 
     #[test]

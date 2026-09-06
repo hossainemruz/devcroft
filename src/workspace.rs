@@ -4,7 +4,7 @@
 use std::{path::Path, time::Duration};
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, IndexPath, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, IndexPath, Root, StyledExt as _, WindowExt as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex,
     tab::{Tab, TabBar},
@@ -18,11 +18,12 @@ use gpui_kit::{
 };
 
 use crate::command_palette::{GROUPS, PaletteCommand, ToggleCommandPalette, command_at};
-use crate::data::{DataRoot, SyncStatus, SyncTracker, sync_portable_with_tracker};
+use crate::data::{DataRoot, DeviceStore, SyncStatus, SyncTracker, sync_portable_with_tracker};
 use crate::git_status::{GitStatus, load_git_status};
-use crate::metrics::WORKSPACE_HEADER_HEIGHT;
+use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
+use crate::settings::SettingsView;
 
 /// How often the header re-reads branch/dirty/ahead-behind state.
 ///
@@ -71,6 +72,7 @@ pub(crate) struct Workspace {
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
     review: Entity<ReviewView>,
+    settings: Entity<SettingsView>,
     project_name: SharedString,
     git_status: GitStatus,
     command_open: bool,
@@ -137,11 +139,23 @@ impl Workspace {
         // startup path never persisted device state; failures stay non-fatal
         // and surface as a palette notification instead.
         let data_root = crate::data::ensure_ready(None).ok();
+        // Initial font size for Settings. The live global was already set
+        // from the same store at startup (`main`), so this is just the
+        // view's starting copy; later edits write back through the store.
+        let initial_font_size = data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok())
+            .map(|state| state.app_font_size_or_default())
+            .unwrap_or(DEFAULT_APP_FONT_SIZE);
+        let settings = cx.new(|cx| {
+            SettingsView::new(data_root.clone(), initial_font_size, cx)
+        });
 
         Self {
             active_tab: WorkspaceTab::Agent,
             tabs,
             review,
+            settings,
             project_name: project_name.into(),
             git_status: GitStatus::default(),
             command_open: false,
@@ -206,6 +220,22 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Open Settings as a modal dialog (fixed height, scrollable body — see
+    /// the dialog component's scrollable pattern). The [`SettingsView`]
+    /// entity outlives the dialog, so the selected section and pending edits
+    /// survive close/reopen. Esc, backdrop click, and the close button all
+    /// dismiss via the dialog layer; nothing here tracks open state.
+    fn open_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Settings")
+                .w(px(920.))
+                .h(px(600.))
+                .child(settings.clone().into_any_element())
+        });
+    }
+
     /// Run the confirmed palette entry. `index` addresses the model installed
     /// by the latest `Command` render (before filtering), so it maps back
     /// through [`command_at`] however the query narrowed the list.
@@ -227,11 +257,10 @@ impl Workspace {
             PaletteCommand::GoEditor => self.select_tab(1, window, cx),
             PaletteCommand::GoTerminal => self.select_tab(2, window, cx),
             PaletteCommand::GoReview => self.select_tab(3, window, cx),
+            PaletteCommand::OpenSettings => self.open_settings(window, cx),
             // Placeholders until their views exist: visible and searchable so
             // the bar advertises the roadmap, honest about doing nothing yet.
-            PaletteCommand::GoHome
-            | PaletteCommand::SwitchRepository
-            | PaletteCommand::OpenSettings => {
+            PaletteCommand::GoHome | PaletteCommand::SwitchRepository => {
                 window.push_notification(format!("{} — coming soon", command.label()), cx);
                 self.focus_active_pane(window, cx);
                 cx.notify();
@@ -381,7 +410,7 @@ fn palette_icon(command: PaletteCommand) -> IconName {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
         let active_content = self.render_active_content();
 
@@ -547,6 +576,11 @@ impl Render for Workspace {
                         ),
                 )
             })
+            // Dialog layer (settings, …): `Root` stores opened dialogs but
+            // never paints them itself — the app must render this layer on
+            // top of its content, otherwise an opened dialog stays invisible.
+            // Last child so dialogs float above the command palette too.
+            .children(Root::render_dialog_layer(window, cx))
     }
 }
 

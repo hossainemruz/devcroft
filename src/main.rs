@@ -89,6 +89,14 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
                 ..Default::default()
             }),
             window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
+            // Wayland app-id / X11 WM_CLASS. Omarchy's universal clipboard
+            // shortcuts (`Super+C/V/X`) only send terminal keys
+            // (`Shift+Insert`, …) to windows tagged `terminal`, matched on
+            // class — without this the compositor sees an empty class,
+            // treats Devcroft as a GUI app, and synthesizes `Ctrl+V`,
+            // which the terminal pane deliberately passes through to the
+            // pty instead of pasting.
+            app_id: Some("devcroft".to_owned()),
             ..Default::default()
         };
 
@@ -162,6 +170,9 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
                 ..Default::default()
             }),
             window_bounds: Some(WindowBounds::centered(size(px(900.), px(700.)), cx)),
+            // Same identity as the workspace window (see `run_app`): the
+            // compositor, taskbars, and window rules key off this.
+            app_id: Some("devcroft".to_owned()),
             ..Default::default()
         };
 

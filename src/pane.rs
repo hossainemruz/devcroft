@@ -282,12 +282,40 @@ impl TerminalPane {
         };
 
         let modifiers = event.keystroke.modifiers;
-        if modifiers.platform && event.keystroke.key.eq_ignore_ascii_case("v") {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
-                && let Err(error) = session.paste(&text)
-            {
-                self.error = Some(format!("Paste failed: {error:#}").into());
-                cx.notify();
+        if is_paste_shortcut(
+            &event.keystroke.key,
+            modifiers.platform,
+            modifiers.control,
+            modifiers.shift,
+            modifiers.alt,
+        ) {
+            match cx.read_from_clipboard() {
+                Some(item) => match item.text() {
+                    Some(text) => {
+                        if let Err(error) = session.paste(&text) {
+                            self.error = Some(format!("Paste failed: {error:#}").into());
+                            cx.notify();
+                        }
+                    }
+                    // No text on the clipboard (image-only): forward the key
+                    // so the hosted application keeps its own handling — e.g.
+                    // the agent reads image data directly on Ctrl+Shift+V.
+                    // Swallowing it here would break image paste.
+                    None if !item.entries().is_empty() => {
+                        if let Err(error) = session.send_key(event) {
+                            self.error = Some(format!("Keyboard input failed: {error:#}").into());
+                            cx.notify();
+                        }
+                    }
+                    None => {
+                        self.error = Some("Clipboard has no text to paste".into());
+                        cx.notify();
+                    }
+                },
+                None => {
+                    self.error = Some("Clipboard has no text to paste".into());
+                    cx.notify();
+                }
             }
         } else if let Err(error) = session.send_key(event) {
             self.error = Some(format!("Keyboard input failed: {error:#}").into());
@@ -1047,6 +1075,31 @@ const APP_SCROLL_DIVISOR: f32 = 3.0;
 /// is far too long for a single-word acknowledgement.
 const COPY_FEEDBACK_TTL: Duration = Duration::from_millis(1500);
 
+/// Whether a keystroke is a terminal paste shortcut. Pure over the keystroke
+/// pieces (not `KeyDownEvent`) so the mapping stays unit-testable without a
+/// window, matching [`palette_mode_for_shortcut`](crate::command_palette::palette_mode_for_shortcut).
+///
+/// Matches `Super/Cmd+V`, `Ctrl+Shift+V` (the standard Linux terminal paste),
+/// and `Shift+Insert` (classic X11 paste). Plain `Ctrl+V` is deliberately not
+/// paste: shells use it for quoted-insert and editors like nvim for
+/// visual-block, so it must keep reaching the pty. `Alt` combinations never
+/// match, so option-modified typing keeps reaching the terminal.
+fn is_paste_shortcut(key: &str, platform: bool, control: bool, shift: bool, alt: bool) -> bool {
+    if alt {
+        return false;
+    }
+    if key.eq_ignore_ascii_case("insert") {
+        return shift && !control && !platform;
+    }
+    if !key.eq_ignore_ascii_case("v") {
+        return false;
+    }
+    if platform && !control {
+        return true;
+    }
+    control && shift && !platform
+}
+
 /// Whether a present is due given the last one. Pure helper so the storm
 /// cadence is unit-testable without a window: the first present is always
 /// due, then at most one per [`TerminalPane::PRESENT_PACE`].
@@ -1106,6 +1159,30 @@ mod tests {
         ));
         assert!(present_due(Some(now), now + TerminalPane::PRESENT_PACE));
         assert!(present_due(Some(now), now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn paste_shortcut_matches_platform_ctrl_shift_and_insert() {
+        // Super/Cmd+V, shift-lenient like the other letter shortcuts.
+        assert!(is_paste_shortcut("v", true, false, false, false));
+        assert!(is_paste_shortcut("V", true, false, true, false));
+        // Ctrl+Shift+V: the standard Linux terminal paste.
+        assert!(is_paste_shortcut("v", false, true, true, false));
+        assert!(is_paste_shortcut("V", false, true, true, false));
+        // Shift+Insert: the classic X11 paste.
+        assert!(is_paste_shortcut("insert", false, false, true, false));
+        assert!(is_paste_shortcut("Insert", false, false, true, false));
+        // Plain Ctrl+V must keep reaching the pty (shell quoted-insert,
+        // nvim visual-block), as must bare keys and alt combinations.
+        assert!(!is_paste_shortcut("v", false, true, false, false));
+        assert!(!is_paste_shortcut("v", false, false, false, false));
+        assert!(!is_paste_shortcut("v", true, false, false, true));
+        assert!(!is_paste_shortcut("v", false, true, true, true));
+        assert!(!is_paste_shortcut("insert", false, false, false, false));
+        assert!(!is_paste_shortcut("insert", false, true, true, false));
+        assert!(!is_paste_shortcut("insert", true, false, true, false));
+        assert!(!is_paste_shortcut("c", true, false, false, false));
+        assert!(!is_paste_shortcut("Enter", true, false, false, false));
     }
 
     #[test]

@@ -548,6 +548,11 @@ impl Render for Workspace {
                         ),
                 )
             })
+            // Notification layer (`push_notification`, e.g. the terminal copy
+            // feedback): like dialogs, `Root` stores these without painting
+            // them. Without this layer every notification is silently
+            // swallowed. Above content and the palette dim, below dialogs.
+            .children(Root::render_notification_layer(window, cx))
             // Dialog layer (settings, …): `Root` stores opened dialogs but
             // never paints them itself — the app must render this layer on
             // top of its content, otherwise an opened dialog stays invisible.

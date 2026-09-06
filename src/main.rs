@@ -1,3 +1,4 @@
+mod add_repository;
 mod cli;
 mod command_palette;
 /// Data-directory foundation (`docs/data-directory-plan.md`): root
@@ -18,7 +19,7 @@ mod session;
 mod settings;
 mod workspace;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use clap::Parser as _;
 use gpui_kit::component::{ActiveTheme as _, Root, Theme, ThemeMode};
 use gpui_kit::{
@@ -41,6 +42,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::App(args) => run_app(args.checkout),
         Command::Preview(args) => run_preview(args.path),
+        Command::GitStatus(args) => run_git_status(args.checkout, args.limit),
     }
 }
 
@@ -170,5 +172,209 @@ fn theme_mode_from_name(name: &str) -> ThemeMode {
     match name.trim().to_ascii_lowercase().as_str() {
         "light" => ThemeMode::Light,
         _ => ThemeMode::Dark,
+    }
+}
+
+/// Headless git-status inspector for loader-vs-CLI disagreements: prints
+/// what the header dot sees for a checkout (branch, tracked dirtiness, and
+/// the first itemized gix entries) next to the `git status --porcelain`
+/// line count, so a stray dirty dot can be attributed to a concrete path.
+/// Runs before any GPUI init, like the other headless commands.
+fn run_git_status(checkout: Option<std::path::PathBuf>, limit: usize) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let working_directory = crate::cli::resolve_working_directory(checkout)?;
+    let canonical =
+        std::fs::canonicalize(&working_directory).unwrap_or_else(|_| working_directory.clone());
+    let summary = crate::git_status::load_git_status(&working_directory);
+    let tracked = crate::git_status::has_tracked_changes(&working_directory);
+    let items = crate::git_status::status_items(&working_directory, limit.max(1));
+
+    let mut report = String::new();
+    let _ = writeln!(report, "workdir: {}", canonical.display());
+    let _ = writeln!(
+        report,
+        "branch: {}",
+        summary.branch.as_deref().unwrap_or("(none)")
+    );
+    let _ = writeln!(report, "detached: {}", summary.detached);
+    let _ = writeln!(report, "dirty: {}", summary.dirty);
+    let _ = writeln!(report, "tracked_changes: {tracked}");
+    let _ = writeln!(
+        report,
+        "has_upstream: {} ahead: {} behind: {}",
+        summary.has_upstream, summary.ahead, summary.behind
+    );
+    let _ = writeln!(report, "gix_items (showing up to {limit}): {}", items.len());
+    for item in &items {
+        let _ = writeln!(report, "  {}  {}", item.kind, item.path);
+    }
+    match cli_porcelain_line_count(&working_directory) {
+        Ok(count) => {
+            let _ = writeln!(report, "cli_porcelain_lines: {count}");
+        }
+        Err(error) => {
+            let _ = writeln!(report, "cli_porcelain_lines: unavailable ({error:#})");
+        }
+    }
+    // Attribution: which CLI ignore rule (if any) covers each gix item,
+    // and what sits directly inside itemized directories. A gix-Untracked
+    // item that the CLI ignores (or that holds only ignored children) is
+    // the precise shape of a loader-vs-CLI divergence.
+    for line in attribute_items(&working_directory, &items) {
+        let _ = writeln!(report, "{line}");
+    }
+    print!("{report}");
+    Ok(())
+}
+
+/// `git status --porcelain=v1` line count with the ambient environment —/// the same view the user gets in a shell. Kept separate from the test
+/// oracle (which isolates config) on purpose: a disagreement between this
+/// number and `gix_items` above is exactly the diagnostic signal.
+fn cli_porcelain_line_count(workdir: &std::path::Path) -> Result<usize> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(["status", "--porcelain=v1"])
+        .output()
+        .with_context(|| "spawning git status for comparison")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git status failed: {}", stderr.trim());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.lines().filter(|line| !line.trim().is_empty()).count())
+}
+
+/// Attribute each gix item from the CLI's side: the `check-ignore` ruling
+/// rule (or `not-ignored`), plus a capped listing of direct children when
+/// the item is a directory on disk. Best-effort diagnostic output — never
+/// fails, degrades to `unavailable` lines when git is missing.
+fn attribute_items(
+    workdir: &std::path::Path,
+    items: &[crate::git_status::StatusItem],
+) -> Vec<String> {
+    use std::collections::HashMap;
+
+    const CHILD_CAP: usize = 20;
+
+    let mut out = vec!["attribution:".to_owned()];
+    if items.is_empty() {
+        out.push("  (no gix items to attribute)".to_owned());
+        return out;
+    }
+    // One `check-ignore` call for all item paths: exit status 1 with
+    // partial output is the normal "some match, some don't" case.
+    let mut rulings: HashMap<String, String> = HashMap::new();
+    let check = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("check-ignore")
+        .arg("-v")
+        .arg("--")
+        .args(items.iter().map(|item| &item.path))
+        .output();
+    match check {
+        Ok(output) => {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                // `source:lineno:pattern<TAB>path`.
+                if let Some((rule, path)) = line.split_once('\t') {
+                    rulings.insert(path.to_owned(), rule.to_owned());
+                }
+            }
+            if rulings.is_empty() {
+                out.push("  check-ignore: not-ignored (no rule covers these paths)".to_owned());
+            }
+        }
+        Err(error) => {
+            out.push(format!("  check-ignore: unavailable ({error:#})"));
+        }
+    }
+    for item in items {
+        match rulings.get(&item.path) {
+            Some(rule) => out.push(format!("  {}: ignored by {rule}", item.path)),
+            None => out.push(format!("  {}: not-ignored", item.path)),
+        }
+        let disk_path = workdir.join(&item.path);
+        match std::fs::read_dir(&disk_path) {
+            Ok(entries) => {
+                let mut children: Vec<String> = entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                            format!("{name}/")
+                        } else {
+                            name
+                        }
+                    })
+                    .collect();
+                children.sort();
+                let shown = children.len().min(CHILD_CAP);
+                out.push(format!(
+                    "    children ({}): {}",
+                    children.len(),
+                    children[..shown].join(" ")
+                ));
+            }
+            Err(_) => out.push("    (not a directory on disk)".to_owned()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git CLI must be available for fixture setup");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    #[test]
+    fn attribute_items_reports_ruling_and_children() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.path().join(".gitignore"), "ignored-dir/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("plain-dir")).unwrap();
+        std::fs::write(dir.path().join("plain-dir/child.txt"), "x\n").unwrap();
+        let items = vec![crate::git_status::StatusItem {
+            path: "plain-dir".to_owned(),
+            kind: "walk:Untracked".to_owned(),
+        }];
+        let lines = attribute_items(dir.path(), &items);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("plain-dir: not-ignored")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("child.txt")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn attribute_items_empty_without_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = attribute_items(dir.path(), &[]);
+        assert!(
+            lines.iter().any(|line| line.contains("no gix items")),
+            "{lines:?}"
+        );
     }
 }

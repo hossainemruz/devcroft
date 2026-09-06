@@ -7,10 +7,12 @@
 //!
 //! The submodules split the plan checklist: [`device`] owns `device.json`
 //! load/save, [`portable`] owns first-run init plus the `origin` remote,
-//! and [`sync`] owns the portable-only Git pipeline over the git CLI.
+//! [`repositories`] owns portable repository records plus checkout
+//! inspection, and [`sync`] owns the portable-only Git pipeline over the git CLI.
 
 mod device;
 mod portable;
+mod repositories;
 mod sync;
 
 use std::env;
@@ -20,10 +22,16 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 
-pub(crate) use device::{DeviceState, DeviceStore};
+pub(crate) use device::{DeviceRepositoryBinding, DeviceState, DeviceStore};
 pub(crate) use portable::{
     InitOptions, InitOutcome, WorkspaceDoc, ensure_portable_init, get_origin, load_workspace,
     set_origin,
+};
+pub(crate) use repositories::{
+    CheckoutInspection, CreatedRepository, MAX_RECENT_REPOSITORIES, NewRepositoryInput,
+    RecentRepository, RepositoryMetadata, checkout_for, create_repository, inspect_checkout,
+    normalize_repository_key, recent_repositories, record_repository_open, repository_dir,
+    require_repository_key, resolve_current_key, suggest_repository_key,
 };
 pub(crate) use sync::{
     SyncOutcome, SyncStatus, SyncTracker, sync_portable, sync_portable_with_tracker,

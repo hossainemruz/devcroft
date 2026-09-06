@@ -122,17 +122,74 @@ fn is_worktree_dirty(repo: &gix::Repository) -> bool {
 }
 
 fn has_untracked(repo: &gix::Repository) -> bool {
-    let Ok(platform) = repo.status(gix::progress::Discard) else {
+    !collect_status_items(repo, 1).is_empty()
+}
+
+/// One worktree change exactly as gix sees it, for diagnosing loader-vs-CLI
+/// disagreements (e.g. the header dot disagreeing with `git status`):
+/// repo-relative path plus a short kind tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StatusItem {
+    pub(crate) path: String,
+    pub(crate) kind: String,
+}
+
+/// Itemized worktree status for `workdir`: what [`load_git_status`] sees,
+/// capped at `limit` items. The same walk backs the header dot (with
+/// `limit` 1), so the inspector and the dot can never disagree about the
+/// underlying data — only about how it is displayed.
+pub(crate) fn status_items(workdir: &Path, limit: usize) -> Vec<StatusItem> {
+    let Ok(repo) = gix::discover(workdir) else {
+        return Vec::new();
+    };
+    collect_status_items(&repo, limit)
+}
+
+/// Whether gix sees tracked modifications, independent of untracked files.
+/// Reported separately by the inspector so a dirty dot can be attributed to
+/// the tracked scan versus the untracked walk.
+pub(crate) fn has_tracked_changes(workdir: &Path) -> bool {
+    let Ok(repo) = gix::discover(workdir) else {
         return false;
     };
+    repo.is_dirty().unwrap_or(false)
+}
+
+fn collect_status_items(repo: &gix::Repository, limit: usize) -> Vec<StatusItem> {
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return Vec::new();
+    };
     let Ok(iter) = platform
+        // Collapsed directories can be reported as untracked even when they
+        // contain only ignored files and empty directories. Inspect files so
+        // those containers do not produce a false dirty dot. This leaves a
+        // walk disabled by status.showUntrackedFiles=no disabled.
+        .untracked_files(gix::status::UntrackedFiles::Files)
         .index_worktree_rewrites(None)
         .index_worktree_submodules(gix::status::Submodule::AsConfigured { check_dirty: true })
         .into_index_worktree_iter(Vec::new())
     else {
-        return false;
+        return Vec::new();
     };
-    iter.filter_map(Result::ok).next().is_some()
+    iter.filter_map(Result::ok)
+        .take(limit)
+        .map(|item| match item {
+            gix::status::index_worktree::Item::Modification {
+                rela_path, status, ..
+            } => StatusItem {
+                path: rela_path.to_string(),
+                kind: format!("tracked:{status:?}"),
+            },
+            gix::status::index_worktree::Item::DirectoryContents { entry, .. } => StatusItem {
+                path: entry.rela_path.to_string(),
+                kind: format!("walk:{:?}", entry.status),
+            },
+            gix::status::index_worktree::Item::Rewrite { dirwalk_entry, .. } => StatusItem {
+                path: dirwalk_entry.rela_path.to_string(),
+                kind: "rewrite".to_owned(),
+            },
+        })
+        .collect()
 }
 
 /// Ahead/behind against the fetch upstream of the current branch.
@@ -351,6 +408,10 @@ mod tests {
         assert!(status.has_upstream);
         assert_eq!(status.ahead, 1);
         assert_eq!(status.behind, 0);
+        assert!(
+            !status.dirty,
+            "committed changes must not mark the tree dirty"
+        );
         assert_eq!(status.ahead_label().as_deref(), Some("↑1"));
         assert!(status.behind_label().is_none());
     }
@@ -405,5 +466,177 @@ mod tests {
         let branch = status.branch.expect("detached HEAD still identifies");
         assert_eq!(branch.len(), 7);
         assert!(!status.has_upstream);
+    }
+
+    /// `git status --porcelain=v1` emptiness as ground truth: the header dot
+    /// must agree with the CLI on every fixture below. No `--untracked-files`
+    /// override, so repo-local config (e.g. `showUntrackedFiles`) applies to
+    /// the oracle exactly as it should to the loader. The oracle runs with
+    /// the same isolated config as the fixtures, so machine-global git
+    /// config cannot skew either side.
+    fn cli_reports_dirty(dir: &Path) -> bool {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["status", "--porcelain=v1"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git CLI must be available for the oracle");
+        assert!(output.status.success());
+        !output.stdout.iter().all(|byte| byte.is_ascii_whitespace())
+    }
+
+    #[test]
+    fn untracked_directory_with_only_ignored_children_is_clean() {
+        let dir = init_repo();
+        write(dir.path(), ".gitignore", b"xcuserdata/\n");
+        commit_all(dir.path(), "initial");
+        write(
+            dir.path(),
+            "Project.xcodeproj/project.xcworkspace/xcuserdata/state",
+            b"ignored\n",
+        );
+        fs::create_dir_all(
+            dir.path()
+                .join("Project.xcodeproj/project.xcworkspace/xcshareddata"),
+        )
+        .unwrap();
+        assert!(!cli_reports_dirty(dir.path()));
+        assert!(!load_git_status(dir.path()).dirty);
+        assert!(status_items(dir.path(), 10).is_empty());
+        // A real untracked file inside the same directory must still count.
+        write(
+            dir.path(),
+            "Project.xcodeproj/project.xcworkspace/xcshareddata/settings",
+            b"new\n",
+        );
+        assert!(cli_reports_dirty(dir.path()));
+        assert!(load_git_status(dir.path()).dirty);
+        assert_eq!(status_items(dir.path(), 1).len(), 1);
+    }
+
+    #[test]
+    fn metadata_only_change_is_clean() {
+        let dir = init_repo();
+        write(dir.path(), "a.txt", b"one\n");
+        commit_all(dir.path(), "initial");
+        // Deterministically invalidate the cached stat without changing content.
+        let file = fs::File::options()
+            .write(true)
+            .open(dir.path().join("a.txt"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(!cli_reports_dirty(dir.path()));
+        assert!(!load_git_status(dir.path()).dirty);
+        assert!(!has_tracked_changes(dir.path()));
+        assert!(status_items(dir.path(), 10).is_empty());
+    }
+
+    #[test]
+    fn loader_agrees_with_cli_on_show_untracked_files_no() {
+        let dir = init_repo();
+        write(dir.path(), "a.txt", b"one\n");
+        commit_all(dir.path(), "initial");
+        git(dir.path(), &["config", "status.showUntrackedFiles", "no"]);
+        write(dir.path(), "hidden.txt", b"untracked\n");
+        // Oracle with the same local config also hides the file.
+        assert!(!cli_reports_dirty(dir.path()));
+        assert!(!load_git_status(dir.path()).dirty);
+    }
+
+    #[test]
+    fn loader_agrees_with_cli_on_submodule_untracked_content() {
+        let sub = init_repo();
+        write(sub.path(), "lib.txt", b"lib\n");
+        commit_all(sub.path(), "lib initial");
+        let dir = init_repo();
+        write(dir.path(), "a.txt", b"one\n");
+        commit_all(dir.path(), "initial");
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.path().to_str().expect("tempdir is utf-8"),
+                "sub",
+            ],
+        );
+        commit_all(dir.path(), "add submodule");
+        write(dir.path(), "sub/untracked.txt", b"untracked\n");
+        assert!(cli_reports_dirty(dir.path()));
+        assert!(load_git_status(dir.path()).dirty);
+    }
+
+    #[test]
+    fn loader_agrees_with_cli_on_ignored_files_only() {
+        let dir = init_repo();
+        write(dir.path(), "a.txt", b"one\n");
+        write(dir.path(), ".gitignore", b"ignored.txt\n");
+        commit_all(dir.path(), "initial");
+        write(dir.path(), "ignored.txt", b"ignored\n");
+        assert!(!cli_reports_dirty(dir.path()));
+        assert!(!load_git_status(dir.path()).dirty);
+    }
+
+    #[test]
+    fn status_items_list_untracked_paths_with_kinds() {
+        let dir = init_repo();
+        write(dir.path(), "a.txt", b"one\n");
+        commit_all(dir.path(), "initial");
+        write(dir.path(), "new.txt", b"fresh\n");
+        assert!(!has_tracked_changes(dir.path()));
+        let items = status_items(dir.path(), 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "new.txt");
+        assert!(
+            items[0].kind.contains("Untracked"),
+            "unexpected kind: {}",
+            items[0].kind
+        );
+    }
+
+    #[test]
+    fn status_items_tag_tracked_modifications() {
+        let dir = init_repo();
+        write(dir.path(), "a.txt", b"one\n");
+        commit_all(dir.path(), "initial");
+        write(dir.path(), "a.txt", b"two\n");
+        assert!(has_tracked_changes(dir.path()));
+        let items = status_items(dir.path(), 10);
+        // The tracked scan already caught this, so the walk may or may not
+        // repeat it — but if it does, the path and tracked tag must match.
+        for item in &items {
+            assert_eq!(item.path, "a.txt");
+            assert!(
+                item.kind.starts_with("tracked:"),
+                "unexpected kind: {}",
+                item.kind
+            );
+        }
+    }
+
+    #[test]
+    fn status_items_cap_at_limit() {
+        let dir = init_repo();
+        write(dir.path(), "a.txt", b"one\n");
+        commit_all(dir.path(), "initial");
+        for index in 0..5 {
+            write(dir.path(), &format!("new-{index}.txt"), b"fresh\n");
+        }
+        assert_eq!(status_items(dir.path(), 2).len(), 2);
+        assert_eq!(status_items(dir.path(), 10).len(), 5);
+    }
+
+    #[test]
+    fn status_items_empty_for_non_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(status_items(dir.path(), 10).is_empty());
+        assert!(!has_tracked_changes(dir.path()));
     }
 }

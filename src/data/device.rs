@@ -35,8 +35,30 @@ pub(crate) struct DeviceState {
     /// out-of-range values are clamped on read, never rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) app_font_size: Option<f32>,
+    /// Machine-local checkout bindings by repository key: the linked local
+    /// checkout plus remote alias. Portable metadata lives in
+    /// `portable/repositories/<key>/repository.json`; only the binding that
+    /// ties a key to this machine lives here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repositories: Option<HashMap<String, DeviceRepositoryBinding>>,
     /// Unknown fields, preserved across edits where practical.
     #[serde(flatten)]
+    pub(crate) extra: HashMap<String, Value>,
+}
+
+/// Machine-local binding for one portable repository: where its checkout
+/// lives on this machine and which remote alias Review prefers.
+/// `snake_case` matches the rest of this file; portable `repository.json`
+/// stays `camelCase` for Electron parity (see `repositories`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DeviceRepositoryBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) checkout_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_opened_at: Option<String>,
+    #[serde(flatten, default)]
     pub(crate) extra: HashMap<String, Value>,
 }
 

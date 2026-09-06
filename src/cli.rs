@@ -26,7 +26,9 @@ pub(crate) struct Cli {
 
 /// Phase 0 surface plus the preview MVP. New resources arrive as
 /// additional variants; each maps to a handler under `src/commands/` in
-/// later phases.
+/// later phases. `GitStatus` is the odd one out: a headless diagnostic in
+/// the spirit of the planned `status | doctor` command that itemizes what
+/// the header dot sees, for loader-vs-CLI disagreements.
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub(crate) enum Command {
     /// Boot the GPUI workspace (the current app behavior, unchanged).
@@ -34,6 +36,10 @@ pub(crate) enum Command {
     /// Preview a file in a dialog (currently Markdown; e.g. from Neovim:
     /// `:!devcroft preview %`).
     Preview(PreviewArgs),
+    /// Print what the header git dot sees for a checkout: branch, tracked
+    /// dirtiness, and the first few itemized gix status entries, plus the
+    /// `git status --porcelain` line count for comparison.
+    GitStatus(GitStatusArgs),
 }
 
 /// Arguments for `devcroft app`.
@@ -57,6 +63,17 @@ pub(crate) struct PreviewArgs {
     /// under the 4 MiB preview limit.
     #[arg(value_name = "PATH")]
     pub(crate) path: PathBuf,
+}
+
+/// Arguments for `devcroft git-status`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub(crate) struct GitStatusArgs {
+    /// Checkout to inspect. Defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) checkout: Option<PathBuf>,
+    /// Maximum itemized gix entries to print.
+    #[arg(long, value_name = "N", default_value_t = 30)]
+    pub(crate) limit: usize,
 }
 
 /// Resolve the working directory for `app`: explicit `--checkout` wins,
@@ -112,6 +129,38 @@ mod tests {
         assert_eq!(
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn git_status_parses_with_defaults() {
+        let cli = Cli::try_parse_from(["devcroft", "git-status"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::GitStatus(GitStatusArgs {
+                checkout: None,
+                limit: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn git_status_parses_checkout_and_limit() {
+        let cli = Cli::try_parse_from([
+            "devcroft",
+            "git-status",
+            "--checkout",
+            "/tmp/work",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::GitStatus(GitStatusArgs {
+                checkout: Some(PathBuf::from("/tmp/work")),
+                limit: 5,
+            })
         );
     }
 

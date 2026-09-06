@@ -12,9 +12,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, IntoElement,
-    InteractiveElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px,
-    rgb,
+    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px, rgb,
 };
 
 use crate::command_palette::{GROUPS, PaletteCommand, ToggleCommandPalette, command_at};
@@ -118,8 +117,9 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             loop {
                 let path = poll_dir.clone();
-                let status =
-                    cx.background_spawn(async move { load_git_status(&path) }).await;
+                let status = cx
+                    .background_spawn(async move { load_git_status(&path) })
+                    .await;
                 let dropped = this
                     .update(cx, |this, cx| {
                         if this.git_status != status {
@@ -147,9 +147,7 @@ impl Workspace {
             .and_then(|root| DeviceStore::new(root).load().ok())
             .map(|state| state.app_font_size_or_default())
             .unwrap_or(DEFAULT_APP_FONT_SIZE);
-        let settings = cx.new(|cx| {
-            SettingsView::new(data_root.clone(), initial_font_size, cx)
-        });
+        let settings = cx.new(|cx| SettingsView::new(data_root.clone(), initial_font_size, cx));
 
         Self {
             active_tab: WorkspaceTab::Agent,
@@ -360,7 +358,11 @@ impl Workspace {
         if self.active_tab == WorkspaceTab::Review {
             return self.review.clone().into_any_element();
         }
-        match self.tabs.get(self.active_tab as usize).and_then(|tab| tab.clone()) {
+        match self
+            .tabs
+            .get(self.active_tab as usize)
+            .and_then(|tab| tab.clone())
+        {
             Some(pane) => pane.into_any_element(),
             None => div().size_full().into_any_element(),
         }
@@ -370,7 +372,11 @@ impl Workspace {
     /// on a detached HEAD. Long branch names truncate instead of pushing the
     /// command bar aside.
     fn render_branch_pill(&self, branch: SharedString) -> impl IntoElement {
-        let glyph = if self.git_status.detached { "➦" } else { "⎇" };
+        let glyph = if self.git_status.detached {
+            "➦"
+        } else {
+            "⎇"
+        };
         h_flex()
             .gap_1()
             .items_center()
@@ -419,11 +425,9 @@ impl Render for Workspace {
             .size_full()
             .bg(rgb(0x080909))
             .text_color(rgb(0xe7e7e7))
-            .on_action(cx.listener(
-                |this, _: &ToggleCommandPalette, window, cx| {
-                    this.toggle_command_palette(window, cx);
-                },
-            ))
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.toggle_command_palette(window, cx);
+            }))
             .child(
                 h_flex()
                     .h(px(58.))
@@ -444,82 +448,59 @@ impl Render for Workspace {
                                     .font_semibold()
                                     .child(self.project_name.clone()),
                             )
-                            .when_some(
-                                self.git_status.branch.clone(),
-                                |this, branch| {
-                                    this.child(self.render_branch_pill(branch.into()))
-                                },
-                            )
+                            .when_some(self.git_status.branch.clone(), |this, branch| {
+                                this.child(self.render_branch_pill(branch.into()))
+                            })
                             // Amber dot while staged, unstaged, or untracked
                             // changes exist; hidden when clean so the steady
                             // state stays quiet.
                             .when(self.git_status.dirty, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0xeab308))
-                                        .child("●"),
-                                )
+                                this.child(div().text_xs().text_color(rgb(0xeab308)).child("●"))
                             })
                             .when_some(self.git_status.ahead_label(), |this, ahead| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x858989))
-                                        .child(ahead),
-                                )
+                                this.child(div().text_xs().text_color(rgb(0x858989)).child(ahead))
                             })
                             .when_some(self.git_status.behind_label(), |this, behind| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x858989))
-                                        .child(behind),
-                                )
+                                this.child(div().text_xs().text_color(rgb(0x858989)).child(behind))
                             }),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_row()
-                            .justify_center()
-                            .child(
-                                h_flex()
-                                    .w(px(380.))
-                                    .h(px(32.))
-                                    .px_3()
-                                    .gap_2()
-                                    .items_center()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(0x292b2b))
-                                    .bg(rgb(0x0e0f0f))
-                                    .text_xs()
-                                    .text_color(rgb(0x737878))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.toggle_command_palette(window, cx);
-                                        }),
-                                    )
-                                    .child(
-                                        Icon::new(IconName::Search)
-                                            .size(px(14.))
-                                            .text_color(rgb(0x737878)),
-                                    )
-                                    .child(div().flex_1().child("Type a command…"))
-                                    .child(
-                                        div()
-                                            .px_1()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(rgb(0x292b2b))
-                                            .text_color(rgb(0x858989))
-                                            .child("⌘K"),
-                                    ),
-                            ),
+                        div().flex_1().flex().flex_row().justify_center().child(
+                            h_flex()
+                                .w(px(380.))
+                                .h(px(32.))
+                                .px_3()
+                                .gap_2()
+                                .items_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x292b2b))
+                                .bg(rgb(0x0e0f0f))
+                                .text_xs()
+                                .text_color(rgb(0x737878))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.toggle_command_palette(window, cx);
+                                    }),
+                                )
+                                .child(
+                                    Icon::new(IconName::Search)
+                                        .size(px(14.))
+                                        .text_color(rgb(0x737878)),
+                                )
+                                .child(div().flex_1().child("Type a command…"))
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x292b2b))
+                                        .text_color(rgb(0x858989))
+                                        .child("⌘K"),
+                                ),
+                        ),
                     )
                     .child(
                         div().flex_none().child(
@@ -552,27 +533,18 @@ impl Render for Workspace {
                                 this.close_command_palette(window, cx);
                             }),
                         )
+                        .child(div().absolute().size_full().bg(rgb(0x000000)).opacity(0.4))
                         .child(
-                            div()
-                                .absolute()
-                                .size_full()
-                                .bg(rgb(0x000000))
-                                .opacity(0.4),
-                        )
-                        .child(
-                            h_flex()
-                                .justify_center()
-                                .pt(px(8.))
-                                .child(
-                                    div()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_, _, _, cx| {
-                                                cx.stop_propagation();
-                                            }),
-                                        )
-                                        .child(self.render_command_bar(cx)),
-                                ),
+                            h_flex().justify_center().pt(px(8.)).child(
+                                div()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(self.render_command_bar(cx)),
+                            ),
                         ),
                 )
             })

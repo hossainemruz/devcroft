@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use gpui_kit::component::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Entity, IntoElement, InteractiveElement, MouseButton,
+    AnyElement, App, AppContext as _, Entity, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Styled, div, px, rgb,
 };
 
@@ -21,7 +21,9 @@ use crate::fonts::TERMINAL_FONT_FAMILY;
 use crate::metrics::review_font_size;
 
 use super::ReviewView;
-use super::model::{ChangedFile, FileStatus, Hunk, HunkLine, LineTag, ReviewDiff, UnavailableReason};
+use super::model::{
+    ChangedFile, FileStatus, Hunk, HunkLine, LineTag, ReviewDiff, UnavailableReason,
+};
 
 /// Height of every stream row. File headers are condensed to a single row
 /// so the whole stream stays uniform (see module docs).
@@ -31,13 +33,31 @@ pub(crate) const ROW_H: f32 = 24.0;
 /// index into a [`LoadedReview`](super::LoadedReview).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamRow {
-    FileHeader { file: usize },
-    HunkHeader { file: usize, hunk: usize },
-    Line { file: usize, hunk: usize, line: usize },
-    Collapsed { file: usize, hunk: usize },
-    Truncated { file: usize },
-    Unavailable { file: usize },
-    NoChanges { file: usize },
+    FileHeader {
+        file: usize,
+    },
+    HunkHeader {
+        file: usize,
+        hunk: usize,
+    },
+    Line {
+        file: usize,
+        hunk: usize,
+        line: usize,
+    },
+    Collapsed {
+        file: usize,
+        hunk: usize,
+    },
+    Truncated {
+        file: usize,
+    },
+    Unavailable {
+        file: usize,
+    },
+    NoChanges {
+        file: usize,
+    },
 }
 
 impl StreamRow {
@@ -121,9 +141,7 @@ pub(crate) fn render_row(
 ) -> AnyElement {
     let file = &loaded.diff.files[row.file()];
     match row {
-        StreamRow::FileHeader { .. } => {
-            file_header_row(file, viewed.contains(&file.path), view)
-        }
+        StreamRow::FileHeader { .. } => file_header_row(file, viewed.contains(&file.path), view),
         StreamRow::HunkHeader { hunk, .. } => match &file.content {
             super::model::FileContent::Text { hunks, .. } => hunk_header_row(&hunks[hunk]),
             super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
@@ -144,11 +162,7 @@ pub(crate) fn render_row(
     }
 }
 
-fn file_header_row(
-    file: &ChangedFile,
-    is_viewed: bool,
-    view: &Entity<ReviewView>,
-) -> AnyElement {
+fn file_header_row(file: &ChangedFile, is_viewed: bool, view: &Entity<ReviewView>) -> AnyElement {
     let path = file.path.clone();
     let toggle_view = view.clone();
     let stats = if file.additions > 0 || file.deletions > 0 {
@@ -206,14 +220,11 @@ fn file_header_row(
                 } else {
                     rgb(0x555a5a)
                 })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    move |_, _, cx: &mut App| {
-                        cx.update_entity(&toggle_view, |view, cx| {
-                            view.toggle_viewed(&path, cx);
-                        });
-                    },
-                )
+                .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                    cx.update_entity(&toggle_view, |view, cx| {
+                        view.toggle_viewed(&path, cx);
+                    });
+                })
                 .child(if is_viewed { "✓" } else { "○" }),
         )
         .into_any_element()
@@ -416,9 +427,21 @@ mod tests {
                 StreamRow::FileHeader { file: 0 },
                 StreamRow::Collapsed { file: 0, hunk: 0 },
                 StreamRow::HunkHeader { file: 0, hunk: 0 },
-                StreamRow::Line { file: 0, hunk: 0, line: 0 },
-                StreamRow::Line { file: 0, hunk: 0, line: 1 },
-                StreamRow::Line { file: 0, hunk: 0, line: 2 },
+                StreamRow::Line {
+                    file: 0,
+                    hunk: 0,
+                    line: 0
+                },
+                StreamRow::Line {
+                    file: 0,
+                    hunk: 0,
+                    line: 1
+                },
+                StreamRow::Line {
+                    file: 0,
+                    hunk: 0,
+                    line: 2
+                },
                 StreamRow::FileHeader { file: 1 },
                 StreamRow::Unavailable { file: 1 },
             ]

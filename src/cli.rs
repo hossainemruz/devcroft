@@ -1,10 +1,13 @@
-//! Command-line surface (`docs/cli-plan.md`, Phase 0).
+//! Command-line surface (`docs/cli-plan.md`, Phase 0 + preview).
 //!
 //! Day-one contract: `devcroft app [--checkout <path>]` boots the GUI,
-//! bare `devcroft` prints help. Later phases add headless store commands
-//! (`task`, `review`, `sync`) and live-UI commands (`preview`, `ref`,
-//! `focus`) behind the same parser, with dispatch in `main()` before any
-//! GPUI initialization so headless commands stay fast.
+//! bare `devcroft` prints help. `devcroft preview <path>` opens the file in
+//! a standalone preview window (no workspace, no socket — the lightweight
+//! MVP standing in for the Phase 2 `preview.open` socket method). Later
+//! phases add headless store commands (`task`, `review`, `sync`) and the
+//! remaining live-UI commands (`ref`, `focus`) behind the same parser, with
+//! dispatch in `main()` before any GPUI initialization so headless commands
+//! stay fast.
 
 use std::path::PathBuf;
 
@@ -21,12 +24,16 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
-/// Phase 0 surface. New resources arrive as additional variants; each maps
-/// to a handler under `src/commands/` in later phases.
+/// Phase 0 surface plus the preview MVP. New resources arrive as
+/// additional variants; each maps to a handler under `src/commands/` in
+/// later phases.
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub(crate) enum Command {
     /// Boot the GPUI workspace (the current app behavior, unchanged).
     App(AppArgs),
+    /// Preview a file in a dialog (currently Markdown; e.g. from Neovim:
+    /// `:!devcroft preview %`).
+    Preview(PreviewArgs),
 }
 
 /// Arguments for `devcroft app`.
@@ -37,6 +44,19 @@ pub(crate) struct AppArgs {
     /// here.
     #[arg(long, value_name = "PATH")]
     pub(crate) checkout: Option<PathBuf>,
+}
+
+/// Arguments for `devcroft preview <path>`.
+///
+/// The previewed file resolves against the process cwd, so a Neovim
+/// `:!devcroft preview %` previews the current buffer wherever it lives.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub(crate) struct PreviewArgs {
+    /// File to preview. Currently rendered as Markdown regardless of
+    /// extension; must exist, be a regular file, be valid UTF-8, and stay
+    /// under the 4 MiB preview limit.
+    #[arg(value_name = "PATH")]
+    pub(crate) path: PathBuf,
 }
 
 /// Resolve the working directory for `app`: explicit `--checkout` wins,
@@ -71,6 +91,27 @@ mod tests {
             Command::App(AppArgs {
                 checkout: Some(PathBuf::from("/tmp/work")),
             })
+        );
+    }
+
+    #[test]
+    fn preview_parses_with_positional_path() {
+        let cli = Cli::try_parse_from(["devcroft", "preview", "README.md"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Preview(PreviewArgs {
+                path: PathBuf::from("README.md"),
+            })
+        );
+    }
+
+    #[test]
+    fn preview_requires_a_path() {
+        let error = Cli::try_parse_from(["devcroft", "preview"]).unwrap_err();
+        // Missing positional is a usage error (exit 2 per the CLI plan).
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 

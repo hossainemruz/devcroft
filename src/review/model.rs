@@ -75,10 +75,7 @@ impl FileStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FileContent {
-    Text {
-        hunks: Vec<Hunk>,
-        truncated: bool,
-    },
+    Text { hunks: Vec<Hunk>, truncated: bool },
     Unavailable(UnavailableReason),
 }
 

@@ -128,8 +128,10 @@ mod tests {
 
     #[test]
     fn groups_cover_every_command_exactly_once() {
-        let grouped: Vec<PaletteCommand> =
-            GROUPS.iter().flat_map(|(_, items)| items.iter().copied()).collect();
+        let grouped: Vec<PaletteCommand> = GROUPS
+            .iter()
+            .flat_map(|(_, items)| items.iter().copied())
+            .collect();
         assert_eq!(grouped.len(), PaletteCommand::ALL.len());
         let unique: HashSet<_> = grouped.iter().collect();
         assert_eq!(unique.len(), PaletteCommand::ALL.len());

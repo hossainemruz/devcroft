@@ -7,8 +7,8 @@
 //! and refresh.
 
 pub(crate) mod git;
-pub(crate) mod model;
 mod icons;
+pub(crate) mod model;
 mod stream;
 mod tree;
 
@@ -34,9 +34,9 @@ use gpui_kit::{
 use crate::command_palette::ToggleCommandPalette;
 
 use self::git::{ReviewScope, load_review, suggest_base_branch};
+use self::icons::{FALLBACK, ICON_PX, IconTiles, ensure_tiles, icon_key};
 use self::model::ReviewDiff;
 use self::stream::{flatten, render_row, status_color};
-use self::icons::{FALLBACK, ICON_PX, IconTiles, ensure_tiles, icon_key};
 use self::tree::{TreeRowMeta, build_file_tree, file_item_id, file_path_from_id};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,8 +92,7 @@ pub(crate) struct ReviewView {
 
 impl ReviewView {
     pub(crate) fn new(cwd: &Path, cx: &mut Context<Self>) -> Self {
-        let base_branch =
-            suggest_base_branch(cwd, "origin").unwrap_or_else(|| "main".to_owned());
+        let base_branch = suggest_base_branch(cwd, "origin").unwrap_or_else(|| "main".to_owned());
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             cwd: cwd.to_owned(),
@@ -215,11 +214,19 @@ impl ReviewView {
                 ScopeTab::FullDiff => format!(
                     "base {} · {}",
                     loaded.diff.base_ref.as_deref().unwrap_or(&self.base_branch),
-                    loaded.diff.head_branch.as_deref().unwrap_or("detached HEAD")
+                    loaded
+                        .diff
+                        .head_branch
+                        .as_deref()
+                        .unwrap_or("detached HEAD")
                 ),
                 ScopeTab::Uncommitted => format!(
                     "uncommitted · {}",
-                    loaded.diff.head_branch.as_deref().unwrap_or("detached HEAD")
+                    loaded
+                        .diff
+                        .head_branch
+                        .as_deref()
+                        .unwrap_or("detached HEAD")
                 ),
             },
             _ => match self.scope_tab {
@@ -234,7 +241,10 @@ impl ReviewView {
             ReviewState::Loaded(loaded) => {
                 let additions: u32 = loaded.diff.files.iter().map(|file| file.additions).sum();
                 let deletions: u32 = loaded.diff.files.iter().map(|file| file.deletions).sum();
-                format!("{} files · +{additions} −{deletions}", loaded.diff.files.len())
+                format!(
+                    "{} files · +{additions} −{deletions}",
+                    loaded.diff.files.len()
+                )
             }
             _ => String::new(),
         }
@@ -265,7 +275,10 @@ impl ReviewView {
                             this.reload(cx);
                         }
                     }))
-                    .children([Tab::new().label("Full diff"), Tab::new().label("Uncommitted")]),
+                    .children([
+                        Tab::new().label("Full diff"),
+                        Tab::new().label("Uncommitted"),
+                    ]),
             )
             .child(
                 div()
@@ -302,74 +315,75 @@ impl ReviewView {
         let metas = self.tree_metas.clone();
         let viewed = self.viewed.clone();
         let tiles = self.icon_tiles.clone();
-        tree(&self.tree_state, move |ix, entry, _selected, _window, _cx| {
-            let id = entry.item().id.to_string();
-            let fallback = entry.item().label.to_string();
-            let meta = metas.get(&id);
-            let name = meta.map(|meta| meta.name.clone()).unwrap_or(fallback);
-            let is_folder = meta.is_some_and(|meta| meta.is_folder);
-            let chevron = if is_folder {
-                if entry.is_expanded() { "▾ " } else { "▸ " }
-            } else {
-                ""
-            };
-            let is_viewed = file_path_from_id(&id)
-                .is_some_and(|path| viewed.borrow().contains(path));
-            // Files show full-color Material tiles; folders keep neutral
-            // gpui-kit glyphs. The colored A/M/D/R/T letter (not the icon)
-            // carries git status. Viewed files dim to match their names.
-            let icon: AnyElement = if is_folder {
-                Icon::new(if entry.is_expanded() {
-                    IconName::FolderOpen
+        tree(
+            &self.tree_state,
+            move |ix, entry, _selected, _window, _cx| {
+                let id = entry.item().id.to_string();
+                let fallback = entry.item().label.to_string();
+                let meta = metas.get(&id);
+                let name = meta.map(|meta| meta.name.clone()).unwrap_or(fallback);
+                let is_folder = meta.is_some_and(|meta| meta.is_folder);
+                let chevron = if is_folder {
+                    if entry.is_expanded() { "▾ " } else { "▸ " }
                 } else {
-                    IconName::FolderClosed
-                })
-                .size(px(ICON_PX))
-                .text_color(rgb(0x858989))
-                .into_any_element()
-            } else {
-                let tile = tiles
-                    .get(icon_key(&name))
-                    .or_else(|| tiles.get(FALLBACK));
-                match tile {
-                    Some(tile) => img(tile.clone())
-                        .size(px(ICON_PX))
-                        .when(is_viewed, |this| this.opacity(0.45))
-                        .into_any_element(),
-                    // Unreachable: apply_diff pre-rasterizes every key plus
-                    // the fallback. An empty slot beats a panic on skew.
-                    None => div().size(px(ICON_PX)).into_any_element(),
-                }
-            };
-            let status_cue = match meta.and_then(|meta| meta.status) {
-                // Single-letter status cue, right-aligned like VS Code's
-                // explorer. The per-file +/- counts live on the diff headers.
-                Some(status) if !is_folder => div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(rgb(status_color(status)))
-                    .child(status.abbrev()),
-                _ => div(),
-            };
-            ListItem::new(ix).child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .pl(px(entry.depth() as f32 * 14.0 + 8.0))
-                    .text_sm()
-                    .when(is_viewed && !is_folder, |this| {
-                        this.text_color(rgb(0x737878))
+                    ""
+                };
+                let is_viewed =
+                    file_path_from_id(&id).is_some_and(|path| viewed.borrow().contains(path));
+                // Files show full-color Material tiles; folders keep neutral
+                // gpui-kit glyphs. The colored A/M/D/R/T letter (not the icon)
+                // carries git status. Viewed files dim to match their names.
+                let icon: AnyElement = if is_folder {
+                    Icon::new(if entry.is_expanded() {
+                        IconName::FolderOpen
+                    } else {
+                        IconName::FolderClosed
                     })
-                    .child(div().text_color(rgb(0x555a5a)).child(chevron))
-                    .child(icon)
-                    .child(div().child(name))
-                    .child(div().flex_1())
-                    .child(status_cue)
-                    .when(is_viewed && !is_folder, |this| {
-                        this.child(div().text_xs().text_color(rgb(0x4ade80)).child("✓"))
-                    }),
-            )
-        })
+                    .size(px(ICON_PX))
+                    .text_color(rgb(0x858989))
+                    .into_any_element()
+                } else {
+                    let tile = tiles.get(icon_key(&name)).or_else(|| tiles.get(FALLBACK));
+                    match tile {
+                        Some(tile) => img(tile.clone())
+                            .size(px(ICON_PX))
+                            .when(is_viewed, |this| this.opacity(0.45))
+                            .into_any_element(),
+                        // Unreachable: apply_diff pre-rasterizes every key plus
+                        // the fallback. An empty slot beats a panic on skew.
+                        None => div().size(px(ICON_PX)).into_any_element(),
+                    }
+                };
+                let status_cue = match meta.and_then(|meta| meta.status) {
+                    // Single-letter status cue, right-aligned like VS Code's
+                    // explorer. The per-file +/- counts live on the diff headers.
+                    Some(status) if !is_folder => div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(rgb(status_color(status)))
+                        .child(status.abbrev()),
+                    _ => div(),
+                };
+                ListItem::new(ix).child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .pl(px(entry.depth() as f32 * 14.0 + 8.0))
+                        .text_sm()
+                        .when(is_viewed && !is_folder, |this| {
+                            this.text_color(rgb(0x737878))
+                        })
+                        .child(div().text_color(rgb(0x555a5a)).child(chevron))
+                        .child(icon)
+                        .child(div().child(name))
+                        .child(div().flex_1())
+                        .child(status_cue)
+                        .when(is_viewed && !is_folder, |this| {
+                            this.child(div().text_xs().text_color(rgb(0x4ade80)).child("✓"))
+                        }),
+                )
+            },
+        )
         .size_full()
     }
 

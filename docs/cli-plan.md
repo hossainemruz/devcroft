@@ -31,6 +31,8 @@ Phase 1 (headless, no socket needed): `devcroft task list|get|create|update`, `d
 
 Phase 2 (live-UI, socket required): `devcroft preview <markdown-file>`, `devcroft ref add --file <checkout-relative> --lines <a[:b]> [--repo <key>] [--id <uuid>]`, plus `devcroft focus --tab agent|review|editor|terminal` as the small navigation primitive that `ref add` and tutorial starter prompts reuse.
 
+MVP note (shipped): `devcroft preview <path>` currently opens a standalone preview window with no running app and no socket — the lightweight MVP in `src/preview.rs`. The socket `preview.open` method above remains the Phase 2 target for driving the running instance, and supersedes the "no fallback renderer" non-goal below for `preview` specifically.
+
 Explicit non-goals for v1: no remote access, no second transport, no daemon mode, no `devcroft app` auto-focus-existing (second same-root `app` errors; focus-via-socket comes later), no `preview` fallback renderer when the app is not running (fail with actionable `app-not-running`).
 
 ## Architecture

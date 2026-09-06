@@ -10,8 +10,8 @@
 //! open/close while the view keeps the selected section and edits across
 //! reopenings.
 
-use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
@@ -231,62 +231,58 @@ impl SettingsView {
         v_flex()
             .gap_4()
             .child(
-                group("Appearance", None).child(
-                    live_row(
-                        "App font size",
-                        "Applies to the Agent, Editor, Terminal, and Review panes.",
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(step_button("-", cx.listener(move |this, _, _, cx| {
-                                this.set_font_size(
-                                    SettingsView::stepped_font_size(size, -1.0),
-                                    cx,
-                                )
-                            })))
-                            .child(
-                                div()
-                                    .w(px(64.))
-                                    .text_center()
-                                    .text_sm()
-                                    .text_color(rgb(0xe7e7e7))
-                                    .child(format_font_size(size)),
-                            )
-                            .child(step_button("+", cx.listener(move |this, _, _, cx| {
+                group("Appearance", None).child(live_row(
+                    "App font size",
+                    "Applies to the Agent, Editor, Terminal, and Review panes.",
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(step_button(
+                            "-",
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_font_size(SettingsView::stepped_font_size(size, -1.0), cx)
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .w(px(64.))
+                                .text_center()
+                                .text_sm()
+                                .text_color(rgb(0xe7e7e7))
+                                .child(format_font_size(size)),
+                        )
+                        .child(step_button(
+                            "+",
+                            cx.listener(move |this, _, _, cx| {
                                 this.set_font_size(SettingsView::stepped_font_size(size, 1.0), cx)
-                            })))
-                            .child(
+                            }),
+                        ))
+                        .child(div().text_xs().text_color(rgb(0x555a5a)).child(format!(
+                            "{}–{} px",
+                            MIN_APP_FONT_SIZE as u32, MAX_APP_FONT_SIZE as u32
+                        )))
+                        .when(!is_default, |this| {
+                            this.child(
                                 div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
                                     .text_xs()
-                                    .text_color(rgb(0x555a5a))
+                                    .text_color(rgb(0x858989))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_font_size(DEFAULT_APP_FONT_SIZE, cx)
+                                        }),
+                                    )
                                     .child(format!(
-                                        "{}–{} px",
-                                        MIN_APP_FONT_SIZE as u32, MAX_APP_FONT_SIZE as u32
+                                        "Reset to {}",
+                                        format_font_size(DEFAULT_APP_FONT_SIZE)
                                     )),
                             )
-                            .when(!is_default, |this| {
-                                this.child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .text_xs()
-                                        .text_color(rgb(0x858989))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.set_font_size(DEFAULT_APP_FONT_SIZE, cx)
-                                            }),
-                                        )
-                                        .child(format!(
-                                            "Reset to {}",
-                                            format_font_size(DEFAULT_APP_FONT_SIZE)
-                                        )),
-                                )
-                            }),
-                    ),
-                ),
+                        }),
+                )),
             )
             .child(
                 v_flex()
@@ -314,16 +310,13 @@ impl SettingsView {
     }
 
     fn render_editor(&self) -> impl IntoElement {
-        v_flex()
-            .gap_4()
-            .child(
-                dummy_group("Editor", "Coming soon — these controls are placeholders.").child(
-                    dummy_row(
-                        "Default command",
-                        "Launched when the Editor tab opens.",
-                        dummy_value(editor_command_label()),
-                    ),
-                )
+        v_flex().gap_4().child(
+            dummy_group("Editor", "Coming soon — these controls are placeholders.")
+                .child(dummy_row(
+                    "Default command",
+                    "Launched when the Editor tab opens.",
+                    dummy_value(editor_command_label()),
+                ))
                 .child(font_size_note_row(self.font_size, "Editor panes"))
                 .child(dummy_row(
                     "Tab width",
@@ -335,20 +328,17 @@ impl SettingsView {
                     "Wrap long lines in the TUI editor.",
                     dummy_switch(false),
                 )),
-            )
+        )
     }
 
     fn render_agent(&self) -> impl IntoElement {
-        v_flex()
-            .gap_4()
-            .child(
-                dummy_group("Agent", "Coming soon — these controls are placeholders.").child(
-                    dummy_row(
-                        "Default command",
-                        "Launched when the Agent tab opens.",
-                        dummy_value(agent_command_label()),
-                    ),
-                )
+        v_flex().gap_4().child(
+            dummy_group("Agent", "Coming soon — these controls are placeholders.")
+                .child(dummy_row(
+                    "Default command",
+                    "Launched when the Agent tab opens.",
+                    dummy_value(agent_command_label()),
+                ))
                 .child(font_size_note_row(self.font_size, "Agent panes"))
                 .child(dummy_row(
                     "Provider",
@@ -360,20 +350,17 @@ impl SettingsView {
                     "When the agent may edit without asking.",
                     dummy_dropdown("Ask before edits"),
                 )),
-            )
+        )
     }
 
     fn render_terminal(&self) -> impl IntoElement {
-        v_flex()
-            .gap_4()
-            .child(
-                dummy_group("Terminal", "Coming soon — these controls are placeholders.").child(
-                    dummy_row(
-                        "Shell",
-                        "Login shell launched in new terminals.",
-                        dummy_value(default_shell_label()),
-                    ),
-                )
+        v_flex().gap_4().child(
+            dummy_group("Terminal", "Coming soon — these controls are placeholders.")
+                .child(dummy_row(
+                    "Shell",
+                    "Login shell launched in new terminals.",
+                    dummy_value(default_shell_label()),
+                ))
                 .child(font_size_note_row(self.font_size, "Terminal panes"))
                 .child(dummy_row(
                     "Scrollback",
@@ -390,36 +377,39 @@ impl SettingsView {
                     "Play a sound on the terminal bell.",
                     dummy_switch(false),
                 )),
-            )
+        )
     }
 
     fn render_keybindings(&self) -> impl IntoElement {
         v_flex()
             .gap_4()
             .child(
-                group("Keyboard", Some("These shortcuts work everywhere, including inside terminals."))
-                    .child(live_row(
-                        "Toggle command palette",
-                        "Search tabs, settings, and sync.",
-                        h_flex().gap_1().items_center().child(kbd("⌘K")).child(kbd("Ctrl+K")),
-                    ))
-                    .child(live_row(
-                        "Close palette or dialog",
-                        "Dismisses the topmost overlay.",
-                        kbd("Esc"),
-                    )),
+                group(
+                    "Keyboard",
+                    Some("These shortcuts work everywhere, including inside terminals."),
+                )
+                .child(live_row(
+                    "Toggle command palette",
+                    "Search tabs, settings, and sync.",
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(kbd("⌘K"))
+                        .child(kbd("Ctrl+K")),
+                ))
+                .child(live_row(
+                    "Close palette or dialog",
+                    "Dismisses the topmost overlay.",
+                    kbd("Esc"),
+                )),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(soon_badge())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x737878))
-                            .child("Custom keybindings are coming soon."),
-                    ),
+                h_flex().gap_2().items_center().child(soon_badge()).child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x737878))
+                        .child("Custom keybindings are coming soon."),
+                ),
             )
     }
 }
@@ -457,21 +447,23 @@ fn format_font_size(size: f32) -> String {
 
 fn group(title: &str, description: Option<&str>) -> gpui_kit::Div {
     v_flex().gap_3().child(
-        v_flex().gap_1().child(
-            div()
-                .text_sm()
-                .font_semibold()
-                .text_color(rgb(0xe7e7e7))
-                .child(title.to_owned()),
-        )
-        .when_some(description, |this, text| {
-            this.child(
+        v_flex()
+            .gap_1()
+            .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(0x737878))
-                    .child(text.to_owned()),
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(rgb(0xe7e7e7))
+                    .child(title.to_owned()),
             )
-        }),
+            .when_some(description, |this, text| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x737878))
+                        .child(text.to_owned()),
+                )
+            }),
     )
 }
 
@@ -490,7 +482,12 @@ fn live_row(
                 .gap_1()
                 .flex_1()
                 .min_w_0()
-                .child(div().text_sm().text_color(rgb(0xe7e7e7)).child(title.into()))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xe7e7e7))
+                        .child(title.into()),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -517,7 +514,12 @@ fn dummy_row(
                 .gap_1()
                 .flex_1()
                 .min_w_0()
-                .child(div().text_sm().text_color(rgb(0xe7e7e7)).child(title.into()))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xe7e7e7))
+                        .child(title.into()),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -525,7 +527,13 @@ fn dummy_row(
                         .child(description.into()),
                 ),
         )
-        .child(h_flex().gap_2().items_center().child(control).child(soon_badge()))
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(control)
+                .child(soon_badge()),
+        )
 }
 
 /// A placeholder group: title with a `Soon` badge plus dimmed rows.

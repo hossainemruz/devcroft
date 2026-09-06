@@ -12,6 +12,11 @@ run = "cargo build"
 description = "Run Devcroft GUI"
 run = "cargo run -- app"
 
+[tasks.preview]
+description = "Preview a file in a dialog"
+usage = 'arg "<path>" help="File to preview"'
+run = 'cargo run -- preview "${usage_path?}"'
+
 [tasks.check]
 description = "Run formatting, compilation, and lints"
 run = [

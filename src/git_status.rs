@@ -264,12 +264,25 @@ mod tests {
     /// needs a fetch refspec (via `remote add`) so gix can map the upstream
     /// branch to its tracking ref, exactly like a cloned checkout.
     fn set_upstream(dir: &Path, branch: &str, rev: &str) {
-        git(dir, &["remote", "add", "origin", "https://example.com/repo.git"]);
-        git(dir, &["update-ref", &format!("refs/remotes/origin/{branch}"), rev]);
-        git(dir, &["config", &format!("branch.{branch}.remote"), "origin"]);
         git(
             dir,
-            &["config", &format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")],
+            &["remote", "add", "origin", "https://example.com/repo.git"],
+        );
+        git(
+            dir,
+            &["update-ref", &format!("refs/remotes/origin/{branch}"), rev],
+        );
+        git(
+            dir,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        git(
+            dir,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
         );
     }
 

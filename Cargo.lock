@@ -1585,6 +1585,7 @@ dependencies = [
  "gpui-kit",
  "ignore",
  "libghostty-vt",
+ "markdown",
  "parking_lot",
  "portable-pty",
  "serde",

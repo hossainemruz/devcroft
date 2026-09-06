@@ -40,7 +40,7 @@ pub(crate) fn file_path_from_id(id: &str) -> Option<&str> {
 /// exactly stream order.
 pub(crate) fn build_file_tree(
     files: &[ChangedFile],
-    ) -> (Vec<TreeItem>, HashMap<String, TreeRowMeta>) {
+) -> (Vec<TreeItem>, HashMap<String, TreeRowMeta>) {
     let mut metas = HashMap::new();
     let mut dir_files: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut all_dirs: BTreeSet<String> = BTreeSet::new();
@@ -79,7 +79,10 @@ fn dir_items(
     metas: &mut HashMap<String, TreeRowMeta>,
 ) -> Vec<TreeItem> {
     let mut items = Vec::new();
-    for sub in all_dirs.iter().filter(|candidate| parent_dir(candidate) == dir) {
+    for sub in all_dirs
+        .iter()
+        .filter(|candidate| parent_dir(candidate) == dir)
+    {
         let id = format!("{DIR_ID_PREFIX}{sub}");
         metas.insert(
             id.clone(),
@@ -90,12 +93,19 @@ fn dir_items(
             },
         );
         let children = dir_items(sub, files, dir_files, all_dirs, metas);
-        items.push(TreeItem::new(id, file_name(sub)).expanded(true).children(children));
+        items.push(
+            TreeItem::new(id, file_name(sub))
+                .expanded(true)
+                .children(children),
+        );
     }
     if let Some(indices) = dir_files.get(dir) {
         for &index in indices {
             let file = &files[index];
-            items.push(TreeItem::new(file_item_id(&file.path), file_name(&file.path)));
+            items.push(TreeItem::new(
+                file_item_id(&file.path),
+                file_name(&file.path),
+            ));
         }
     }
     items
@@ -170,6 +180,9 @@ mod tests {
         files.sort_by(|a, b| compare_review_paths(&a.path, &b.path));
         let (items, _) = build_file_tree(&files);
         let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
-        assert_eq!(ids, vec!["dir:a", "dir:src", "file:README.md", "file:src-old.rs"]);
+        assert_eq!(
+            ids,
+            vec!["dir:a", "dir:src", "file:README.md", "file:src-old.rs"]
+        );
     }
 }

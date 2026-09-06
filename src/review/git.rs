@@ -51,7 +51,10 @@ pub(crate) fn load_review(repo_path: &Path, scope: &ReviewScope) -> Result<Revie
     let repo = open(repo_path)?;
     let head = repo.head_id().context("reading HEAD")?.detach();
     let (base_commit, base_ref) = match scope {
-        ReviewScope::FullDiff { base_branch, remote } => {
+        ReviewScope::FullDiff {
+            base_branch,
+            remote,
+        } => {
             let base_tip = resolve_base_commit(&repo, base_branch, remote)?;
             let merge_base = repo
                 .merge_base(base_tip, head)
@@ -173,7 +176,10 @@ struct BaseEntry {
 }
 
 /// List every blob/symlink/gitlink in a tree, keyed by forward-slash path.
-fn list_tree(repo: &gix::Repository, tree_id: gix::ObjectId) -> Result<BTreeMap<String, BaseEntry>> {
+fn list_tree(
+    repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+) -> Result<BTreeMap<String, BaseEntry>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![(tree_id, String::new())];
     while let Some((id, prefix)) = stack.pop() {
@@ -252,9 +258,7 @@ fn read_worktree(path: &Path) -> WorkContent {
     }
     if meta.file_type().is_symlink() {
         return match std::fs::read_link(path) {
-            Ok(target) => {
-                WorkContent::Symlink(target.as_os_str().as_encoded_bytes().to_vec())
-            }
+            Ok(target) => WorkContent::Symlink(target.as_os_str().as_encoded_bytes().to_vec()),
             Err(_) => WorkContent::Gone,
         };
     }
@@ -309,8 +313,16 @@ fn assemble(
     }
 
     pair_exact_renames(&mut files, &mut deleted, &mut added);
-    files.extend(added.into_iter().map(|(path, bytes)| added_file(&path, &bytes)));
-    files.extend(deleted.into_iter().map(|(path, bytes)| deleted_file(&path, &bytes)));
+    files.extend(
+        added
+            .into_iter()
+            .map(|(path, bytes)| added_file(&path, &bytes)),
+    );
+    files.extend(
+        deleted
+            .into_iter()
+            .map(|(path, bytes)| deleted_file(&path, &bytes)),
+    );
     // Canonical review order: folders first, matching the sidebar tree's
     // pre-order exactly (see `compare_review_paths`).
     files.sort_by(|a, b| compare_review_paths(&a.path, &b.path));
@@ -343,25 +355,20 @@ fn classify_tracked(
     let base_is_link = entry.mode.is_link();
     let work_is_link = matches!(work, WorkContent::Symlink(_));
     match work {
-        WorkContent::Gone => {
-            match read_blob(repo, entry.oid) {
-                BlobRead::Hit(bytes) if !is_binary(&bytes) => {
-                    deleted.push((path.to_owned(), bytes));
-                }
-                BlobRead::Hit(_) => files.push(deleted_file_unavailable(
-                    path,
-                    UnavailableReason::Binary,
-                )),
-                BlobRead::TooLarge => files.push(deleted_file_unavailable(
-                    path,
-                    UnavailableReason::TooLarge,
-                )),
-                BlobRead::Missing => files.push(deleted_file_unavailable(
-                    path,
-                    UnavailableReason::Missing,
-                )),
+        WorkContent::Gone => match read_blob(repo, entry.oid) {
+            BlobRead::Hit(bytes) if !is_binary(&bytes) => {
+                deleted.push((path.to_owned(), bytes));
             }
-        }
+            BlobRead::Hit(_) => {
+                files.push(deleted_file_unavailable(path, UnavailableReason::Binary))
+            }
+            BlobRead::TooLarge => {
+                files.push(deleted_file_unavailable(path, UnavailableReason::TooLarge))
+            }
+            BlobRead::Missing => {
+                files.push(deleted_file_unavailable(path, UnavailableReason::Missing))
+            }
+        },
         WorkContent::Dir => {
             files.push(ChangedFile {
                 path: path.to_owned(),
@@ -460,7 +467,12 @@ fn mode_changed(repo: &gix::Repository, path: &str, entry: &BaseEntry) -> bool {
 }
 
 /// Compare base bytes against work bytes for a path present on both sides.
-fn classify_modified(path: &str, base_bytes: &[u8], work_bytes: &[u8], files: &mut Vec<ChangedFile>) {
+fn classify_modified(
+    path: &str,
+    base_bytes: &[u8],
+    work_bytes: &[u8],
+    files: &mut Vec<ChangedFile>,
+) {
     if is_binary(base_bytes) || is_binary(work_bytes) {
         files.push(ChangedFile {
             path: path.to_owned(),
@@ -734,7 +746,9 @@ fn discover_untracked(workdir: &Path, base_entries: &BTreeMap<String, BaseEntry>
             .map(|component| component.as_os_str().as_encoded_bytes())
             .collect::<Vec<_>>()
             .join(&b'/');
-        let Ok(path) = String::from_utf8(path) else { continue };
+        let Ok(path) = String::from_utf8(path) else {
+            continue;
+        };
         if !base_entries.contains_key(&path) {
             out.push(path);
         }
@@ -908,7 +922,7 @@ mod tests {
         assert_eq!((renamed.additions, renamed.deletions), (0, 0));
     }
 
-        #[test]
+    #[test]
     fn multiple_crossing_renames_pair_correctly() {
         let dir = init_repo();
         write(dir.path(), "a.txt", b"content X\n");
@@ -943,7 +957,10 @@ mod tests {
 
         let diff = load_review(dir.path(), &uncommitted()).unwrap();
         let paths: Vec<&str> = diff.files.iter().map(|file| file.path.as_str()).collect();
-        assert_eq!(paths, vec!["a/b.rs", "src/main.rs", "README.md", "src-old.rs"]);
+        assert_eq!(
+            paths,
+            vec!["a/b.rs", "src/main.rs", "README.md", "src-old.rs"]
+        );
     }
 
     #[test]
@@ -994,7 +1011,10 @@ mod tests {
             suggest_base_branch(dir.path(), "origin").as_deref(),
             Some("main")
         );
-        git(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
         git(
             dir.path(),
             &[

@@ -22,7 +22,11 @@ use gpui_kit::{
 };
 
 use crate::{
-    command_palette::ToggleCommandPalette,
+    agent::AgentKind,
+    command_palette::{
+        GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
+        is_go_to_terminal_shortcut, palette_mode_for_shortcut,
+    },
     fonts::TERMINAL_FONT_FAMILY,
     metrics::{
         INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT, TERMINAL_PADDING,
@@ -71,7 +75,14 @@ pub(crate) struct TerminalPane {
 struct TerminalCopyFeedback;
 
 impl TerminalPane {
-    pub(crate) fn new(tab: WorkspaceTab, cwd: &Path, cx: &mut Context<Self>) -> Self {
+    /// One pane for `tab`. The Agent tab launches `agent`; every other
+    /// tab uses its fixed command (see [`TerminalSession::spawn`]).
+    pub(crate) fn new(
+        tab: WorkspaceTab,
+        cwd: &Path,
+        agent: AgentKind,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut pane = Self {
             focus_handle: cx.focus_handle(),
             tab,
@@ -89,7 +100,7 @@ impl TerminalPane {
             copy_feedback_seq: 0,
         };
 
-        let output = match TerminalSession::spawn(tab, cwd) {
+        let output = match TerminalSession::spawn(tab, cwd, agent) {
             Ok((session, output)) => {
                 pane.session = Some(session);
                 Some(output)
@@ -216,17 +227,36 @@ impl TerminalPane {
             self.selection_focus = None;
             cx.notify();
         }
-        // The command bar toggle must reach the workspace even while a
+        // The command-bar toggles must reach the workspace even while a
         // terminal has focus: everything below would otherwise be sent to the
-        // pty. Dispatch it as an action (handled by `Workspace`) instead of
-        // terminal input. The global `cmd-k`/`ctrl-k` binding covers every
-        // other focus site, and dispatching here is idempotent with it —
-        // whichever path runs first stops the event.
-        if event.keystroke.key.eq_ignore_ascii_case("k")
-            && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
-            && !event.keystroke.modifiers.alt
-        {
-            window.dispatch_action(Box::new(ToggleCommandPalette), cx);
+        // pty. Dispatch them as actions (handled by `Workspace`) instead of
+        // terminal input. The global `cmd-k`/`ctrl-k` and `cmd-p`/`ctrl-p`
+        // bindings cover every other focus site, and dispatching here is
+        // idempotent with them — whichever path runs first stops the event.
+        if is_go_to_terminal_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToTerminal), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(mode) = palette_mode_for_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            event.keystroke.modifiers.alt,
+        ) {
+            match mode {
+                PaletteMode::Actions => {
+                    window.dispatch_action(Box::new(ToggleActionsPalette), cx);
+                }
+                PaletteMode::Projects => {
+                    window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
+                }
+            }
             window.prevent_default();
             cx.stop_propagation();
             return;

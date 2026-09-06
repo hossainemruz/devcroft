@@ -34,6 +34,7 @@ use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::{
+    agent::AgentKind,
     keys::map_key,
     metrics::{
         INITIAL_COLS, INITIAL_ROWS, TERMINAL_PADDING, WORKSPACE_HEADER_HEIGHT, cell_height,
@@ -121,9 +122,13 @@ pub(crate) struct TerminalSession {
 }
 
 impl TerminalSession {
+    /// Spawn the login shell plus the tab's startup command. The Agent tab
+    /// launches `agent` ([`AgentKind::command`]); every other tab uses its
+    /// fixed [`WorkspaceTab::command`].
     pub(crate) fn spawn(
         tab: WorkspaceTab,
         cwd: &Path,
+        agent: AgentKind,
     ) -> Result<(Self, async_channel::Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -224,7 +229,10 @@ impl TerminalSession {
             })?
             .on_xtversion(|_| Some("devcroft"))?;
 
-        if let Some(program) = tab.command() {
+        if let Some(program) = match tab {
+            WorkspaceTab::Agent => Some(agent.command()),
+            _ => tab.command(),
+        } {
             let mut pty = writer.lock();
             pty.write_all(format!("{program}\r").as_bytes())
                 .with_context(|| format!("starting {} in the login shell", tab.label()))?;
@@ -716,9 +724,12 @@ mod tests {
     #[test]
     fn block_fills_split_into_marked_space_runs() {
         let cwd = std::env::temp_dir();
-        let (mut session, _output) =
-            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
-                .expect("spawning a shell for the block-fill test");
+        let (mut session, _output) = TerminalSession::spawn(
+            crate::workspace::WorkspaceTab::Terminal,
+            &cwd,
+            AgentKind::DEFAULT,
+        )
+        .expect("spawning a shell for the block-fill test");
         // Only these bytes are fed, so the snapshot is fully determined by
         // them regardless of any shell output waiting in the channel.
         session.feed("▀▄█".as_bytes());
@@ -749,9 +760,12 @@ mod tests {
     #[test]
     fn snapshot_reuses_clean_rows_and_tracks_cursor() {
         let cwd = std::env::temp_dir();
-        let (mut session, _output) =
-            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
-                .expect("spawning a shell for the incremental test");
+        let (mut session, _output) = TerminalSession::spawn(
+            crate::workspace::WorkspaceTab::Terminal,
+            &cwd,
+            AgentKind::DEFAULT,
+        )
+        .expect("spawning a shell for the incremental test");
         let row_text = |rows: &[Vec<RenderRun>], index: usize| -> String {
             rows[index].iter().map(|run| run.text.as_ref()).collect()
         };
@@ -798,9 +812,12 @@ mod tests {
     #[test]
     fn snapshot_rebuilds_after_resize() {
         let cwd = std::env::temp_dir();
-        let (mut session, _output) =
-            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
-                .expect("spawning a shell for the resize test");
+        let (mut session, _output) = TerminalSession::spawn(
+            crate::workspace::WorkspaceTab::Terminal,
+            &cwd,
+            AgentKind::DEFAULT,
+        )
+        .expect("spawning a shell for the resize test");
         session.feed(b"aaa");
         let rows = session
             .snapshot()
@@ -829,9 +846,12 @@ mod tests {
     #[test]
     fn snapshot_presents_pure_cursor_moves() {
         let cwd = std::env::temp_dir();
-        let (mut session, _output) =
-            TerminalSession::spawn(crate::workspace::WorkspaceTab::Terminal, &cwd)
-                .expect("spawning a shell for the cursor-move test");
+        let (mut session, _output) = TerminalSession::spawn(
+            crate::workspace::WorkspaceTab::Terminal,
+            &cwd,
+            AgentKind::DEFAULT,
+        )
+        .expect("spawning a shell for the cursor-move test");
         // Only these bytes are fed, so the snapshot is fully determined by
         // them regardless of any shell output waiting in the channel.
         let cursor_column = |rows: &[Vec<RenderRun>]| -> usize {

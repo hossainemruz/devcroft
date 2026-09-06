@@ -35,6 +35,13 @@ pub(crate) struct DeviceState {
     /// out-of-range values are clamped on read, never rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) app_font_size: Option<f32>,
+    /// Per-workspace default agent harness, keyed by canonical checkout
+    /// path string (see `workspace_agents`). Machine-local like the rest of
+    /// this file: different machines may have different harnesses
+    /// installed. Unknown ids are tolerated on read (callers fall back to
+    /// the default) and preserved across edits via plain-string storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_agents: Option<HashMap<String, String>>,
     /// Machine-local checkout bindings by repository key: the linked local
     /// checkout plus remote alias. Portable metadata lives in
     /// `portable/repositories/<key>/repository.json`; only the binding that

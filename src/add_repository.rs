@@ -28,7 +28,10 @@ use gpui_kit::{
     KeyDownEvent, ParentElement, PathPromptOptions, Render, Styled, Window, div, rgb,
 };
 
-use crate::command_palette::ToggleCommandPalette;
+use crate::command_palette::{
+    GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
+    is_go_to_terminal_shortcut, palette_mode_for_shortcut,
+};
 use crate::data::{
     CheckoutInspection, DataRoot, NewRepositoryInput, create_repository, inspect_checkout,
 };
@@ -279,14 +282,34 @@ impl AddRepositoryView {
         .detach();
     }
 
-    /// Mirror Settings/terminal panes: the palette toggle keeps working
-    /// while the dialog has focus; everything else bubbles normally.
+    /// Mirror Settings/terminal panes: the palette toggles and the
+    /// go-to-terminal shortcut keep working while the dialog has focus;
+    /// everything else bubbles normally.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key.eq_ignore_ascii_case("k")
-            && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
-            && !event.keystroke.modifiers.alt
-        {
-            window.dispatch_action(Box::new(ToggleCommandPalette), cx);
+        if is_go_to_terminal_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToTerminal), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(mode) = palette_mode_for_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            event.keystroke.modifiers.alt,
+        ) {
+            match mode {
+                PaletteMode::Actions => {
+                    window.dispatch_action(Box::new(ToggleActionsPalette), cx);
+                }
+                PaletteMode::Projects => {
+                    window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
+                }
+            }
             window.prevent_default();
             cx.stop_propagation();
         }

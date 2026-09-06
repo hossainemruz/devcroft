@@ -10,7 +10,66 @@
 
 use crate::data::RecentRepository;
 
-gpui_kit::actions!(devcroft, [ToggleCommandPalette]);
+gpui_kit::actions!(
+    devcroft,
+    [ToggleActionsPalette, ToggleProjectsPalette, GoToTerminal]
+);
+
+/// Which filtered view of the command bar is open. `cmd/ctrl-k` opens the
+/// action commands (navigation, settings, sync); `cmd/ctrl-p` opens project
+/// navigation (recent repositories plus adding one). `Add repository…` lives
+/// only in projects mode, so every command has a single home.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaletteMode {
+    Actions,
+    Projects,
+}
+
+impl PaletteMode {
+    pub(crate) fn placeholder(self) -> &'static str {
+        match self {
+            Self::Actions => "Type a command or search…",
+            Self::Projects => "Type a project name…",
+        }
+    }
+}
+
+/// Match the command-bar shortcuts from a raw keystroke: `cmd/ctrl-k` opens
+/// actions, `cmd/ctrl-p` opens projects. Pure over the keystroke pieces (not
+/// `KeyDownEvent`) so every focus site forwards identically and the mapping
+/// stays unit-testable without a window. `alt` combinations never match, so
+/// option-modified typing (e.g. `µ` on macOS) keeps reaching the terminal.
+pub(crate) fn palette_mode_for_shortcut(
+    key: &str,
+    platform: bool,
+    control: bool,
+    alt: bool,
+) -> Option<PaletteMode> {
+    if alt || !(platform || control) {
+        return None;
+    }
+    if key.eq_ignore_ascii_case("k") {
+        Some(PaletteMode::Actions)
+    } else if key.eq_ignore_ascii_case("p") {
+        Some(PaletteMode::Projects)
+    } else {
+        None
+    }
+}
+
+/// Match the go-to-terminal shortcut (`cmd-/`, Super on Linux) from a raw
+/// keystroke. Same shape as [`palette_mode_for_shortcut`] so every focus
+/// site forwards identically. Deliberately platform-only with no `ctrl`
+/// fallback: `ctrl-/` is a working key inside terminal applications, so it
+/// must keep reaching the pty. Both `/` and `?` match: shift+/ reports the
+/// shifted glyph on most layouts, and the shortcut intentionally stays
+/// shift-lenient just like the (case-insensitive) letter shortcuts above.
+pub(crate) fn is_go_to_terminal_shortcut(key: &str, platform: bool, alt: bool) -> bool {
+    if alt || !platform {
+        return false;
+    }
+    key == "/" || key == "?"
+}
 
 /// Every static command the bar can run, in canonical order. Repository
 /// switching is dynamic (one [`PaletteItem::SwitchRepository`] per recent
@@ -132,37 +191,75 @@ pub(crate) struct PaletteSection {
 
 /// Build the rendered sections: static command groups plus the recent
 /// repositories (already ordered, most-recent first) ahead of the static
-/// repository commands. `Workspace` renders exactly this and resolves
-/// confirmations against it, so the two can never disagree.
+/// repository commands. Test-only: production renders per-mode through
+/// [`palette_sections_for_mode`], and this full model pins the shared
+/// section/item ordering the modes are built from.
+#[cfg(test)]
 pub(crate) fn palette_sections(recents: &[RecentRepository]) -> Vec<PaletteSection> {
-    let commands = |commands: &[PaletteCommand]| {
-        commands
-            .iter()
-            .map(|command| PaletteItem::Command(*command))
-            .collect::<Vec<_>>()
-    };
     vec![
         PaletteSection {
             heading: "Go to",
-            items: commands(&GO_TO_COMMANDS),
+            items: command_items(&GO_TO_COMMANDS),
         },
         PaletteSection {
             heading: "Repositories",
-            items: recents
-                .iter()
-                .map(PaletteItem::switch_target)
-                .chain(commands(&REPOSITORY_COMMANDS))
-                .collect(),
+            items: repository_items(recents),
         },
         PaletteSection {
             heading: "Settings",
-            items: commands(&SETTINGS_COMMANDS),
+            items: command_items(&SETTINGS_COMMANDS),
         },
         PaletteSection {
             heading: "Sync",
-            items: commands(&SYNC_COMMANDS),
+            items: command_items(&SYNC_COMMANDS),
         },
     ]
+}
+
+/// Build the rendered sections for one [`PaletteMode`]: actions show the
+/// go-to, settings, and sync groups (no repositories group at all);
+/// projects show just the repositories group (switch targets plus the add
+/// command). Confirmations resolve against exactly this model, same contract
+/// as [`palette_sections`].
+pub(crate) fn palette_sections_for_mode(
+    recents: &[RecentRepository],
+    mode: PaletteMode,
+) -> Vec<PaletteSection> {
+    match mode {
+        PaletteMode::Actions => vec![
+            PaletteSection {
+                heading: "Go to",
+                items: command_items(&GO_TO_COMMANDS),
+            },
+            PaletteSection {
+                heading: "Settings",
+                items: command_items(&SETTINGS_COMMANDS),
+            },
+            PaletteSection {
+                heading: "Sync",
+                items: command_items(&SYNC_COMMANDS),
+            },
+        ],
+        PaletteMode::Projects => vec![PaletteSection {
+            heading: "Repositories",
+            items: repository_items(recents),
+        }],
+    }
+}
+
+fn command_items(commands: &[PaletteCommand]) -> Vec<PaletteItem> {
+    commands
+        .iter()
+        .map(|command| PaletteItem::Command(*command))
+        .collect()
+}
+
+fn repository_items(recents: &[RecentRepository]) -> Vec<PaletteItem> {
+    recents
+        .iter()
+        .map(PaletteItem::switch_target)
+        .chain(command_items(&REPOSITORY_COMMANDS))
+        .collect()
 }
 
 /// Resolve a confirmed `IndexPath` (section/row in the model installed by the
@@ -270,6 +367,105 @@ mod tests {
             sections[1].items,
             vec![PaletteItem::Command(PaletteCommand::AddRepository)]
         );
+    }
+
+    #[test]
+    fn actions_mode_holds_every_command_but_add_repository() {
+        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions);
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].heading, "Go to");
+        assert_eq!(sections[1].heading, "Settings");
+        assert_eq!(sections[2].heading, "Sync");
+        let commands: Vec<PaletteCommand> = sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .filter_map(|item| match item {
+                PaletteItem::Command(command) => Some(*command),
+                PaletteItem::SwitchRepository { .. } => None,
+            })
+            .collect();
+        // Every static command except `AddRepository`, which lives only in
+        // projects mode — and no switch targets even with recents present.
+        let expected: Vec<PaletteCommand> = PaletteCommand::ALL
+            .into_iter()
+            .filter(|command| *command != PaletteCommand::AddRepository)
+            .collect();
+        assert_eq!(commands.len(), expected.len());
+        for command in expected {
+            assert!(
+                commands.contains(&command),
+                "{command:?} missing in actions mode"
+            );
+        }
+        assert!(
+            !commands.contains(&PaletteCommand::AddRepository),
+            "AddRepository must live only in projects mode"
+        );
+    }
+
+    #[test]
+    fn projects_mode_holds_only_the_repositories_group() {
+        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].heading, "Repositories");
+        assert_eq!(
+            sections[0].items,
+            vec![
+                PaletteItem::SwitchRepository {
+                    key: "aaa-first".to_owned(),
+                    label: "First Repo".to_owned(),
+                },
+                PaletteItem::SwitchRepository {
+                    key: "bbb-second".to_owned(),
+                    label: "bbb-second".to_owned(),
+                },
+                PaletteItem::Command(PaletteCommand::AddRepository),
+            ]
+        );
+    }
+
+    #[test]
+    fn shortcut_matcher_routes_k_to_actions_and_p_to_projects() {
+        use PaletteMode::{Actions, Projects};
+
+        assert_eq!(
+            palette_mode_for_shortcut("k", true, false, false),
+            Some(Actions)
+        );
+        assert_eq!(
+            palette_mode_for_shortcut("K", false, true, false),
+            Some(Actions)
+        );
+        assert_eq!(
+            palette_mode_for_shortcut("p", true, false, false),
+            Some(Projects)
+        );
+        assert_eq!(
+            palette_mode_for_shortcut("P", false, true, false),
+            Some(Projects)
+        );
+        // No modifier, alt held, or any other key never toggles the bar.
+        assert_eq!(palette_mode_for_shortcut("k", false, false, false), None);
+        assert_eq!(palette_mode_for_shortcut("p", false, false, false), None);
+        assert_eq!(palette_mode_for_shortcut("k", true, false, true), None);
+        assert_eq!(palette_mode_for_shortcut("p", true, true, true), None);
+        assert_eq!(palette_mode_for_shortcut("o", true, false, false), None);
+        assert_eq!(palette_mode_for_shortcut("Enter", true, false, false), None);
+    }
+
+    #[test]
+    fn terminal_shortcut_matches_slash_with_platform_modifier_only() {
+        assert!(is_go_to_terminal_shortcut("/", true, false));
+        // Shift+/ reports the shifted glyph; the shortcut stays shift-lenient.
+        assert!(is_go_to_terminal_shortcut("?", true, false));
+        // No `ctrl` fallback: `ctrl-/` must keep reaching the terminal.
+        assert!(!is_go_to_terminal_shortcut("/", false, false));
+        assert!(!is_go_to_terminal_shortcut("?", false, false));
+        // Alt held, or any other key, never jumps to terminal.
+        assert!(!is_go_to_terminal_shortcut("/", true, true));
+        assert!(!is_go_to_terminal_shortcut("k", true, false));
+        assert!(!is_go_to_terminal_shortcut("p", true, false));
+        assert!(!is_go_to_terminal_shortcut("Enter", true, false));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! (project header and tab bar) hosting the active terminal pane.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -20,12 +21,15 @@ use gpui_kit::{
 };
 
 use crate::add_repository::AddRepositoryView;
+use crate::agent::AgentKind;
 use crate::command_palette::{
-    PaletteCommand, PaletteItem, PaletteSection, ToggleCommandPalette, item_at, palette_sections,
+    GoToTerminal, PaletteCommand, PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette,
+    ToggleProjectsPalette, item_at, palette_sections_for_mode,
 };
 use crate::data::{
     DataRoot, DeviceStore, MAX_RECENT_REPOSITORIES, RecentRepository, SyncStatus, SyncTracker,
     checkout_for, recent_repositories, record_repository_open, resolve_current_key,
+    resolve_workspace_agent, set_workspace_agent as persist_workspace_agent,
     sync_portable_with_tracker,
 };
 use crate::git_status::{GitStatus, load_git_status};
@@ -33,6 +37,7 @@ use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
 use crate::settings::SettingsView;
+use crate::workspace_settings::WorkspaceSettingsView;
 
 /// How often the header re-reads branch/dirty/ahead-behind state.
 ///
@@ -64,7 +69,9 @@ impl WorkspaceTab {
 
     pub(crate) fn command(self) -> Option<&'static str> {
         match self {
-            Self::Agent => Some("opencode"),
+            // Single source of truth lives on the default harness, so the
+            // label in Settings and the spawned command cannot drift.
+            Self::Agent => Some(AgentKind::DEFAULT.command()),
             Self::Editor => Some("nvim ."),
             Self::Terminal | Self::Review => None,
         }
@@ -125,10 +132,24 @@ pub(crate) struct Workspace {
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
     review: Entity<ReviewView>,
+    /// Harness the current Agent pane was spawned with. Preserved across
+    /// repository switches with its tabs; picking a new default restarts
+    /// the pane with it (see `restart_agent_pane`).
+    session_agent: AgentKind,
+    /// Persisted default harness for the current checkout: what the Agent
+    /// pane launches. Updated by the workspace settings sheet, which
+    /// restarts the pane so the two always agree for the visible checkout.
+    default_agent: AgentKind,
+    /// Strong entity handles keep hidden PTYs and their output tasks alive.
+    inactive_repositories: HashMap<PathBuf, RepositoryTabs>,
     settings: Entity<SettingsView>,
     project_name: SharedString,
     git_poll: GitPoll,
     command_open: bool,
+    /// Which filtered view the open bar shows. Set on every opening (and on
+    /// mode switches while open); the render model follows it, so confirmations
+    /// always resolve against the visible rows.
+    palette_mode: PaletteMode,
     command_state: Entity<CommandState>,
     data_root: Option<DataRoot>,
     sync_tracker: SyncTracker,
@@ -147,6 +168,40 @@ pub(crate) struct Workspace {
     palette_model: Vec<PaletteSection>,
 }
 
+struct RepositoryTabs {
+    active_tab: WorkspaceTab,
+    tabs: Vec<Option<Entity<TerminalPane>>>,
+    review: Entity<ReviewView>,
+    /// Harness its Agent pane was spawned with, kept so a switch back
+    /// restores the running session instead of respawning with a newer
+    /// default.
+    agent: AgentKind,
+}
+
+impl RepositoryTabs {
+    fn new(working_directory: &Path, agent: AgentKind, cx: &mut Context<Workspace>) -> Self {
+        let tabs = WorkspaceTab::ALL
+            .into_iter()
+            .map(|tab| {
+                tab.has_terminal()
+                    .then(|| cx.new(|cx| TerminalPane::new(tab, working_directory, agent, cx)))
+            })
+            .collect();
+        let review = cx.new(|cx| ReviewView::new(working_directory, cx));
+        Self {
+            active_tab: WorkspaceTab::Agent,
+            tabs,
+            review,
+            agent,
+        }
+    }
+}
+
+/// Resolve aliases to the same checkout without making startup depend on I/O success.
+fn checkout_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_owned())
+}
+
 impl Workspace {
     pub(crate) fn new(
         window: &mut Window,
@@ -159,21 +214,22 @@ impl Workspace {
             .unwrap_or("workspace")
             .to_owned();
 
-        let tabs = WorkspaceTab::ALL
-            .into_iter()
-            .map(|tab| {
-                if !tab.has_terminal() {
-                    return None;
-                }
-                let cwd = working_directory.to_path_buf();
-                Some(cx.new(|cx| TerminalPane::new(tab, &cwd, cx)))
-            })
-            .collect::<Vec<_>>();
+        let working_directory = &checkout_identity(working_directory);
+        // Resolved before the first panes spawn so the Agent tab launches
+        // the stored harness. Failures stay non-fatal (default harness) and
+        // surface as a palette notification instead; this also keeps sync
+        // working even if the startup path never persisted device state.
+        let data_root = crate::data::ensure_ready(None).ok();
+        let initial_agent = resolve_workspace_agent(data_root.as_ref(), working_directory);
+        let RepositoryTabs {
+            active_tab,
+            tabs,
+            review,
+            agent: session_agent,
+        } = RepositoryTabs::new(working_directory, initial_agent, cx);
         if let Some(Some(initial)) = tabs.first() {
             initial.read(cx).focus_handle.clone().focus(window, cx);
         }
-        let review_cwd = working_directory.to_path_buf();
-        let review = cx.new(|cx| ReviewView::new(&review_cwd, cx));
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         // Poll branch/dirty/ahead-behind off the main thread; the header
         // repaints only when the snapshot actually changes. The first
@@ -211,10 +267,6 @@ impl Workspace {
             }
         })
         .detach();
-        // Resolved here (not passed in) so sync keeps working even if the
-        // startup path never persisted device state; failures stay non-fatal
-        // and surface as a palette notification instead.
-        let data_root = crate::data::ensure_ready(None).ok();
         // Initial font size for Settings. The live global was already set
         // from the same store at startup (`main`), so this is just the
         // view's starting copy; later edits write back through the store.
@@ -232,13 +284,17 @@ impl Workspace {
             .and_then(|root| resolve_current_key(root, working_directory));
 
         Self {
-            active_tab: WorkspaceTab::Agent,
+            active_tab,
             tabs,
             review,
+            session_agent,
+            default_agent: initial_agent,
+            inactive_repositories: HashMap::new(),
             settings,
             project_name: project_name.into(),
             git_poll: GitPoll::default(),
             command_open: false,
+            palette_mode: PaletteMode::Actions,
             command_state,
             data_root,
             sync_tracker: SyncTracker::default(),
@@ -272,26 +328,56 @@ impl Workspace {
         }
     }
 
-    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Jump straight to the Terminal tab (`cmd-/`). An open command bar
+    /// closes first, so the shortcut never leaves the palette stranded over
+    /// the new tab.
+    fn go_to_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab(WorkspaceTab::Terminal as usize, window, cx);
         if self.command_open {
             self.close_command_palette(window, cx);
-        } else {
-            self.open_command_palette(window, cx);
         }
     }
 
-    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_command_palette(
+        &mut self,
+        mode: PaletteMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_open {
+            // Same shortcut again closes; the other shortcut switches the
+            // open bar to its view instead of closing it.
+            if self.palette_mode == mode {
+                self.close_command_palette(window, cx);
+            } else {
+                self.palette_mode = mode;
+                self.reload_recent_repositories();
+                self.command_state.update(cx, |state, cx| {
+                    state.set_query("", window, cx);
+                });
+                let query_focus = self.command_state.read(cx).focus_handle(cx).clone();
+                query_focus.focus(window, cx);
+                cx.notify();
+            }
+        } else {
+            self.open_command_palette(mode, window, cx);
+        }
+    }
+
+    fn open_command_palette(
+        &mut self,
+        mode: PaletteMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.command_open {
             return;
         }
         self.command_open = true;
+        self.palette_mode = mode;
         // A few small JSON reads per opening — not per render — so the
         // switcher always reflects recent adds and switches.
-        self.recent_repositories = self
-            .data_root
-            .as_ref()
-            .map(|root| recent_repositories(root, MAX_RECENT_REPOSITORIES))
-            .unwrap_or_default();
+        self.reload_recent_repositories();
         self.command_state.update(cx, |state, cx| {
             state.set_query("", window, cx);
         });
@@ -300,6 +386,17 @@ impl Workspace {
         let query_focus = self.command_state.read(cx).focus_handle(cx).clone();
         query_focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// Refresh the palette switcher cache from disk. Opening, mode-switching,
+    /// and repository switches all funnel here so render never touches the
+    /// filesystem.
+    fn reload_recent_repositories(&mut self) {
+        self.recent_repositories = self
+            .data_root
+            .as_ref()
+            .map(|root| recent_repositories(root, MAX_RECENT_REPOSITORIES))
+            .unwrap_or_default();
     }
 
     fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -394,13 +491,9 @@ impl Workspace {
         });
     }
 
-    /// Instantly re-root the workspace at another linked checkout: record
-    /// recency first (a failure there leaves the current workspace
-    /// untouched), then rebuild the terminal panes and Review around the
-    /// new directory. Dropping the old panes ends their PTY children with
-    /// them — each session owns its child handle — and the orphaned output
-    /// tasks exit on their next entity update, so no restart handshake is
-    /// needed.
+    /// Switch visible checkout after recording recency. Hidden checkout entities
+    /// stay owned by the workspace, so their processes and view state survive
+    /// until the window closes. Only a first visit creates new panes.
     fn switch_repository(
         &mut self,
         key: &str,
@@ -450,7 +543,8 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.working_directory = checkout.clone();
+        let checkout = checkout_identity(&checkout);
+        self.restore_repository_tabs(&checkout, cx);
         self.project_name = checkout
             .file_name()
             .and_then(|name| name.to_str())
@@ -458,18 +552,6 @@ impl Workspace {
             .to_owned()
             .into();
         self.current_repository = Some(key.to_owned());
-        self.tabs = WorkspaceTab::ALL
-            .into_iter()
-            .map(|tab| {
-                if !tab.has_terminal() {
-                    return None;
-                }
-                let cwd = checkout.clone();
-                Some(cx.new(|cx| TerminalPane::new(tab, &cwd, cx)))
-            })
-            .collect();
-        // `ReviewView::new` loads immediately, so no explicit `activate`.
-        self.review = cx.new(|cx| ReviewView::new(&checkout, cx));
         // Reset plus an immediate fresh load: the header shows the new
         // checkout's state within one scan instead of flashing the old
         // checkout's status until the next poll tick — and the load id
@@ -479,6 +561,116 @@ impl Workspace {
         window.push_notification(format!("Switched to {label}"), cx);
         self.focus_active_pane(window, cx);
         cx.notify();
+    }
+
+    fn restore_repository_tabs(&mut self, checkout: &Path, cx: &mut Context<Self>) {
+        if self.working_directory == checkout {
+            return;
+        }
+        // The persisted default may have changed while this checkout was
+        // hidden (e.g. another window saved it), so re-resolve: fresh tabs
+        // spawn with it, restored tabs keep their running session.
+        let default_agent = resolve_workspace_agent(self.data_root.as_ref(), checkout);
+        let next = self
+            .inactive_repositories
+            .remove(checkout)
+            .unwrap_or_else(|| RepositoryTabs::new(checkout, default_agent, cx));
+        self.default_agent = default_agent;
+        let previous = RepositoryTabs {
+            active_tab: std::mem::replace(&mut self.active_tab, next.active_tab),
+            tabs: std::mem::replace(&mut self.tabs, next.tabs),
+            review: std::mem::replace(&mut self.review, next.review),
+            // Swap the session agents alongside their tab sets: the active
+            // panes keep the harness they were spawned with, and the hidden
+            // set keeps its own.
+            agent: std::mem::replace(&mut self.session_agent, next.agent),
+        };
+        let previous_directory =
+            std::mem::replace(&mut self.working_directory, checkout.to_owned());
+        self.inactive_repositories
+            .insert(previous_directory, previous);
+    }
+
+    /// Persist the workspace default harness from the settings sheet and
+    /// restart the Agent tab with it: the old PTY session is dropped with
+    /// its pane entity, and a fresh login shell launches the new harness.
+    /// Other tabs and hidden repositories are untouched.
+    pub(crate) fn set_default_agent(
+        &mut self,
+        agent: AgentKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.default_agent == agent {
+            return;
+        }
+        if let Err(error) = persist_workspace_agent(
+            self.data_root.as_ref(),
+            &self.working_directory.clone(),
+            agent,
+        ) {
+            window.push_notification(format!("Could not save the default agent: {error:#}"), cx);
+            return;
+        }
+        self.default_agent = agent;
+        self.session_agent = agent;
+        self.restart_agent_pane(window, cx);
+        window.push_notification(
+            format!(
+                "Default agent is now {} — Agent tab restarted with `{}`",
+                agent.label(),
+                agent.command()
+            ),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Replace the current checkout's Agent pane with a fresh one launching
+    /// the default harness. Dropping the old entity ends its PTY session;
+    /// focus follows only when the Agent tab is showing, so a restart from
+    /// the sheet never yanks focus away from another tab.
+    fn restart_agent_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let working_directory = self.working_directory.clone();
+        let agent = self.default_agent;
+        if let Some(slot) = self.tabs.get_mut(WorkspaceTab::Agent as usize) {
+            *slot =
+                Some(cx.new(|cx| {
+                    TerminalPane::new(WorkspaceTab::Agent, &working_directory, agent, cx)
+                }));
+        }
+        if self.active_tab == WorkspaceTab::Agent {
+            self.focus_active_pane(window, cx);
+        }
+    }
+
+    /// Persisted default harness for the current checkout, for the settings
+    /// sheet's live selection.
+    pub(crate) fn default_agent(&self) -> AgentKind {
+        self.default_agent
+    }
+
+    /// Open the per-workspace settings sheet with a fresh view: the sheet
+    /// always reflects the current checkout and its live selection, so
+    /// re-reading on every opening beats reasoning about staleness across
+    /// repository switches. The sheet layer is owned by [`Root`]; like the
+    /// Add Repository dialog, the view is dropped with it.
+    fn open_workspace_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
+        let view = cx.new(|cx| {
+            WorkspaceSettingsView::new(
+                self.working_directory.clone(),
+                self.project_name.to_string(),
+                self.default_agent,
+                workspace,
+                cx,
+            )
+        });
+        window.open_sheet(cx, move |sheet, _, _| {
+            sheet
+                .title("Workspace settings")
+                .child(view.clone().into_any_element())
+        });
     }
 
     /// Re-check git status right now instead of waiting for the next poll
@@ -522,6 +714,9 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 if reload {
                     this.review.update(cx, |view, cx| view.reload(cx));
+                    for repository in this.inactive_repositories.values() {
+                        repository.review.update(cx, |view, cx| view.reload(cx));
+                    }
                 }
                 cx.notify();
             });
@@ -533,7 +728,7 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let confirm_workspace = workspace.clone();
         let mut command = Command::new(&self.command_state)
-            .placeholder("Type a command or search…")
+            .placeholder(self.palette_mode.placeholder())
             .on_confirm(move |index, window, cx| {
                 confirm_workspace
                     .update(cx, |this, cx| this.on_palette_confirm(index, window, cx))
@@ -560,8 +755,10 @@ impl Workspace {
             .w(px(560.));
         // Install exactly the model confirmations resolve against, so render
         // and confirm can never disagree about what a row means. Labels,
-        // keywords, and icons all come from the model item.
-        self.palette_model = palette_sections(&self.recent_repositories);
+        // keywords, and icons all come from the model item. The model follows
+        // the open mode, so each shortcut sees only its own rows.
+        self.palette_model =
+            palette_sections_for_mode(&self.recent_repositories, self.palette_mode);
         let current = self.current_repository.clone();
         for section in &self.palette_model {
             command = command.group(
@@ -571,6 +768,17 @@ impl Workspace {
                         .iter()
                         .map(|item| {
                             let rendered = match item {
+                                // The terminal has a direct keybinding, so it
+                                // carries the real action: the row renders the
+                                // binding hint for free, and confirming still
+                                // runs `on_palette_confirm` afterwards
+                                // (idempotent re-select of the same tab).
+                                PaletteItem::Command(PaletteCommand::GoTerminal) => {
+                                    CommandItem::new()
+                                        .label(item.label())
+                                        .icon(palette_icon(PaletteCommand::GoTerminal))
+                                        .action(Box::new(GoToTerminal))
+                                }
                                 PaletteItem::Command(command) => CommandItem::new()
                                     .label(item.label())
                                     .icon(palette_icon(*command)),
@@ -633,9 +841,10 @@ impl Workspace {
     }
 }
 
-/// Leading glyph per palette command. Promote a command to a real GPUI
-/// `Action` (instead of the `on_confirm` path above) when it needs a direct
-/// keybinding: `CommandItem::action` then renders the binding hint for free.
+/// Leading glyph per palette command. A command with a direct keybinding
+/// (like GoTerminal's `cmd-/`) additionally carries its real GPUI
+/// `Action` on the row via `CommandItem::action`, which renders the binding
+/// hint for free; `on_confirm` still resolves it afterwards, idempotently.
 fn palette_icon(command: PaletteCommand) -> IconName {
     match command {
         PaletteCommand::GoAgent => IconName::Bot,
@@ -659,8 +868,14 @@ impl Render for Workspace {
             .size_full()
             .bg(rgb(0x080909))
             .text_color(rgb(0xe7e7e7))
-            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
-                this.toggle_command_palette(window, cx);
+            .on_action(cx.listener(|this, _: &ToggleActionsPalette, window, cx| {
+                this.toggle_command_palette(PaletteMode::Actions, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleProjectsPalette, window, cx| {
+                this.toggle_command_palette(PaletteMode::Projects, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToTerminal, window, cx| {
+                this.go_to_terminal(window, cx);
             }))
             .child(
                 h_flex()
@@ -716,7 +931,11 @@ impl Render for Workspace {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
-                                        this.toggle_command_palette(window, cx);
+                                        this.toggle_command_palette(
+                                            PaletteMode::Actions,
+                                            window,
+                                            cx,
+                                        );
                                     }),
                                 )
                                 .child(
@@ -733,23 +952,55 @@ impl Render for Workspace {
                                         .border_color(rgb(0x292b2b))
                                         .text_color(rgb(0x858989))
                                         .child("⌘K"),
+                                )
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x292b2b))
+                                        .text_color(rgb(0x858989))
+                                        .child("⌘P"),
                                 ),
                         ),
                     )
                     .child(
-                        div().flex_none().child(
-                            TabBar::new("workspace-tabs")
-                                .segmented()
-                                .selected_index(active_index)
-                                .on_click(cx.listener(|this, index: &usize, window, cx| {
-                                    this.select_tab(*index, window, cx);
-                                }))
-                                .children(
-                                    WorkspaceTab::ALL
-                                        .into_iter()
-                                        .map(|tab| Tab::new().label(tab.label())),
-                                ),
-                        ),
+                        h_flex()
+                            .flex_none()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                TabBar::new("workspace-tabs")
+                                    .segmented()
+                                    .selected_index(active_index)
+                                    .on_click(cx.listener(|this, index: &usize, window, cx| {
+                                        this.select_tab(*index, window, cx);
+                                    }))
+                                    .children(
+                                        WorkspaceTab::ALL
+                                            .into_iter()
+                                            .map(|tab| Tab::new().label(tab.label())),
+                                    ),
+                            )
+                            // Per-workspace settings: default agent harness for
+                            // this checkout. Opens a sheet (see
+                            // `open_workspace_settings`); the sheet layer below
+                            // paints it.
+                            .child(
+                                div()
+                                    .p_2()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(0x737878))
+                                    .hover(|this| this.bg(rgb(0x1d1f1f)).text_color(rgb(0xe7e7e7)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.open_workspace_settings(window, cx);
+                                        }),
+                                    )
+                                    .child(Icon::new(IconName::Settings).size(px(16.))),
+                            ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(active_content))
@@ -785,8 +1036,14 @@ impl Render for Workspace {
             // Notification layer (`push_notification`, e.g. the terminal copy
             // feedback): like dialogs, `Root` stores these without painting
             // them. Without this layer every notification is silently
-            // swallowed. Above content and the palette dim, below dialogs.
+            // swallowed. Above content and the palette dim, below sheets and
+            // dialogs.
             .children(Root::render_notification_layer(window, cx))
+            // Sheet layer (workspace settings): `Root` stores the opened
+            // sheet but never paints it itself — without this layer the gear
+            // button opens a sheet that stays invisible. Below dialogs so a
+            // dialog opened over a sheet floats on top.
+            .children(Root::render_sheet_layer(window, cx))
             // Dialog layer (settings, …): `Root` stores opened dialogs but
             // never paints them itself — the app must render this layer on
             // top of its content, otherwise an opened dialog stays invisible.
@@ -799,6 +1056,31 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn checkout_identity_normalizes_paths_and_preserves_missing_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            checkout_identity(&directory.path().join(".")),
+            checkout_identity(directory.path())
+        );
+        let missing = directory.path().join("missing");
+        assert_eq!(checkout_identity(&missing), missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_aliases_share_identity_but_distinct_checkouts_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        let other = directory.path().join("other");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&checkout, &alias).unwrap();
+        assert_eq!(checkout_identity(&checkout), checkout_identity(&alias));
+        assert_ne!(checkout_identity(&checkout), checkout_identity(&other));
+    }
 
     #[test]
     fn tab_contract_matches_requested_commands() {

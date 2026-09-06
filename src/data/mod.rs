@@ -14,6 +14,7 @@ mod device;
 mod portable;
 mod repositories;
 mod sync;
+mod workspace_agents;
 
 use std::env;
 use std::ffi::OsStr;
@@ -36,6 +37,7 @@ pub(crate) use repositories::{
 pub(crate) use sync::{
     SyncOutcome, SyncStatus, SyncTracker, sync_portable, sync_portable_with_tracker,
 };
+pub(crate) use workspace_agents::{resolve_workspace_agent, set_workspace_agent, workspace_key};
 
 /// Environment override for the data root (tests, smoke isolation, moves).
 pub(crate) const ENV_OVERRIDE: &str = "DEVCROFT_DATA_DIR";

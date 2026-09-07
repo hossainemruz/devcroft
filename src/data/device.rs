@@ -15,6 +15,18 @@ use serde_json::Value;
 use super::{DataRoot, write_json_atomic};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
+/// Selectable automatic portable-sync intervals, in minutes (see
+/// `feature-parity.md` §12). `None` (absent in `device.json`) means Off.
+/// Reads stay tolerant — any positive stored value schedules — while the
+/// Settings UI only ever writes these options (or clears to Off).
+pub(crate) const SYNC_INTERVAL_OPTIONS: [u64; 4] = [2, 5, 15, 30];
+
+/// Whether `minutes` is one of [`SYNC_INTERVAL_OPTIONS`]. Pure so the
+/// Settings highlight stays unit-testable without a window.
+pub(crate) fn is_supported_sync_interval(minutes: u64) -> bool {
+    SYNC_INTERVAL_OPTIONS.contains(&minutes)
+}
+
 /// Machine-local state: checkout bindings, agent/editor settings,
 /// pins/recents, theme. Never committed.
 ///
@@ -261,6 +273,16 @@ mod tests {
         std::fs::write(store.path(), "{not json").unwrap();
         let error = format!("{:#}", store.load().expect_err("must fail"));
         assert!(error.contains("device.json"), "{error}");
+    }
+
+    #[test]
+    fn supported_sync_intervals_match_parity_options() {
+        assert_eq!(SYNC_INTERVAL_OPTIONS, [2, 5, 15, 30]);
+        for minutes in SYNC_INTERVAL_OPTIONS {
+            assert!(is_supported_sync_interval(minutes));
+        }
+        assert!(!is_supported_sync_interval(0));
+        assert!(!is_supported_sync_interval(10));
     }
 
     #[test]

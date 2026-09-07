@@ -7,7 +7,7 @@ Status: implemented in `src/data/` (items 1–4 below, with tests); item 5 inten
 - One app-owned root resolved from the environment with OS defaults, overridable only by `DEVCROFT_DATA_DIR` (tests, smoke isolation, one-off moves). No in-app directory picker and no `dataDirectory` selection UI — a deliberate break from Electron parity (deletes directory-selection generation tracking and portable-access switching logic).
 - Portable data lives at a fixed derived path `$DEVCROFT_DATA_DIR/portable`, which is itself the git repo root (`portable/.git`). Only this subtree is ever staged, committed, fetched, rebased, or pushed.
 - `DEVCROFT_DATA_DIR` itself is never a git repo, so "sync only portable" is structural: `git -C portable/ ...` physically cannot see `device.json`. No `.gitignore` trust required, and `git clean -fdx` inside `portable/` cannot delete machine-local state.
-- First run supports initializing `portable/` empty (`git init` + seed), by cloning (`git clone <url> portable` into a root that may already hold `device.json`), or by attaching a remote later (`git remote add origin <url>`). All mutating git operations shell out to the git CLI so ssh-agent, credential helpers, and signing config come free; `gix` stays read-only for Review diffs.
+- First run supports initializing `portable/` empty (`git init -b main` + seed), by cloning (`git clone <url> portable` into a root that may already hold `device.json`), or by attaching a remote later (`git remote add origin <url>`). All mutating git operations shell out to the git CLI so ssh-agent, credential helpers, and signing config come free; `gix` stays read-only for Review diffs.
 
 ## Layout
 
@@ -28,7 +28,7 @@ $DEVCROFT_DATA_DIR/
 
 ## Sync contract (portable only, cwd always `portable/`)
 
-- Stage portable files, commit with `chore(devcroft): sync portable data` when dirty, fetch and rebase onto the exact fetched commit, push; stop with a surfaced error on conflict/auth and leave the working tree usable.
+- Stage portable files, commit with `chore(devcroft): sync portable data` when dirty, fetch and rebase onto the exact fetched commit, push; stop with a surfaced error on conflict/auth and leave the working tree usable. First sync against a newly attached remote bootstraps the upstream: track `origin/<branch>` when the fetch brought it (refusing unrelated histories with guidance instead of a mid-rebase conflict), otherwise publish with `push -u` (plain push, never force).
 - Sync status (`idle`/`syncing`/`error`) stays in memory, never persisted. Manual plus scheduled triggers as before; no auto-resolve UI.
 - `device.json` keeps the tolerant `readJson` shape with unknown-field preservation, but drops the `dataDirectory` field (path is now derived, not selected).
 
@@ -36,7 +36,7 @@ $DEVCROFT_DATA_DIR/
 
 1. Add root resolution: `DEVCROFT_DATA_DIR` env wins, else per-OS default above; `mkdir -p` root and `portable`.
 2. Add `device.json` load/save with atomic temp-sibling-plus-rename writes and serialized read-modify-write (same guarantees as Electron's `DeviceStateStore`, minus `dataDirectory`).
-3. Add first-run init: if `portable/.git` absent, `git init` (or `git clone <url> portable` when a URL is supplied) and seed `workspace.json`; command to set/show the `origin` remote.
+3. Add first-run init: if `portable/.git` absent, `git init -b main` (or `git clone <url> portable` when a URL is supplied) and seed `workspace.json`; command to set/show the `origin` remote.
 4. Scope all sync git invocations to `portable/` and verify `device.json` is unreachable from them (add a test that `git -C portable status --porcelain` never lists `../device.json`).
 5. Move the old `devcroft-data` repo contents into `portable/` once, preserving history if worth it (`git mv` or copy `.git`); otherwise fresh `git init` since no migration is owed.
 6. Wire portable reload (Home/Tasks/Review projections) after sync rebase, same as before.

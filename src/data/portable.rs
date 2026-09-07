@@ -51,7 +51,8 @@ pub(crate) enum InitOutcome {
 /// - `portable/.git` present: seed `workspace.json` if absent, no git writes.
 /// - `clone_url` given: `git clone <url> portable` with cwd at the root
 ///   (which may already hold `device.json`), then seed if absent.
-/// - otherwise: `git init` in place (adopting any existing files) plus seed.
+/// - otherwise: `git init -b main` in place (adopting any existing files)
+///   plus seed.
 ///
 /// `workspace.json` is seeded even when git is unavailable so local files
 /// stay usable; sync surfaces the actionable git error later.
@@ -67,10 +68,34 @@ pub(crate) fn ensure_portable_init(root: &DataRoot, options: &InitOptions) -> Re
         seed_workspace_json(&portable)?;
         return Ok(InitOutcome::Cloned);
     }
-    let git_result = run_git_in(&portable, &["init"]);
+    let git_result = init_with_main_branch(&portable);
     seed_workspace_json(&portable)?;
-    git_result.map(|_| ())?;
+    git_result?;
     Ok(InitOutcome::InitializedEmpty)
+}
+
+/// `git init` defaulting the unborn branch to `main` regardless of the
+/// machine's `init.defaultBranch` (or the old `master` default). `init -b`
+/// needs git 2.28+; older toolchains fall back to plain init plus an
+/// explicit unborn-HEAD rename. Only called when `portable/.git` is absent,
+/// so existing repos (even ones already on `master`) are never renamed
+/// behind the user's back.
+fn init_with_main_branch(portable: &Path) -> Result<()> {
+    match run_git_in(portable, &["init", "-b", "main"]) {
+        Ok(_) => Ok(()),
+        Err(first) => {
+            if portable.join(".git").exists() {
+                // `-b` was rejected but something was created: surface the
+                // failure rather than layering a fallback on top of a
+                // half-initialized repo.
+                return Err(first).context("initializing portable git repository");
+            }
+            run_git_in(portable, &["init"]).context("initializing portable git repository")?;
+            run_git_in(portable, &["symbolic-ref", "HEAD", "refs/heads/main"])
+                .context("setting portable initial branch to main")?;
+            Ok(())
+        }
+    }
 }
 
 /// Tolerant `workspace.json` load: a missing file is default state, and the
@@ -115,6 +140,128 @@ pub(crate) fn set_origin(root: &DataRoot, url: &str) -> Result<()> {
             .context("adding portable origin remote")?;
     }
     Ok(())
+}
+
+/// Remove the `origin` remote. Idempotent: a missing `origin` is success and
+/// reports `false`, so a Remove action stays honest about what changed.
+pub(crate) fn clear_origin(root: &DataRoot) -> Result<bool> {
+    let portable = root.portable_dir();
+    require_repo(&portable)?;
+    if get_origin(root)?.is_none() {
+        return Ok(false);
+    }
+    run_git_in(&portable, &["remote", "remove", "origin"])
+        .context("removing portable origin remote")?;
+    Ok(true)
+}
+
+/// Local branch names (`refs/heads`), sorted, without any prefix.
+pub(crate) fn list_local_branches(root: &DataRoot) -> Result<Vec<String>> {
+    let portable = root.portable_dir();
+    require_repo(&portable)?;
+    let output = run_git_in(
+        &portable,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Current branch name, or `None` on a detached HEAD. Falls back from
+/// `branch --show-current` to `symbolic-ref` for very old git.
+pub(crate) fn current_branch_name(portable: &Path) -> Result<Option<String>> {
+    if let Ok(name) = run_git_in(portable, &["branch", "--show-current"]) {
+        let name = name.trim().to_owned();
+        if !name.is_empty() {
+            return Ok(Some(name));
+        }
+    }
+    match run_git_in(portable, &["symbolic-ref", "--short", "HEAD"]) {
+        Ok(name) => {
+            let name = name.trim().to_owned();
+            Ok((!name.is_empty()).then_some(name))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Upstream of the current branch (`origin/main` style), if one is recorded.
+pub(crate) fn current_upstream(root: &DataRoot) -> Result<Option<String>> {
+    let portable = root.portable_dir();
+    require_repo(&portable)?;
+    match run_git_in(
+        &portable,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    ) {
+        Ok(name) => {
+            let name = name.trim().to_owned();
+            Ok((!name.is_empty()).then_some(name))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// How [`checkout_branch`] resolved `name`, so the UI can report exactly
+/// what happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckoutOutcome {
+    /// Switched to an existing local branch.
+    Switched,
+    /// No local branch, but `origin/<name>` existed: git's DWIM created a
+    /// local branch tracking it.
+    TrackedRemote,
+    /// Neither existed: created from the previous HEAD.
+    Created,
+}
+
+/// Switch the portable repo to branch `name`.
+///
+/// Resolution order: existing local branch (plain switch), else git's DWIM
+/// tracking `origin/<name>` when the last fetch brought it, else create
+/// from HEAD. A dirty tree that conflicts with the switch fails with git's
+/// own (sanitized) error and changes nothing — commit via sync first or
+/// resolve it with ordinary git tooling.
+pub(crate) fn checkout_branch(root: &DataRoot, name: &str) -> Result<CheckoutOutcome> {
+    let portable = root.portable_dir();
+    require_repo(&portable)?;
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('-') || name == "HEAD" {
+        bail!("invalid portable branch name {name:?}");
+    }
+    run_git_in(&portable, &["check-ref-format", "--branch", name])
+        .with_context(|| format!("invalid portable branch name {name:?}"))?;
+    if list_local_branches(root)?
+        .iter()
+        .any(|branch| branch == name)
+    {
+        run_git_in(&portable, &["checkout", name])
+            .with_context(|| format!("switching portable to branch {name:?}"))?;
+        return Ok(CheckoutOutcome::Switched);
+    }
+    // No local branch: only let `checkout` DWIM-adopt `origin/<name>` when
+    // that ref really exists — otherwise a name matching a file path would
+    // restore that path instead of switching branches.
+    if run_git_in(
+        &portable,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/origin/{name}"),
+        ],
+    )
+    .is_ok()
+    {
+        run_git_in(&portable, &["checkout", name])
+            .with_context(|| format!("tracking portable branch origin/{name}"))?;
+        return Ok(CheckoutOutcome::TrackedRemote);
+    }
+    run_git_in(&portable, &["checkout", "-b", name])
+        .with_context(|| format!("creating portable branch {name:?}"))?;
+    Ok(CheckoutOutcome::Created)
 }
 
 fn require_repo(portable: &Path) -> Result<()> {
@@ -187,6 +334,172 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = DataRoot::new(dir.path().join("data"));
         (dir, root)
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git CLI must be available for assertions");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}",
+            dir.display()
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn init_defaults_to_main_branch() {
+        let (_dir, root) = fresh_root();
+        let outcome = ensure_portable_init(&root, &InitOptions::default()).unwrap();
+        assert_eq!(outcome, InitOutcome::InitializedEmpty);
+        // Unborn HEAD: `--show-current` prints the branch name on modern
+        // git. The hermetic env above pins no `init.defaultBranch`, so this
+        // fails if init ever inherits the old `master` default again.
+        let branch = git_output(&root.portable_dir(), &["branch", "--show-current"]);
+        assert_eq!(branch.trim(), "main");
+    }
+
+    fn commit_all(dir: &Path, message: &str) {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-m", message]);
+    }
+
+    #[test]
+    fn checkout_switches_between_local_branches() {
+        let (_dir, root) = fresh_root();
+        ensure_portable_init(&root, &InitOptions::default()).unwrap();
+        configure_identity(&root.portable_dir());
+        std::fs::write(root.portable_dir().join("base.txt"), "base\n").unwrap();
+        commit_all(&root.portable_dir(), "base");
+        git(&root.portable_dir(), &["checkout", "-b", "experiment"]);
+        std::fs::write(root.portable_dir().join("exp.txt"), "exp\n").unwrap();
+        commit_all(&root.portable_dir(), "experiment work");
+
+        let mut branches = list_local_branches(&root).unwrap();
+        branches.sort();
+        assert_eq!(branches, vec!["experiment".to_owned(), "main".to_owned()]);
+
+        assert_eq!(
+            checkout_branch(&root, "main").unwrap(),
+            CheckoutOutcome::Switched
+        );
+        assert_eq!(
+            current_branch_name(&root.portable_dir())
+                .unwrap()
+                .as_deref(),
+            Some("main")
+        );
+        assert!(!root.portable_dir().join("exp.txt").exists());
+        assert!(root.portable_dir().join("base.txt").exists());
+    }
+
+    #[test]
+    fn checkout_creates_a_new_branch_from_head() {
+        let (_dir, root) = fresh_root();
+        ensure_portable_init(&root, &InitOptions::default()).unwrap();
+        configure_identity(&root.portable_dir());
+        commit_all(&root.portable_dir(), "base");
+
+        assert_eq!(
+            checkout_branch(&root, "fresh").unwrap(),
+            CheckoutOutcome::Created
+        );
+        assert_eq!(
+            current_branch_name(&root.portable_dir())
+                .unwrap()
+                .as_deref(),
+            Some("fresh")
+        );
+        assert!(
+            list_local_branches(&root)
+                .unwrap()
+                .contains(&"fresh".to_owned())
+        );
+    }
+
+    #[test]
+    fn checkout_adopts_remote_branch_when_only_remote_exists() {
+        // Remote `main` seeded elsewhere.
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+        let seed = tempfile::tempdir().unwrap();
+        git(seed.path(), &["init", "-b", "main"]);
+        configure_identity(seed.path());
+        std::fs::write(seed.path().join("remote.txt"), "remote\n").unwrap();
+        commit_all(seed.path(), "seed");
+        let url = remote.path().to_str().unwrap().to_owned();
+        git(seed.path(), &["remote", "add", "origin", &url]);
+        git(seed.path(), &["push", "-u", "origin", "main"]);
+
+        // Local sits on an unrelated branch with no `main` of its own.
+        let (_dir, root) = fresh_root();
+        ensure_portable_init(&root, &InitOptions::default()).unwrap();
+        configure_identity(&root.portable_dir());
+        commit_all(&root.portable_dir(), "base");
+        git(&root.portable_dir(), &["branch", "-m", "main", "scratch"]);
+        set_origin(&root, &url).unwrap();
+        git(&root.portable_dir(), &["fetch", "origin"]);
+
+        assert_eq!(
+            checkout_branch(&root, "main").unwrap(),
+            CheckoutOutcome::TrackedRemote
+        );
+        assert_eq!(
+            current_branch_name(&root.portable_dir())
+                .unwrap()
+                .as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            current_upstream(&root).unwrap().as_deref(),
+            Some("origin/main")
+        );
+        assert!(root.portable_dir().join("remote.txt").exists());
+    }
+
+    #[test]
+    fn checkout_rejects_bad_names_and_missing_repo() {
+        let (_dir, root) = fresh_root();
+        ensure_portable_init(&root, &InitOptions::default()).unwrap();
+        configure_identity(&root.portable_dir());
+        commit_all(&root.portable_dir(), "base");
+
+        for bad in ["", "   ", "with space", "-leading-dash", "HEAD", "a?b"] {
+            assert!(
+                checkout_branch(&root, bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // Still on main afterwards: rejections change nothing.
+        assert_eq!(
+            current_branch_name(&root.portable_dir())
+                .unwrap()
+                .as_deref(),
+            Some("main")
+        );
+
+        let (_empty_dir, empty_root) = fresh_root();
+        std::fs::create_dir_all(empty_root.portable_dir()).unwrap();
+        assert!(list_local_branches(&empty_root).is_err());
+        assert!(checkout_branch(&empty_root, "main").is_err());
+    }
+
+    #[test]
+    fn current_branch_name_reports_none_when_detached() {
+        let (_dir, root) = fresh_root();
+        ensure_portable_init(&root, &InitOptions::default()).unwrap();
+        configure_identity(&root.portable_dir());
+        commit_all(&root.portable_dir(), "base");
+        git(&root.portable_dir(), &["checkout", "--detach", "HEAD"]);
+        assert_eq!(current_branch_name(&root.portable_dir()).unwrap(), None);
+        assert_eq!(current_upstream(&root).unwrap(), None);
     }
 
     #[test]
@@ -322,5 +635,20 @@ mod tests {
             "{error:#}"
         );
         assert!(set_origin(&root, "https://example.com/o/r.git").is_err());
+        assert!(clear_origin(&root).is_err());
+    }
+
+    #[test]
+    fn origin_clear_is_idempotent() {
+        let (_dir, root) = fresh_root();
+        ensure_portable_init(&root, &InitOptions::default()).unwrap();
+        // Nothing configured: success reporting no change.
+        assert!(!clear_origin(&root).unwrap());
+
+        set_origin(&root, "https://example.com/o/r.git").unwrap();
+        assert!(clear_origin(&root).unwrap());
+        assert_eq!(get_origin(&root).unwrap(), None);
+        // Second clear is a no-op success.
+        assert!(!clear_origin(&root).unwrap());
     }
 }

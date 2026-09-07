@@ -14,7 +14,9 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use parking_lot::Mutex;
 
-use super::{DataRoot, SYNC_COMMIT_MESSAGE, run_git_in, sanitize_git_message};
+use super::{
+    DataRoot, SYNC_COMMIT_MESSAGE, portable::current_branch_name, run_git_in, sanitize_git_message,
+};
 
 /// In-memory sync status. Never persisted, per the plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,17 +142,23 @@ fn sync_once(root: &DataRoot) -> Result<SyncOutcome> {
 
     run_git_in(&portable, &["fetch", "origin"])
         .context("fetching portable origin (check network and credentials)")?;
-    ensure_upstream(&portable)?;
-    // The upstream ref now points at the exact commit just fetched, so a
-    // plain rebase integrates precisely that — the plan's documented
-    // strategy, with no ref race between fetch and rebase.
-    run_git_in(&portable, &["rebase"]).context(
-        "rebasing portable onto upstream (resolve or abort the rebase in portable/ before retrying)",
-    )?;
+    // First sync against a newly attached remote has no upstream yet: track
+    // the fetched branch when there is one, otherwise publish ours. A fresh
+    // `push -u` already integrates everything, so the rebase+push below is
+    // skipped in that case.
+    let published = bootstrap_upstream_when_missing(&portable)?;
+    if !published {
+        // The upstream ref now points at the exact commit just fetched, so a
+        // plain rebase integrates precisely that — the plan's documented
+        // strategy, with no ref race between fetch and rebase.
+        run_git_in(&portable, &["rebase"]).context(
+            "rebasing portable onto upstream (resolve or abort the rebase in portable/ before retrying)",
+        )?;
+        run_git_in(&portable, &["push"])
+            .context("pushing portable (check credentials and remote permissions)")?;
+    }
     let head_after = current_head(&portable)?;
     let reload_required = head_after != head_before;
-    run_git_in(&portable, &["push"])
-        .context("pushing portable (check credentials and remote permissions)")?;
 
     Ok(SyncOutcome {
         committed,
@@ -203,17 +211,77 @@ fn remote_url(portable: &Path) -> Result<Option<String>> {
     }
 }
 
-fn ensure_upstream(portable: &Path) -> Result<()> {
-    match run_git_in(
+fn ensure_upstream_when_present(portable: &Path) -> Result<bool> {
+    Ok(run_git_in(
         portable,
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    ) {
-        Ok(_) => Ok(()),
-        Err(_) => bail!(
-            "no upstream is configured for the current branch in {} — set one (e.g. `git push -u origin HEAD`) or resolve it with ordinary git tooling before syncing",
-            portable.display()
-        ),
+    )
+    .is_ok())
+}
+
+/// Bootstrap the upstream on first sync against a newly attached remote.
+///
+/// Returns `true` when it published the local branch itself (`push -u`,
+/// the remote had no such branch), in which case the caller skips the
+/// rebase+push round trip. Returns `false` when an upstream already existed
+/// or was just attached to the fetched branch, and the normal rebase+push
+/// applies.
+///
+/// Never force-pushes and never merges: tracking attaches to the fetched
+/// branch (with an unrelated-histories guard so a README-initialized
+/// remote fails with guidance instead of a mid-rebase conflict state),
+/// while publishing only creates a branch the remote does not have.
+fn bootstrap_upstream_when_missing(portable: &Path) -> Result<bool> {
+    if ensure_upstream_when_present(portable)? {
+        return Ok(false);
     }
+    let Some(branch) = current_branch_name(portable)? else {
+        bail!(
+            "portable HEAD is detached in {} — check out a branch there before syncing",
+            portable.display()
+        );
+    };
+    if run_git_in(
+        portable,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/origin/{branch}"),
+        ],
+    )
+    .is_ok()
+    {
+        // Check history compatibility before attaching anything, so a
+        // refused first sync leaves no half-written config behind and a
+        // retry surfaces the same clean error.
+        let upstream_ref = format!("origin/{branch}");
+        if current_head(portable)?.is_none() {
+            bail!(
+                "portable has no commits yet in {} — add a file and sync again to publish it to {upstream_ref}",
+                portable.display()
+            );
+        }
+        if run_git_in(portable, &["merge-base", "HEAD", &upstream_ref]).is_err() {
+            bail!(
+                "local {branch} and {upstream_ref} share no history in {} — empty the remote branch or clone it into a fresh portable directory instead of syncing unrelated histories",
+                portable.display()
+            );
+        }
+        run_git_in(
+            portable,
+            &["branch", "--set-upstream-to", &upstream_ref, &branch],
+        )
+        .context("tracking the portable upstream branch (set it with ordinary git tooling before syncing)")?;
+        return Ok(false);
+    }
+    // The remote has no such branch (e.g. a fresh empty repo): publish ours
+    // and record the upstream in one step. Plain push, never force.
+    run_git_in(
+        portable,
+        &["push", "-u", "origin", &format!("HEAD:{branch}")],
+    )
+    .context("publishing portable to origin (check credentials and remote permissions)")?;
+    Ok(true)
 }
 
 /// Unusual git states are left for ordinary tooling: stop before touching
@@ -444,6 +512,134 @@ mod tests {
         assert!(outcome.reload_required);
         assert!(root.portable_dir().join("remote.txt").exists());
         assert_ne!(outcome.head_before, outcome.head_after);
+    }
+
+    #[test]
+    fn sync_publishes_local_branch_to_empty_remote() {
+        let (_dir, root) = fresh_root();
+        init_with_identity(&root);
+        normalize_branch_to_main(&root.portable_dir());
+        std::fs::write(root.portable_dir().join("notes.txt"), "hello\n").unwrap();
+
+        // Brand-new empty remote, attached after local init: no upstream
+        // anywhere, the exact shape Settings produces on first setup.
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+        set_origin(&root, remote.path().to_str().unwrap()).unwrap();
+
+        let outcome = sync_portable(&root).unwrap();
+        assert!(outcome.committed);
+        assert!(outcome.pushed);
+        assert!(!outcome.reload_required);
+
+        // The remote really has our branch now, and the upstream is recorded.
+        let upstream = git_output(
+            &root.portable_dir(),
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream.trim(), "origin/main");
+        let shown = git_output(remote.path(), &["show", "main:notes.txt"]);
+        assert_eq!(shown, "hello\n");
+
+        // Second sync is the steady state: clean, fetch, no-op rebase, push.
+        let outcome = sync_portable(&root).unwrap();
+        assert!(!outcome.committed);
+        assert!(outcome.pushed);
+        assert!(!outcome.reload_required);
+    }
+
+    #[test]
+    fn sync_tracks_existing_remote_branch_without_manual_setup() {
+        // Remote seeded from elsewhere: `main` exists with content.
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+        let seed = tempfile::tempdir().unwrap();
+        git(seed.path(), &["init", "-b", "main"]);
+        configure_identity(seed.path());
+        std::fs::write(seed.path().join("remote.txt"), "remote\n").unwrap();
+        git(seed.path(), &["add", "-A"]);
+        git(seed.path(), &["commit", "-m", "seed"]);
+        let url = remote.path().to_str().unwrap().to_owned();
+        git(seed.path(), &["remote", "add", "origin", &url]);
+        git(seed.path(), &["push", "-u", "origin", "main"]);
+
+        // Local starts from the same history but with no upstream recorded:
+        // fetch plus a hard reset reproduces "attached later" without any
+        // tracking config.
+        let (_dir, root) = fresh_root();
+        init_with_identity(&root);
+        normalize_branch_to_main(&root.portable_dir());
+        set_origin(&root, &url).unwrap();
+        git(&root.portable_dir(), &["fetch", "origin"]);
+        git(&root.portable_dir(), &["reset", "--hard", "origin/main"]);
+
+        std::fs::write(root.portable_dir().join("local.txt"), "local\n").unwrap();
+        let outcome = sync_portable(&root).unwrap();
+        assert!(outcome.committed);
+        assert!(outcome.pushed);
+        assert!(root.portable_dir().join("remote.txt").exists());
+        assert!(root.portable_dir().join("local.txt").exists());
+        let upstream = git_output(
+            &root.portable_dir(),
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream.trim(), "origin/main");
+    }
+
+    #[test]
+    fn sync_refuses_unrelated_histories_without_rebase_state() {
+        // Remote `main` seeded elsewhere (e.g. a README-initialized repo);
+        // local `main` is an unrelated root commit.
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+        let seed = tempfile::tempdir().unwrap();
+        git(seed.path(), &["init", "-b", "main"]);
+        configure_identity(seed.path());
+        std::fs::write(seed.path().join("README.md"), "# data\n").unwrap();
+        git(seed.path(), &["add", "-A"]);
+        git(seed.path(), &["commit", "-m", "readme"]);
+        let url = remote.path().to_str().unwrap().to_owned();
+        git(seed.path(), &["remote", "add", "origin", &url]);
+        git(seed.path(), &["push", "-u", "origin", "main"]);
+
+        let (_dir, root) = fresh_root();
+        init_with_identity(&root);
+        normalize_branch_to_main(&root.portable_dir());
+        std::fs::write(root.portable_dir().join("notes.txt"), "local\n").unwrap();
+        set_origin(&root, &url).unwrap();
+
+        let error = sync_portable(&root).expect_err("must refuse unrelated histories");
+        assert!(
+            format!("{error:#}").contains("share no history"),
+            "{error:#}"
+        );
+        // No rebase was started, so the tree stays usable and a retry
+        // surfaces the same clean error instead of "in progress".
+        assert!(
+            !root.portable_dir().join(".git/rebase-merge").exists()
+                && !root.portable_dir().join(".git/rebase-apply").exists()
+        );
+        let retry = sync_portable(&root).expect_err("must still refuse");
+        assert!(
+            format!("{retry:#}").contains("share no history"),
+            "{retry:#}"
+        );
+    }
+
+    #[test]
+    fn sync_errors_on_detached_head_without_upstream() {
+        let (_dir, root) = fresh_root();
+        init_with_identity(&root);
+        git(&root.portable_dir(), &["add", "-A"]);
+        git(&root.portable_dir(), &["commit", "-m", "base"]);
+
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+        set_origin(&root, remote.path().to_str().unwrap()).unwrap();
+        git(&root.portable_dir(), &["checkout", "--detach", "HEAD"]);
+
+        let error = sync_portable(&root).expect_err("must fail detached");
+        assert!(format!("{error:#}").contains("detached"), "{error:#}");
     }
 
     #[test]

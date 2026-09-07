@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::component::{
@@ -45,6 +45,14 @@ use crate::workspace_settings::WorkspaceSettingsView;
 /// feeling live after saves without churning full worktree walks on large
 /// checkouts.
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the automatic-sync scheduler re-reads the persisted interval.
+///
+/// The schedule itself (`device.json` `sync_interval_minutes`) is checked on
+/// this cadence, so Settings edits re-arm within one tick and turning the
+/// schedule off takes effect promptly. Ten seconds keeps a 2-minute minimum
+/// interval reasonably tight while each tick costs one small JSON read.
+const AUTO_SYNC_POLL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceTab {
@@ -152,6 +160,10 @@ pub(crate) struct Workspace {
     command_state: Entity<CommandState>,
     data_root: Option<DataRoot>,
     sync_tracker: SyncTracker,
+    /// When the last sync run started (manual or automatic). The automatic
+    /// scheduler measures the interval from here, so manual runs reset the
+    /// clock and a just-opened window waits a full interval first.
+    last_sync_started: Instant,
     /// Checkout the panes and Review are rooted at. The git poll loop
     /// re-reads this every tick, so switching repositories re-roots status
     /// without restarting the loop.
@@ -266,6 +278,46 @@ impl Workspace {
             }
         })
         .detach();
+        // Automatic portable sync: re-read the persisted interval on a short
+        // tick and run a silent sync once it elapses since the last run
+        // started. Skips while a sync is already in flight (join, don't
+        // queue) and re-arms within one tick when the interval changes or is
+        // turned off. Silent on purpose: status is visible in Settings >
+        // Sync, and only manual runs push notifications. The loop ends with
+        // the entity: `update` fails once the workspace is dropped.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTO_SYNC_POLL).await;
+                let due = this.update(cx, |this, _| {
+                    let minutes = this.auto_sync_interval_minutes()?;
+                    (minutes > 0
+                        && this.last_sync_started.elapsed()
+                            >= Duration::from_secs(minutes.saturating_mul(60)))
+                    .then_some(())
+                });
+                match due {
+                    Ok(Some(())) => {
+                        let alive = this
+                            .update(cx, |this, cx| {
+                                if this.sync_tracker.status() == SyncStatus::Syncing {
+                                    return;
+                                }
+                                if this.data_root.is_none() {
+                                    return;
+                                }
+                                this.trigger_sync(cx);
+                            })
+                            .is_ok();
+                        if !alive {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .detach();
         // Initial font size for Settings. The live global was already set
         // from the same store at startup (`main`), so this is just the
         // view's starting copy; later edits write back through the store.
@@ -274,7 +326,18 @@ impl Workspace {
             .and_then(|root| DeviceStore::new(root).load().ok())
             .map(|state| state.app_font_size_or_default())
             .unwrap_or(DEFAULT_APP_FONT_SIZE);
-        let settings = cx.new(|cx| SettingsView::new(data_root.clone(), initial_font_size, cx));
+        // One shared tracker: the palette guard, the scheduler skip, and the
+        // Settings status line all read the same run state.
+        let sync_tracker = SyncTracker::default();
+        let settings = cx.new(|cx| {
+            SettingsView::new(
+                window,
+                data_root.clone(),
+                initial_font_size,
+                sync_tracker.clone(),
+                cx,
+            )
+        });
         // Best-effort current-repository match so the palette can mark it
         // without waiting for the first switch; a `--checkout` outside any
         // linked binding simply starts unmarked.
@@ -296,7 +359,8 @@ impl Workspace {
             palette_mode: PaletteMode::Actions,
             command_state,
             data_root,
-            sync_tracker: SyncTracker::default(),
+            sync_tracker,
+            last_sync_started: Instant::now(),
             working_directory: working_directory.to_owned(),
             current_repository,
             recent_repositories: Vec::new(),
@@ -416,6 +480,14 @@ impl Workspace {
     /// dismiss via the dialog layer; nothing here tracks open state.
     fn open_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
+        let workspace = cx.entity().downgrade();
+        // Link the workspace for Sync-now delegation and reload the persisted
+        // interval plus saved origin, so the Sync section never shows state
+        // gone stale behind the dialog (e.g. after external git edits).
+        settings.update(cx, |view, cx| {
+            view.set_workspace(workspace);
+            view.refresh_sync_from_disk(window, cx);
+        });
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Settings")
@@ -462,14 +534,7 @@ impl Workspace {
                     cx.notify();
                 }
                 PaletteCommand::SyncPortable => {
-                    if self.sync_tracker.status() == SyncStatus::Syncing {
-                        window.push_notification("Portable sync is already running", cx);
-                    } else if self.data_root.is_none() {
-                        window.push_notification("Portable data is unavailable", cx);
-                    } else {
-                        window.push_notification("Syncing portable data…", cx);
-                        self.trigger_sync(cx);
-                    }
+                    self.request_sync(window, cx);
                     self.focus_active_pane(window, cx);
                     cx.notify();
                 }
@@ -694,6 +759,44 @@ impl Workspace {
         .detach();
     }
 
+    /// Manual sync entry point shared by the command palette and the
+    /// Settings Sync section. Guards an in-flight run and surfaces
+    /// notifications; the silent scheduler goes through [`trigger_sync`](Self::trigger_sync)
+    /// directly.
+    pub(crate) fn request_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sync_tracker.status() == SyncStatus::Syncing {
+            window.push_notification("Portable sync is already running", cx);
+        } else if self.data_root.is_none() {
+            window.push_notification("Portable data is unavailable", cx);
+        } else {
+            window.push_notification("Syncing portable data…", cx);
+            self.trigger_sync(cx);
+        }
+        cx.notify();
+    }
+
+    /// Persisted automatic-sync interval, re-read every scheduler tick so
+    /// Settings edits re-arm the schedule within one poll. `None` (or zero)
+    /// means Off.
+    fn auto_sync_interval_minutes(&self) -> Option<u64> {
+        self.data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok())
+            .and_then(|state| state.sync_interval_minutes)
+            .filter(|minutes| *minutes > 0)
+    }
+
+    /// Reload portable-backed projections (Review surfaces) after the files
+    /// underneath them may have moved — a sync rebase or a Settings branch
+    /// switch. Shared so both paths reload exactly the same set.
+    pub(crate) fn reload_portable_projections(&mut self, cx: &mut Context<Self>) {
+        self.review.update(cx, |view, cx| view.reload(cx));
+        for repository in self.inactive_repositories.values() {
+            repository.review.update(cx, |view, cx| view.reload(cx));
+        }
+        cx.notify();
+    }
+
     /// Run one portable sync off the main thread. Completion reloads the
     /// Review projection when the rebase may have moved files (including
     /// after an error, which can still leave working-tree changes behind)
@@ -702,7 +805,10 @@ impl Workspace {
         let Some(root) = self.data_root.clone() else {
             return;
         };
+        // Manual runs reset the automatic schedule clock.
+        self.last_sync_started = Instant::now();
         let tracker = self.sync_tracker.clone();
+        let settings = self.settings.clone();
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
@@ -714,11 +820,11 @@ impl Workspace {
             };
             let _ = this.update(cx, |this, cx| {
                 if reload {
-                    this.review.update(cx, |view, cx| view.reload(cx));
-                    for repository in this.inactive_repositories.values() {
-                        repository.review.update(cx, |view, cx| view.reload(cx));
-                    }
+                    this.reload_portable_projections(cx);
                 }
+                // Repaint the Settings dialog if open so its status line
+                // follows the run without polling.
+                settings.update(cx, |_, cx| cx.notify());
                 cx.notify();
             });
         })

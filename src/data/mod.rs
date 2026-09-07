@@ -23,10 +23,14 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 
-pub(crate) use device::{DeviceRepositoryBinding, DeviceState, DeviceStore};
+pub(crate) use device::{
+    DeviceRepositoryBinding, DeviceState, DeviceStore, SYNC_INTERVAL_OPTIONS,
+    is_supported_sync_interval,
+};
 pub(crate) use portable::{
-    InitOptions, InitOutcome, WorkspaceDoc, ensure_portable_init, get_origin, load_workspace,
-    set_origin,
+    CheckoutOutcome, InitOptions, InitOutcome, WorkspaceDoc, checkout_branch, clear_origin,
+    current_branch_name, current_upstream, ensure_portable_init, get_origin, list_local_branches,
+    load_workspace, set_origin,
 };
 pub(crate) use repositories::{
     CheckoutInspection, CreatedRepository, NewRepositoryInput, RecentRepository,

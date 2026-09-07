@@ -4,9 +4,10 @@ mod cli;
 mod command_palette;
 /// Data-directory foundation (`docs/data-directory-plan.md`): root
 /// resolution, device store, first-run init, portable-only sync.
-/// Startup consumes resolution/init/device-load today; sync, origin, and
-/// workspace loading gain UI consumers with Home/Tasks/Review, so the
-/// not-yet-wired surface is allow-listed until then — tests cover it now.
+/// Startup consumes resolution/init/device-load; origin and sync gain
+/// Settings consumers (manual run, schedule, remote) while workspace
+/// loading gains UI consumers with Home/Tasks/Review, so the not-yet-wired
+/// surface is allow-listed until then — tests cover it now.
 #[allow(dead_code, unused_imports)]
 mod data;
 mod fonts;

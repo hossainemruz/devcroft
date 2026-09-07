@@ -2,37 +2,47 @@
 //!
 //! General hosts the live app-wide font size — persisted to `device.json`
 //! and applied to the Agent/Editor/Terminal/Review panes without a restart.
-//! Every other section is an honest placeholder (disabled controls with a
-//! `Soon` badge) until its backend exists.
+//! Sync hosts the portable-data Git remote, the automatic sync schedule, and
+//! a manual Sync-now action with live status. Every other section is an
+//! honest placeholder (disabled controls with a `Soon` badge) until its
+//! backend exists.
 //!
 //! [`SettingsView`] is a long-lived [`Workspace`](crate::workspace::Workspace)
 //! entity rendered inside a dialog (`window.open_dialog`): the dialog owns
 //! open/close while the view keeps the selected section and edits across
 //! reopenings.
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Render, Styled, Window, div, px, rgb,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled, WeakEntity, Window,
+    div, px, rgb,
 };
 
 use crate::command_palette::{
     GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
     is_go_to_terminal_shortcut, palette_mode_for_shortcut,
 };
-use crate::data::{DataRoot, DeviceStore};
+use crate::data::{
+    CheckoutOutcome, DataRoot, DeviceStore, SYNC_INTERVAL_OPTIONS, SyncStatus, SyncTracker,
+    checkout_branch, clear_origin, current_branch_name, current_upstream, get_origin,
+    is_supported_sync_interval, list_local_branches, set_origin,
+};
 use crate::fonts::TERMINAL_FONT_FAMILY;
 use crate::metrics::{
     DEFAULT_APP_FONT_SIZE, MAX_APP_FONT_SIZE, MIN_APP_FONT_SIZE, clamp_app_font_size,
     review_font_size, set_app_font_size,
 };
-use crate::workspace::WorkspaceTab;
+use crate::workspace::{Workspace, WorkspaceTab};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     General,
+    Sync,
     Editor,
     Agent,
     Terminal,
@@ -40,8 +50,9 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::General,
+        Self::Sync,
         Self::Editor,
         Self::Agent,
         Self::Terminal,
@@ -51,6 +62,7 @@ impl SettingsSection {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Sync => "Sync",
             Self::Editor => "Editor",
             Self::Agent => "Agent",
             Self::Terminal => "Terminal",
@@ -61,6 +73,7 @@ impl SettingsSection {
     pub(crate) fn description(self) -> &'static str {
         match self {
             Self::General => "App-wide appearance.",
+            Self::Sync => "Portable data Git sync.",
             Self::Editor => "Editor pane preferences.",
             Self::Agent => "Agent pane preferences.",
             Self::Terminal => "Terminal pane preferences.",
@@ -74,20 +87,328 @@ pub(crate) struct SettingsView {
     active_section: SettingsSection,
     font_size: f32,
     data_root: Option<DataRoot>,
+    sync_tracker: SyncTracker,
+    sync_interval: Option<u64>,
+    saved_origin: Option<String>,
+    origin_input: Entity<InputState>,
+    origin_busy: bool,
+    origin_error: Option<String>,
+    origin_notice: Option<String>,
+    interval_error: Option<String>,
+    branches: Vec<String>,
+    current_branch: Option<String>,
+    branch_upstream: Option<String>,
+    branch_input: Entity<InputState>,
+    branch_busy: bool,
+    branch_error: Option<String>,
+    branch_notice: Option<String>,
+    workspace: Option<WeakEntity<Workspace>>,
 }
 
 impl SettingsView {
     pub(crate) fn new(
+        window: &mut Window,
         data_root: Option<DataRoot>,
         initial_font_size: f32,
+        sync_tracker: SyncTracker,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (sync_interval, saved_origin) = match data_root.as_ref() {
+            Some(root) => {
+                let interval = DeviceStore::new(root)
+                    .load()
+                    .ok()
+                    .and_then(|state| state.sync_interval_minutes);
+                let origin = get_origin(root).unwrap_or(None);
+                (interval, origin)
+            }
+            None => (None, None),
+        };
+        let prefill = saved_origin.clone().unwrap_or_default();
+        let origin_input = cx.new(|cx| {
+            let mut state =
+                InputState::new(window, cx).placeholder("e.g. git@github.com:you/portable.git");
+            if !prefill.is_empty() {
+                state.set_value(prefill.clone(), window, cx);
+            }
+            state
+        });
+        let branch_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. experiment"));
+        let (branches, current_branch, branch_upstream) = load_branch_state(data_root.as_ref());
         Self {
             focus_handle: cx.focus_handle(),
             active_section: SettingsSection::General,
             font_size: clamp_app_font_size(initial_font_size),
             data_root,
+            sync_tracker,
+            sync_interval,
+            saved_origin,
+            origin_input,
+            origin_busy: false,
+            origin_error: None,
+            origin_notice: None,
+            interval_error: None,
+            branches,
+            current_branch,
+            branch_upstream,
+            branch_input,
+            branch_busy: false,
+            branch_error: None,
+            branch_notice: None,
+            workspace: None,
         }
+    }
+
+    /// Link the owning workspace for Sync-now delegation. Set by the
+    /// workspace before the dialog opens; `None` until then.
+    pub(crate) fn set_workspace(&mut self, workspace: WeakEntity<Workspace>) {
+        self.workspace = Some(workspace);
+    }
+
+    /// Re-read the persisted sync interval and the saved `origin` remote so
+    /// the Sync section never shows stale state (e.g. after external git or
+    /// CLI edits). Called before the dialog opens.
+    pub(crate) fn refresh_sync_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(root) = self.data_root.clone() {
+            self.sync_interval = DeviceStore::new(&root)
+                .load()
+                .ok()
+                .and_then(|state| state.sync_interval_minutes);
+            self.saved_origin = get_origin(&root).unwrap_or(None);
+        } else {
+            self.sync_interval = None;
+            self.saved_origin = None;
+        }
+        let saved = self.saved_origin.clone().unwrap_or_default();
+        self.origin_input.update(cx, |state, cx| {
+            state.set_value(saved, window, cx);
+        });
+        let (branches, current_branch, branch_upstream) =
+            load_branch_state(self.data_root.as_ref());
+        self.branches = branches;
+        self.current_branch = current_branch;
+        self.branch_upstream = branch_upstream;
+        self.branch_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.origin_busy = false;
+        self.origin_error = None;
+        self.origin_notice = None;
+        self.interval_error = None;
+        self.branch_busy = false;
+        self.branch_error = None;
+        self.branch_notice = None;
+        cx.notify();
+    }
+
+    /// Persist an automatic-sync interval choice (`None` is Off). The
+    /// workspace scheduler polls `device.json`, so it picks the new schedule
+    /// up within one poll tick — no explicit re-arm needed.
+    fn set_sync_interval(&mut self, interval: Option<u64>, cx: &mut Context<Self>) {
+        if self.sync_interval == interval {
+            return;
+        }
+        self.sync_interval = interval;
+        self.interval_error = None;
+        if let Some(root) = self.data_root.clone()
+            && let Err(error) = DeviceStore::new(&root).update(|state| {
+                state.sync_interval_minutes = interval;
+            })
+        {
+            self.interval_error = Some(format!("Could not save the sync interval: {error:#}"));
+        }
+        cx.notify();
+    }
+
+    /// Save the trimmed input as the portable `origin` remote. Runs git off
+    /// the main thread; the dialog stays open with inline feedback.
+    fn save_origin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.origin_busy {
+            return;
+        }
+        let url = self.origin_input.read(cx).value().trim().to_owned();
+        if url.is_empty() {
+            self.origin_error = Some("Enter a remote URL first.".to_owned());
+            self.origin_notice = None;
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.data_root.clone() else {
+            self.origin_error = Some("Portable data is unavailable.".to_owned());
+            self.origin_notice = None;
+            cx.notify();
+            return;
+        };
+        self.origin_busy = true;
+        self.origin_error = None;
+        self.origin_notice = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let outcome = cx
+                .background_spawn(async move { set_origin(&root, &url).map(|()| url) })
+                .await;
+            let _ = cx.update(|_, cx| {
+                view.update(cx, |this, cx| {
+                    this.origin_busy = false;
+                    match outcome {
+                        Ok(saved) => {
+                            this.saved_origin = Some(saved);
+                            this.origin_notice = Some("Origin remote saved.".to_owned());
+                        }
+                        Err(error) => {
+                            this.origin_error = Some(format!("Could not save origin: {error:#}"));
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            });
+        })
+        .detach();
+    }
+
+    /// Remove the portable `origin` remote (idempotent). Clears the field on
+    /// success so the empty state is visible, not implied.
+    fn remove_origin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.origin_busy {
+            return;
+        }
+        let Some(root) = self.data_root.clone() else {
+            self.origin_error = Some("Portable data is unavailable.".to_owned());
+            self.origin_notice = None;
+            cx.notify();
+            return;
+        };
+        self.origin_busy = true;
+        self.origin_error = None;
+        self.origin_notice = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let outcome = cx
+                .background_spawn(async move { clear_origin(&root) })
+                .await;
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |this, cx| {
+                    this.origin_busy = false;
+                    match outcome {
+                        Ok(true) => {
+                            this.saved_origin = None;
+                            this.origin_input.update(cx, |state, cx| {
+                                state.set_value("", window, cx);
+                            });
+                            this.origin_notice = Some("Origin remote removed.".to_owned());
+                        }
+                        Ok(false) => {
+                            this.origin_notice = Some("No origin remote is configured.".to_owned());
+                        }
+                        Err(error) => {
+                            this.origin_error = Some(format!("Could not remove origin: {error:#}"));
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            });
+        })
+        .detach();
+    }
+
+    /// Delegate a Sync-now press to the owning workspace so the run shares
+    /// the single [`SyncTracker`] and reloads Review on completion.
+    fn request_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            self.origin_error = Some("Workspace is unavailable.".to_owned());
+            cx.notify();
+            return;
+        };
+        workspace
+            .update(cx, |this, cx| {
+                this.request_sync(window, cx);
+            })
+            .ok();
+        cx.notify();
+    }
+
+    /// Ask the owning workspace to reload portable-backed projections after
+    /// a branch switch changed the files underneath them.
+    fn refresh_projections(&mut self, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.clone() {
+            workspace
+                .update(cx, |this, cx| {
+                    this.reload_portable_projections(cx);
+                })
+                .ok();
+        }
+    }
+
+    /// Switch the portable repo to branch `name` (existing local branch,
+    /// remote-tracking adoption, or fresh creation). Guarded against an
+    /// in-flight sync and runs git off the main thread with inline feedback.
+    fn switch_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.branch_busy {
+            return;
+        }
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            self.branch_error = Some("Enter a branch name first.".to_owned());
+            self.branch_notice = None;
+            cx.notify();
+            return;
+        }
+        if self.sync_tracker.status() == SyncStatus::Syncing {
+            self.branch_error = Some(
+                "A sync is running — wait for it to finish before switching branches.".to_owned(),
+            );
+            self.branch_notice = None;
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.data_root.clone() else {
+            self.branch_error = Some("Portable data is unavailable.".to_owned());
+            self.branch_notice = None;
+            cx.notify();
+            return;
+        };
+        if self.current_branch.as_deref() == Some(name.as_str()) {
+            self.branch_notice = Some(format!("Already on {name}."));
+            self.branch_error = None;
+            cx.notify();
+            return;
+        }
+        self.branch_busy = true;
+        self.branch_error = None;
+        self.branch_notice = None;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let outcome = cx
+                .background_spawn(async move { checkout_branch(&root, &name).map(|o| (o, name)) })
+                .await;
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |this, cx| {
+                    this.branch_busy = false;
+                    match outcome {
+                        Ok((outcome, name)) => {
+                            let (branches, current_branch, branch_upstream) =
+                                load_branch_state(this.data_root.as_ref());
+                            this.branches = branches;
+                            this.current_branch = current_branch;
+                            this.branch_upstream = branch_upstream;
+                            this.branch_input.update(cx, |state, cx| {
+                                state.set_value("", window, cx);
+                            });
+                            this.branch_notice = Some(checkout_notice(outcome, &name));
+                            this.refresh_projections(cx);
+                        }
+                        Err(error) => {
+                            this.branch_error = Some(format!("Could not switch branch: {error:#}"));
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            });
+        })
+        .detach();
     }
 
     /// Step the font size and clamp into range. Pure so the bounds stay
@@ -234,6 +555,7 @@ impl SettingsView {
                                 SettingsSection::General => {
                                     self.render_general(cx).into_any_element()
                                 }
+                                SettingsSection::Sync => self.render_sync(cx).into_any_element(),
                                 SettingsSection::Editor => self.render_editor().into_any_element(),
                                 SettingsSection::Agent => self.render_agent().into_any_element(),
                                 SettingsSection::Terminal => {
@@ -329,6 +651,310 @@ impl SettingsView {
                             .child("Review diffs render proportionally smaller  +12 −34"),
                     ),
             )
+    }
+
+    fn render_sync(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let save_view = view.clone();
+        let remove_view = view.clone();
+        let sync_view = view.clone();
+        let checkout_view = view.clone();
+        let syncing = self.sync_tracker.status() == SyncStatus::Syncing;
+        let (status_text, status_is_error) = sync_status_line(
+            self.sync_tracker.status(),
+            self.sync_tracker.last_error().as_deref(),
+        );
+        let interval = self.sync_interval;
+        let custom_note = match interval {
+            Some(minutes) if !is_supported_sync_interval(minutes) => Some(format!(
+                "Custom interval from device.json: every {minutes} minutes."
+            )),
+            _ => None,
+        };
+        let saved_line = match self.saved_origin.as_deref() {
+            Some(url) if !url.is_empty() => format!("Saved origin: {url}"),
+            _ => "No origin remote configured.".to_owned(),
+        };
+        let repo_line = match self.data_root.as_ref() {
+            Some(root) => format!("Local repo: {}", root.portable_dir().display()),
+            None => "Portable data is unavailable.".to_owned(),
+        };
+        v_flex()
+            .gap_4()
+            .child(
+                group(
+                    "Remote",
+                    Some("Git remote for portable data. Only portable/ is ever synced; device.json stays on this machine."),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x858989))
+                                .child("Origin URL"),
+                        )
+                        .child(
+                            // Stop the click at the field: the Settings root
+                            // focuses the view itself on every mouse-down,
+                            // which would steal focus back from the input
+                            // right after it focuses itself and leave it
+                            // untypable. The field is deeper, so its own
+                            // focus handling still runs first.
+                            div()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                )
+                                .child(Input::new(&self.origin_input)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Button::new("sync-save-origin")
+                                        .label(if self.origin_busy {
+                                            "Saving…"
+                                        } else {
+                                            "Save"
+                                        })
+                                        .primary()
+                                        .on_click(move |_, window, cx| {
+                                            save_view
+                                                .update(cx, |this, cx| {
+                                                    this.save_origin(window, cx)
+                                                })
+                                                .ok();
+                                        }),
+                                )
+                                .child(
+                                    Button::new("sync-remove-origin")
+                                        .label("Remove")
+                                        .ghost()
+                                        .on_click(move |_, window, cx| {
+                                            remove_view
+                                                .update(cx, |this, cx| {
+                                                    this.remove_origin(window, cx)
+                                                })
+                                                .ok();
+                                        }),
+                                ),
+                        )
+                        .when_some(self.origin_error.clone(), |this, error| {
+                            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                        })
+                        .when_some(self.origin_notice.clone(), |this, notice| {
+                            this.child(div().text_sm().text_color(rgb(0x858989)).child(notice))
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x737878))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(saved_line),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x555a5a))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(repo_line),
+                        ),
+                ),
+            )
+            .child(
+                group(
+                    "Branch",
+                    Some("Local branch of the portable repo. Switching replaces portable files with that branch's content."),
+                )
+                .child(self.render_branch_current())
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .children(self.branches.iter().map(|branch| {
+                            let selected = self.current_branch.as_deref() == Some(branch.as_str());
+                            let name = branch.clone();
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .text_sm()
+                                .cursor_pointer()
+                                .when(selected, |this| {
+                                    this.border_color(rgb(0x2f81f7))
+                                        .bg(rgb(0x0e1a2b))
+                                        .text_color(rgb(0xe7e7e7))
+                                })
+                                .when(!selected, |this| {
+                                    this.border_color(rgb(0x292b2b))
+                                        .bg(rgb(0x0e0f0f))
+                                        .text_color(rgb(0x858989))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.switch_branch(name.clone(), window, cx)
+                                    }),
+                                )
+                                .child(branch.clone())
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                )
+                                .child(Input::new(&self.branch_input)),
+                        )
+                        .child(
+                            Button::new("sync-checkout-branch")
+                                .label(if self.branch_busy {
+                                    "Switching…"
+                                } else {
+                                    "Switch or create"
+                                })
+                                .primary()
+                                .on_click(move |_, window, cx| {
+                                    checkout_view
+                                        .update(cx, |this, cx| {
+                                            let name =
+                                                this.branch_input.read(cx).value().to_string();
+                                            this.switch_branch(name, window, cx)
+                                        })
+                                        .ok();
+                                }),
+                        ),
+                )
+                .when_some(self.branch_error.clone(), |this, error| {
+                    this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                })
+                .when_some(self.branch_notice.clone(), |this, notice| {
+                    this.child(div().text_sm().text_color(rgb(0x858989)).child(notice))
+                }),
+            )
+            .child(
+                group(
+                    "Automatic sync",
+                    Some("Sync in the background on a schedule. Manual sync is always available from the command palette."),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .children(
+                            [None]
+                                .into_iter()
+                                .chain(SYNC_INTERVAL_OPTIONS.into_iter().map(Some))
+                                .map(|option| {
+                                    let selected = interval == option;
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .when(selected, |this| {
+                                        this.border_color(rgb(0x2f81f7))
+                                            .bg(rgb(0x0e1a2b))
+                                            .text_color(rgb(0xe7e7e7))
+                                    })
+                                    .when(!selected, |this| {
+                                        this.border_color(rgb(0x292b2b))
+                                            .bg(rgb(0x0e0f0f))
+                                            .text_color(rgb(0x858989))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.set_sync_interval(option, cx)
+                                        }),
+                                    )
+                                    .child(format_sync_interval(option))
+                            }),
+                        ),
+                )
+                .when_some(custom_note, |this, note| {
+                    this.child(div().text_xs().text_color(rgb(0x858989)).child(note))
+                })
+                .when_some(self.interval_error.clone(), |this, error| {
+                    this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                }),
+            )
+            .child(
+                group(
+                    "Manual sync",
+                    Some("Stage, commit, fetch, rebase, and push portable data now."),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(
+                            Button::new("sync-now")
+                                .label(if syncing { "Syncing…" } else { "Sync now" })
+                                .primary()
+                                .loading(syncing)
+                                .on_click(move |_, window, cx| {
+                                    sync_view
+                                        .update(cx, |this, cx| {
+                                            this.request_sync(window, cx)
+                                        })
+                                        .ok();
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(if status_is_error {
+                                    rgb(0xf87171)
+                                } else {
+                                    rgb(0x858989)
+                                })
+                                .child(status_text),
+                        ),
+                ),
+            )
+    }
+
+    /// Current-branch line for the Branch group: the checked-out branch plus
+    /// what sync will push to, or the honest degraded states.
+    fn render_branch_current(&self) -> impl IntoElement {
+        let current = match self.current_branch.as_deref() {
+            Some(branch) if !branch.is_empty() => format!("Current: {branch}"),
+            _ if self.data_root.is_none() => "Portable data is unavailable.".to_owned(),
+            _ if !self.branches.is_empty() => {
+                "Detached HEAD — switch to a branch to sync.".to_owned()
+            }
+            _ => "No branches yet — create one below.".to_owned(),
+        };
+        let tracking = match self.branch_upstream.as_deref() {
+            Some(upstream) if !upstream.is_empty() => format!("Tracking {upstream}."),
+            _ if self.current_branch.is_some() => {
+                "No upstream — set automatically on next sync.".to_owned()
+            }
+            _ => "".to_owned(),
+        };
+        v_flex()
+            .gap_1()
+            .child(div().text_sm().text_color(rgb(0xe7e7e7)).child(current))
+            .when(!tracking.is_empty(), |this| {
+                this.child(div().text_xs().text_color(rgb(0x858989)).child(tracking))
+            })
     }
 
     fn render_editor(&self) -> impl IntoElement {
@@ -464,6 +1090,57 @@ fn format_font_size(size: f32) -> String {
         format!("{:.0} px", size)
     } else {
         format!("{:.1} px", size)
+    }
+}
+
+/// Human label for an automatic-sync choice (`None` is Off). Pure so the
+/// interval pills stay unit-testable without a window.
+fn format_sync_interval(interval: Option<u64>) -> String {
+    match interval {
+        None => "Off".to_owned(),
+        Some(minutes) => format!("Every {minutes} min"),
+    }
+}
+
+/// One-line sync status for the Manual group. Returns the line plus whether
+/// it is an error (red) or informational (muted). Pure for tests; the
+/// rendered line reads the shared [`SyncTracker`].
+fn sync_status_line(status: SyncStatus, last_error: Option<&str>) -> (String, bool) {
+    match status {
+        SyncStatus::Idle => ("Idle".to_owned(), false),
+        SyncStatus::Syncing => ("Syncing…".to_owned(), false),
+        SyncStatus::Error => match last_error {
+            Some(error) if !error.trim().is_empty() => (format!("Error: {}", error.trim()), true),
+            _ => ("Error.".to_owned(), true),
+        },
+    }
+}
+
+/// Branch state for the Sync section, read tolerantly from disk: anything
+/// unreadable (no data root, missing repo) degrades to empty rather than
+/// failing the whole dialog.
+fn load_branch_state(
+    data_root: Option<&DataRoot>,
+) -> (Vec<String>, Option<String>, Option<String>) {
+    let Some(root) = data_root else {
+        return (Vec::new(), None, None);
+    };
+    let branches = list_local_branches(root).unwrap_or_default();
+    let current = current_branch_name(&root.portable_dir()).unwrap_or(None);
+    let upstream = current
+        .as_ref()
+        .and_then(|_| current_upstream(root).unwrap_or(None));
+    (branches, current, upstream)
+}
+
+/// Success line for a branch switch. Pure for tests.
+fn checkout_notice(outcome: CheckoutOutcome, name: &str) -> String {
+    match outcome {
+        CheckoutOutcome::Switched => format!("Switched to {name}."),
+        CheckoutOutcome::TrackedRemote => {
+            format!("Switched to {name}, tracking origin/{name}.")
+        }
+        CheckoutOutcome::Created => format!("Created and switched to new branch {name}."),
     }
 }
 
@@ -729,7 +1406,14 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            vec!["General", "Editor", "Agent", "Terminal", "Keybindings"]
+            vec![
+                "General",
+                "Sync",
+                "Editor",
+                "Agent",
+                "Terminal",
+                "Keybindings"
+            ]
         );
         for section in SettingsSection::ALL {
             assert!(
@@ -737,6 +1421,50 @@ mod tests {
                 "{section:?} needs a header description"
             );
         }
+    }
+
+    #[test]
+    fn sync_interval_labels_cover_off_and_options() {
+        assert_eq!(format_sync_interval(None), "Off");
+        assert_eq!(format_sync_interval(Some(2)), "Every 2 min");
+        assert_eq!(format_sync_interval(Some(30)), "Every 30 min");
+    }
+
+    #[test]
+    fn sync_status_lines_flag_errors_only() {
+        assert_eq!(
+            sync_status_line(SyncStatus::Idle, None),
+            ("Idle".to_owned(), false)
+        );
+        assert_eq!(
+            sync_status_line(SyncStatus::Syncing, None),
+            ("Syncing…".to_owned(), false)
+        );
+        // The error line surfaces the sanitized tracker message.
+        assert_eq!(
+            sync_status_line(SyncStatus::Error, Some("  boom  ")),
+            ("Error: boom".to_owned(), true)
+        );
+        assert_eq!(
+            sync_status_line(SyncStatus::Error, None),
+            ("Error.".to_owned(), true)
+        );
+    }
+
+    #[test]
+    fn checkout_notices_name_the_resolution() {
+        assert_eq!(
+            checkout_notice(CheckoutOutcome::Switched, "main"),
+            "Switched to main."
+        );
+        assert_eq!(
+            checkout_notice(CheckoutOutcome::TrackedRemote, "main"),
+            "Switched to main, tracking origin/main."
+        );
+        assert_eq!(
+            checkout_notice(CheckoutOutcome::Created, "experiment"),
+            "Created and switched to new branch experiment."
+        );
     }
 
     #[test]

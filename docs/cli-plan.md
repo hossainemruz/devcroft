@@ -1,6 +1,6 @@
 # CLI plan (`devcroft` binary)
 
-Status: partially implemented — the CLI scaffold, standalone preview, and Git-status diagnostic exist; headless task commands and live-UI socket work remain planned. This document records CLI direction and phasing. [`task-management-plan.md`](task-management-plan.md) now owns the task/artifact command scope and domain contracts where they differ from this document.
+Status: partially implemented — the CLI scaffold, standalone preview, Git-status diagnostic, and headless repository/task/subtask/artifact commands exist; review/sync commands and live-UI socket work remain planned. This document records CLI direction and phasing. [`task-management-plan.md`](task-management-plan.md) owns the task/artifact scope and domain contracts; [`task-cli.md`](task-cli.md) defines the implemented planning arguments, JSON shapes, input bounds, and exit behavior where they differ from this document.
 
 ## Goal
 

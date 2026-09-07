@@ -38,7 +38,7 @@ pub(crate) use portable::{
 };
 pub(crate) use repositories::{
     CheckoutInspection, CreatedRepository, NewRepositoryInput, RecentRepository,
-    RepositoryMetadata, checkout_for, create_repository, inspect_checkout,
+    RepositoryMetadata, checkout_for, create_repository, inspect_checkout, list_repositories,
     normalize_repository_key, recent_repositories, record_repository_open, repository_dir,
     require_repository_key, resolve_current_key, suggest_repository_key,
 };

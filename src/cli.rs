@@ -1,18 +1,19 @@
-//! Command-line surface (`docs/cli-plan.md`, Phase 0 + preview).
+//! Command-line surface; headless planning contract in `docs/task-cli.md`.
 //!
 //! Day-one contract: `devcroft app [--checkout <path>]` boots the GUI,
 //! bare `devcroft` prints help. `devcroft preview <path>` opens the file in
 //! a standalone preview window (no workspace, no socket — the lightweight
-//! MVP standing in for the Phase 2 `preview.open` socket method). Later
-//! phases add headless store commands (`task`, `review`, `sync`) and the
-//! remaining live-UI commands (`ref`, `focus`) behind the same parser, with
-//! dispatch in `main()` before any GPUI initialization so headless commands
-//! stay fast.
+//! MVP standing in for the Phase 2 `preview.open` socket method). Repository
+//! discovery and task/subtask/artifact commands are headless shared-store
+//! operations. Review/sync and live-UI ref/focus commands remain future work.
+//! Dispatch in `main()` precedes GPUI initialization.
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+
+pub(crate) mod planning;
 
 /// First-class CLI: `devcroft app` starts the workspace; future subcommands
 /// reuse this parser without changing the dispatch shape in `main()`.
@@ -24,9 +25,8 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
-/// Phase 0 surface plus the preview MVP. New resources arrive as
-/// additional variants; each maps to a handler under `src/commands/` in
-/// later phases. `GitStatus` is the odd one out: a headless diagnostic in
+/// GUI entry points and headless resources, with planning handlers under
+/// `src/commands/`. `GitStatus` is a headless diagnostic in
 /// the spirit of the planned `status | doctor` command that itemizes what
 /// the header dot sees, for loader-vs-CLI disagreements.
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -40,6 +40,14 @@ pub(crate) enum Command {
     /// dirtiness, and the first few itemized gix status entries, plus the
     /// `git status --porcelain` line count for comparison.
     GitStatus(GitStatusArgs),
+    /// Discover portable repository keys (no local checkout required).
+    Repository(planning::RepositoryArgs),
+    /// Manage persistent tasks without a running desktop.
+    Task(planning::TaskArgs),
+    /// Manage task-local subtasks using the containing task's revision.
+    Subtask(planning::SubtaskArgs),
+    /// Manage standalone Markdown artifacts without a running desktop.
+    Artifact(planning::ArtifactArgs),
 }
 
 /// Arguments for `devcroft app`.

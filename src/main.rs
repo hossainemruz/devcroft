@@ -2,6 +2,7 @@ mod add_repository;
 mod agent;
 mod cli;
 mod command_palette;
+mod commands;
 /// Data-directory foundation (`docs/data-directory-plan.md`): root
 /// resolution, device store, first-run init, portable-only sync.
 /// Startup consumes resolution/init/device-load; origin and sync gain
@@ -51,6 +52,10 @@ fn main() -> Result<()> {
         Command::App(args) => run_app(args.checkout),
         Command::Preview(args) => run_preview(args.path),
         Command::GitStatus(args) => run_git_status(args.checkout, args.limit),
+        Command::Repository(args) => commands::repository(args).context("devcroft repository"),
+        Command::Task(args) => commands::task(args).context("devcroft task"),
+        Command::Subtask(args) => commands::subtask(args).context("devcroft subtask"),
+        Command::Artifact(args) => commands::artifact(args).context("devcroft artifact"),
     }
 }
 

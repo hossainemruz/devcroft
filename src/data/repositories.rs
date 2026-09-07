@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::device::DeviceRepositoryBinding;
+use super::store_lock::{portable_gate, reject_symlink};
+use super::tasks::read_bounded;
 use super::{DataRoot, DeviceStore, run_git_in, write_json_atomic};
 
 /// Portable repository metadata. `camelCase` matches the Electron
@@ -59,6 +61,80 @@ pub(crate) struct RepositoryMetadata {
     pub(crate) base_branch: Option<String>,
     #[serde(flatten, default)]
     pub(crate) extra: HashMap<String, Value>,
+}
+
+/// Portable discovery does not require or load machine-local checkout bindings.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepositorySummary {
+    pub(crate) key: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RepositoryList {
+    pub(crate) repositories: Vec<RepositorySummary>,
+    pub(crate) errors: Vec<String>,
+    pub(crate) truncated: bool,
+}
+
+/// Unlike palette recents, report malformed siblings and include unbound keys.
+/// The portable gate prevents built-in sync/checkout from changing the scan.
+pub(crate) fn list_repositories(root: &DataRoot, limit: usize) -> Result<RepositoryList> {
+    let _gate = portable_gate(root, false)?;
+    reject_symlink(&root.portable_dir())?;
+    let dir = root.portable_dir().join("repositories");
+    reject_symlink(&dir)?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RepositoryList::default()),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+    };
+    let mut result = RepositoryList::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                result.errors.push(e.to_string());
+                continue;
+            }
+        };
+        let loaded = (|| -> Result<RepositorySummary> {
+            let key = require_repository_key(&entry.file_name().to_string_lossy())?;
+            reject_symlink(&entry.path())?;
+            let path = entry.path().join("repository.json");
+            let metadata: RepositoryMetadata = serde_json::from_slice(&read_bounded(&path)?)
+                .with_context(|| format!("malformed repository at {}", path.display()))?;
+            let mut warnings = Vec::new();
+            if metadata
+                .key
+                .as_ref()
+                .is_some_and(|recorded| recorded != &key)
+            {
+                warnings.push(format!(
+                    "repository {key}: metadata key {:?} differs from directory key; use {key}",
+                    metadata.key
+                ));
+            }
+            Ok(RepositorySummary {
+                key,
+                display_name: metadata.display_name,
+                warnings,
+            })
+        })();
+        match loaded {
+            Ok(record) => result.repositories.push(record),
+            Err(e) => result
+                .errors
+                .push(format!("{}: {e:#}", entry.path().display())),
+        }
+    }
+    result.repositories.sort_by(|a, b| a.key.cmp(&b.key));
+    result.errors.sort();
+    result.truncated = result.repositories.len() > limit;
+    result.repositories.truncate(limit);
+    Ok(result)
 }
 
 /// Editable inputs for [`create_repository`]. Every field is optional except

@@ -1,6 +1,6 @@
 # Task management plan
 
-Status: agreed product scope and implementation sequence; PRs 1–2's task/artifact stores, linking, and sync coordination are implemented, with the concrete contract in [`task-storage.md`](task-storage.md). PRs 3–5 remain planned; no task/artifact CLI or UI is implemented yet. This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
+Status: agreed product scope and implementation sequence; PRs 1–3's task/artifact stores, linking, sync coordination, and headless CLI are implemented. Concrete contracts are in [`task-storage.md`](task-storage.md) and [`task-cli.md`](task-cli.md), with shared [agent instructions](task-agent-instructions.md). PRs 4–5 remain planned; no task/artifact UI is implemented yet. This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
 
 ## Goal and boundaries
 
@@ -81,7 +81,7 @@ devcroft subtask create|update|remove
 devcroft artifact list|get|create|update|archive|unarchive
 ```
 
-The command families above are scope commitments, not literal shell invocations. PR 3 finalizes exact argument names and JSON shapes before implementation, following these requirements:
+The command families above are scope commitments, not literal shell invocations. PR 3's exact argument names and JSON shapes are documented in [`task-cli.md`](task-cli.md), following these requirements:
 
 - Human-readable output by default, stable machine-readable output via `--json`, diagnostics on stderr, and existing CLI success/runtime/usage exit conventions. No socket or app-not-running error for store operations.
 - Markdown input accepts a file or stdin so agents need not place large documents in shell arguments. Specify UTF-8 and bounded input sizes with actionable errors.
@@ -134,7 +134,7 @@ Implement standalone Markdown artifacts, kinds, safe metadata/content updates, r
 
 Acceptance: tests cover standalone/shared artifacts, live content resolution, metadata-only/content-only changes, stale writes including externally edited Markdown, coherent reads and interrupted writes, missing references, archived links, and path validation. Settle the multi-file persistence decision before treating this storage contract as complete.
 
-### PR 3 — Headless CLI and agent instructions
+### PR 3 — Headless CLI and agent instructions (Done)
 
 Expose repository discovery and task/subtask/artifact command families with JSON output, Markdown input, explicit filters, and shared agent instructions. Depends on PRs 1–2.
 

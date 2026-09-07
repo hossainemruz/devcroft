@@ -1,6 +1,6 @@
 # Task and artifact storage contract (PRs 1–2)
 
-The task domain/store is implemented in `src/data/tasks.rs`, standalone artifacts in `src/data/artifacts.rs`, and machine-local locking in `src/data/store_lock.rs`. This is the storage foundation from [the task-management plan](task-management-plan.md), not an agent-facing CLI or desktop feature yet.
+The task domain/store is implemented in `src/data/tasks.rs`, standalone artifacts in `src/data/artifacts.rs`, and machine-local locking in `src/data/store_lock.rs`. This is the storage foundation from [the task-management plan](task-management-plan.md), exposed headlessly through the [PR 3 CLI](task-cli.md). Desktop task/artifact browsing remains planned.
 
 ## Serialized records
 

@@ -27,10 +27,9 @@ use crate::command_palette::{
     ToggleProjectsPalette, item_at, palette_sections_for_mode,
 };
 use crate::data::{
-    DataRoot, DeviceStore, MAX_RECENT_REPOSITORIES, RecentRepository, SyncStatus, SyncTracker,
-    checkout_for, recent_repositories, record_repository_open, resolve_current_key,
-    resolve_workspace_agent, set_workspace_agent as persist_workspace_agent,
-    sync_portable_with_tracker,
+    DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
+    recent_repositories, record_repository_open, resolve_current_key, resolve_workspace_agent,
+    set_workspace_agent as persist_workspace_agent, sync_portable_with_tracker,
 };
 use crate::git_status::{GitStatus, load_git_status};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
@@ -390,12 +389,14 @@ impl Workspace {
 
     /// Refresh the palette switcher cache from disk. Opening, mode-switching,
     /// and repository switches all funnel here so render never touches the
-    /// filesystem.
+    /// filesystem. Uncapped on purpose: the palette searches every switchable
+    /// repository (recency-sorted), since Home doesn't exist yet to cover
+    /// overflow.
     fn reload_recent_repositories(&mut self) {
         self.recent_repositories = self
             .data_root
             .as_ref()
-            .map(|root| recent_repositories(root, MAX_RECENT_REPOSITORIES))
+            .map(|root| recent_repositories(root, usize::MAX))
             .unwrap_or_default();
     }
 
@@ -557,7 +558,7 @@ impl Workspace {
         // checkout's status until the next poll tick — and the load id
         // invalidates the tick that was in flight for the old checkout.
         self.refresh_git_status(cx);
-        self.recent_repositories = recent_repositories(&root, MAX_RECENT_REPOSITORIES);
+        self.recent_repositories = recent_repositories(&root, usize::MAX);
         window.push_notification(format!("Switched to {label}"), cx);
         self.focus_active_pane(window, cx);
         cx.notify();

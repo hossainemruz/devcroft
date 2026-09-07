@@ -97,10 +97,6 @@ pub(crate) struct CreatedRepository {
     pub(crate) checkout_path: PathBuf,
 }
 
-/// Cap for the palette switcher: repositories beyond the most recently
-/// used stay reachable through Home (later), not the command bar.
-pub(crate) const MAX_RECENT_REPOSITORIES: usize = 3;
-
 /// One switchable repository for the palette: portable metadata joined
 /// with its machine-local checkout binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,8 +387,11 @@ pub(crate) fn inspect_checkout(path: &Path) -> Result<CheckoutInspection> {
 
 /// Create `portable/repositories/<key>/repository.json` and bind the
 /// checkout in `device.json`. Explicit non-blank input wins; otherwise the
-/// inspected checkout value is used. Errors when the key is invalid, taken,
-/// or the directory is not a git checkout.
+/// inspected checkout value is used. Stamps `last_opened_at` and
+/// `last_repository` like [`record_repository_open`], so a just-added
+/// repository sorts first in [`recent_repositories`] instead of sinking
+/// below every opened record and falling off the palette cap. Errors when
+/// the key is invalid, taken, or the directory is not a git checkout.
 pub(crate) fn create_repository(
     root: &DataRoot,
     key: &str,
@@ -429,14 +428,17 @@ pub(crate) fn create_repository(
         .with_context(|| format!("saving repository record to {}", dir.display()))?;
     let checkout_display = inspection.checkout_path.to_string_lossy().into_owned();
     let remote_display = inspection.remote_name.clone();
+    let opened_at = now_rfc3339_utc();
     DeviceStore::new(root)
         .update(|state| {
             let mut bindings = state.repositories.take().unwrap_or_default();
             let mut binding = bindings.remove(&key).unwrap_or_default();
             binding.checkout_path = Some(checkout_display.clone());
             binding.remote_name = Some(remote_display.clone());
+            binding.last_opened_at = Some(opened_at.clone());
             bindings.insert(key.clone(), binding);
             state.repositories = Some(bindings);
+            state.last_repository = Some(key.clone());
         })
         .context("saving checkout binding to device.json")?;
     Ok(CreatedRepository {
@@ -771,6 +773,19 @@ mod tests {
         let binding = state.repositories.as_ref().unwrap()["hossainemruz-devcroft"].clone();
         assert!(binding.checkout_path.as_deref().is_some());
         assert_eq!(binding.remote_name.as_deref(), Some("origin"));
+        // Creating stamps recency so the new repo survives the palette cap.
+        assert_eq!(
+            state.last_repository.as_deref(),
+            Some("hossainemruz-devcroft")
+        );
+        let opened = binding
+            .last_opened_at
+            .clone()
+            .expect("create must stamp recency");
+        assert!(
+            opened.len() == 20 && opened.ends_with('Z'),
+            "expected RFC-3339 UTC, got {opened}"
+        );
     }
 
     #[test]
@@ -856,19 +871,19 @@ mod tests {
         // macOS, while inspection always stores the canonical root.
         let checkout = std::fs::canonicalize(checkout.keep()).unwrap();
         create_repository(root, key, &checkout, &NewRepositoryInput::default()).unwrap();
-        if let Some(opened) = opened {
-            let opened = opened.to_owned();
-            let key = key.to_owned();
-            DeviceStore::new(root)
-                .update(|state| {
-                    let mut bindings = state.repositories.take().unwrap_or_default();
-                    let mut binding = bindings.remove(&key).unwrap_or_default();
-                    binding.last_opened_at = Some(opened.clone());
-                    bindings.insert(key.clone(), binding);
-                    state.repositories = Some(bindings);
-                })
-                .unwrap();
-        }
+        // `create_repository` stamps recency; the `None` fixture means
+        // never-opened, so clear it back to preserve the ordering case.
+        let opened = opened.map(str::to_owned);
+        let key = key.to_owned();
+        DeviceStore::new(root)
+            .update(|state| {
+                let mut bindings = state.repositories.take().unwrap_or_default();
+                let mut binding = bindings.remove(&key).unwrap_or_default();
+                binding.last_opened_at = opened.clone();
+                bindings.insert(key.clone(), binding);
+                state.repositories = Some(bindings);
+            })
+            .unwrap();
         checkout
     }
 
@@ -896,6 +911,33 @@ mod tests {
             .map(|repo| repo.key)
             .collect();
         assert_eq!(keys, vec!["a-tied", "b-tied", "c-fresh"]);
+    }
+
+    #[test]
+    fn create_sorts_first_and_survives_cap() {
+        let (_dir, root) = fresh_root();
+        seed_linked(&root, "bbb-old", Some("2024-01-01T00:00:00Z"));
+        seed_linked(&root, "ccc-mid", Some("2024-03-01T00:00:00Z"));
+        seed_linked(&root, "ddd-prev", Some("2024-06-01T00:00:00Z"));
+
+        // A just-added repository stamps `now` (2026 in tests), so it sorts
+        // ahead of every 2024-dated record and survives the explicit limit
+        // of 3 used here.
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        create_repository(
+            &root,
+            "aaa-new",
+            checkout.path(),
+            &NewRepositoryInput::default(),
+        )
+        .unwrap();
+
+        let keys: Vec<_> = recent_repositories(&root, 3)
+            .into_iter()
+            .map(|repo| repo.key)
+            .collect();
+        assert_eq!(keys, vec!["aaa-new", "ddd-prev", "ccc-mid"]);
     }
 
     #[test]

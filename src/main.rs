@@ -12,6 +12,7 @@ mod command_palette;
 mod data;
 mod fonts;
 mod git_status;
+mod home;
 mod keys;
 mod metrics;
 mod pane;

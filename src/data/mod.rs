@@ -10,6 +10,7 @@
 //! [`repositories`] owns portable repository records plus checkout
 //! inspection, and [`sync`] owns the portable-only Git pipeline over the git CLI.
 
+pub(crate) mod dashboard;
 mod device;
 mod portable;
 mod repositories;

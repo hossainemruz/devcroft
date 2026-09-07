@@ -32,11 +32,13 @@ use crate::data::{
     set_workspace_agent as persist_workspace_agent, sync_portable_with_tracker,
 };
 use crate::git_status::{GitStatus, load_git_status};
+use crate::home::{HomeEvent, HomeView};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
 use crate::settings::SettingsView;
 use crate::workspace_settings::WorkspaceSettingsView;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 
 /// How often the header re-reads branch/dirty/ahead-behind state.
 ///
@@ -136,6 +138,9 @@ impl GitPoll {
 }
 
 pub(crate) struct Workspace {
+    home: Entity<HomeView>,
+    home_visible: bool,
+    portable_git_poll: GitPoll,
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
     review: Entity<ReviewView>,
@@ -232,15 +237,12 @@ impl Workspace {
         // working even if the startup path never persisted device state.
         let data_root = crate::data::ensure_ready(None).ok();
         let initial_agent = resolve_workspace_agent(data_root.as_ref(), working_directory);
-        let RepositoryTabs {
-            active_tab,
-            tabs,
-            review,
-            agent: session_agent,
-        } = RepositoryTabs::new(working_directory, initial_agent, cx);
-        if let Some(Some(initial)) = tabs.first() {
-            initial.read(cx).focus_handle.clone().focus(window, cx);
-        }
+        // Home must not launch an agent or editor in the startup directory.
+        // Panes are created only when the user enters a repository workspace.
+        let active_tab = WorkspaceTab::Agent;
+        let tabs = vec![None; WorkspaceTab::ALL.len()];
+        let review = cx.new(|cx| ReviewView::new(working_directory, cx));
+        let session_agent = initial_agent;
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         // Poll branch/dirty/ahead-behind off the main thread; the header
         // repaints only when the snapshot actually changes. The first
@@ -272,6 +274,32 @@ impl Workspace {
                     })
                     .is_err();
                 if dropped {
+                    break;
+                }
+                cx.background_executor().timer(GIT_POLL_INTERVAL).await;
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let next = this.update(cx, |this, _| {
+                    let root = this.data_root.as_ref()?;
+                    Some(this.portable_git_poll.begin_check(root.portable_dir()))
+                });
+                let Ok(Some((generation, path))) = next else {
+                    break;
+                };
+                let status = cx
+                    .background_spawn(async move { load_git_status(&path) })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.portable_git_poll.commit(generation, status) {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
                     break;
                 }
                 cx.background_executor().timer(GIT_POLL_INTERVAL).await;
@@ -329,6 +357,15 @@ impl Workspace {
         // One shared tracker: the palette guard, the scheduler skip, and the
         // Settings status line all read the same run state.
         let sync_tracker = SyncTracker::default();
+        let home = cx.new(|cx| HomeView::new(data_root.clone(), sync_tracker.clone(), cx));
+        home.read(cx).focus_handle.clone().focus(window, cx);
+        cx.subscribe_in(&home, window, |this, _, event, window, cx| match event {
+            HomeEvent::OpenRepository { key, label } => {
+                this.switch_repository(key, label, window, cx)
+            }
+            HomeEvent::AddRepository => this.open_add_repository(window, cx),
+        })
+        .detach();
         let settings = cx.new(|cx| {
             SettingsView::new(
                 window,
@@ -346,6 +383,9 @@ impl Workspace {
             .and_then(|root| resolve_current_key(root, working_directory));
 
         Self {
+            home,
+            home_visible: true,
+            portable_git_poll: GitPoll::default(),
             active_tab,
             tabs,
             review,
@@ -373,6 +413,7 @@ impl Workspace {
             return;
         };
         self.active_tab = tab;
+        self.enter_repository(cx);
         if tab == WorkspaceTab::Review {
             self.review.update(cx, |view, cx| view.activate(cx));
         }
@@ -381,6 +422,10 @@ impl Workspace {
     }
 
     fn focus_active_pane(&self, window: &mut Window, cx: &mut App) {
+        if self.home_visible {
+            self.home.read(cx).focus_handle.clone().focus(window, cx);
+            return;
+        }
         if self.active_tab == WorkspaceTab::Review {
             self.review.read(cx).focus_handle.clone().focus(window, cx);
             return;
@@ -525,14 +570,7 @@ impl Workspace {
                 PaletteCommand::GoReview => self.select_tab(3, window, cx),
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
-                // Placeholder until its view exists: visible and searchable
-                // so the bar advertises the roadmap, honest about doing
-                // nothing yet.
-                PaletteCommand::GoHome => {
-                    window.push_notification(format!("{} — coming soon", command.label()), cx);
-                    self.focus_active_pane(window, cx);
-                    cx.notify();
-                }
+                PaletteCommand::GoHome => self.go_home(window, cx),
                 PaletteCommand::SyncPortable => {
                     self.request_sync(window, cx);
                     self.focus_active_pane(window, cx);
@@ -548,6 +586,14 @@ impl Workspace {
     fn open_add_repository(&self, window: &mut Window, cx: &mut Context<Self>) {
         let data_root = self.data_root.clone();
         let view = cx.new(|cx| AddRepositoryView::new(window, cx, data_root));
+        cx.subscribe(
+            &view,
+            |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
+                this.home.update(cx, |view, cx| view.reload(cx));
+                this.reload_recent_repositories();
+            },
+        )
+        .detach();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Add repository")
@@ -567,13 +613,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Re-selecting the current repository is a no-op: re-rooting would
-        // pointlessly kill its running PTYs.
-        if self.current_repository.as_deref() == Some(key) {
-            self.focus_active_pane(window, cx);
-            cx.notify();
-            return;
-        }
+        // Resolve and record even on re-entry from Home. Restoring the same
+        // checkout is a no-op, so its running PTYs remain untouched.
         let Some(root) = self.data_root.clone() else {
             window.push_notification("Portable data is unavailable", cx);
             self.focus_active_pane(window, cx);
@@ -611,6 +652,7 @@ impl Workspace {
         }
         let checkout = checkout_identity(&checkout);
         self.restore_repository_tabs(&checkout, cx);
+        self.enter_repository(cx);
         self.project_name = checkout
             .file_name()
             .and_then(|name| name.to_str())
@@ -655,6 +697,26 @@ impl Workspace {
             std::mem::replace(&mut self.working_directory, checkout.to_owned());
         self.inactive_repositories
             .insert(previous_directory, previous);
+    }
+
+    fn enter_repository(&mut self, cx: &mut Context<Self>) {
+        self.home_visible = false;
+        self.home.update(cx, |view, _| view.deactivate());
+        for tab in WorkspaceTab::ALL {
+            if tab.has_terminal() && self.tabs[tab as usize].is_none() {
+                self.tabs[tab as usize] = Some(cx.new(|cx| {
+                    TerminalPane::new(tab, &self.working_directory, self.default_agent, cx)
+                }));
+            }
+        }
+    }
+
+    fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.home_visible = true;
+        self.command_open = false;
+        self.home.update(cx, |view, cx| view.activate(cx));
+        self.focus_active_pane(window, cx);
+        cx.notify();
     }
 
     /// Persist the workspace default harness from the settings sheet and
@@ -790,6 +852,8 @@ impl Workspace {
     /// underneath them may have moved — a sync rebase or a Settings branch
     /// switch. Shared so both paths reload exactly the same set.
     pub(crate) fn reload_portable_projections(&mut self, cx: &mut Context<Self>) {
+        self.home.update(cx, |view, cx| view.reload(cx));
+        self.reload_recent_repositories();
         self.review.update(cx, |view, cx| view.reload(cx));
         for repository in self.inactive_repositories.values() {
             repository.review.update(cx, |view, cx| view.reload(cx));
@@ -904,6 +968,9 @@ impl Workspace {
     }
 
     fn render_active_content(&self) -> AnyElement {
+        if self.home_visible {
+            return self.home.clone().into_any_element();
+        }
         if self.active_tab == WorkspaceTab::Review {
             return self.review.clone().into_any_element();
         }
@@ -972,6 +1039,7 @@ impl Render for Workspace {
 
         v_flex()
             .relative()
+            .when(self.home_visible, |this| this.tab_group())
             .size_full()
             .bg(rgb(0x080909))
             .text_color(rgb(0xe7e7e7))
@@ -992,37 +1060,53 @@ impl Render for Workspace {
                     .items_center()
                     .border_b_1()
                     .border_color(rgb(0x292b2b))
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_2()
-                            .items_center()
-                            .child(div().text_color(rgb(0x8e9494)).child("‹"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(self.project_name.clone()),
-                            )
-                            .when_some(self.git_poll.status().branch.clone(), |this, branch| {
-                                this.child(self.render_branch_pill(branch.into()))
-                            })
-                            // Amber dot while staged, unstaged, or untracked
-                            // changes exist; hidden when clean so the steady
-                            // state stays quiet.
-                            .when(self.git_poll.status().dirty, |this| {
-                                this.child(div().text_xs().text_color(rgb(0xeab308)).child("●"))
-                            })
-                            .when_some(self.git_poll.status().ahead_label(), |this, ahead| {
-                                this.child(div().text_xs().text_color(rgb(0x858989)).child(ahead))
-                            })
-                            .when_some(self.git_poll.status().behind_label(), |this, behind| {
-                                this.child(div().text_xs().text_color(rgb(0x858989)).child(behind))
-                            }),
-                    )
+                    .when(self.home_visible, |header| {
+                        header.child(div().text_lg().font_semibold().child("Devcroft"))
+                    })
+                    .when(!self.home_visible, |header| {
+                        header.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_2()
+                                .items_center()
+                                .child(Button::new("go-home").ghost().label("‹ Home").on_click(
+                                    cx.listener(|this, _, window, cx| this.go_home(window, cx)),
+                                ))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(self.project_name.clone()),
+                                )
+                                .when_some(self.git_poll.status().branch.clone(), |this, branch| {
+                                    this.child(self.render_branch_pill(branch.into()))
+                                })
+                                // Amber dot while staged, unstaged, or untracked
+                                // changes exist; hidden when clean so the steady
+                                // state stays quiet.
+                                .when(self.git_poll.status().dirty, |this| {
+                                    this.child(div().text_xs().text_color(rgb(0xeab308)).child("●"))
+                                })
+                                .when_some(self.git_poll.status().ahead_label(), |this, ahead| {
+                                    this.child(
+                                        div().text_xs().text_color(rgb(0x858989)).child(ahead),
+                                    )
+                                })
+                                .when_some(
+                                    self.git_poll.status().behind_label(),
+                                    |this, behind| {
+                                        this.child(
+                                            div().text_xs().text_color(rgb(0x858989)).child(behind),
+                                        )
+                                    },
+                                ),
+                        )
+                    })
                     .child(
                         div().flex_1().flex().flex_row().justify_center().child(
-                            h_flex()
+                            Button::new("workspace-command-trigger")
+                                .ghost()
+                                .accessibility_label("Open command palette")
                                 .w(px(380.))
                                 .h(px(32.))
                                 .px_3()
@@ -1035,16 +1119,9 @@ impl Render for Workspace {
                                 .text_xs()
                                 .text_color(rgb(0x737878))
                                 .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.toggle_command_palette(
-                                            PaletteMode::Actions,
-                                            window,
-                                            cx,
-                                        );
-                                    }),
-                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_command_palette(PaletteMode::Actions, window, cx);
+                                }))
                                 .child(
                                     Icon::new(IconName::Search)
                                         .size(px(14.))
@@ -1071,44 +1148,79 @@ impl Render for Workspace {
                                 ),
                         ),
                     )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                TabBar::new("workspace-tabs")
-                                    .segmented()
-                                    .selected_index(active_index)
-                                    .on_click(cx.listener(|this, index: &usize, window, cx| {
-                                        this.select_tab(*index, window, cx);
-                                    }))
-                                    .children(
-                                        WorkspaceTab::ALL
-                                            .into_iter()
-                                            .map(|tab| Tab::new().label(tab.label())),
-                                    ),
+                    .when(self.home_visible, |header| {
+                        let status = self.portable_git_poll.status();
+                        let label = if self.data_root.is_none() {
+                            "Portable data unavailable".to_owned()
+                        } else {
+                            format!(
+                                "Portable · {} {} {} {}",
+                                status.branch.as_deref().unwrap_or("Git unavailable"),
+                                if status.dirty {
+                                    "● Modified"
+                                } else if status.branch.is_some() {
+                                    "Clean"
+                                } else {
+                                    ""
+                                },
+                                status.ahead_label().unwrap_or_default(),
+                                status.behind_label().unwrap_or_default()
                             )
-                            // Per-workspace settings: default agent harness for
-                            // this checkout. Opens a sheet (see
-                            // `open_workspace_settings`); the sheet layer below
-                            // paints it.
-                            .child(
-                                div()
-                                    .p_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_color(rgb(0x737878))
-                                    .hover(|this| this.bg(rgb(0x1d1f1f)).text_color(rgb(0xe7e7e7)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.open_workspace_settings(window, cx);
-                                        }),
-                                    )
-                                    .child(Icon::new(IconName::Settings).size(px(16.))),
-                            ),
-                    ),
+                        };
+                        header.child(
+                            Button::new("portable-status")
+                                .ghost()
+                                .max_w(px(320.))
+                                .overflow_hidden()
+                                .tooltip(label.clone())
+                                .label(label)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(window, cx)
+                                })),
+                        )
+                    })
+                    .when(!self.home_visible, |header| {
+                        header.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    TabBar::new("workspace-tabs")
+                                        .segmented()
+                                        .selected_index(active_index)
+                                        .on_click(cx.listener(|this, index: &usize, window, cx| {
+                                            this.select_tab(*index, window, cx);
+                                        }))
+                                        .children(
+                                            WorkspaceTab::ALL
+                                                .into_iter()
+                                                .map(|tab| Tab::new().label(tab.label())),
+                                        ),
+                                )
+                                // Per-workspace settings: default agent harness for
+                                // this checkout. Opens a sheet (see
+                                // `open_workspace_settings`); the sheet layer below
+                                // paints it.
+                                .child(
+                                    div()
+                                        .p_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(rgb(0x737878))
+                                        .hover(|this| {
+                                            this.bg(rgb(0x1d1f1f)).text_color(rgb(0xe7e7e7))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, window, cx| {
+                                                this.open_workspace_settings(window, cx);
+                                            }),
+                                        )
+                                        .child(Icon::new(IconName::Settings).size(px(16.))),
+                                ),
+                        )
+                    }),
             )
             .child(div().flex_1().min_h_0().child(active_content))
             .when(self.command_open, |this| {

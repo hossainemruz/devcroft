@@ -53,6 +53,9 @@ pub(crate) struct AddRepositoryView {
     error: Option<String>,
 }
 
+pub(crate) struct RepositoryAdded;
+impl gpui_kit::EventEmitter<RepositoryAdded> for AddRepositoryView {}
+
 impl AddRepositoryView {
     pub(crate) fn new(
         window: &mut Window,
@@ -266,6 +269,7 @@ impl AddRepositoryView {
                 .await;
             let _ = cx.update(|window, cx| match outcome {
                 Ok(key) => {
+                    let _ = view.update(cx, |_, cx| cx.emit(RepositoryAdded));
                     window.push_notification(format!("Repository \"{key}\" added"), cx);
                     window.close_dialog(cx);
                 }

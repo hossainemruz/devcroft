@@ -1,6 +1,6 @@
 # Task management plan
 
-Status: agreed product scope and implementation sequence; PR 1's task domain/store and sync coordination are implemented, with the concrete contract in [`task-storage.md`](task-storage.md). PRs 2–5 remain planned; no task/artifact CLI or UI is implemented yet. This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
+Status: agreed product scope and implementation sequence; PRs 1–2's task/artifact stores, linking, and sync coordination are implemented, with the concrete contract in [`task-storage.md`](task-storage.md). PRs 3–5 remain planned; no task/artifact CLI or UI is implemented yet. This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
 
 ## Goal and boundaries
 
@@ -58,7 +58,6 @@ portable/
   artifacts/
     art-r3w8n6hp/
       artifact.json
-      content.md
 ```
 
 Use `task-` and `art-` prefixes with eight random lowercase alphanumeric characters drawn from a visually unambiguous alphabet. Check for collisions at creation and retry rather than overwriting. This avoids a global sequence counter and makes offline multi-machine creation practical, but does not promise mathematical uniqueness or automatic Git conflict resolution. Use task-local subtask IDs such as `s1`, addressed together with the task ID.
@@ -67,7 +66,7 @@ One shared storage/domain implementation serves CLI and desktop. Validate identi
 
 Use atomic writes, brief cross-process locking, and optimistic revision checks. Reads return opaque revision tokens; mutations require the token for the containing record, check it under the lock, and return the updated record and token. Subtask mutations check the containing task revision. Concurrent updates to different records can succeed; stale edits to the same record fail clearly and require rereading. Archived state is part of the same mutation contract. Revision detection must account for external content changes, not rely only on timestamps.
 
-Artifact metadata and Markdown are separate files in the proposed layout. Two atomic replacements are not a multi-file transaction. PR 2 must select and document a minimal coherent read/write and interrupted-write recovery strategy before finalizing this layout, with failure-injection tests. Do not silently add a general transaction journal or versioned document system; if coherence requires material architectural expansion, revisit the storage representation instead. Artifact revision tokens cover metadata and content together. Define lock placement and coordination with existing portable sync so locks remain machine-local and sync cannot bypass mutation protection.
+PR 2 settled coherence by revisiting the proposed two-file representation: artifact metadata and verbatim Markdown content are stored together in `artifact.json`, using a single atomic replacement and a revision over the entire record. There is no separate `content.md`, journal, or versioned document system. Failure-injection tests cover failed and interrupted writes; the concrete recovery and machine-local lock/sync contract is documented in [`task-storage.md`](task-storage.md).
 
 No migration from the historical Electron task schemas is required by this feature. Unexpected legacy or unsupported records must be reported and never silently reset, migrated, or overwritten. Portable Git can retain committed history, but the first release does not expose artifact history or revision pinning.
 
@@ -123,13 +122,13 @@ Reflect CLI mutations while relevant views are open without requiring navigation
 
 ## PR-sized implementation sequence
 
-### PR 1 — Task storage and domain model
+### PR 1 — Task storage and domain model (Done)
 
 Implement records, ID allocation, task/subtask mutations, repository references, dependency validation, progress derivation, archive, revision checks, and cross-process mutation protection. Inspect existing data-store and sync primitives before deciding which can be reused safely across processes.
 
 Acceptance: isolated tests cover empty ideas, unknown repositories, multi-repository membership, stable subtask identities, ordering/removal, dependencies and cycles, all statuses, zero-subtask progress, archive, stale writes, collision retry, malformed siblings, unsupported records, and atomic failure behavior. Document concrete serialized fields and lock/sync coordination.
 
-### PR 2 — Artifact storage and linking
+### PR 2 — Artifact storage and linking (Done)
 
 Implement standalone Markdown artifacts, kinds, safe metadata/content updates, revision tokens, archive, and task/subtask links. Depends on PR 1's shared ID/mutation conventions.
 

@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result, bail};
 
 use super::DataRoot;
 
-/// Task operations share the gate; sync/checkout hold it exclusively. Blocking
+/// Task/artifact operations share the gate; sync/checkout hold it exclusively. Blocking
 /// calls belong on worker threads, not GPUI's UI thread. Closing releases locks,
 /// including when a process exits unexpectedly. External Git/editors are advisory
 /// nonparticipants and must not run concurrently with application mutations.
@@ -20,6 +20,12 @@ pub(super) fn portable_gate(root: &DataRoot, exclusive: bool) -> Result<File> {
 
 pub(super) fn task_lock(root: &DataRoot, id: &str, exclusive: bool) -> Result<File> {
     let dir = root.root().join("cache/task-locks");
+    ensure_directory(&dir)?;
+    lock_file(&dir.join(format!("{id}.lock")), exclusive)
+}
+
+pub(super) fn artifact_lock(root: &DataRoot, id: &str, exclusive: bool) -> Result<File> {
+    let dir = root.root().join("cache/artifact-locks");
     ensure_directory(&dir)?;
     lock_file(&dir.join(format!("{id}.lock")), exclusive)
 }

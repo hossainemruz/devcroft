@@ -1,6 +1,6 @@
-# Task storage contract (PR 1)
+# Task and artifact storage contract (PRs 1–2)
 
-The task domain/store is implemented in `src/data/tasks.rs`; machine-local locking is in `src/data/store_lock.rs`. This is the storage foundation from [the task-management plan](task-management-plan.md), not an agent-facing CLI or desktop feature yet. Artifact storage and links arrive in PR 2.
+The task domain/store is implemented in `src/data/tasks.rs`, standalone artifacts in `src/data/artifacts.rs`, and machine-local locking in `src/data/store_lock.rs`. This is the storage foundation from [the task-management plan](task-management-plan.md), not an agent-facing CLI or desktop feature yet.
 
 ## Serialized records
 
@@ -49,7 +49,7 @@ Each task is stored once at `portable/tasks/<task-id>/task.json`, as two-space U
 
 `TaskStore` exposes create/get/list, task patching, archive/unarchive through `set_archived`, and subtask create/update/remove/reorder. Patches distinguish omitted fields from explicit empty strings/lists. Store-controlled IDs, timestamps, counters, and schema cannot be replaced through patch APIs. No task deletion API is provided.
 
-Reads and successful mutations return a `Snapshot` containing the task, an opaque revision token, and repository-reference warnings. The token currently uses `git-blob-sha1:<digest>` over the complete persisted bytes using the existing gix dependency, without invoking Git or creating an object database. Consumers must treat it as opaque. Whitespace and unknown-field changes invalidate it, even when timestamps are unchanged. All updates, including subtask and archive operations, require the containing task's last-read token. A mismatch produces `task_changed` with reread/retry guidance.
+Reads and successful mutations return a `Snapshot` containing the task, an opaque revision token, and repository/artifact-reference warnings. The token currently uses `git-blob-sha1:<digest>` over the complete persisted bytes using the existing gix dependency, without invoking Git or creating an object database. Consumers must treat it as opaque. Whitespace and unknown-field changes invalidate it, even when timestamps are unchanged. All updates, including subtask and archive operations, require the containing task's last-read token. A mismatch produces `task_changed` with reread/retry guidance.
 
 New repository associations require a readable, parseable portable `repository.json`; a machine-local checkout is not required. Existing missing/malformed repository references produce warnings rather than making a task unreadable. Status/title/archive edits may preserve them, but introducing a new task or subtask association to the unavailable repository is rejected. References are never silently dropped.
 
@@ -71,7 +71,7 @@ Built-in portable sync acquires the gate exclusively for its entire Git pipeline
 
 Locks use Rust's OS-backed file-lock API, are released on handle close/process exit, and remain structurally outside portable Git. Lock files are never deleted or recreated during normal operation, because waiters may retain their inode. Paths under the configured data root reject static symlinks for store directories, record files, and locks; IDs are validated before deriving record paths. The root is a trusted personal directory, not a sandbox against a hostile process swapping paths concurrently.
 
-This gate coordinates the new task store with built-in sync and branch switching. It is not a retrofit of every existing portable writer. Existing repository/dashboard writes, manual editors, and external Git do not acquire it. External edits made before a mutation are detected by revision checks; simultaneous non-cooperating edits/Git operations are not made transactional and should be avoided. Other new stores, including artifacts, should adopt the gate. Independent offline ID collisions or same-record Git conflicts remain ordinary explicit Git conflicts, never automatically resolved by this layer.
+This gate coordinates the task and artifact stores with built-in sync and branch switching. It is not a retrofit of every existing portable writer. Existing repository/dashboard writes, manual editors, and external Git do not acquire it. External edits made before a mutation are detected by revision checks; simultaneous non-cooperating edits/Git operations are not made transactional and should be avoided. Other new stores should adopt the gate. Independent offline ID collisions or same-record Git conflicts remain ordinary explicit Git conflicts, never automatically resolved by this layer.
 
 ## Atomicity and failure behavior
 
@@ -81,4 +81,37 @@ A process interrupted before rename can leave a hidden `.task-*.tmp` sibling or 
 
 ## Validation
 
+PR 2 adds artifact round trips, metadata-only/content-only patches, external Markdown edits, unknown-field preservation, shared live task/subtask links, archived and missing links, explicit link clearing, collision retry, malformed/unsupported siblings, path rejection, concurrent stale writers/coherent readers, and injected pre-rename failure with interrupted temporary-file recovery behavior. A subprocess exits after flushing its candidate but before rename, exercising old-record recovery and automatic lock release without cleanup; its ignored helper is explicitly run by the parent test.
+
 Tests use temporary data roots only. Coverage includes idea-only tasks, field clearing, repository membership and missing-reference warnings, every status, zero-subtask progress, dependency validation, stable IDs through removal/reorder, archive/list behavior, malformed and unsupported siblings, unknown-field preservation, external edits, collision retry, size limits, symlink/traversal rejection, and injected pre-rename failure. Concurrency tests cover one winner for stale writers, independent record writes, subprocess lock compatibility/release, and sync/checkout waiting for task operations without committing lock files. The ignored subprocess helper is invoked explicitly by the parent lock test; it is not skipped concurrency coverage.
+
+## Artifact representation and coherence decision (PR 2)
+
+The proposed `artifact.json` plus `content.md` layout is replaced by **one `portable/artifacts/<artifact-id>/artifact.json` file**. Metadata and verbatim Markdown share a single atomic replacement; there is no second authoritative content file, transaction journal, recovery manifest, or versioned document system. This intentionally trades direct `.md` editing for the same minimal, coherent commit boundary as tasks. Future CLI file/stdin inputs will supply Markdown to the `content` field, not create a second portable file. External edits to that field are Markdown edits and invalidate the whole-record revision even if timestamps do not change.
+
+```json
+{
+  "schemaVersion": 3,
+  "id": "art-r3w8n6hp",
+  "title": "API design",
+  "kind": "rfc",
+  "content": "# Proposal\n\nExpose the agreed API.\n",
+  "archived": false,
+  "createdAt": 1788825600000,
+  "updatedAt": 1788825600000
+}
+```
+
+Artifact IDs use `art-` and the same eight-character alphabet and collision-checked allocation convention as tasks. Kinds are exactly `rfc`, `plan`, and `note`. Schema version 3 reserves a distinct contract from historical formats; missing/unsupported schemas, unknown kinds, missing content, and malformed records are errors, never reset or migrated. Unknown fields round-trip. A sibling `content.md` is reported as an unsupported split representation rather than silently ignored or imported. Title, kind, and content are required; content may be empty and is preserved verbatim. The complete serialized UTF-8 JSON record, including escaping, is bounded to 4 MiB. Timestamps and title validation match tasks.
+
+`ArtifactStore` offers create/get/list/update and `set_archived`. Patches distinguish omission from explicit empty content. Reads and successful mutations return metadata, Markdown content, and a `git-blob-sha1:<digest>` token over all persisted bytes. IDs, schema, and timestamps are store-controlled. Stale mutations fail with `artifact_changed` and reread/retry guidance. Default lists exclude archived artifacts, limit results to 50, sort by descending update time then ID, expose truncation, and report malformed siblings independently. Direct reads include archived records. There is no deletion, ownership, history, or frozen revision API.
+
+Artifact operations acquire the shared portable gate, then a shared/exclusive record lock at `<data-root>/cache/artifact-locks/<artifact-id>.lock`. Built-in sync and checkout already hold the gate exclusively and therefore cannot bypass artifact mutation protection. Task operations that validate or report artifact references hold the gate and task lock, then acquire one artifact read lock at a time without reacquiring the gate. Artifact operations never acquire task locks. Links do not constitute a cross-record transaction: resolving a linked ID returns the current artifact at that read, not content pinned to the task revision.
+
+Artifact writes reuse the task atomic-replacement primitive: prepare the complete snapshot, write and sync a unique hidden sibling, then rename over `artifact.json`. A failure before rename leaves both old metadata and old content intact. Interruption before rename may leave `.task-*.tmp` files (the shared primitive's filename convention); readers ignore them and continue using `artifact.json`. Interruption after rename leaves the complete new record authoritative. Incomplete initial-creation directories are reported and never adopted. Recovery requires no replay: inspect/remove abandoned temporary files or incomplete directories manually before sync, which stages all portable files. As with tasks, this is process-interruption atomicity, not a power-loss durability guarantee; directory entries are not fsynced. Concurrent nonparticipating editors remain outside the advisory locking contract.
+
+## Task and subtask artifact links
+
+Task and subtask schema 3 records now accept an optional `artifacts` array of artifact IDs, defaulting to empty. Create and patch inputs support these links; `Some([])` explicitly clears them. IDs must have valid syntax and lists cannot contain duplicates. Each newly introduced association on a task or individual subtask must resolve to a supported, readable artifact, including archived artifacts. Multiple tasks and subtasks can share the same ID. Existing missing/malformed references remain intact and produce snapshot warnings; unrelated status/title/archive edits still work. Adding a missing artifact to a different subtask is a new association and fails even if the parent already references it.
+
+Task reads return IDs, not inlined documents. Resolve each through `ArtifactStore::get` for live content. Artifact edits do not alter task revisions, progress, dependencies, or repository membership. Task archive does not archive artifacts; artifact archive does not break links. Removing links changes only the containing task and requires its revision token.

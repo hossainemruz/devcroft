@@ -1,4 +1,4 @@
-//! PR 1 task domain and store. No artifact, CLI, or UI implementation yet.
+//! Task domain and store, including live artifact references.
 //! See docs/task-storage.md for the serialized and concurrency contracts.
 // Public-to-crate APIs land before their CLI/UI consumers in later PRs.
 #![allow(dead_code)]
@@ -18,7 +18,7 @@ use super::store_lock::{ensure_directory, portable_gate, reject_symlink, task_lo
 use super::{DataRoot, RepositoryMetadata, require_repository_key};
 
 const SCHEMA_VERSION: u32 = 3;
-const MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SUBTASKS: usize = 1000;
 const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
 type Extra = BTreeMap<String, Value>;
@@ -45,6 +45,8 @@ pub(crate) struct Subtask {
     pub(crate) dependencies: Vec<String>,
     #[serde(default)]
     pub(crate) status: Status,
+    #[serde(default)]
+    pub(crate) artifacts: Vec<String>,
     #[serde(flatten)]
     extra: Extra,
 }
@@ -59,6 +61,8 @@ pub(crate) struct Task {
     pub(crate) description: String,
     #[serde(default)]
     pub(crate) repositories: Vec<String>,
+    #[serde(default)]
+    pub(crate) artifacts: Vec<String>,
     #[serde(default)]
     pub(crate) subtasks: Vec<Subtask>,
     /// High-water mark survives removal, so a deleted ID is never reused.
@@ -122,6 +126,7 @@ impl Task {
         );
         ensure!(self.next_subtask_id > 0, "nextSubtaskId must be positive");
         unique(&self.repositories, "repositories")?;
+        validate_artifact_links(&self.artifacts)?;
         for key in self.involved_repositories() {
             require_repository_key(&key)?;
         }
@@ -139,6 +144,7 @@ impl Task {
             );
             nonblank(&subtask.title, "subtask title")?;
             unique(&subtask.dependencies, "dependencies")?;
+            validate_artifact_links(&subtask.artifacts)?;
         }
         // Kahn's algorithm avoids stack recursion on externally edited graphs.
         let indices: HashMap<_, _> = self
@@ -181,6 +187,7 @@ impl Task {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NewTask {
+    pub(crate) artifacts: Vec<String>,
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) repositories: Vec<String>,
@@ -188,6 +195,7 @@ pub(crate) struct NewTask {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TaskPatch {
+    pub(crate) artifacts: Option<Vec<String>>,
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) repositories: Option<Vec<String>>,
@@ -195,6 +203,7 @@ pub(crate) struct TaskPatch {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NewSubtask {
+    pub(crate) artifacts: Vec<String>,
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) repository: String,
@@ -203,6 +212,7 @@ pub(crate) struct NewSubtask {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SubtaskPatch {
+    pub(crate) artifacts: Option<Vec<String>>,
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) repository: Option<String>,
@@ -214,7 +224,7 @@ pub(crate) struct SubtaskPatch {
 pub(crate) struct Snapshot {
     pub(crate) task: Task,
     pub(crate) revision: String,
-    /// Includes missing/malformed repository records, without making tasks unreadable.
+    /// Missing/malformed repository and artifact records do not hide the task.
     pub(crate) warnings: Vec<String>,
 }
 
@@ -270,6 +280,7 @@ impl TaskStore {
                 title: input.title.trim().to_owned(),
                 description: input.description.clone(),
                 repositories: input.repositories.clone(),
+                artifacts: input.artifacts.clone(),
                 subtasks: Vec::new(),
                 next_subtask_id: 1,
                 archived: false,
@@ -279,6 +290,7 @@ impl TaskStore {
             };
             task.validate()?;
             self.validate_new_repositories(&task, None)?;
+            self.validate_new_artifacts(&task, None)?;
             match fs::create_dir(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -366,6 +378,9 @@ impl TaskStore {
 
     pub(crate) fn update(&self, id: &str, revision: &str, patch: TaskPatch) -> Result<Snapshot> {
         self.mutate(id, revision, |task| {
+            if let Some(v) = patch.artifacts {
+                task.artifacts = v;
+            }
             if let Some(v) = patch.title {
                 task.title = v.trim().to_owned();
             }
@@ -409,6 +424,7 @@ impl TaskStore {
                 description: input.description,
                 repository: input.repository,
                 dependencies: input.dependencies,
+                artifacts: input.artifacts,
                 status: Status::Todo,
                 extra: Extra::new(),
             });
@@ -431,6 +447,9 @@ impl TaskStore {
                 .with_context(|| format!("missing subtask {subtask_id}"))?;
             if let Some(v) = patch.title {
                 s.title = v.trim().to_owned();
+            }
+            if let Some(v) = patch.artifacts {
+                s.artifacts = v;
             }
             if let Some(v) = patch.description {
                 s.description = v;
@@ -522,6 +541,7 @@ impl TaskStore {
         );
         task.validate()?;
         self.validate_new_repositories(&task, Some(&old.task))?;
+        self.validate_new_artifacts(&task, Some(&old.task))?;
         self.write(&self.checked_path(Some(id))?.join("task.json"), &task)
     }
 
@@ -580,11 +600,22 @@ impl TaskStore {
     }
 
     fn snapshot(&self, task: Task, bytes: &[u8]) -> Result<Snapshot> {
-        let warnings = task
+        let mut warnings: Vec<String> = task
             .involved_repositories()
             .iter()
             .filter_map(|key| self.require_repository(key).err().map(|e| format!("{e:#}")))
             .collect();
+        let artifacts = super::artifacts::ArtifactStore::new(&self.root);
+        let ids: BTreeSet<_> = task
+            .artifacts
+            .iter()
+            .chain(task.subtasks.iter().flat_map(|s| &s.artifacts))
+            .collect();
+        for id in ids {
+            if let Err(e) = artifacts.get_under_gate(id) {
+                warnings.push(format!("artifact {id}: {e:#}"));
+            }
+        }
         let revision = format!(
             "git-blob-sha1:{}",
             gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, bytes)?
@@ -629,6 +660,35 @@ impl TaskStore {
         }
         Ok(())
     }
+
+    fn validate_new_artifacts(&self, task: &Task, old: Option<&Task>) -> Result<()> {
+        let store = super::artifacts::ArtifactStore::new(&self.root);
+        for id in &task.artifacts {
+            if !old.is_some_and(|t| t.artifacts.contains(id)) {
+                store.get_under_gate(id)?;
+            }
+        }
+        for s in &task.subtasks {
+            for id in &s.artifacts {
+                if !old.is_some_and(|t| {
+                    t.subtasks
+                        .iter()
+                        .any(|before| before.id == s.id && before.artifacts.contains(id))
+                }) {
+                    store.get_under_gate(id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_artifact_links(ids: &[String]) -> Result<()> {
+    unique(ids, "artifacts")?;
+    for id in ids {
+        super::artifacts::validate_id(id)?;
+    }
+    Ok(())
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -653,7 +713,7 @@ fn subtask_number(id: &str) -> Result<u64> {
     Ok(number)
 }
 
-fn nonblank(value: &str, name: &str) -> Result<()> {
+pub(super) fn nonblank(value: &str, name: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{name} must not be blank");
     Ok(())
 }
@@ -667,14 +727,14 @@ fn unique(values: &[String], name: &str) -> Result<()> {
     Ok(())
 }
 
-fn timestamp() -> Result<u64> {
+pub(super) fn timestamp() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_millis()
         .try_into()?)
 }
 
-fn random_id() -> String {
+pub(super) fn random_id() -> String {
     // RandomState supplies independently randomized hash keys from std. These
     // are short collision-checked identifiers, not secrets or access tokens.
     let mut bits = RandomState::new().hash_one((SystemTime::now(), std::process::id()));
@@ -686,7 +746,7 @@ fn random_id() -> String {
     id
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+pub(super) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     reject_symlink(path)?;
     ensure!(
         fs::metadata(path)
@@ -708,7 +768,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn atomic_replace(
+pub(super) fn atomic_replace(
     path: &Path,
     bytes: &[u8],
     before_rename: impl FnOnce() -> Result<()>,

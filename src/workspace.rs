@@ -23,8 +23,8 @@ use gpui_kit::{
 use crate::add_repository::AddRepositoryView;
 use crate::agent::AgentKind;
 use crate::command_palette::{
-    GoToTerminal, PaletteCommand, PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette,
-    ToggleProjectsPalette, item_at, palette_sections_for_mode,
+    GoToAgent, GoToEditor, GoToTerminal, PaletteCommand, PaletteItem, PaletteMode, PaletteSection,
+    ToggleActionsPalette, ToggleProjectsPalette, item_at, palette_sections_for_mode,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
@@ -433,6 +433,26 @@ impl Workspace {
         if let Some(Some(pane)) = self.tabs.get(self.active_tab as usize) {
             let focus_handle = pane.read(cx).focus_handle.clone();
             focus_handle.focus(window, cx);
+        }
+    }
+
+    /// Jump straight to the Agent tab (`cmd-a`). An open command bar
+    /// closes first, so the shortcut never leaves the palette stranded over
+    /// the new tab.
+    fn go_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab(WorkspaceTab::Agent as usize, window, cx);
+        if self.command_open {
+            self.close_command_palette(window, cx);
+        }
+    }
+
+    /// Jump straight to the Editor tab (`cmd-e`). An open command bar
+    /// closes first, so the shortcut never leaves the palette stranded over
+    /// the new tab.
+    fn go_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab(WorkspaceTab::Editor as usize, window, cx);
+        if self.command_open {
+            self.close_command_palette(window, cx);
         }
     }
 
@@ -939,11 +959,21 @@ impl Workspace {
                         .iter()
                         .map(|item| {
                             let rendered = match item {
-                                // The terminal has a direct keybinding, so it
-                                // carries the real action: the row renders the
-                                // binding hint for free, and confirming still
-                                // runs `on_palette_confirm` afterwards
-                                // (idempotent re-select of the same tab).
+                                // Tabs with direct keybindings carry the real
+                                // action: the row renders the binding hint for
+                                // free, and confirming still runs
+                                // `on_palette_confirm` afterwards (idempotent
+                                // re-select of the same tab).
+                                PaletteItem::Command(PaletteCommand::GoAgent) => CommandItem::new()
+                                    .label(item.label())
+                                    .icon(palette_icon(PaletteCommand::GoAgent))
+                                    .action(Box::new(GoToAgent)),
+                                PaletteItem::Command(PaletteCommand::GoEditor) => {
+                                    CommandItem::new()
+                                        .label(item.label())
+                                        .icon(palette_icon(PaletteCommand::GoEditor))
+                                        .action(Box::new(GoToEditor))
+                                }
                                 PaletteItem::Command(PaletteCommand::GoTerminal) => {
                                     CommandItem::new()
                                         .label(item.label())
@@ -1016,7 +1046,7 @@ impl Workspace {
 }
 
 /// Leading glyph per palette command. A command with a direct keybinding
-/// (like GoTerminal's `cmd-/`) additionally carries its real GPUI
+/// (like GoAgent's `cmd-a`) additionally carries its real GPUI
 /// `Action` on the row via `CommandItem::action`, which renders the binding
 /// hint for free; `on_confirm` still resolves it afterwards, idempotently.
 fn palette_icon(command: PaletteCommand) -> IconName {
@@ -1048,6 +1078,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleProjectsPalette, window, cx| {
                 this.toggle_command_palette(PaletteMode::Projects, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToAgent, window, cx| {
+                this.go_to_agent(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToEditor, window, cx| {
+                this.go_to_editor(window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoToTerminal, window, cx| {
                 this.go_to_terminal(window, cx);

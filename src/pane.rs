@@ -24,7 +24,8 @@ use gpui_kit::{
 use crate::{
     agent::AgentKind,
     command_palette::{
-        GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
+        GoToAgent, GoToEditor, GoToTerminal, PaletteMode, ToggleActionsPalette,
+        ToggleProjectsPalette, is_go_to_agent_shortcut, is_go_to_editor_shortcut,
         is_go_to_terminal_shortcut, palette_mode_for_shortcut,
     },
     fonts::TERMINAL_FONT_FAMILY,
@@ -233,6 +234,28 @@ impl TerminalPane {
         // terminal input. The global `cmd-k`/`ctrl-k` and `cmd-p`/`ctrl-p`
         // bindings cover every other focus site, and dispatching here is
         // idempotent with them — whichever path runs first stops the event.
+        // The tab jumps (`cmd-a`/`cmd-e`/`cmd-/`) are platform-only with no
+        // `ctrl` fallback, so `ctrl-a`/`ctrl-e`/`ctrl-/` keep reaching the pty.
+        if is_go_to_agent_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToAgent), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_editor_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToEditor), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if is_go_to_terminal_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,

@@ -33,7 +33,9 @@ use gpui_kit::{
 
 use crate::cli::{Cli, Command};
 use crate::{
-    command_palette::{GoToTerminal, ToggleActionsPalette, ToggleProjectsPalette},
+    command_palette::{
+        GoToAgent, GoToEditor, GoToTerminal, ToggleActionsPalette, ToggleProjectsPalette,
+    },
     fonts::load_terminal_fonts,
     preview::PreviewView,
     workspace::Workspace,
@@ -69,17 +71,20 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         // Global command-bar toggles: `cmd-k` opens the action commands,
         // `cmd-p` the project switcher (`cmd` is Super on Linux, so this
         // covers super+k/super+p there too; the `ctrl` variants are fallbacks
-        // for environments without a platform modifier). `cmd-/` jumps
-        // straight to the Terminal tab — deliberately without a `ctrl`
-        // fallback, so `ctrl-/` keeps reaching terminal applications. The
-        // terminal pane also forwards these keystrokes explicitly (see
-        // `TerminalPane::on_key_down`), since its raw key handler would
-        // otherwise swallow the event while focused.
+        // for environments without a platform modifier). `cmd-a`/`cmd-e` jump
+        // straight to the Agent/Editor tabs and `cmd-/` to the Terminal tab —
+        // all deliberately without `ctrl` fallbacks, so `ctrl-a`/`ctrl-e`
+        // (readline beginning/end-of-line) and `ctrl-/` keep reaching
+        // terminal applications. The terminal pane also forwards these
+        // keystrokes explicitly (see `TerminalPane::on_key_down`), since its
+        // raw key handler would otherwise swallow the event while focused.
         cx.bind_keys([
             KeyBinding::new("cmd-k", ToggleActionsPalette, None),
             KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
             KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
             KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
+            KeyBinding::new("cmd-a", GoToAgent, None),
+            KeyBinding::new("cmd-e", GoToEditor, None),
             KeyBinding::new("cmd-/", GoToTerminal, None),
         ]);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");

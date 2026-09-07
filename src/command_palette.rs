@@ -12,7 +12,13 @@ use crate::data::RecentRepository;
 
 gpui_kit::actions!(
     devcroft,
-    [ToggleActionsPalette, ToggleProjectsPalette, GoToTerminal]
+    [
+        ToggleActionsPalette,
+        ToggleProjectsPalette,
+        GoToAgent,
+        GoToEditor,
+        GoToTerminal
+    ]
 );
 
 /// Which filtered view of the command bar is open. `cmd/ctrl-k` opens the
@@ -55,6 +61,28 @@ pub(crate) fn palette_mode_for_shortcut(
     } else {
         None
     }
+}
+
+/// Match the go-to-agent shortcut (`cmd-a`, Super on Linux) from a raw
+/// keystroke. Same shape as [`palette_mode_for_shortcut`] so every focus
+/// site forwards identically. Deliberately platform-only with no `ctrl`
+/// fallback: `ctrl-a` is readline beginning-of-line, so it must keep
+/// reaching the pty. Case-insensitive like the letter shortcuts above.
+pub(crate) fn is_go_to_agent_shortcut(key: &str, platform: bool, alt: bool) -> bool {
+    if alt || !platform {
+        return false;
+    }
+    key.eq_ignore_ascii_case("a")
+}
+
+/// Match the go-to-editor shortcut (`cmd-e`, Super on Linux) from a raw
+/// keystroke. Same shape as [`is_go_to_agent_shortcut`]: platform-only with
+/// no `ctrl` fallback because `ctrl-e` is readline end-of-line.
+pub(crate) fn is_go_to_editor_shortcut(key: &str, platform: bool, alt: bool) -> bool {
+    if alt || !platform {
+        return false;
+    }
+    key.eq_ignore_ascii_case("e")
 }
 
 /// Match the go-to-terminal shortcut (`cmd-/`, Super on Linux) from a raw
@@ -451,6 +479,36 @@ mod tests {
         assert_eq!(palette_mode_for_shortcut("p", true, true, true), None);
         assert_eq!(palette_mode_for_shortcut("o", true, false, false), None);
         assert_eq!(palette_mode_for_shortcut("Enter", true, false, false), None);
+    }
+
+    #[test]
+    fn agent_shortcut_matches_a_with_platform_modifier_only() {
+        assert!(is_go_to_agent_shortcut("a", true, false));
+        assert!(is_go_to_agent_shortcut("A", true, false));
+        // No `ctrl` fallback: `ctrl-a` is readline beginning-of-line and
+        // must keep reaching the terminal.
+        assert!(!is_go_to_agent_shortcut("a", false, false));
+        assert!(!is_go_to_agent_shortcut("A", false, false));
+        // Alt held, or any other key, never jumps to agent.
+        assert!(!is_go_to_agent_shortcut("a", true, true));
+        assert!(!is_go_to_agent_shortcut("e", true, false));
+        assert!(!is_go_to_agent_shortcut("k", true, false));
+        assert!(!is_go_to_agent_shortcut("Enter", true, false));
+    }
+
+    #[test]
+    fn editor_shortcut_matches_e_with_platform_modifier_only() {
+        assert!(is_go_to_editor_shortcut("e", true, false));
+        assert!(is_go_to_editor_shortcut("E", true, false));
+        // No `ctrl` fallback: `ctrl-e` is readline end-of-line and must
+        // keep reaching the terminal.
+        assert!(!is_go_to_editor_shortcut("e", false, false));
+        assert!(!is_go_to_editor_shortcut("E", false, false));
+        // Alt held, or any other key, never jumps to editor.
+        assert!(!is_go_to_editor_shortcut("e", true, true));
+        assert!(!is_go_to_editor_shortcut("a", true, false));
+        assert!(!is_go_to_editor_shortcut("k", true, false));
+        assert!(!is_go_to_editor_shortcut("Enter", true, false));
     }
 
     #[test]

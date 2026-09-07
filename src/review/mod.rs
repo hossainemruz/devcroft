@@ -32,8 +32,9 @@ use gpui_kit::{
 };
 
 use crate::command_palette::{
-    GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
-    is_go_to_terminal_shortcut, palette_mode_for_shortcut,
+    GoToAgent, GoToEditor, GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
+    is_go_to_agent_shortcut, is_go_to_editor_shortcut, is_go_to_terminal_shortcut,
+    palette_mode_for_shortcut,
 };
 
 use self::git::{ReviewScope, load_review, suggest_base_branch};
@@ -194,14 +195,34 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// Forward the command-bar toggles and the go-to-terminal shortcut to
+    /// Forward the command-bar toggles and the go-to-tab shortcuts to
     /// the workspace, mirroring `TerminalPane::on_key_down`. The tree/stream
     /// children don't swallow keys today, but without this any future child
-    /// that stops propagation would silently break `cmd-k`/`cmd-p`/`cmd-/`
-    /// on this tab again. All other keys bubble normally (no
+    /// that stops propagation would silently break `cmd-k`/`cmd-p`/`cmd-a`/
+    /// `cmd-e`/`cmd-/` on this tab again. All other keys bubble normally (no
     /// `prevent_default`/`stop_propagation`) so tree navigation and list
     /// scrolling keep working.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if is_go_to_agent_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToAgent), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_editor_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToEditor), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if is_go_to_terminal_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,

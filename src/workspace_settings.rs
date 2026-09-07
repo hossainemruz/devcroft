@@ -19,8 +19,9 @@ use std::path::PathBuf;
 
 use crate::agent::AgentKind;
 use crate::command_palette::{
-    GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
-    is_go_to_terminal_shortcut, palette_mode_for_shortcut,
+    GoToAgent, GoToEditor, GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
+    is_go_to_agent_shortcut, is_go_to_editor_shortcut, is_go_to_terminal_shortcut,
+    palette_mode_for_shortcut,
 };
 use crate::workspace::Workspace;
 
@@ -70,9 +71,29 @@ impl WorkspaceSettingsView {
     }
 
     /// Mirror Settings/terminal panes: the palette toggles and the
-    /// go-to-terminal shortcut keep working while the sheet has focus;
+    /// go-to-tab shortcuts keep working while the sheet has focus;
     /// everything else bubbles normally.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if is_go_to_agent_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToAgent), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_editor_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToEditor), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if is_go_to_terminal_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,

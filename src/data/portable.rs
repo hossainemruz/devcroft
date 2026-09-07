@@ -226,6 +226,7 @@ pub(crate) enum CheckoutOutcome {
 /// own (sanitized) error and changes nothing — commit via sync first or
 /// resolve it with ordinary git tooling.
 pub(crate) fn checkout_branch(root: &DataRoot, name: &str) -> Result<CheckoutOutcome> {
+    let _gate = super::store_lock::portable_gate(root, true)?;
     let portable = root.portable_dir();
     require_repo(&portable)?;
     let name = name.trim();

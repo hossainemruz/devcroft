@@ -22,7 +22,7 @@ Windows uses `Local`, not `Roaming`: `Roaming` replicates to domain controllers 
 ```
 $DEVCROFT_DATA_DIR/
   device.json          # machine-local only: checkout bindings, agent/editor settings, pins/recents, theme. Never committed.
-  portable/            # git repo root: workspace.json, repositories/<key>/..., tasks/<id>/...
+  portable/            # git repo root: workspace.json, repositories/<key>/..., tasks/<id>/..., artifacts/<id>/...
   cache/ logs/ tmp/    # later, as needed. Never synced.
 ```
 
@@ -42,5 +42,7 @@ $DEVCROFT_DATA_DIR/
 6. Wire portable reload (Home/Tasks/Review projections) after sync rebase, same as before.
 
 ## Explicit non-goals
+
+Task/artifact scope is defined in [`task-management-plan.md`](task-management-plan.md), which reuses this root and portable-only sync boundary. PR 1's task store and machine-local locks are implemented as documented in [`task-storage.md`](task-storage.md); artifacts, CLI commands, and task UI remain planned.
 
 - No Electron `userData` reuse, no `Devcroft` → `devcroft` migration, no selectable data directory, no `Roaming` support on Windows, no libgit2/`gix` writes, no committed `device.json`.

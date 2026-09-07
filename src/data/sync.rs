@@ -110,6 +110,7 @@ fn sync_portable_inner(root: &DataRoot, tracker: Option<&SyncTracker>) -> Result
 }
 
 fn sync_once(root: &DataRoot) -> Result<SyncOutcome> {
+    let _gate = super::store_lock::portable_gate(root, true)?;
     let portable = root.portable_dir();
     if !portable.join(".git").exists() {
         bail!(

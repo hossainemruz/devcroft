@@ -14,7 +14,9 @@ pub(crate) mod dashboard;
 mod device;
 mod portable;
 mod repositories;
+mod store_lock;
 mod sync;
+pub(crate) mod tasks;
 mod workspace_agents;
 
 use std::env;

@@ -1,12 +1,14 @@
 # CLI plan (`devcroft` binary)
 
-Status: planning — no code yet. This document records the agreed CLI shape, transport, and phasing so implementation (Phase 0+) has a stable contract to build against.
+Status: partially implemented — the CLI scaffold, standalone preview, and Git-status diagnostic exist; headless task commands and live-UI socket work remain planned. This document records CLI direction and phasing. [`task-management-plan.md`](task-management-plan.md) now owns the task/artifact command scope and domain contracts where they differ from this document.
 
 ## Goal
 
 Give the project a first-class CLI where `devcroft app` starts the current GPUI workspace, and later subcommands let the agent (running in the Agent tab), Neovim (running in the Editor tab), and other independent local processes perform Devcroft-specific work: task management, review-comment management, Markdown preview, and adding line/selection references from diff view/editor into the agent input queue.
 
 ## Relation to existing plans
+
+- `task-management-plan.md` supersedes task-specific Electron parity and the task assumptions below: standalone artifact commands, repository-less ideas, short random task/artifact IDs, task/subtask artifact links, archive/unarchive, `subtask remove`, and revision-checked mutations. There is no requirement for exact parity with the old eight repository/task MCP operations or canonical sequential `task-0001` IDs. Review operations and their security/concurrency boundaries remain unchanged. Task/artifact store commands are headless and do not depend on socket phases.
 
 - `docs/feature-parity.md` §11 already requires the rewrite to expose the thirteen original agent operations as a CLI rather than a loopback MCP server, preserving filters, validation, atomicity, optimistic-concurrency contracts, the human-owned comment-body boundary, the tutorial source-inspection contract, error vocabulary, and live-refresh semantics adapted to a non-running-desktop model. This plan is the concrete shape of that requirement.
 - `docs/data-directory-plan.md` owns root resolution (`DEVCROFT_DATA_DIR` override else per-OS default), `portable/` as the only synced subtree, and atomic JSON writes. The CLI reuses it verbatim and derives its transport from the same root.

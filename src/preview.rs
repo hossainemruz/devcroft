@@ -5,7 +5,7 @@
 //! (`:!devcroft preview %`). [`PreviewView`] then renders the file in a
 //! standalone window — no workspace, no terminal panes, no socket — as a
 //! stateful scrollable [`TextView`](gpui_kit::component::text::TextView)
-//! beside a table-of-contents sidebar with scrollspy.
+//! with a hover-expandable table of contents and scrollspy.
 //!
 //! Markdown is the first renderer; future kinds (images, …) add sibling
 //! readers and either extend [`PreviewView`] or add a parallel view,
@@ -14,15 +14,16 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+use gpui_kit::base::Scrollbar;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::text::{TextView, TextViewState};
+use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ListOffset, MouseButton, ParentElement as _, Render, SharedString, Styled as _,
-    Window, div, px,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, HighlightStyle,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton, Overflow,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled as _, Window, div, px, rems,
 };
 
 /// Maximum previewed file size: matches the 4 MiB repository file-API limit
@@ -157,8 +158,8 @@ fn active_heading(toc: &[TocEntry], top: usize, bottom: usize, total: usize) -> 
     active
 }
 
-/// Standalone preview window content: a table-of-contents sidebar beside
-/// the rendered document. Focused on mount (see `run_preview`) so keyboard
+/// Standalone preview window content: a centered document with an outline
+/// overlay. Focused on mount (see `run_preview`) so keyboard
 /// scrolling works without a click first.
 pub(crate) struct PreviewView {
     state: Entity<TextViewState>,
@@ -169,6 +170,8 @@ pub(crate) struct PreviewView {
     blocks: usize,
     active: usize,
     focus_handle: FocusHandle,
+    toc_hovered: bool,
+    toc_focus: FocusHandle,
 }
 
 impl PreviewView {
@@ -199,6 +202,8 @@ impl PreviewView {
             blocks,
             active: 0,
             focus_handle: cx.focus_handle(),
+            toc_hovered: false,
+            toc_focus: cx.focus_handle().tab_stop(true),
         }
     }
 
@@ -229,45 +234,79 @@ impl PreviewView {
         cx.notify();
     }
 
-    /// Table-of-contents sidebar: one clickable row per heading, indented
-    /// by depth, with the scrollspy-active row in the theme's accent pair.
-    /// Hidden entirely (see `render`) when the document has no headings.
-    fn render_toc(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The outline overlays the document rather than changing its wrapping.
+    /// Focus expands it too; arrow keys navigate and Escape returns to reading.
+    fn render_toc(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
+        let expanded = self.toc_hovered || self.toc_focus.is_focused(window);
         v_flex()
+            .id("preview-toc")
+            .track_focus(&self.toc_focus)
             .flex_none()
-            .w(px(248.))
-            .h_full()
+            .w(px(if expanded { 280. } else { 40. }))
+            .max_w_full()
+            .h_auto()
+            .max_h((window.viewport_size().height - px(96.)).max(px(40.)))
             .py_3()
             .px_2()
-            .border_r_1()
-            .border_color(cx.theme().border)
-            .overflow_y_scrollbar()
-            .child(
-                div()
-                    .px_2()
-                    .pb_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("On this page"),
-            )
+            .rounded_lg()
+            .when(expanded, |this| {
+                this.bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .shadow_lg()
+            })
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                this.toc_hovered = *hovered;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let index = match event.keystroke.key.as_str() {
+                    "up" => this.active.saturating_sub(1),
+                    "down" => (this.active + 1).min(this.toc.len() - 1),
+                    "home" => 0,
+                    "end" => this.toc.len() - 1,
+                    "escape" => {
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    _ => return,
+                };
+                this.on_toc_click(index, cx);
+                window.prevent_default();
+                cx.stop_propagation();
+            }))
+            .overflow_y_scroll()
+            .when(expanded, |this| {
+                this.child(
+                    div()
+                        .px_2()
+                        .pb_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("On this page"),
+                )
+            })
             .children(self.toc.iter().enumerate().map(|(index, entry)| {
                 let is_active = index == active;
                 // h1 flush; each deeper level indented one step.
                 let indent = px(8. + f32::from(entry.level.saturating_sub(1)) * 12.);
                 div()
                     .id(("toc-row", index))
+                    .flex_none()
                     .w_full()
-                    .py_1()
-                    .pl(indent)
-                    .pr_2()
+                    .py(px(if expanded { 6. } else { 4. }))
+                    .pl(if expanded { indent } else { px(0.) })
+                    .pr(px(if expanded { 8. } else { 0. }))
                     .rounded_md()
                     .cursor_pointer()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .text_sm()
-                    .when(is_active, |this| {
+                    .when(is_active && expanded, |this| {
                         this.bg(cx.theme().accent)
                             .text_color(cx.theme().accent_foreground)
                     })
@@ -280,7 +319,21 @@ impl PreviewView {
                             this.on_toc_click(index, cx);
                         }),
                     )
-                    .child(entry.title.clone())
+                    .when(expanded, |this| this.child(entry.title.clone()))
+                    .when(!expanded, |this| {
+                        this.items_end().flex().justify_end().child(
+                            div()
+                                .flex_none()
+                                .w(px((26. - f32::from(entry.level - 1) * 4.).max(8.)))
+                                .h(px(2.))
+                                .rounded_full()
+                                .bg(if is_active {
+                                    cx.theme().foreground
+                                } else {
+                                    cx.theme().muted_foreground.opacity(0.45)
+                                }),
+                        )
+                    })
             }))
     }
 }
@@ -292,19 +345,118 @@ impl Focusable for PreviewView {
 }
 
 impl Render for PreviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let reading_width = (window.viewport_size().width - px(80.)).clamp(px(1.), px(960.));
+        let list_state = self.state.read(cx).list_state().clone();
+        let mut table = StyleRefinement::default();
+        table.overflow.x = Some(Overflow::Scroll);
+        let code_block = div()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().accent.opacity(0.6))
+            .text_size(px(14.))
+            .line_height(px(23.))
+            .style()
+            .clone();
+        let table_head = div()
+            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+            .bg(cx.theme().accent.opacity(0.5))
+            .style()
+            .clone();
+        let table_cell = div().px_3().py_2().style().clone();
+        let style = TextViewStyle::default()
+            .paragraph_gap(rems(1.25))
+            .heading_font_size(|level, _| {
+                px(match level {
+                    1 => 34.,
+                    2 => 26.,
+                    3 => 21.,
+                    _ => 18.,
+                })
+            })
+            // HighlightStyle cannot change a span's font, padding, or corner
+            // radius. Keep the source untouched and use a quiet, theme-aware
+            // highlight until the renderer exposes real inline-code styling.
+            .inline_code(HighlightStyle {
+                background_color: Some(cx.theme().foreground.opacity(0.075)),
+                ..Default::default()
+            })
+            .code_block(code_block)
+            .table(table)
+            .table_head(table_head)
+            .table_cell(table_cell);
         h_flex()
+            .id("preview-reader")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab" && !this.toc.is_empty() {
+                    if this.toc_focus.is_focused(window) {
+                        this.focus_handle.focus(window, cx);
+                    } else {
+                        this.toc_focus.focus(window, cx);
+                    }
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .relative()
             .size_full()
+            .justify_center()
             .bg(cx.theme().background)
-            .when(!self.toc.is_empty(), |this| this.child(self.render_toc(cx)))
+            .text_color(cx.theme().foreground)
             .child(
                 div()
-                    .flex_1()
+                    .w(reading_width)
                     .min_w_0()
                     .h_full()
-                    .p_4()
-                    .child(TextView::new(&self.state).scrollable(true)),
+                    .py(px(32.))
+                    .text_size(px(17.))
+                    .line_height(px(29.))
+                    .child(
+                        // TextView currently always draws a 16px scrollbar in
+                        // scrollable mode. Clip that gutter (including hitboxes)
+                        // and bind the window-edge scrollbar to the same list.
+                        // Keeping the virtualized list preserves TOC offsets,
+                        // selection, and keyboard scrolling.
+                        div().size_full().overflow_hidden().child(
+                            TextView::new(&self.state)
+                                .style(style)
+                                .scrollable(true)
+                                .w(reading_width + px(16.))
+                                .pr(px(16.)),
+                        ),
+                    ),
             )
+            .child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top(px(32.))
+                    .bottom(px(32.))
+                    .w(px(16.))
+                    .child(
+                        Scrollbar::vertical(&list_state)
+                            .id("preview-window-scrollbar")
+                            .viewport_from_layout(),
+                    ),
+            )
+            .when(!self.toc.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .absolute()
+                        .right(px(24.))
+                        .top_0()
+                        .h_full()
+                        .max_w_full()
+                        .py(px(48.))
+                        .justify_center()
+                        .child(self.render_toc(window, cx)),
+                )
+            })
     }
 }
 

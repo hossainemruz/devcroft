@@ -323,6 +323,17 @@ fn shared_agent_workflow_is_headless_and_revision_checked() {
     for repo in ["public-api", "backend", "deployment"] {
         let listed = f.json(&["task", "list", "--repository", repo], b"");
         assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+        // Repository desktop views use this same store projection: membership
+        // filters the list, not the task's cross-repository execution record.
+        assert_eq!(listed["tasks"][0]["task"], task["task"]);
+        let detail = f.json(&["task", "get", task_id(&task)], b"");
+        assert_eq!(detail["task"], task["task"]);
+        assert_eq!(detail["task"]["subtasks"][1]["dependencies"], json!(["s1"]));
+        assert_eq!(detail["task"]["subtasks"][2]["dependencies"], json!(["s2"]));
+        assert_eq!(
+            detail["task"]["subtasks"][0]["artifacts"],
+            json!([artifact_id(&plan)])
+        );
         assert_eq!(
             listed["tasks"][0]["task"]["subtasks"]
                 .as_array()

@@ -1,6 +1,6 @@
 # Artifact browsing and reading
 
-Open **Home → Browse artifacts** to read standalone RFCs, plans, and notes. No task or repository association is required. Creation and Markdown edits remain agent/CLI operations; task views and task/subtask link controls belong to PR 5.
+Open **Home → Browse artifacts** to read standalone RFCs, plans, and notes. No task or repository association is required. Creation and Markdown edits remain agent/CLI operations. [Task views](task-ui.md) use the same live viewer for task/subtask artifact links, with **Back to task** preserving the task selection and reading position.
 
 ## Browser and viewer
 
@@ -14,7 +14,7 @@ Open **Home → Browse artifacts** to read standalone RFCs, plans, and notes. No
 
 While the artifact page is active, a two-second background poll rereads the store. **Refresh**, portable Git status changes, and the existing post-sync/branch-change reload path also request a reload. Hidden views stop polling. Scans and archive writes share a single in-flight slot; requests during an operation coalesce, and superseded scan results cannot replace a newer selection/filter. Filesystem work and revision-checked writes run off the GPUI UI thread.
 
-The shared store scans records to derive each list; the visible page bound is not an incremental filesystem index. The selected ID is read independently of that bound and the archive filter. `ArtifactBrowser::open` is the reusable ID-based entry point for future task/subtask links; callers activate the browser while it is visible.
+The shared store scans records to derive each list; the visible page bound is not an incremental filesystem index. The selected ID is read independently of that bound and the archive filter. `ArtifactBrowser::open` is the reusable ID-based entry point used by task/subtask links; callers activate the browser while it is visible.
 
 Unchanged Markdown retains its renderer, selection, and exact scroll position. Changed Markdown keeps keyboard focus and returns to the previously active heading if it still exists; text selection and exact pixel position are not preserved across content changes. List scroll is retained while reading and returning to browsing.
 

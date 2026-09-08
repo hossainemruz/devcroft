@@ -86,6 +86,7 @@ pub(crate) enum HomeEvent {
 }
 
 pub(crate) struct HomeView {
+    tasks: gpui_kit::Entity<crate::tasks::TaskBrowser>,
     artifacts: gpui_kit::Entity<crate::artifacts::ArtifactBrowser>,
     pub(crate) focus_handle: FocusHandle,
     root: Option<DataRoot>,
@@ -125,7 +126,17 @@ impl HomeView {
         tracker: SyncTracker,
         cx: &mut Context<Self>,
     ) -> Self {
+        let tasks = cx.new(|cx| {
+            crate::tasks::TaskBrowser::new(root.clone(), crate::tasks::Scope::Global, cx)
+        });
+        tasks.update(cx, |view, cx| view.show_recent(true, cx));
+        cx.subscribe(&tasks, |this, _, _: &crate::tasks::OpenedTask, cx| {
+            this.page = Some("Tasks");
+            cx.notify();
+        })
+        .detach();
         let mut view = Self {
+            tasks,
             artifacts: cx.new(|cx| crate::artifacts::ArtifactBrowser::new(root.clone(), cx)),
             focus_handle: cx.focus_handle(),
             root,
@@ -158,6 +169,7 @@ impl HomeView {
     }
 
     pub(crate) fn activate(&mut self, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| view.show_recent(true, cx));
         self.artifacts
             .update(cx, |view, cx| view.set_active(false, cx));
         self.active = true;
@@ -167,6 +179,7 @@ impl HomeView {
     }
 
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
         self.artifacts
             .update(cx, |view, cx| view.set_active(false, cx));
         self.active = false;
@@ -209,7 +222,7 @@ impl HomeView {
     }
 
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
-        self.refresh_artifacts(cx);
+        self.refresh_planning(cx);
         if let Some(root) = &self.root {
             self.projects = recent_repositories(root, 4);
             match Dashboard::load(root) {
@@ -243,7 +256,10 @@ impl HomeView {
         cx.notify();
     }
 
-    pub(crate) fn refresh_artifacts(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_planning(&mut self, cx: &mut Context<Self>) {
+        if self.active && (self.page.is_none() || self.page == Some("Tasks")) {
+            self.tasks.update(cx, |view, cx| view.refresh_all(cx));
+        }
         if self.active && self.page == Some("Artifacts") {
             self.artifacts.update(cx, |view, cx| view.refresh(cx));
         }
@@ -352,6 +368,13 @@ impl HomeView {
                     .label("View all →")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.page = Some(destination);
+                        this.tasks.update(cx, |view, cx| {
+                            if destination == "Tasks" {
+                                view.show_recent(false, cx);
+                            } else {
+                                view.set_active(false, cx);
+                            }
+                        });
                         this.scroll.set_offset(point(px(0.), px(0.)));
                         cx.notify();
                     })),
@@ -724,6 +747,19 @@ impl HomeView {
 
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page == Some("Tasks") {
+            return v_flex()
+                .size_full()
+                .min_h_0()
+                .child(
+                    Button::new("tasks-home")
+                        .ghost()
+                        .label("← Home")
+                        .on_click(cx.listener(|this, _, _, cx| this.activate(cx))),
+                )
+                .child(div().flex_1().min_h_0().child(self.tasks.clone()))
+                .into_any_element();
+        }
         if self.page == Some("Artifacts") {
             return v_flex()
                 .size_full()
@@ -759,6 +795,7 @@ impl Render for HomeView {
                     .label("Browse artifacts →")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.page = Some("Artifacts");
+                        this.tasks.update(cx, |view, cx| view.set_active(false, cx));
                         this.artifacts
                             .update(cx, |view, cx| view.set_active(true, cx));
                         cx.notify();
@@ -879,26 +916,9 @@ impl Render for HomeView {
                     .label("+ Add project")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository))),
             );
-            body = body.child(self.heading("Recent Tasks", "Tasks", cx)).child(
-                h_flex().gap_4().flex_wrap().children((0..4).map(|index| {
-                    v_flex()
-                        .flex_none()
-                        .w(px(card_width))
-                        .min_h(px(140.))
-                        .p_4()
-                        .gap_3()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .child(format!("Task placeholder {}", index + 1))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Task planning is coming later"),
-                        )
-                })),
-            );
+            body = body
+                .child(self.heading("Recent Tasks", "Tasks", cx))
+                .child(div().h(px(360.)).child(self.tasks.clone()));
             body = body.child(
                 Checkbox::new("show-completed")
                     .label("Show completed todos and read links")

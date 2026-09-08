@@ -22,6 +22,7 @@ mod preview;
 mod review;
 mod session;
 mod settings;
+mod tasks;
 mod workspace;
 mod workspace_settings;
 

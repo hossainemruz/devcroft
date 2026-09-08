@@ -62,10 +62,17 @@ pub(crate) enum WorkspaceTab {
     Editor,
     Terminal,
     Review,
+    Tasks,
 }
 
 impl WorkspaceTab {
-    pub(crate) const ALL: [Self; 4] = [Self::Agent, Self::Editor, Self::Terminal, Self::Review];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Agent,
+        Self::Editor,
+        Self::Terminal,
+        Self::Review,
+        Self::Tasks,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -73,6 +80,7 @@ impl WorkspaceTab {
             Self::Editor => "Editor",
             Self::Terminal => "Terminal",
             Self::Review => "Review",
+            Self::Tasks => "Tasks",
         }
     }
 
@@ -82,14 +90,13 @@ impl WorkspaceTab {
             // label in Settings and the spawned command cannot drift.
             Self::Agent => Some(AgentKind::DEFAULT.command()),
             Self::Editor => Some("nvim ."),
-            Self::Terminal | Self::Review => None,
+            Self::Terminal | Self::Review | Self::Tasks => None,
         }
     }
 
-    /// Whether the tab hosts a terminal pane. `Review` renders its own
-    /// (currently empty) content instead of spawning a shell.
+    /// Review and Tasks render native content instead of hosting a shell.
     pub(crate) fn has_terminal(self) -> bool {
-        !matches!(self, Self::Review)
+        !matches!(self, Self::Review | Self::Tasks)
     }
 }
 
@@ -138,6 +145,7 @@ impl GitPoll {
 }
 
 pub(crate) struct Workspace {
+    tasks: Entity<crate::tasks::TaskBrowser>,
     home: Entity<HomeView>,
     home_visible: bool,
     portable_git_poll: GitPoll,
@@ -295,7 +303,10 @@ impl Workspace {
                 if this
                     .update(cx, |this, cx| {
                         if this.portable_git_poll.commit(generation, status) {
-                            this.home.update(cx, |view, cx| view.refresh_artifacts(cx));
+                            if !this.home_visible && this.active_tab == WorkspaceTab::Tasks {
+                                this.tasks.update(cx, |view, cx| view.refresh_all(cx));
+                            }
+                            this.home.update(cx, |view, cx| view.refresh_planning(cx));
                             cx.notify();
                         }
                     })
@@ -385,6 +396,13 @@ impl Workspace {
 
         Self {
             home,
+            tasks: cx.new(|cx| {
+                crate::tasks::TaskBrowser::new(
+                    data_root.clone(),
+                    crate::tasks::Scope::Repository(current_repository.clone()),
+                    cx,
+                )
+            }),
             home_visible: true,
             portable_git_poll: GitPoll::default(),
             active_tab,
@@ -429,6 +447,10 @@ impl Workspace {
         }
         if self.active_tab == WorkspaceTab::Review {
             self.review.read(cx).focus_handle.clone().focus(window, cx);
+            return;
+        }
+        if self.active_tab == WorkspaceTab::Tasks {
+            self.tasks.read(cx).focus_handle.clone().focus(window, cx);
             return;
         }
         if let Some(Some(pane)) = self.tabs.get(self.active_tab as usize) {
@@ -681,6 +703,12 @@ impl Workspace {
             .to_owned()
             .into();
         self.current_repository = Some(key.to_owned());
+        self.tasks.update(cx, |view, cx| {
+            view.set_scope(
+                crate::tasks::Scope::Repository(self.current_repository.clone()),
+                cx,
+            )
+        });
         // Reset plus an immediate fresh load: the header shows the new
         // checkout's state within one scan instead of flashing the old
         // checkout's status until the next poll tick — and the load id
@@ -721,6 +749,9 @@ impl Workspace {
     }
 
     fn enter_repository(&mut self, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| {
+            view.set_active(self.active_tab == WorkspaceTab::Tasks, cx)
+        });
         self.home_visible = false;
         self.home.update(cx, |view, cx| view.deactivate(cx));
         for tab in WorkspaceTab::ALL {
@@ -733,6 +764,7 @@ impl Workspace {
     }
 
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
         self.home.update(cx, |view, cx| view.activate(cx));
@@ -873,6 +905,9 @@ impl Workspace {
     /// underneath them may have moved — a sync rebase or a Settings branch
     /// switch. Shared so both paths reload exactly the same set.
     pub(crate) fn reload_portable_projections(&mut self, cx: &mut Context<Self>) {
+        if !self.home_visible && self.active_tab == WorkspaceTab::Tasks {
+            self.tasks.update(cx, |view, cx| view.refresh_all(cx));
+        }
         self.home.update(cx, |view, cx| view.reload(cx));
         self.reload_recent_repositories();
         self.review.update(cx, |view, cx| view.reload(cx));
@@ -1002,6 +1037,9 @@ impl Workspace {
         if self.home_visible {
             return self.home.clone().into_any_element();
         }
+        if self.active_tab == WorkspaceTab::Tasks {
+            return self.tasks.clone().into_any_element();
+        }
         if self.active_tab == WorkspaceTab::Review {
             return self.review.clone().into_any_element();
         }
@@ -1070,7 +1108,10 @@ impl Render for Workspace {
 
         v_flex()
             .relative()
-            .when(self.home_visible, |this| this.tab_group())
+            .when(
+                self.home_visible || self.active_tab == WorkspaceTab::Tasks,
+                |this| this.tab_group(),
+            )
             .size_full()
             .bg(rgb(0x080909))
             .text_color(rgb(0xe7e7e7))
@@ -1346,6 +1387,9 @@ mod tests {
         assert_eq!(WorkspaceTab::Review.command(), None);
         assert_eq!(WorkspaceTab::Review.label(), "Review");
         assert!(!WorkspaceTab::Review.has_terminal());
+        assert_eq!(WorkspaceTab::Tasks.label(), "Tasks");
+        assert_eq!(WorkspaceTab::Tasks.command(), None);
+        assert!(!WorkspaceTab::Tasks.has_terminal());
     }
 
     fn dirty_status() -> GitStatus {

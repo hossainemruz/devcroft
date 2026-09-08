@@ -37,7 +37,7 @@ devcroft task list --json
 devcroft artifact create --title "Design RFC" --kind rfc --content-file design.md --json
 ```
 
-Records use the selected `DEVCROFT_DATA_DIR` or the normal per-OS data root, independent of source repositories. Updates require last-read revision tokens; Markdown input accepts a UTF-8 file or `-` for stdin. See the [command/output contract](docs/task-cli.md) and [shared OpenCode/Claude agent instructions](docs/task-agent-instructions.md). Task/artifact desktop browsing remains planned.
+Records use the selected `DEVCROFT_DATA_DIR` or the normal per-OS data root, independent of source repositories. Updates require last-read revision tokens; Markdown input accepts a UTF-8 file or `-` for stdin. See the [command/output contract](docs/task-cli.md) and [shared OpenCode/Claude agent instructions](docs/task-agent-instructions.md). The desktop provides [global/repository task views and real Home summaries](docs/task-ui.md), plus a [live artifact browser and Markdown viewer](docs/artifact-ui.md). Creation and content/status editing remain CLI/agent workflows.
 
 ## Requirements
 

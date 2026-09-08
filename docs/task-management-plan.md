@@ -1,6 +1,6 @@
 # Task management plan
 
-Status: agreed product scope and implementation sequence; PRs 1–3's task/artifact stores, linking, sync coordination, and headless CLI are implemented. PR 4's global artifact browser and live Markdown viewer are implemented with automated coverage; interactive UI smoke validation remains pending (see [`artifact-ui.md`](artifact-ui.md)). Concrete contracts are in [`task-storage.md`](task-storage.md) and [`task-cli.md`](task-cli.md), with shared [agent instructions](task-agent-instructions.md). PR 5 remains planned; task views are not implemented yet. This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
+Status: agreed product scope and implementation sequence; PRs 1–3's task/artifact stores, linking, sync coordination, and headless CLI are implemented. PRs 4–5's artifact viewer, global/repository task views, and real Home summaries are implemented with automated coverage. Interactive desktop acceptance remains pending; see [`artifact-ui.md`](artifact-ui.md) and [`task-ui.md`](task-ui.md). Concrete contracts are in [`task-storage.md`](task-storage.md) and [`task-cli.md`](task-cli.md), with shared [agent instructions](task-agent-instructions.md). This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
 
 ## Goal and boundaries
 
@@ -142,7 +142,7 @@ Acceptance: binary integration tests use an isolated data root to create an idea
 
 This is the first usable milestone: agents can manage persistent tasks and artifacts before desktop browsing is complete.
 
-### PR 4 — Artifact browsing and viewer
+### PR 4 — Artifact browsing and viewer (Done)
 
 Add global artifact browsing, Markdown viewer/popup, copy IDs, archive/unarchive, archived access, and refresh. Depends on PR 2; use PR 3 for agent-driven smoke validation when available.
 
@@ -150,11 +150,13 @@ Acceptance: find and read an RFC before any task exists, view archived artifacts
 
 Implemented: Home → Browse artifacts, active/archived browsing, shared ID-based Markdown reading, copy controls, revision-checked archive/unarchive, and serialized background refresh on a two-second cadence plus manual and portable-change reloads. Automated loader and binary smoke coverage passes; follow the [interactive acceptance checklist](artifact-ui.md#interactive-acceptance-checklist) before considering desktop acceptance complete.
 
-### PR 5 — Global and repository task views
+### PR 5 — Global and repository task views (Done)
 
 Add global/repository task lists, complete task detail, subtask progress/status/dependencies, artifact links, archive controls, refresh, and real Home recent-task summaries. Depends on task stores and integrates PR 4's viewer; task-view development can otherwise overlap artifact-view development.
 
 Acceptance: exercise the API → backend → deployment example from every repository, showing only relevant tasks in lists but all subtasks in detail. Verify repository-less ideas globally, Not planned versus complete, archived browsing, task/subtask artifact links, stale/missing records, and CLI/sync refresh. Confirm task progress is unaffected by PR state.
+
+Implemented: Home's Recent Tasks uses four real active summaries; View all opens the global list, and each workspace has a repository-key-filtered Tasks tab. Task details retain the full Markdown description and ordered cross-repository subtask breakdown, status, dependencies, artifact links, warnings, derived progress, and revision-checked archive controls. The existing artifact viewer is shared by task/subtask links. Serialized background polling and manual/portable-change reloads update open views without navigation. Automated loader and headless binary coverage exercises the representative multi-repository workflow; interactive acceptance remains pending in the [task UI checklist](task-ui.md#interactive-acceptance-checklist).
 
 ## Validation and implementation touchpoints
 

@@ -21,14 +21,14 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const PAGE_SIZE: usize = 100;
 
 #[derive(Default)]
-struct Refresh {
-    busy: bool,
-    pending: bool,
+pub(crate) struct Refresh {
+    pub(crate) busy: bool,
+    pub(crate) pending: bool,
     generation: u64,
 }
 
 impl Refresh {
-    fn request(&mut self) -> Option<u64> {
+    pub(crate) fn request(&mut self) -> Option<u64> {
         self.generation = self.generation.wrapping_add(1);
         if self.busy {
             self.pending = true;
@@ -39,7 +39,7 @@ impl Refresh {
         Some(self.generation)
     }
 
-    fn finish(&mut self, generation: u64) -> bool {
+    pub(crate) fn finish(&mut self, generation: u64) -> bool {
         self.busy = false;
         generation == self.generation
     }

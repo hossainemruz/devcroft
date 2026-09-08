@@ -3,16 +3,18 @@
 use crate::artifacts::{ArtifactBrowser, Refresh};
 use crate::data::DataRoot;
 use crate::data::tasks::{ListOptions, Snapshot, Status, Task, TaskList, TaskStore};
+use crate::relative_time::{current_unix_secs, relative_duration_label};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, ColorName, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _,
+    h_flex, tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
     IntoElement, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Window, div,
+    Styled, Window, div, px,
 };
 use std::{collections::HashMap, time::Duration};
 
@@ -63,6 +65,22 @@ fn load(
     }
 }
 
+/// Recent-tasks grid sizing: roomier minimum than project cards (titles,
+/// pills and badges need ~340px), capped at 3 columns — 2 across on small
+/// windows, 3 on large ones. The 48px inset is Home body padding; the
+/// embedded browser carries no padding of its own so cards align with the
+/// section title.
+fn recent_task_columns(viewport_width: f32) -> usize {
+    let available = (viewport_width.min(1440.) - 48.).max(1.);
+    ((available + 16.) / (340. + 16.)).floor().clamp(1., 3.) as usize
+}
+
+fn recent_task_card_width(viewport_width: f32) -> f32 {
+    let available = (viewport_width.min(1440.) - 48.).max(1.);
+    let columns = recent_task_columns(viewport_width) as f32;
+    (available - (columns - 1.) * 16.) / columns
+}
+
 pub(crate) fn progress_label(task: &Task) -> String {
     let progress = task.progress();
     if !progress.is_planned() {
@@ -81,6 +99,136 @@ fn status_label(status: Status) -> &'static str {
         Status::Blocked => "blocked",
         Status::Done => "done",
     }
+}
+
+/// Card status pill, derived: tasks carry no own status, only subtask
+/// states plus the archived flag. Deliberately never `Blocked` — a task
+/// with one blocked and four done subtasks is nearly complete, not
+/// blocked; the blocked count surfaces separately so the pill can't lie.
+pub(crate) fn task_card_status(task: &Task) -> &'static str {
+    if task.archived {
+        return "Archived";
+    }
+    let progress = task.progress();
+    if !progress.is_planned() {
+        return "Not planned";
+    }
+    if progress.is_complete() {
+        return "Complete";
+    }
+    if task.subtasks.iter().all(|s| s.status == Status::Todo) {
+        return "Todo";
+    }
+    "In progress"
+}
+
+pub(crate) fn blocked_subtask_count(task: &Task) -> usize {
+    task.subtasks
+        .iter()
+        .filter(|s| s.status == Status::Blocked)
+        .count()
+}
+
+/// `1/4` for the title-row pill. `None` when unplanned — the title then
+/// takes the full row instead of clipping against a wide status pill.
+pub(crate) fn task_card_progress(task: &Task) -> Option<String> {
+    let progress = task.progress();
+    progress
+        .is_planned()
+        .then(|| format!("{}/{}", progress.completed, progress.total))
+}
+
+/// `In progress · Updated 3h ago`. The ID is gone on purpose: an
+/// uncopyable ID is decoration, and copy lives in the detail header.
+pub(crate) fn task_card_meta(task: &Task, now_secs: i64) -> String {
+    format!(
+        "{} · {}",
+        task_card_status(task),
+        task_updated_label(task, now_secs)
+    )
+}
+
+pub(crate) fn task_updated_label(task: &Task, now_secs: i64) -> String {
+    let updated = now_secs.saturating_sub(task.updated_at as i64).max(0);
+    format!("Updated {}", relative_duration_label(updated))
+}
+
+/// One hue per card state, rendered with the component library's `Tag`
+/// (tinted recipe: subtle bg, strong text). Dormant states take gray so
+/// the eye lands on work with momentum.
+fn task_status_color(status: &str) -> ColorName {
+    match status {
+        "Complete" => ColorName::Green,
+        "In progress" => ColorName::Blue,
+        "Todo" => ColorName::Yellow,
+        "Blocked" => ColorName::Red,
+        _ => ColorName::Gray,
+    }
+}
+
+/// `4 Subtasks · 2 Repositories · 3 Artifacts`, skipping zero parts.
+/// `None` for a bare idea with nothing to count — the card drops the row
+/// instead of printing zeroes.
+pub(crate) fn task_card_stats(task: &Task) -> Option<String> {
+    let mut parts = Vec::new();
+    let subtasks = task.subtasks.len();
+    if subtasks > 0 {
+        parts.push(count_label(subtasks, "Subtask", "Subtasks"));
+    }
+    let repositories = task.involved_repositories().len();
+    if repositories > 0 {
+        parts.push(count_label(repositories, "Repository", "Repositories"));
+    }
+    let artifacts = task.artifacts.len()
+        + task
+            .subtasks
+            .iter()
+            .map(|subtask| subtask.artifacts.len())
+            .sum::<usize>();
+    if artifacts > 0 {
+        parts.push(count_label(artifacts, "Artifact", "Artifacts"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+/// The most useful next line on the card: in-flight work first, then the
+/// first todo whose dependencies are all done, then the first blocker.
+/// `None` for bare ideas and finished tasks — nothing to point at.
+pub(crate) fn task_next_up(task: &Task) -> Option<String> {
+    let progress = task.progress();
+    if !progress.is_planned() || progress.is_complete() {
+        return None;
+    }
+    if let Some(active) = task.subtasks.iter().find(|s| s.status == Status::Doing) {
+        return Some(format!("Active: {}", active.title));
+    }
+    let done: std::collections::HashSet<&str> = task
+        .subtasks
+        .iter()
+        .filter(|s| s.status == Status::Done)
+        .map(|s| s.id.as_str())
+        .collect();
+    if let Some(next) = task.subtasks.iter().find(|s| {
+        s.status == Status::Todo && s.dependencies.iter().all(|dep| done.contains(dep.as_str()))
+    }) {
+        return Some(format!("Next: {}", next.title));
+    }
+    task.subtasks
+        .iter()
+        .find(|s| s.status == Status::Blocked)
+        .map(|s| format!("Blocked on: {}", s.title))
 }
 
 pub(crate) struct OpenedTask;
@@ -403,7 +551,7 @@ impl TaskBrowser {
 }
 
 impl Render for TaskBrowser {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.artifact_open {
             // Titlebar back drills out (artifact → task → list → origin), so
             // no duplicate back button when the titlebar owns chrome.
@@ -468,8 +616,16 @@ impl Render for TaskBrowser {
             )
             .size_full()
             .min_h_0()
-            .gap_3()
-            .p_3();
+            .gap_3();
+        // Embedded on Home (`recent`) the browser hugs content and aligns
+        // with section edges: no forced height, no chrome padding. The old
+        // fixed-height box left a void under short lists and its padding
+        // indented cards past the section title. Full pages keep both.
+        body = if self.recent {
+            body.w_full().p_0()
+        } else {
+            body.size_full().p_3()
+        };
         // No body title or manual refresh: the repository tab already shows
         // the checkout in the titlebar, the global page shows "Tasks" there,
         // and new/updated tasks arrive through the active 2-second poll.
@@ -595,60 +751,149 @@ impl Render for TaskBrowser {
                     "No tasks. Ask an agent to create an idea with devcroft task create."
                 });
             }
+            // Copying an ID stays in the detail header; rows stay scannable.
+            // Recent mode tiles a grid (2 across on small windows, 3 on
+            // large ones); the full page keeps full-width rows.
+            let card_width = self
+                .recent
+                .then(|| recent_task_card_width(f32::from(window.viewport_size().width)));
+            let now_secs = current_unix_secs();
+            let mut cards = Vec::with_capacity(self.list.tasks.len());
             for snapshot in &self.list.tasks {
                 let task = &snapshot.task;
                 let id = task.id.clone();
-                let copy = id.clone();
-                list = list.child(
-                    h_flex()
-                        .gap_2()
-                        .flex_none()
-                        .child(
-                            gpui_kit::base::Button::new(SharedString::from(format!("open-{id}")))
-                                .accessibility_label(format!("Open {} · {id}", task.title))
-                                .flex_1()
-                                .min_w_0()
-                                .flex_col()
-                                .items_start()
-                                .p_3()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded_md()
-                                .focus(|style| style.border_color(cx.theme().ring))
-                                .hover(|style| style.bg(cx.theme().secondary))
+                let progress = task_card_progress(task);
+                let status = task_card_status(task);
+                let meta = task_card_meta(task, now_secs);
+                let updated = task_updated_label(task, now_secs);
+                let blocked = blocked_subtask_count(task);
+                let stats = task_card_stats(task);
+                let accessible = match &stats {
+                    Some(stats) => format!("Open {} · {meta} · {stats}", task.title),
+                    None => format!("Open {} · {meta}", task.title),
+                };
+                let open = id.clone();
+                let card = gpui_kit::base::Button::new(SharedString::from(format!("open-{id}")))
+                    .accessibility_label(accessible)
+                    .flex_none()
+                    .flex_col()
+                    .items_start()
+                    .gap_3()
+                    .p_3()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded_md()
+                    .focus(|style| style.border_color(cx.theme().ring))
+                    .hover(|style| style.bg(cx.theme().secondary))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .font_semibold()
+                                    .child(task.title.clone()),
+                            )
+                            .when_some(progress, |row, counts| {
+                                row.child(
+                                    Tag::secondary()
+                                        .with_size(Size::Small)
+                                        .rounded_full()
+                                        .flex_none()
+                                        .child(counts),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .overflow_hidden()
+                            .child(
+                                Tag::color(task_status_color(status))
+                                    .with_size(Size::Small)
+                                    .rounded_full()
+                                    .flex_none()
+                                    .child(status),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(updated),
+                            ),
+                    )
+                    .when_some(stats, |row, text| {
+                        row.child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_2()
+                                .overflow_hidden()
                                 .child(
                                     div()
-                                        .w_full()
-                                        .overflow_hidden()
+                                        .flex_none()
                                         .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .font_semibold()
-                                        .child(task.title.clone()),
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(text),
                                 )
-                                .child(format!(
-                                    "{id} · {}{}",
-                                    progress_label(task),
-                                    if task.archived { " · Archived" } else { "" }
-                                ))
-                                .child(repository_badges(task, cx))
-                                .when(!snapshot.warnings.is_empty(), |row| {
+                                .when(blocked > 0, |row| {
                                     row.child(
-                                        "⚠ Missing or unreadable references — open for details",
+                                        Tag::color(ColorName::Red)
+                                            .with_size(Size::Small)
+                                            .rounded_full()
+                                            .flex_none()
+                                            .child(format!("{blocked} blocked")),
                                     )
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open(id.clone(), window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("copy-{copy}")))
-                                .label("Copy ID")
-                                .on_click(move |_, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-                                    window.push_notification("Task ID copied", cx);
                                 }),
-                        ),
+                        )
+                    })
+                    .when_some(task_next_up(task), |row, text| {
+                        row.child(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(text),
+                        )
+                    })
+                    .when(!snapshot.warnings.is_empty(), |row| {
+                        row.child("⚠ Missing or unreadable references — open for details")
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.open(open.clone(), window, cx)),
+                    );
+                let card = match card_width {
+                    Some(width) => card.w(px(width)),
+                    None => card.w_full(),
+                };
+                cards.push(card.into_any_element());
+            }
+            if self.recent {
+                list = list.child(
+                    h_flex()
+                        .w_full()
+                        .gap_4()
+                        .flex_wrap()
+                        .items_stretch()
+                        .children(cards),
                 );
+            } else {
+                list = list.children(cards);
             }
             if self.list.truncated && !self.recent {
                 list = list.child(Button::new("more-tasks").label("Load 100 more").on_click(

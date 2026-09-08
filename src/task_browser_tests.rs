@@ -312,3 +312,195 @@ fn progress_is_only_subtask_status_and_archive_does_not_finish_work() {
         .unwrap();
     assert_eq!(progress_label(&done.task), "Complete · 1/1 done");
 }
+
+#[test]
+fn cards_derive_status_from_subtasks_without_a_task_level_field() {
+    let (_dir, _root, store) = fixture();
+    let snapshot = idea(&store);
+    assert_eq!(task_card_status(&snapshot.task), "Not planned");
+    assert_eq!(blocked_subtask_count(&snapshot.task), 0);
+    let mut current = snapshot;
+    for repository in ["public-api", "backend"] {
+        current = store
+            .create_subtask(
+                &current.task.id,
+                &current.revision,
+                NewSubtask {
+                    title: repository.into(),
+                    repository: repository.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(task_card_status(&current.task), "Todo");
+    let mut doing = current.task.clone();
+    doing.subtasks[0].status = Status::Doing;
+    assert_eq!(task_card_status(&doing), "In progress");
+    assert_eq!(blocked_subtask_count(&doing), 0);
+    let mut stuck = current.task.clone();
+    stuck.subtasks[0].status = Status::Blocked;
+    stuck.subtasks[1].status = Status::Done;
+    assert_eq!(task_card_status(&stuck), "In progress");
+    assert_eq!(blocked_subtask_count(&stuck), 1);
+    // The blocked pill lives on the stats row, so a blocked task must
+    // always have stats to host it.
+    assert!(task_card_stats(&stuck).is_some());
+    let mut done = current.task.clone();
+    for subtask in &mut done.subtasks {
+        subtask.status = Status::Done;
+    }
+    assert_eq!(task_card_status(&done), "Complete");
+    let mut archived = current.task.clone();
+    archived.archived = true;
+    assert_eq!(task_card_status(&archived), "Archived");
+}
+
+#[test]
+fn recent_grid_fits_two_small_and_three_large() {
+    assert_eq!(recent_task_columns(600.), 1);
+    assert_eq!(recent_task_columns(800.), 2);
+    assert_eq!(recent_task_columns(900.), 2);
+    assert_eq!(recent_task_columns(1200.), 3);
+    assert_eq!(recent_task_columns(1440.), 3);
+    assert_eq!(recent_task_columns(2560.), 3);
+    for (viewport, columns) in [(600., 1.), (800., 2.), (1440., 3.)] {
+        let occupied = recent_task_card_width(viewport) * columns + (columns - 1.) * 16.;
+        assert!((occupied - (viewport.min(1440.) - 48.)).abs() < 0.01);
+    }
+}
+
+#[test]
+fn cards_show_status_and_recency_in_the_meta_line() {
+    let (_dir, _root, store) = fixture();
+    let snapshot = idea(&store);
+    let mut task = snapshot.task;
+    task.updated_at = 1_717_200_000;
+    assert_eq!(
+        task_card_meta(&task, 1_717_200_000),
+        "Not planned · Updated just now"
+    );
+    assert_eq!(
+        task_card_meta(&task, 1_717_200_000 + 7_200),
+        "Not planned · Updated 2h ago"
+    );
+    assert_eq!(task_card_progress(&task), None);
+    let planned = store
+        .create_subtask(
+            &task.id,
+            &snapshot.revision,
+            NewSubtask {
+                title: "Only".into(),
+                repository: "backend".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    task.subtasks = planned.task.subtasks;
+    assert_eq!(task_card_progress(&task).as_deref(), Some("0/1"));
+    task.subtasks[0].status = Status::Done;
+    assert_eq!(task_card_progress(&task).as_deref(), Some("1/1"));
+    assert_eq!(
+        task_card_meta(&task, 1_717_200_000),
+        "Complete · Updated just now"
+    );
+}
+
+#[test]
+fn cards_count_subtasks_repositories_and_artifacts() {
+    let (_dir, _root, store) = fixture();
+    let snapshot = idea(&store);
+    assert_eq!(task_card_stats(&snapshot.task), None);
+    let planned = store
+        .create_subtask(
+            &snapshot.task.id,
+            &snapshot.revision,
+            NewSubtask {
+                title: "First".into(),
+                repository: "backend".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut task = planned.task;
+    task.repositories = vec!["backend".into(), "public-api".into()];
+    task.artifacts = vec!["art-1".into()];
+    assert_eq!(
+        task_card_stats(&task).as_deref(),
+        Some("1 Subtask · 2 Repositories · 1 Artifact")
+    );
+    let second = store
+        .create_subtask(
+            &task.id,
+            &planned.revision,
+            NewSubtask {
+                title: "Second".into(),
+                repository: "backend".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    task.subtasks = second.task.subtasks;
+    assert_eq!(
+        task_card_stats(&task).as_deref(),
+        Some("2 Subtasks · 2 Repositories · 1 Artifact")
+    );
+}
+
+#[test]
+fn cards_point_at_the_next_actionable_subtask() {
+    let (_dir, _root, store) = fixture();
+    let snapshot = idea(&store);
+    assert_eq!(task_next_up(&snapshot.task), None);
+    // Beta waits on Alpha; Gamma is free.
+    let mut current = snapshot;
+    for (title, dependencies) in [
+        ("Alpha", vec![]),
+        ("Beta", vec!["s1".into()]),
+        ("Gamma", vec![]),
+    ] {
+        current = store
+            .create_subtask(
+                &current.task.id,
+                &current.revision,
+                NewSubtask {
+                    title: title.into(),
+                    repository: "backend".into(),
+                    dependencies,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(task_next_up(&current.task).as_deref(), Some("Next: Alpha"));
+    let mut doing = current.task.clone();
+    doing.subtasks[2].status = Status::Doing;
+    assert_eq!(task_next_up(&doing).as_deref(), Some("Active: Gamma"));
+    // Finishing Alpha unblocks Beta; Gamma still in flight.
+    let mut unblocked = doing.clone();
+    unblocked.subtasks[0].status = Status::Done;
+    assert_eq!(task_next_up(&unblocked).as_deref(), Some("Active: Gamma"));
+    let mut idle = unblocked.clone();
+    idle.subtasks[2].status = Status::Todo;
+    assert_eq!(task_next_up(&idle).as_deref(), Some("Next: Beta"));
+    let mut stuck = idle.clone();
+    stuck.subtasks[1].status = Status::Blocked;
+    stuck.subtasks[2].status = Status::Blocked;
+    assert_eq!(task_next_up(&stuck).as_deref(), Some("Blocked on: Beta"));
+    let mut done = stuck.clone();
+    for subtask in &mut done.subtasks {
+        subtask.status = Status::Done;
+    }
+    assert_eq!(task_next_up(&done), None);
+}
+
+#[test]
+fn status_pills_map_each_state_to_its_hue() {
+    assert_eq!(task_status_color("Complete"), ColorName::Green);
+    assert_eq!(task_status_color("In progress"), ColorName::Blue);
+    assert_eq!(task_status_color("Todo"), ColorName::Yellow);
+    assert_eq!(task_status_color("Blocked"), ColorName::Red);
+    for dormant in ["Not planned", "Archived", "anything-else"] {
+        assert_eq!(task_status_color(dormant), ColorName::Gray);
+    }
+}

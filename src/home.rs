@@ -6,7 +6,8 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, ColorName, Disableable as _, Size, Sizable, StyledExt as _, WindowExt as _,
+    h_flex, tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -23,6 +24,7 @@ fn item_id(prefix: &str, id: &str) -> SharedString {
 use crate::data::dashboard::{Category, Dashboard, Item, Kind, safe_web_url};
 use crate::data::{DataRoot, RecentRepository, SyncStatus, SyncTracker, recent_repositories};
 use crate::git_status::{GitStatus, load_git_status};
+use crate::relative_time::{current_unix_secs, relative_duration_label};
 
 const PROJECT_GIT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -78,6 +80,108 @@ fn project_git_label(status: Option<&GitStatus>) -> String {
         Some(detail) => format!("{branch} · {detail}"),
         None => branch,
     }
+}
+
+/// Tag content for the git state row: `Some((label, hue))` once git
+/// resolves, `None` while loading or unavailable (muted text instead).
+/// Dirty is amber caution, not red — red already means blocked elsewhere.
+/// Shared with the workspace titlebar so both stay the same hue.
+pub(crate) fn project_state_tag(status: Option<&GitStatus>) -> Option<(&'static str, ColorName)> {
+    match status {
+        None => None,
+        Some(status) if status.branch.is_none() => None,
+        Some(status) if status.dirty => Some(("Modified", ColorName::Amber)),
+        Some(_) => Some(("Clean", ColorName::Green)),
+    }
+}
+
+/// Short branch text for the card pill: `⎇ main`, or `◍ abcdef1` for a
+/// detached HEAD. `None` while loading or when git is unavailable.
+fn project_branch_pill(status: Option<&GitStatus>) -> Option<String> {
+    let status = status?;
+    let branch = status.branch.as_ref()?;
+    Some(if status.detached {
+        format!("◍ {branch}")
+    } else {
+        format!("⎇ {branch}")
+    })
+}
+
+/// Ahead/behind counts as one trailing fragment (`↑2 · ↓1`), if any.
+fn project_sync_label(status: Option<&GitStatus>) -> Option<String> {
+    let status = status?;
+    status.branch.as_ref()?;
+    let parts: Vec<String> = status
+        .ahead_label()
+        .into_iter()
+        .chain(status.behind_label())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+/// Parse the `YYYY-MM-DDTHH:MM:SSZ` timestamps written by
+/// `record_repository_open`. Returns unix seconds. Hand-rolled so recency
+/// needs no date dependency; rejects anything outside the exact shape.
+fn parse_rfc3339_utc(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20 {
+        return None;
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let number =
+        |from: usize, to: usize| -> Option<i64> { value.get(from..to)?.parse::<i64>().ok() };
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days since 1970-01-01 (Howard Hinnant's civil-from-days, inverted).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 {
+        adjusted_year / 400
+    } else {
+        (adjusted_year - 399) / 400
+    };
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// `Opened 2h ago` for the card footer. `None` when never opened or when
+/// the stored timestamp is malformed; callers fall back to `Not opened yet`.
+fn project_opened_label(last_opened_at: Option<&str>, now_secs: i64) -> Option<String> {
+    let raw = last_opened_at.filter(|value| !value.is_empty())?;
+    let then = parse_rfc3339_utc(raw)?;
+    let diff = now_secs.saturating_sub(then);
+    Some(format!("Opened {}", relative_duration_label(diff)))
 }
 
 pub(crate) enum HomeEvent {
@@ -859,7 +963,14 @@ impl Render for HomeView {
                 .into_any_element();
         }
         let card_width = recent_card_width(f32::from(window.viewport_size().width));
-        let mut body = v_flex().w_full().max_w(px(1440.)).mx_auto().gap_6().p_6();
+        let mut body = v_flex()
+            .w_full()
+            .max_w(px(1440.))
+            .mx_auto()
+            .gap_4()
+            .px_6()
+            .pt_4()
+            .pb_6();
         if let Some(page) = self.page {
             body = body
                 .child(
@@ -875,31 +986,43 @@ impl Render for HomeView {
                     "Use Home to manage your current items. More views and workflows will follow.",
                 );
         } else {
-            body = body.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Tab to navigate · Enter/Space to activate · Arrow keys between projects · Page Up/Down to scroll"),
-            );
             if let Some(error) = &self.error {
                 body = body.child(div().text_color(cx.theme().danger).child(error.clone()));
             }
             body = body.child(self.heading("Recent Projects", "Projects", cx));
             let mut projects = h_flex().gap_4().flex_wrap();
+            let now_secs = current_unix_secs();
             for (index, project) in self.projects.iter().enumerate() {
                 let key = project.key.clone();
                 let label = project.display_name.clone().unwrap_or_else(|| key.clone());
                 let open_label = label.clone();
                 let git_status = self.project_git.statuses.get(&project.checkout_path);
                 let status = project_git_label(git_status);
-                let branch = project_branch_label(git_status);
-                let working_tree = project_working_tree_label(git_status);
+                let group = project
+                    .group
+                    .clone()
+                    .filter(|value| !value.trim().is_empty());
+                let description = project
+                    .description
+                    .clone()
+                    .filter(|value| !value.trim().is_empty());
+                let state = project_state_tag(git_status);
+                let pending = match git_status {
+                    None => Some("Loading Git status…"),
+                    Some(status) if status.branch.is_none() => Some("Git status unavailable"),
+                    _ => None,
+                };
+                let branch_pill = project_branch_pill(git_status);
+                let sync = project_sync_label(git_status);
+                let opened = project_opened_label(project.last_opened_at.as_deref(), now_secs)
+                    .unwrap_or_else(|| "Not opened yet".to_owned());
+                let accessible = format!("Open {label}. {status}. {opened}");
                 projects = projects.child(
                     // gpui-kit Base Button supplies pointer, Enter/Space, tab
                     // traversal and accessibility semantics for the whole card.
                     gpui_kit::base::Button::new(item_id("project", &key))
                         .track_focus(&self.project_focus[&key])
-                        .accessibility_label(format!("Open {label}. {status}"))
+                        .accessibility_label(accessible)
                         .cursor_pointer()
                         .flex_col()
                         .items_start()
@@ -907,7 +1030,7 @@ impl Render for HomeView {
                         .flex_none()
                         .w(px(card_width))
                         .min_h(px(160.))
-                        .gap_3()
+                        .gap_2()
                         .p_4()
                         .rounded_lg()
                         .border_1()
@@ -938,41 +1061,111 @@ impl Render for HomeView {
                             }
                         }))
                         .child(
-                            div()
+                            h_flex()
                                 .w_full()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .font_semibold()
-                                .child(label),
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .font_semibold()
+                                        .child(label),
+                                )
+                                .when_some(group, |this, tag| {
+                                    this.child(
+                                        div()
+                                            .flex_none()
+                                            .px_2()
+                                            .rounded_full()
+                                            .bg(cx.theme().secondary)
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(tag),
+                                    )
+                                }),
                         )
                         .child(
-                            div()
+                            h_flex()
                                 .w_full()
-                                .text_sm()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(branch),
+                                .items_center()
+                                .gap_2()
+                                .flex_wrap()
+                                .when_some(state, |row, (label, hue)| {
+                                    row.child(
+                                        Tag::color(hue)
+                                            .with_size(Size::Small)
+                                            .rounded_full()
+                                            .flex_none()
+                                            .child(label),
+                                    )
+                                })
+                                .when_some(pending, |row, text| {
+                                    row.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(text),
+                                    )
+                                })
+                                .when_some(branch_pill, |this, pill| {
+                                    this.child(
+                                        Tag::secondary()
+                                            .with_size(Size::Small)
+                                            .rounded_full()
+                                            .flex_none()
+                                            .child(pill),
+                                    )
+                                })
+                                .when_some(sync, |this, counts| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(counts),
+                                    )
+                                }),
                         )
-                        .when_some(working_tree, |this, detail| {
+                        .when_some(description, |this, text| {
                             this.child(
                                 div()
                                     .w_full()
-                                    .text_sm()
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
+                                    .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(detail),
+                                    .child(text),
                             )
                         })
                         .child(
-                            div()
+                            h_flex()
+                                .w_full()
                                 .mt_auto()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Open workspace →"),
+                                .pt_1()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(opened),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Open →"),
+                                ),
                         ),
                 );
             }
@@ -992,15 +1185,22 @@ impl Render for HomeView {
             );
             body = body
                 .child(self.heading("Recent Tasks", "Tasks", cx))
-                .child(div().h(px(360.)).child(self.tasks.clone()));
+                .child(self.tasks.clone());
             body = body.child(
-                Checkbox::new("show-completed")
-                    .label("Show completed todos and read links")
-                    .checked(self.show_completed)
-                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                        this.show_completed = *checked;
-                        cx.notify();
-                    })),
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_lg().font_semibold().child("Inbox"))
+                    .child(
+                        Checkbox::new("show-completed")
+                            .label("Show completed")
+                            .checked(self.show_completed)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.show_completed = *checked;
+                                cx.notify();
+                            })),
+                    ),
             );
             body = body.child(
                 h_flex()
@@ -1160,5 +1360,70 @@ mod layout_tests {
             let occupied = recent_card_width(viewport) * columns + (columns - 1.) * 16.;
             assert!((occupied - (viewport - 48.)).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn project_cards_distinguish_state_branch_and_sync() {
+        assert_eq!(project_state_tag(None), None);
+        assert_eq!(project_state_tag(Some(&GitStatus::default())), None);
+        let clean = GitStatus {
+            branch: Some("main".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            project_state_tag(Some(&clean)),
+            Some(("Clean", ColorName::Green))
+        );
+        assert_eq!(project_branch_pill(Some(&clean)).as_deref(), Some("⎇ main"));
+        assert_eq!(project_sync_label(Some(&clean)), None);
+        let dirty = GitStatus {
+            branch: Some("main".into()),
+            dirty: true,
+            has_upstream: true,
+            ahead: 2,
+            behind: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            project_state_tag(Some(&dirty)),
+            Some(("Modified", ColorName::Amber))
+        );
+        assert_eq!(project_sync_label(Some(&dirty)).as_deref(), Some("↑2 · ↓1"));
+        let detached = GitStatus {
+            branch: Some("abcdef1".into()),
+            detached: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            project_branch_pill(Some(&detached)).as_deref(),
+            Some("◍ abcdef1")
+        );
+        assert_eq!(project_branch_pill(None), None);
+    }
+
+    #[test]
+    fn project_cards_label_recency_without_a_date_dependency() {
+        assert_eq!(
+            parse_rfc3339_utc("2024-06-01T00:00:00Z"),
+            Some(1_717_200_000)
+        );
+        assert_eq!(parse_rfc3339_utc("not-a-timestamp"), None);
+        assert_eq!(parse_rfc3339_utc("2024-13-01T00:00:00Z"), None);
+        let now = parse_rfc3339_utc("2024-06-01T00:00:00Z").unwrap();
+        assert_eq!(
+            project_opened_label(Some("2024-06-01T00:00:00Z"), now).as_deref(),
+            Some("Opened just now")
+        );
+        assert_eq!(
+            project_opened_label(Some("2024-05-31T22:00:00Z"), now).as_deref(),
+            Some("Opened 2h ago")
+        );
+        assert_eq!(
+            project_opened_label(Some("2024-05-25T00:00:00Z"), now).as_deref(),
+            Some("Opened 1w ago")
+        );
+        assert_eq!(project_opened_label(None, now), None);
+        assert_eq!(project_opened_label(Some(""), now), None);
+        assert_eq!(project_opened_label(Some("broken"), now), None);
     }
 }

@@ -181,6 +181,10 @@ pub(crate) struct RecentRepository {
     pub(crate) display_name: Option<String>,
     pub(crate) checkout_path: PathBuf,
     pub(crate) last_opened_at: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) group: Option<String>,
+    pub(crate) owner: Option<String>,
+    pub(crate) name: Option<String>,
 }
 
 impl RecentRepository {
@@ -230,6 +234,12 @@ pub(crate) fn recent_repositories(root: &DataRoot, limit: usize) -> Vec<RecentRe
             last_opened_at: binding
                 .and_then(|binding| binding.last_opened_at.clone())
                 .filter(|opened| !opened.is_empty()),
+            description: metadata
+                .description
+                .filter(|value| !value.trim().is_empty()),
+            group: metadata.group.filter(|value| !value.trim().is_empty()),
+            owner: metadata.owner.filter(|value| !value.trim().is_empty()),
+            name: metadata.name.filter(|value| !value.trim().is_empty()),
         });
     }
     recents.sort_by(
@@ -1064,6 +1074,37 @@ mod tests {
         assert_eq!(recents[0].key, "shown");
         assert_eq!(recents[0].label(), "Shown Repo");
         assert_eq!(recents[0].checkout_path, checkout);
+    }
+
+    #[test]
+    fn recent_passes_through_card_metadata() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        create_repository(
+            &root,
+            "grouped",
+            checkout.path(),
+            &NewRepositoryInput {
+                display_name: Some("Grouped Repo".to_owned()),
+                description: Some("What this checkout is for".to_owned()),
+                group: Some("work".to_owned()),
+                owner: Some("acme".to_owned()),
+                name: Some("grouped".to_owned()),
+                ..NewRepositoryInput::default()
+            },
+        )
+        .unwrap();
+
+        let recents = recent_repositories(&root, 10);
+        assert_eq!(recents.len(), 1);
+        assert_eq!(
+            recents[0].description.as_deref(),
+            Some("What this checkout is for")
+        );
+        assert_eq!(recents[0].group.as_deref(), Some("work"));
+        assert_eq!(recents[0].owner.as_deref(), Some("acme"));
+        assert_eq!(recents[0].name.as_deref(), Some("grouped"));
     }
 
     #[test]

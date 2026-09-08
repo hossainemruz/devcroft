@@ -19,6 +19,7 @@ mod keys;
 mod metrics;
 mod pane;
 mod preview;
+mod relative_time;
 mod review;
 mod session;
 mod settings;

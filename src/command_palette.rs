@@ -357,12 +357,20 @@ mod tests {
                 display_name: Some("First Repo".to_owned()),
                 checkout_path: PathBuf::from("/tmp/first"),
                 last_opened_at: Some("2024-06-01T00:00:00Z".to_owned()),
+                description: None,
+                group: None,
+                owner: None,
+                name: None,
             },
             RecentRepository {
                 key: "bbb-second".to_owned(),
                 display_name: None,
                 checkout_path: PathBuf::from("/tmp/second"),
                 last_opened_at: Some("2024-01-01T00:00:00Z".to_owned()),
+                description: None,
+                group: None,
+                owner: None,
+                name: None,
             },
         ]
     }

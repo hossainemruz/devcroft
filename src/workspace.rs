@@ -8,11 +8,9 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, IndexPath, Root, StyledExt as _, WindowExt as _,
-    command::{Command, CommandGroup, CommandItem, CommandState},
-    h_flex,
-    tab::{Tab, TabBar},
-    v_flex,
+    ActiveTheme as _, ColorName, Icon, IconName, IndexPath, Root, Size, Sizable, StyledExt as _,
+    WindowExt as _, command::{Command, CommandGroup, CommandItem, CommandState}, h_flex,
+    tab::{Tab, TabBar}, tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -32,7 +30,7 @@ use crate::data::{
     set_workspace_agent as persist_workspace_agent, sync_portable_with_tracker,
 };
 use crate::git_status::{GitStatus, load_git_status};
-use crate::home::{HomeEvent, HomeView};
+use crate::home::{HomeEvent, HomeView, project_state_tag};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
@@ -1498,30 +1496,48 @@ impl Render for Workspace {
                     })
                     .when(self.home_visible && !is_home_page, |header| {
                         let status = self.portable_git_poll.status();
-                        let label = if self.data_root.is_none() {
-                            "Portable data unavailable".to_owned()
-                        } else {
-                            format!(
-                                "Portable · {} {} {} {}",
-                                status.branch.as_deref().unwrap_or("Git unavailable"),
-                                if status.dirty {
-                                    "● Modified"
-                                } else if status.branch.is_some() {
-                                    "Clean"
-                                } else {
-                                    ""
-                                },
-                                status.ahead_label().unwrap_or_default(),
-                                status.behind_label().unwrap_or_default()
+                        // Just the state tag — branch and counts live in the
+                        // tooltip. Same hues as the project cards.
+                        let (label, hue, detail) = if self.data_root.is_none() {
+                            (
+                                "Unavailable",
+                                ColorName::Gray,
+                                "Portable data unavailable".to_owned(),
                             )
+                        } else {
+                            match project_state_tag(Some(status)) {
+                                Some((label, hue)) => {
+                                    let mut detail = format!(
+                                        "Portable · {} · {label}",
+                                        status.branch.as_deref().unwrap_or("Git unavailable")
+                                    );
+                                    for counts in status
+                                        .ahead_label()
+                                        .into_iter()
+                                        .chain(status.behind_label())
+                                    {
+                                        detail.push_str(" · ");
+                                        detail.push_str(&counts);
+                                    }
+                                    (label, hue, detail)
+                                }
+                                None => (
+                                    "Unavailable",
+                                    ColorName::Gray,
+                                    "Portable git status unavailable".to_owned(),
+                                ),
+                            }
                         };
                         header.child(
                             Button::new("portable-status")
                                 .ghost()
-                                .max_w(px(320.))
-                                .overflow_hidden()
-                                .tooltip(label.clone())
-                                .label(label)
+                                .tooltip(detail)
+                                .child(
+                                    Tag::color(hue)
+                                        .with_size(Size::Small)
+                                        .rounded_full()
+                                        .child(label),
+                                )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_settings(window, cx)
                                 })),

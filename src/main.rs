@@ -1,5 +1,6 @@
 mod add_repository;
 mod agent;
+mod artifacts;
 mod cli;
 mod command_palette;
 mod commands;

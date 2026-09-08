@@ -172,6 +172,7 @@ pub(crate) struct PreviewView {
     focus_handle: FocusHandle,
     toc_hovered: bool,
     toc_focus: FocusHandle,
+    embedded: bool,
 }
 
 impl PreviewView {
@@ -204,7 +205,32 @@ impl PreviewView {
             focus_handle: cx.focus_handle(),
             toc_hovered: false,
             toc_focus: cx.focus_handle().tab_stop(true),
+            embedded: false,
         }
+    }
+
+    /// Embedded readers share Tab traversal with their surrounding controls.
+    pub(crate) fn embedded(content: SharedString, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new(content, cx);
+        view.embedded = true;
+        view
+    }
+
+    /// Keep keyboard focus and the nearest outline position on live revisions.
+    /// Unchanged Markdown never calls this, so ordinary polling preserves exact scroll.
+    pub(crate) fn set_content(&mut self, content: SharedString, cx: &mut Context<Self>) {
+        let heading = self.toc.get(self.active).map(|entry| entry.title.clone());
+        let mut next = Self::new(content, cx);
+        next.focus_handle = self.focus_handle.clone();
+        next.toc_focus = self.toc_focus.clone();
+        next.embedded = self.embedded;
+        if let Some(index) =
+            heading.and_then(|title| next.toc.iter().position(|entry| entry.title == title))
+        {
+            next.on_toc_click(index, cx);
+        }
+        *self = next;
+        cx.notify();
     }
 
     fn on_scroll(&mut self, top: usize, bottom: usize, cx: &mut Context<Self>) {
@@ -392,7 +418,7 @@ impl Render for PreviewView {
             .id("preview-reader")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "tab" && !this.toc.is_empty() {
+                if !this.embedded && event.keystroke.key == "tab" && !this.toc.is_empty() {
                     if this.toc_focus.is_focused(window) {
                         this.focus_handle.focus(window, cx);
                     } else {

@@ -159,6 +159,53 @@ fn revision(value: &Value) -> &str {
 }
 
 #[test]
+fn standalone_artifact_browser_smoke_contract() {
+    let f = Fixture::new();
+    let first = f.json(
+        &[
+            "artifact",
+            "create",
+            "--title",
+            "Standalone RFC",
+            "--kind",
+            "rfc",
+            "--content-file",
+            "-",
+        ],
+        b"# Before\n",
+    );
+    assert!(!f.root.join("portable/tasks").exists());
+    let revised = f.mutate_artifact(
+        &first,
+        "update",
+        &["--content-file", "-"],
+        b"# After\n\nLive revision\n",
+    );
+    assert_ne!(revision(&first), revision(&revised));
+    let read = f.json(&["artifact", "get", artifact_id(&first)], b"");
+    assert_eq!(read, revised);
+    let archived = f.mutate_artifact(&revised, "archive", &[], b"");
+    assert_eq!(f.json(&["artifact", "list"], b"")["artifacts"], json!([]));
+    assert_eq!(
+        f.json(&["artifact", "get", artifact_id(&first)], b""),
+        archived
+    );
+    assert_eq!(
+        f.json(&["artifact", "list", "--include-archived"], b"")["artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let restored = f.mutate_artifact(&archived, "unarchive", &[], b"");
+    assert_eq!(
+        restored["artifact"]["content"],
+        "# After\n\nLive revision\n"
+    );
+    f.assert_headless();
+}
+
+#[test]
 fn shared_agent_workflow_is_headless_and_revision_checked() {
     let f = Fixture::new();
     assert_eq!(

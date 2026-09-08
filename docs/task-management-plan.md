@@ -1,6 +1,6 @@
 # Task management plan
 
-Status: agreed product scope and implementation sequence; PRs 1–3's task/artifact stores, linking, sync coordination, and headless CLI are implemented. Concrete contracts are in [`task-storage.md`](task-storage.md) and [`task-cli.md`](task-cli.md), with shared [agent instructions](task-agent-instructions.md). PRs 4–5 remain planned; no task/artifact UI is implemented yet. This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
+Status: agreed product scope and implementation sequence; PRs 1–3's task/artifact stores, linking, sync coordination, and headless CLI are implemented. PR 4's global artifact browser and live Markdown viewer are implemented with automated coverage; interactive UI smoke validation remains pending (see [`artifact-ui.md`](artifact-ui.md)). Concrete contracts are in [`task-storage.md`](task-storage.md) and [`task-cli.md`](task-cli.md), with shared [agent instructions](task-agent-instructions.md). PR 5 remains planned; task views are not implemented yet. This document is authoritative for the Rust task/artifact feature and supersedes the historical task model in `feature-parity.md` §§2, 9, and 11 and the task-specific assumptions in `cli-plan.md`. Existing review-comment and review-tutorial contracts are unchanged.
 
 ## Goal and boundaries
 
@@ -147,6 +147,8 @@ This is the first usable milestone: agents can manage persistent tasks and artif
 Add global artifact browsing, Markdown viewer/popup, copy IDs, archive/unarchive, archived access, and refresh. Depends on PR 2; use PR 3 for agent-driven smoke validation when available.
 
 Acceptance: find and read an RFC before any task exists, view archived artifacts, display malformed/missing content clearly, and see CLI revisions reflected in the open viewer. Verify keyboard navigation and copy behavior.
+
+Implemented: Home → Browse artifacts, active/archived browsing, shared ID-based Markdown reading, copy controls, revision-checked archive/unarchive, and serialized background refresh on a two-second cadence plus manual and portable-change reloads. Automated loader and binary smoke coverage passes; follow the [interactive acceptance checklist](artifact-ui.md#interactive-acceptance-checklist) before considering desktop acceptance complete.
 
 ### PR 5 — Global and repository task views
 

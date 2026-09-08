@@ -295,6 +295,7 @@ impl Workspace {
                 if this
                     .update(cx, |this, cx| {
                         if this.portable_git_poll.commit(generation, status) {
+                            this.home.update(cx, |view, cx| view.refresh_artifacts(cx));
                             cx.notify();
                         }
                     })
@@ -721,7 +722,7 @@ impl Workspace {
 
     fn enter_repository(&mut self, cx: &mut Context<Self>) {
         self.home_visible = false;
-        self.home.update(cx, |view, _| view.deactivate());
+        self.home.update(cx, |view, cx| view.deactivate(cx));
         for tab in WorkspaceTab::ALL {
             if tab.has_terminal() && self.tabs[tab as usize].is_none() {
                 self.tabs[tab as usize] = Some(cx.new(|cx| {

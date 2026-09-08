@@ -9,11 +9,11 @@
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, Styled, WeakEntity, Window, div, px, rgb,
+    Anchor, App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement, Render, Styled, WeakEntity, Window, div, rgb,
 };
 use std::path::PathBuf;
 
@@ -123,84 +123,69 @@ impl WorkspaceSettingsView {
         }
     }
 
-    fn render_option(&self, agent: AgentKind, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.selected == agent;
-        h_flex()
-            .gap_3()
-            .items_center()
+    /// Agent selector dropdown: the trigger shows the current harness and the
+    /// menu lists every harness with its command and description, so adding a
+    /// variant later is one more menu item instead of one more card. Picks go
+    /// through [`Self::pick`] so state, persistence, and feedback stay on the
+    /// single workspace path. The menu builder is `Fn` (it may re-run after
+    /// dismiss), so it captures a [`WeakEntity`] and re-enters through
+    /// `update` on click rather than borrowing `cx`.
+    fn render_agent_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected;
+        let view = cx.entity().downgrade();
+        Button::new("workspace-settings-agent")
+            .label(selected.label())
+            .accessibility_label(format!("Agent, {}", selected.label()))
+            .dropdown_caret(true)
+            .outline()
             .w_full()
-            .px_4()
-            .py_3()
-            .rounded_md()
-            .border_1()
-            .when(selected, |this| {
-                this.border_color(rgb(0x2f81f7)).bg(rgb(0x0e1a2b))
-            })
-            .when(!selected, |this| {
-                this.border_color(rgb(0x292b2b))
-                    .bg(rgb(0x0e0f0f))
-                    .hover(|this| this.border_color(rgb(0x3a3d3d)))
-            })
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| this.pick(agent, window, cx)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .size(px(18.))
-                    .rounded_full()
-                    .border_1()
-                    .items_center()
-                    .justify_center()
-                    .flex()
-                    .border_color(if selected {
-                        rgb(0x2f81f7)
-                    } else {
-                        rgb(0x555a5a)
-                    })
-                    .when(selected, |this| {
-                        this.child(div().size(px(10.)).rounded_full().bg(rgb(0x2f81f7)))
-                    }),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(0xe7e7e7))
-                                    .child(agent.label().to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(0x292b2b))
-                                    .bg(rgb(0x080909))
-                                    .text_xs()
-                                    .text_color(rgb(0x858989))
-                                    .child(format!("`{}`", agent.command())),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x737878))
-                            .child(agent.description().to_owned()),
-                    ),
-            )
-            .when(selected, |this| {
-                this.child(div().text_sm().text_color(rgb(0x2f81f7)).child("✓"))
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let mut menu = menu;
+                for agent in AgentKind::ALL {
+                    let view = view.clone();
+                    let checked = agent == selected;
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            v_flex()
+                                .w_full()
+                                .gap_1()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_semibold()
+                                                .text_color(rgb(0xe7e7e7))
+                                                .child(agent.label().to_owned()),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(rgb(0x292b2b))
+                                                .bg(rgb(0x080909))
+                                                .text_xs()
+                                                .text_color(rgb(0x858989))
+                                                .child(format!("`{}`", agent.command())),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x737878))
+                                        .child(agent.description().to_owned()),
+                                )
+                        })
+                        .checked(checked)
+                        .on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |this, cx| this.pick(agent, window, cx));
+                        }),
+                    );
+                }
+                menu.scrollable(true)
             })
     }
 }
@@ -216,12 +201,7 @@ impl Render for WorkspaceSettingsView {
         let focus = self.focus_handle.clone();
         let track = self.focus_handle.clone();
         let checkout_text = self.checkout.to_string_lossy().into_owned();
-        // Built with a loop (not `map`): each row borrows `cx` for its
-        // listener, which cannot escape an `FnMut` closure body.
-        let mut options = Vec::with_capacity(AgentKind::ALL.len());
-        for agent in AgentKind::ALL {
-            options.push(self.render_option(agent, cx).into_any_element());
-        }
+        let dropdown = self.render_agent_dropdown(cx).into_any_element();
         v_flex()
             .size_full()
             .px_6()
@@ -257,25 +237,20 @@ impl Render for WorkspaceSettingsView {
             )
             .child(
                 v_flex()
-                    .gap_1()
+                    .gap_2()
                     .child(
                         div()
                             .text_sm()
                             .font_semibold()
                             .text_color(rgb(0xe7e7e7))
-                            .child("Default agent"),
+                            .child("Agent"),
                     )
+                    .child(dropdown)
                     .child(
                         div().text_xs().text_color(rgb(0x737878)).child(
-                            "Launched when the Agent tab is first created for this workspace.",
+                            "Changing agent will terminate current session and restart the tab.",
                         ),
                     ),
-            )
-            .child(v_flex().gap_2().children(options))
-            .child(
-                div().text_xs().text_color(rgb(0x737878)).child(
-                    "Switching restarts the Agent tab with the new harness — the current session is stopped. The choice is saved for this workspace and restored on reopen.",
-                ),
             )
             .child(
                 h_flex().justify_end().pt_2().child(

@@ -131,7 +131,7 @@ mod tests {
         let key = workspace_key(checkout.path());
         DeviceStore::new(&root)
             .update(|state| {
-                state.workspace_agents = Some([(key, "codex".to_owned())].into());
+                state.workspace_agents = Some([(key, "gemini".to_owned())].into());
             })
             .unwrap();
         assert_eq!(

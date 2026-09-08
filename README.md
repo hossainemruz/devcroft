@@ -2,11 +2,11 @@
 
 Devcroft is a small GPUI desktop workspace with three persistent, Ghostty-powered terminal tabs:
 
-- **Agent** launches the workspace's default agent (`opencode` unless changed to `claude` in the workspace settings sheet) in your default shell.
+- **Agent** launches the workspace's default agent (`opencode` unless changed to `claude`, `codex`, or `omp` in the workspace settings sheet) in your default shell.
 - **Editor** launches `nvim .` in your default shell.
 - **Terminal** launches your default login shell.
 
-Each tab owns an independent PTY session. Switching tabs keeps the underlying process alive. Devcroft starts the default shell as an interactive login shell in every tab, then enters the Agent or Editor command through that shell. This matches a normal terminal launch and makes shell startup files, environment changes, aliases, functions, and tool-manager activation available to `opencode` and `nvim`.
+Each tab owns an independent PTY session. Switching tabs keeps the underlying process alive. Devcroft starts the default shell as an interactive login shell in every tab, then enters the Agent or Editor command through that shell. This matches a normal terminal launch and makes shell startup files, environment changes, aliases, functions, and tool-manager activation available to the agent harness and `nvim`.
 
 The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, italic, and bold italic), so Nerd Font symbols work without a separate system font installation. Attribution and license files are in [`assets/`](assets/).
 
@@ -28,7 +28,7 @@ Use **Tab / Shift+Tab** to move through Home's controls, including the command b
 
 ## Headless task and artifact CLI
 
-Manage persistent ideas, cross-repository subtasks, and standalone Markdown RFCs/plans/notes without starting the desktop. After building, use `target/debug/devcroft --help` (or `devcroft` if the binary is on your `PATH`). Repository discovery and store operations do not need `opencode`, `claude`, or a local checkout.
+Manage persistent ideas, cross-repository subtasks, and standalone Markdown RFCs/plans/notes without starting the desktop. After building, use `target/debug/devcroft --help` (or `devcroft` if the binary is on your `PATH`). Repository discovery and store operations do not need an agent harness (`opencode`, `claude`, `codex`, or `omp`) or a local checkout.
 
 ```sh
 devcroft repository list --json
@@ -41,7 +41,7 @@ Records use the selected `DEVCROFT_DATA_DIR` or the normal per-OS data root, ind
 
 ## Requirements
 
-[mise](https://mise.jdx.dev/) manages the required Rust and Zig toolchains. The application expects `opencode` and `nvim` to already be available in the environment inherited by your default shell.
+[mise](https://mise.jdx.dev/) manages the required Rust and Zig toolchains. The application expects `nvim` and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) to already be available in the environment inherited by your default shell.
 
 ```sh
 mise install

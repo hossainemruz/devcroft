@@ -5,15 +5,18 @@
 //! [`crate::data`]). Picking a harness in the workspace settings sheet
 //! persists it and restarts the Agent tab with [`AgentKind::command`].
 //!
-//! Only `opencode` and `claude` exist today. Adding a harness later is a
-//! matter of extending this enum plus its id/command tables below — the
-//! persistence layer already round-trips unknown ids as plain strings.
+//! Only `opencode`, `claude`, `codex`, and `omp` exist today. Adding a
+//! harness later is a matter of extending this enum plus its id/command
+//! tables below — the persistence layer already round-trips unknown ids as
+//! plain strings.
 
 /// Agent harness launched in the Agent tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentKind {
     Opencode,
     Claude,
+    Codex,
+    Omp,
 }
 
 impl AgentKind {
@@ -21,7 +24,7 @@ impl AgentKind {
     pub(crate) const DEFAULT: Self = Self::Opencode;
 
     /// Every harness the workspace settings sheet offers, in display order.
-    pub(crate) const ALL: [Self; 2] = [Self::Opencode, Self::Claude];
+    pub(crate) const ALL: [Self; 4] = [Self::Opencode, Self::Claude, Self::Codex, Self::Omp];
 
     /// Stable id used in `device.json` and matched case-insensitively on
     /// read, so hand-edited values like `"Claude"` still resolve.
@@ -29,6 +32,8 @@ impl AgentKind {
         match self {
             Self::Opencode => "opencode",
             Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Omp => "omp",
         }
     }
 
@@ -37,6 +42,8 @@ impl AgentKind {
         match self {
             Self::Opencode => "opencode",
             Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Omp => "omp",
         }
     }
 
@@ -45,6 +52,8 @@ impl AgentKind {
         match self {
             Self::Opencode => "The default AI agent.",
             Self::Claude => "Anthropic's Claude Code CLI.",
+            Self::Codex => "OpenAI's Codex CLI.",
+            Self::Omp => "The oh-my-pi agent harness.",
         }
     }
 
@@ -53,6 +62,8 @@ impl AgentKind {
         match self {
             Self::Opencode => "opencode",
             Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Omp => "omp",
         }
     }
 
@@ -62,6 +73,8 @@ impl AgentKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "opencode" => Some(Self::Opencode),
             "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "omp" | "oh-my-pi" | "ohmypi" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -83,7 +96,7 @@ mod tests {
     #[test]
     fn unknown_ids_fall_back_to_default() {
         assert_eq!(AgentKind::parse(""), None);
-        assert_eq!(AgentKind::parse("codex"), None);
+        assert_eq!(AgentKind::parse("gemini"), None);
         assert_eq!(
             AgentKind::parse("unknown").unwrap_or(AgentKind::DEFAULT),
             AgentKind::Opencode
@@ -91,9 +104,18 @@ mod tests {
     }
 
     #[test]
+    fn omp_aliases_resolve_to_omp() {
+        assert_eq!(AgentKind::parse("omp"), Some(AgentKind::Omp));
+        assert_eq!(AgentKind::parse("oh-my-pi"), Some(AgentKind::Omp));
+        assert_eq!(AgentKind::parse("OHMYPI"), Some(AgentKind::Omp));
+    }
+
+    #[test]
     fn commands_match_supported_harnesses() {
         assert_eq!(AgentKind::Opencode.command(), "opencode");
         assert_eq!(AgentKind::Claude.command(), "claude");
+        assert_eq!(AgentKind::Codex.command(), "codex");
+        assert_eq!(AgentKind::Omp.command(), "omp");
     }
 
     #[test]

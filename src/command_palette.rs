@@ -109,6 +109,8 @@ pub(crate) enum PaletteCommand {
     GoTerminal,
     GoReview,
     GoHome,
+    BrowseArtifacts,
+    ViewTasks,
     AddRepository,
     OpenSettings,
     SyncPortable,
@@ -116,12 +118,14 @@ pub(crate) enum PaletteCommand {
 
 impl PaletteCommand {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::GoAgent,
         Self::GoEditor,
         Self::GoTerminal,
         Self::GoReview,
         Self::GoHome,
+        Self::BrowseArtifacts,
+        Self::ViewTasks,
         Self::AddRepository,
         Self::OpenSettings,
         Self::SyncPortable,
@@ -134,6 +138,8 @@ impl PaletteCommand {
             Self::GoTerminal => "Go to Terminal",
             Self::GoReview => "Go to Review",
             Self::GoHome => "Go to Home",
+            Self::BrowseArtifacts => "Browse artifacts",
+            Self::ViewTasks => "View tasks",
             Self::AddRepository => "Add repository…",
             Self::OpenSettings => "Open settings…",
             Self::SyncPortable => "Sync portable data now",
@@ -150,6 +156,16 @@ impl PaletteCommand {
             Self::GoTerminal => &["tab", "terminal", "shell"],
             Self::GoReview => &["tab", "review", "diff"],
             Self::GoHome => &["tab", "home", "dashboard"],
+            Self::BrowseArtifacts => &[
+                "artifact",
+                "artifacts",
+                "rfc",
+                "plan",
+                "note",
+                "browse",
+                "read",
+            ],
+            Self::ViewTasks => &["task", "tasks", "todo", "plan", "view", "browse", "list"],
             Self::AddRepository => &["repo", "repository", "project", "add", "new", "checkout"],
             Self::OpenSettings => &["settings", "preferences", "config"],
             Self::SyncPortable => &["sync", "portable", "push", "pull", "backup"],
@@ -300,12 +316,14 @@ pub(crate) fn item_at(
     sections.get(section)?.items.get(row).cloned()
 }
 
-const GO_TO_COMMANDS: [PaletteCommand; 5] = [
+const GO_TO_COMMANDS: [PaletteCommand; 7] = [
     PaletteCommand::GoAgent,
     PaletteCommand::GoEditor,
     PaletteCommand::GoTerminal,
     PaletteCommand::GoReview,
     PaletteCommand::GoHome,
+    PaletteCommand::BrowseArtifacts,
+    PaletteCommand::ViewTasks,
 ];
 
 const REPOSITORY_COMMANDS: [PaletteCommand; 1] = [PaletteCommand::AddRepository];
@@ -540,6 +558,14 @@ mod tests {
             Some(PaletteItem::Command(PaletteCommand::GoHome))
         );
         assert_eq!(
+            item_at(&sections, 0, 5),
+            Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+        );
+        assert_eq!(
+            item_at(&sections, 0, 6),
+            Some(PaletteItem::Command(PaletteCommand::ViewTasks))
+        );
+        assert_eq!(
             item_at(&sections, 1, 0),
             Some(PaletteItem::SwitchRepository {
                 key: "aaa-first".to_owned(),
@@ -558,7 +584,7 @@ mod tests {
             item_at(&sections, 3, 0),
             Some(PaletteItem::Command(PaletteCommand::SyncPortable))
         );
-        assert_eq!(item_at(&sections, 0, 5), None);
+        assert_eq!(item_at(&sections, 0, 7), None);
         assert_eq!(item_at(&sections, 4, 0), None);
     }
 
@@ -566,9 +592,9 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 5 go-to + 2 switch + 1 add + 1 settings + 1 sync.
-        assert_eq!(all.len(), 10);
-        assert_eq!(filter_items(&sections, "   ").len(), 10);
+        // 7 go-to + 2 switch + 1 add + 1 settings + 1 sync.
+        assert_eq!(all.len(), 12);
+        assert_eq!(filter_items(&sections, "   ").len(), 12);
     }
 
     #[test]
@@ -622,6 +648,22 @@ mod tests {
         assert!(
             filter_items(&sections, "opencode")
                 .contains(&PaletteItem::Command(PaletteCommand::GoAgent))
+        );
+        assert!(
+            filter_items(&sections, "browse artifacts")
+                .contains(&PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+        );
+        assert!(
+            filter_items(&sections, "view tasks")
+                .contains(&PaletteItem::Command(PaletteCommand::ViewTasks))
+        );
+        assert_eq!(
+            filter_items(&sections, "BROWSE ARTIFACTS"),
+            vec![PaletteItem::Command(PaletteCommand::BrowseArtifacts)]
+        );
+        assert_eq!(
+            filter_items(&sections, "VIEW TASKS"),
+            vec![PaletteItem::Command(PaletteCommand::ViewTasks)]
         );
     }
 

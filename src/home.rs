@@ -185,6 +185,36 @@ impl HomeView {
         self.active = false;
     }
 
+    /// Show the global task list: the same destination as Recent Tasks'
+    /// **View all →**. Used by the command palette so tasks are reachable
+    /// without scrolling Home. Mirrors the heading button: the full list
+    /// replaces recent summaries, the artifact browser stays inactive, and
+    /// a reload refreshes projects/dashboard plus the now-visible list.
+    pub(crate) fn show_tasks_page(&mut self, cx: &mut Context<Self>) {
+        self.active = true;
+        self.page = Some("Tasks");
+        self.tasks
+            .update(cx, |view, cx| view.show_recent(false, cx));
+        self.artifacts
+            .update(cx, |view, cx| view.set_active(false, cx));
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        self.reload(cx);
+    }
+
+    /// Show the artifact browser, reachable through the command palette's
+    /// **Browse artifacts** entry. The task list deactivates, the artifact
+    /// browser activates, and a reload refreshes projects/dashboard plus
+    /// the now-visible browser.
+    pub(crate) fn show_artifacts_page(&mut self, cx: &mut Context<Self>) {
+        self.active = true;
+        self.page = Some("Artifacts");
+        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
+        self.artifacts
+            .update(cx, |view, cx| view.set_active(true, cx));
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        self.reload(cx);
+    }
+
     fn refresh_project_git(&mut self, cx: &mut Context<Self>) {
         if !self.active || self.page.is_some() || self.git_loading || self.projects.is_empty() {
             return;
@@ -790,17 +820,6 @@ impl Render for HomeView {
                     "Use Home to manage your current items. More views and workflows will follow.",
                 );
         } else {
-            body = body.child(
-                Button::new("browse-artifacts")
-                    .label("Browse artifacts →")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.page = Some("Artifacts");
-                        this.tasks.update(cx, |view, cx| view.set_active(false, cx));
-                        this.artifacts
-                            .update(cx, |view, cx| view.set_active(true, cx));
-                        cx.notify();
-                    })),
-            );
             body = body.child(
                 div()
                     .text_sm()

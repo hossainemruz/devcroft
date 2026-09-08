@@ -614,6 +614,8 @@ impl Workspace {
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
                 PaletteCommand::GoHome => self.go_home(window, cx),
+                PaletteCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
+                PaletteCommand::ViewTasks => self.view_tasks(window, cx),
                 PaletteCommand::SyncPortable => {
                     self.request_sync(window, cx);
                     self.focus_active_pane(window, cx);
@@ -768,6 +770,33 @@ impl Workspace {
         self.home_visible = true;
         self.command_open = false;
         self.home.update(cx, |view, cx| view.activate(cx));
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    /// Jump to Home's global task list (Recent Tasks' **View all →**
+    /// destination). The repository Tasks tab keeps its own scope; this is
+    /// the cross-repository list. Deactivates the workspace task view so its
+    /// poll stops while Home is visible.
+    fn view_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
+        self.home_visible = true;
+        self.command_open = false;
+        self.home.update(cx, |view, cx| view.show_tasks_page(cx));
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    /// Jump to Home's artifact browser (the command palette's
+    /// **Browse artifacts** entry). Standalone RFCs/plans/notes need no task or repository
+    /// association. Deactivates the workspace task view so its poll stops
+    /// while Home is visible.
+    fn browse_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
+        self.home_visible = true;
+        self.command_open = false;
+        self.home
+            .update(cx, |view, cx| view.show_artifacts_page(cx));
         self.focus_active_pane(window, cx);
         cx.notify();
     }
@@ -1095,6 +1124,8 @@ fn palette_icon(command: PaletteCommand) -> IconName {
         PaletteCommand::GoTerminal => IconName::SquareTerminal,
         PaletteCommand::GoReview => IconName::Eye,
         PaletteCommand::GoHome => IconName::LayoutDashboard,
+        PaletteCommand::BrowseArtifacts => IconName::BookOpen,
+        PaletteCommand::ViewTasks => IconName::CircleCheck,
         PaletteCommand::AddRepository => IconName::Plus,
         PaletteCommand::OpenSettings => IconName::Settings,
         PaletteCommand::SyncPortable => IconName::RotateCw,

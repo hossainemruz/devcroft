@@ -129,9 +129,13 @@ impl HomeView {
         let tasks = cx.new(|cx| {
             crate::tasks::TaskBrowser::new(root.clone(), crate::tasks::Scope::Global, cx)
         });
-        tasks.update(cx, |view, cx| view.show_recent(true, cx));
+        tasks.update(cx, |view, cx| {
+            view.show_recent(true, cx);
+            view.set_titlebar_owned(false);
+        });
         cx.subscribe(&tasks, |this, _, _: &crate::tasks::OpenedTask, cx| {
             this.page = Some("Tasks");
+            this.tasks.update(cx, |view, _| view.set_titlebar_owned(true));
             cx.notify();
         })
         .detach();
@@ -169,7 +173,10 @@ impl HomeView {
     }
 
     pub(crate) fn activate(&mut self, cx: &mut Context<Self>) {
-        self.tasks.update(cx, |view, cx| view.show_recent(true, cx));
+        self.tasks.update(cx, |view, cx| {
+            view.show_recent(true, cx);
+            view.set_titlebar_owned(false);
+        });
         self.artifacts
             .update(cx, |view, cx| view.set_active(false, cx));
         self.active = true;
@@ -193,8 +200,10 @@ impl HomeView {
     pub(crate) fn show_tasks_page(&mut self, cx: &mut Context<Self>) {
         self.active = true;
         self.page = Some("Tasks");
-        self.tasks
-            .update(cx, |view, cx| view.show_recent(false, cx));
+        self.tasks.update(cx, |view, cx| {
+            view.show_recent(false, cx);
+            view.set_titlebar_owned(true);
+        });
         self.artifacts
             .update(cx, |view, cx| view.set_active(false, cx));
         self.scroll.set_offset(point(px(0.), px(0.)));
@@ -213,6 +222,57 @@ impl HomeView {
             .update(cx, |view, cx| view.set_active(true, cx));
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.reload(cx);
+    }
+
+    pub(crate) fn is_artifacts_page(&self) -> bool {
+        self.page == Some("Artifacts")
+    }
+
+    pub(crate) fn is_tasks_page(&self) -> bool {
+        self.page == Some("Tasks")
+    }
+
+    pub(crate) fn artifacts_include_archived(&self, cx: &gpui_kit::App) -> bool {
+        self.artifacts.read(cx).include_archived()
+    }
+
+    pub(crate) fn set_artifacts_archived(&self, include: bool, cx: &mut Context<Self>) {
+        self.artifacts
+            .update(cx, |view, cx| view.set_include_archived(include, cx));
+    }
+
+    pub(crate) fn artifacts_has_selection(&self, cx: &gpui_kit::App) -> bool {
+        self.artifacts.read(cx).has_selection()
+    }
+
+    pub(crate) fn clear_artifact_selection(&self, cx: &mut Context<Self>) {
+        self.artifacts
+            .update(cx, |view, cx| view.clear_selection(cx));
+    }
+
+    pub(crate) fn tasks_include_archived(&self, cx: &gpui_kit::App) -> bool {
+        self.tasks.read(cx).include_archived()
+    }
+
+    pub(crate) fn set_tasks_archived(&self, include: bool, cx: &mut Context<Self>) {
+        self.tasks
+            .update(cx, |view, cx| view.set_include_archived(include, cx));
+    }
+
+    pub(crate) fn tasks_is_artifact_open(&self, cx: &gpui_kit::App) -> bool {
+        self.tasks.read(cx).is_artifact_open()
+    }
+
+    pub(crate) fn tasks_has_selection(&self, cx: &gpui_kit::App) -> bool {
+        self.tasks.read(cx).has_selection()
+    }
+
+    pub(crate) fn close_task_artifact(&self, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| view.close_artifact(cx));
+    }
+
+    pub(crate) fn clear_task_selection(&self, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |view, cx| view.back_to_list(cx));
     }
 
     fn refresh_project_git(&mut self, cx: &mut Context<Self>) {
@@ -401,6 +461,7 @@ impl HomeView {
                         this.tasks.update(cx, |view, cx| {
                             if destination == "Tasks" {
                                 view.show_recent(false, cx);
+                                view.set_titlebar_owned(true);
                             } else {
                                 view.set_active(false, cx);
                             }
@@ -778,29 +839,23 @@ impl HomeView {
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.page == Some("Tasks") {
-            return v_flex()
+            // Navigation and filter live in the workspace titlebar, matching
+            // the repository workspace and artifact browser layout.
+            return div()
                 .size_full()
                 .min_h_0()
-                .child(
-                    Button::new("tasks-home")
-                        .ghost()
-                        .label("← Home")
-                        .on_click(cx.listener(|this, _, _, cx| this.activate(cx))),
-                )
-                .child(div().flex_1().min_h_0().child(self.tasks.clone()))
+                .flex_1()
+                .child(self.tasks.clone())
                 .into_any_element();
         }
         if self.page == Some("Artifacts") {
-            return v_flex()
+            // Navigation and filter live in the workspace titlebar, matching
+            // the repository workspace layout.
+            return div()
                 .size_full()
                 .min_h_0()
-                .child(
-                    Button::new("artifacts-home")
-                        .ghost()
-                        .label("← Home")
-                        .on_click(cx.listener(|this, _, _, cx| this.activate(cx))),
-                )
-                .child(div().flex_1().min_h_0().child(self.artifacts.clone()))
+                .flex_1()
+                .child(self.artifacts.clone())
                 .into_any_element();
         }
         let card_width = recent_card_width(f32::from(window.viewport_size().width));

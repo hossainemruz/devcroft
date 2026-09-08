@@ -39,6 +39,7 @@ use crate::review::ReviewView;
 use crate::settings::SettingsView;
 use crate::workspace_settings::WorkspaceSettingsView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 
 /// How often the header re-reads branch/dirty/ahead-behind state.
 ///
@@ -98,6 +99,17 @@ impl WorkspaceTab {
     pub(crate) fn has_terminal(self) -> bool {
         !matches!(self, Self::Review | Self::Tasks)
     }
+}
+
+/// Where a home full-page (Tasks or Artifacts) should return to. Captured on
+/// entry so the titlebar back button behaves like a browser back button
+/// instead of always landing on Home.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageOrigin {
+    Home,
+    Tasks,
+    Artifacts,
+    Repository,
 }
 
 /// Generation-guarded holder for the header's git status. Background loads
@@ -190,6 +202,13 @@ pub(crate) struct Workspace {
     /// Sections installed by the latest palette render; confirmations
     /// resolve against exactly this model.
     palette_model: Vec<PaletteSection>,
+    /// Origin captured when entering the artifact browser, so the titlebar
+    /// back button returns where the user came from. `Some` only while the
+    /// artifact page is visible.
+    artifacts_origin: Option<PageOrigin>,
+    /// Origin captured when entering the global Tasks page. `Some` only
+    /// while that page is visible.
+    tasks_origin: Option<PageOrigin>,
 }
 
 struct RepositoryTabs {
@@ -424,6 +443,8 @@ impl Workspace {
             current_repository,
             recent_repositories: Vec::new(),
             palette_model: Vec::new(),
+            artifacts_origin: None,
+            tasks_origin: None,
         }
     }
 
@@ -751,6 +772,8 @@ impl Workspace {
     }
 
     fn enter_repository(&mut self, cx: &mut Context<Self>) {
+        self.artifacts_origin = None;
+        self.tasks_origin = None;
         self.tasks.update(cx, |view, cx| {
             view.set_active(self.active_tab == WorkspaceTab::Tasks, cx)
         });
@@ -766,6 +789,8 @@ impl Workspace {
     }
 
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.artifacts_origin = None;
+        self.tasks_origin = None;
         self.tasks.update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
@@ -777,8 +802,21 @@ impl Workspace {
     /// Jump to Home's global task list (Recent Tasks' **View all →**
     /// destination). The repository Tasks tab keeps its own scope; this is
     /// the cross-repository list. Deactivates the workspace task view so its
-    /// poll stops while Home is visible.
+    /// poll stops while Home is visible. Captures the origin so the titlebar
+    /// back button returns where the user came from.
     fn view_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let already_there = self.home_visible && self.home.read(cx).is_tasks_page();
+        if !already_there {
+            let origin = if !self.home_visible {
+                PageOrigin::Repository
+            } else if self.home.read(cx).is_artifacts_page() {
+                PageOrigin::Artifacts
+            } else {
+                PageOrigin::Home
+            };
+            self.tasks_origin = Some(origin);
+        }
+        self.artifacts_origin = None;
         self.tasks.update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
@@ -790,8 +828,22 @@ impl Workspace {
     /// Jump to Home's artifact browser (the command palette's
     /// **Browse artifacts** entry). Standalone RFCs/plans/notes need no task or repository
     /// association. Deactivates the workspace task view so its poll stops
-    /// while Home is visible.
+    /// while Home is visible. Captures the origin so the titlebar back
+    /// button returns where the user came from.
     fn browse_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let already_there =
+            self.home_visible && self.home.read(cx).is_artifacts_page();
+        if !already_there {
+            let origin = if !self.home_visible {
+                PageOrigin::Repository
+            } else if self.home.read(cx).is_tasks_page() {
+                PageOrigin::Tasks
+            } else {
+                PageOrigin::Home
+            };
+            self.artifacts_origin = Some(origin);
+        }
+        self.tasks_origin = None;
         self.tasks.update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
@@ -799,6 +851,97 @@ impl Workspace {
             .update(cx, |view, cx| view.show_artifacts_page(cx));
         self.focus_active_pane(window, cx);
         cx.notify();
+    }
+
+    /// Titlebar back for the artifact browser. Mirrors browser history:
+    /// drill out of an open artifact first, otherwise return to the captured
+    /// origin (repository workspace, global tasks, or Home dashboard).
+    fn go_back_from_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.home.read(cx).artifacts_has_selection(cx) {
+            self.home.update(cx, |view, cx| view.clear_artifact_selection(cx));
+            self.focus_active_pane(window, cx);
+            cx.notify();
+            return;
+        }
+        match self.artifacts_origin.take() {
+            Some(PageOrigin::Repository) => {
+                self.enter_repository(cx);
+                self.focus_active_pane(window, cx);
+                cx.notify();
+            }
+            Some(PageOrigin::Tasks) => {
+                // Direct switch without capturing a new origin: this is a
+                // back navigation, not a forward entry. Clear both so the
+                // next back falls through to Home.
+                self.artifacts_origin = None;
+                self.tasks_origin = None;
+                self.tasks.update(cx, |view, cx| view.set_active(false, cx));
+                self.home_visible = true;
+                self.command_open = false;
+                self.home.update(cx, |view, cx| view.show_tasks_page(cx));
+                self.focus_active_pane(window, cx);
+                cx.notify();
+            }
+            Some(PageOrigin::Home) | Some(PageOrigin::Artifacts) | None => {
+                self.go_home(window, cx);
+            }
+        }
+    }
+
+    fn artifacts_back_label(&self) -> SharedString {
+        match self.artifacts_origin {
+            Some(PageOrigin::Repository) => format!("‹ {}", self.project_name).into(),
+            Some(PageOrigin::Tasks) => "‹ Tasks".into(),
+            Some(PageOrigin::Home) | Some(PageOrigin::Artifacts) | None => "‹ Home".into(),
+        }
+    }
+
+    /// Titlebar back for the global Tasks page. Drills out stepwise first
+    /// (linked artifact → task detail → task list), otherwise returns to the
+    /// captured origin (repository workspace, artifacts, or Home).
+    fn go_back_from_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.home.read(cx).tasks_is_artifact_open(cx) {
+            self.home.update(cx, |view, cx| view.close_task_artifact(cx));
+            self.focus_active_pane(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.home.read(cx).tasks_has_selection(cx) {
+            self.home.update(cx, |view, cx| view.clear_task_selection(cx));
+            self.focus_active_pane(window, cx);
+            cx.notify();
+            return;
+        }
+        match self.tasks_origin.take() {
+            Some(PageOrigin::Repository) => {
+                self.enter_repository(cx);
+                self.focus_active_pane(window, cx);
+                cx.notify();
+            }
+            Some(PageOrigin::Artifacts) => {
+                // Direct switch without capturing: back navigation clears
+                // both origins so the next back falls through to Home.
+                self.artifacts_origin = None;
+                self.tasks_origin = None;
+                self.tasks.update(cx, |view, cx| view.set_active(false, cx));
+                self.home_visible = true;
+                self.command_open = false;
+                self.home.update(cx, |view, cx| view.show_artifacts_page(cx));
+                self.focus_active_pane(window, cx);
+                cx.notify();
+            }
+            Some(PageOrigin::Home) | Some(PageOrigin::Tasks) | None => {
+                self.go_home(window, cx);
+            }
+        }
+    }
+
+    fn tasks_back_label(&self) -> SharedString {
+        match self.tasks_origin {
+            Some(PageOrigin::Repository) => format!("‹ {}", self.project_name).into(),
+            Some(PageOrigin::Artifacts) => "‹ Artifacts".into(),
+            Some(PageOrigin::Home) | Some(PageOrigin::Tasks) | None => "‹ Home".into(),
+        }
     }
 
     /// Persist the workspace default harness from the settings sheet and
@@ -1136,6 +1279,34 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
         let active_content = self.render_active_content();
+        // Tasks and Artifacts full-pages share the repository workspace
+        // chrome: title and back navigation live here, not in a second row.
+        // The archived filter also lives here; the portable git status is
+        // hidden on these pages and the lists stay live through their active
+        // polls.
+        let is_artifacts = self.home_visible && self.home.read(cx).is_artifacts_page();
+        let is_tasks = self.home_visible && self.home.read(cx).is_tasks_page();
+        let show_archived = if is_artifacts {
+            self.home.read(cx).artifacts_include_archived(cx)
+        } else {
+            false
+        };
+        let show_tasks_archived = if is_tasks {
+            self.home.read(cx).tasks_include_archived(cx)
+        } else {
+            false
+        };
+        let artifacts_back = if is_artifacts {
+            self.artifacts_back_label()
+        } else {
+            SharedString::from("")
+        };
+        let tasks_back = if is_tasks {
+            self.tasks_back_label()
+        } else {
+            SharedString::from("")
+        };
+        let is_home_page = is_artifacts || is_tasks;
 
         v_flex()
             .relative()
@@ -1169,8 +1340,50 @@ impl Render for Workspace {
                     .items_center()
                     .border_b_1()
                     .border_color(rgb(0x292b2b))
-                    .when(self.home_visible, |header| {
+                    .when(self.home_visible && !is_home_page, |header| {
                         header.child(div().text_lg().font_semibold().child("Devcroft"))
+                    })
+                    .when(is_artifacts, |header| {
+                        header.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Button::new("artifacts-back").ghost().label(artifacts_back).on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.go_back_from_artifacts(window, cx)
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(SharedString::from("Artifacts")),
+                                ),
+                        )
+                    })
+                    .when(is_tasks, |header| {
+                        header.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Button::new("tasks-back").ghost().label(tasks_back).on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.go_back_from_tasks(window, cx)
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(SharedString::from("Tasks")),
+                                ),
+                        )
                     })
                     .when(!self.home_visible, |header| {
                         header.child(
@@ -1257,7 +1470,33 @@ impl Render for Workspace {
                                 ),
                         ),
                     )
-                    .when(self.home_visible, |header| {
+                    .when(is_artifacts, |header| {
+                        header.child(
+                            Checkbox::new("show-archived-artifacts")
+                                .label("Show archived")
+                                .checked(show_archived)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    let checked = *checked;
+                                    this.home.update(cx, |view, cx| {
+                                        view.set_artifacts_archived(checked, cx)
+                                    });
+                                })),
+                        )
+                    })
+                    .when(is_tasks, |header| {
+                        header.child(
+                            Checkbox::new("show-archived-tasks")
+                                .label("Show archived")
+                                .checked(show_tasks_archived)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    let checked = *checked;
+                                    this.home.update(cx, |view, cx| {
+                                        view.set_tasks_archived(checked, cx)
+                                    });
+                                })),
+                        )
+                    })
+                    .when(self.home_visible && !is_home_page, |header| {
                         let status = self.portable_git_poll.status();
                         let label = if self.data_root.is_none() {
                             "Portable data unavailable".to_owned()

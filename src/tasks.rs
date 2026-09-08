@@ -90,6 +90,11 @@ pub(crate) struct TaskBrowser {
     scope: Scope,
     active: bool,
     recent: bool,
+    /// When true the workspace titlebar owns the page title, back button,
+    /// and archived filter (global Tasks page). The body omits its duplicate
+    /// title/refresh/archived/back controls and stays live via the poll.
+    /// Repository Tasks tab and dashboard recent keep body chrome (false).
+    titlebar_chrome: bool,
     refresh: Refresh,
     archived: bool,
     limit: usize,
@@ -133,6 +138,7 @@ impl TaskBrowser {
             scope,
             active: false,
             recent: false,
+            titlebar_chrome: false,
             refresh: Refresh::default(),
             archived: false,
             limit: PAGE_SIZE,
@@ -181,6 +187,42 @@ impl TaskBrowser {
             self.back(cx);
         }
         self.set_active(true, cx);
+    }
+
+    pub(crate) fn set_titlebar_owned(&mut self, owned: bool) {
+        self.titlebar_chrome = owned;
+    }
+
+    pub(crate) fn include_archived(&self) -> bool {
+        self.archived
+    }
+
+    pub(crate) fn set_include_archived(&mut self, include: bool, cx: &mut Context<Self>) {
+        if self.archived == include {
+            return;
+        }
+        self.archived = include;
+        self.limit = PAGE_SIZE;
+        self.reload(cx);
+    }
+
+    pub(crate) fn is_artifact_open(&self) -> bool {
+        self.artifact_open
+    }
+
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selected_id.is_some()
+    }
+
+    pub(crate) fn close_artifact(&mut self, cx: &mut Context<Self>) {
+        self.artifact_open = false;
+        self.artifacts
+            .update(cx, |view, cx| view.set_active(false, cx));
+        self.reload(cx);
+    }
+
+    pub(crate) fn back_to_list(&mut self, cx: &mut Context<Self>) {
+        self.back(cx);
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
@@ -363,12 +405,17 @@ impl TaskBrowser {
 impl Render for TaskBrowser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.artifact_open {
-            return v_flex()
+            // Titlebar back drills out (artifact → task → list → origin), so
+            // no duplicate back button when the titlebar owns chrome.
+            let mut page = v_flex()
                 .id("task-artifact")
                 .track_focus(&self.focus_handle)
                 .size_full()
                 .min_h_0()
-                .child(
+                .gap_3()
+                .p_3();
+            if !self.titlebar_chrome {
+                page = page.child(
                     Button::new("back-to-task")
                         .label("← Back to task")
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -378,7 +425,9 @@ impl Render for TaskBrowser {
                             this.reload(cx);
                             this.focus_handle.focus(window, cx);
                         })),
-                )
+                );
+            }
+            return page
                 .child(div().flex_1().min_h_0().child(self.artifacts.clone()))
                 .into_any_element();
         }
@@ -421,40 +470,26 @@ impl Render for TaskBrowser {
             .min_h_0()
             .gap_3()
             .p_3();
-        if !self.recent {
-            body = body.child(
-                h_flex()
-                    .gap_3()
-                    .flex_wrap()
-                    .child(div().text_2xl().font_semibold().child(match &self.scope {
-                        Scope::Global => "Tasks".into(),
-                        Scope::Repository(key) => {
-                            format!("Tasks · {}", key.as_deref().unwrap_or("unlinked checkout"))
-                        }
-                    }))
-                    .child(
-                        Button::new("refresh-tasks")
-                            .label("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
-                    ),
-            );
-        }
+        // No body title or manual refresh: the repository tab already shows
+        // the checkout in the titlebar, the global page shows "Tasks" there,
+        // and new/updated tasks arrive through the active 2-second poll.
         if let Some(id) = self.selected_id.clone() {
             let copy = id.clone();
+            // Titlebar back handles drill-out when it owns chrome.
+            let mut row = h_flex().gap_3().flex_wrap().items_center();
+            if !self.titlebar_chrome {
+                row = row.child(
+                    Button::new("task-back")
+                        .ghost()
+                        .label("← Task list")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.back(cx);
+                            this.focus_handle.focus(window, cx);
+                        })),
+                );
+            }
             body = body.child(
-                h_flex()
-                    .gap_3()
-                    .flex_wrap()
-                    .child(
-                        Button::new("task-back")
-                            .ghost()
-                            .label("← Task list")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.back(cx);
-                                this.focus_handle.focus(window, cx);
-                            })),
-                    )
-                    .child(id)
+                row.child(div().text_sm().text_color(cx.theme().muted_foreground).child(id))
                     .child(Button::new("copy-task").label("Copy ID").on_click(
                         move |_, window, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
@@ -540,21 +575,9 @@ impl Render for TaskBrowser {
             }
             body = body.child(detail);
         } else {
-            if !self.recent {
-                body = body.child(
-                    Button::new("archived-tasks")
-                        .label(if self.archived {
-                            "Showing active + archived"
-                        } else {
-                            "Show archived too"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.archived = !this.archived;
-                            this.limit = PAGE_SIZE;
-                            this.reload(cx);
-                        })),
-                );
-            }
+            // Archived filter lives in the workspace titlebar (global page
+            // and repository tab), so the body never shows it. Dashboard
+            // recent (`recent`) never filters.
             let mut list = v_flex()
                 .id("task-list")
                 .flex_1()

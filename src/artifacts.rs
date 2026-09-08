@@ -135,6 +135,32 @@ impl ArtifactBrowser {
         }
     }
 
+    pub(crate) fn include_archived(&self) -> bool {
+        self.include_archived
+    }
+
+    pub(crate) fn set_include_archived(&mut self, include: bool, cx: &mut Context<Self>) {
+        if self.include_archived == include {
+            return;
+        }
+        self.include_archived = include;
+        self.limit = PAGE_SIZE;
+        self.refresh(cx);
+    }
+
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selected_id.is_some()
+    }
+
+    pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected_id = None;
+        self.selected = None;
+        self.preview = None;
+        self.selected_error = None;
+        self.mutation_error = None;
+        self.refresh(cx);
+    }
+
     /// Shared ID-based viewer entry point for future task/subtask links. Archived
     /// records resolve even when they are excluded from the browser list.
     pub(crate) fn open(&mut self, id: String, cx: &mut Context<Self>) {
@@ -254,6 +280,10 @@ impl ArtifactBrowser {
 
 impl Render for ArtifactBrowser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Title, back navigation, and the archived filter live in the
+        // workspace titlebar (see `Workspace::render`). New and updated
+        // artifacts arrive through the active 2-second poll, so no manual
+        // refresh control is needed here.
         let mut body = v_flex()
             .id("artifact-browser")
             .track_focus(&self.focus_handle)
@@ -269,41 +299,17 @@ impl Render for ArtifactBrowser {
             .size_full()
             .min_h_0()
             .gap_3()
-            .p_4()
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(div().text_2xl().font_semibold().child("Artifacts"))
-                    .child(
-                        Button::new("refresh-artifacts")
-                            .label(if self.refresh.busy {
-                                "Refreshing…"
-                            } else {
-                                "Refresh"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    ),
-            );
+            .p_4();
         if let Some(id) = self.selected_id.clone() {
             let copy_id = id.clone();
+            // Titlebar back handles drill-out (detail → list → origin), so
+            // no duplicate back button here.
             body = body.child(
                 h_flex()
                     .gap_3()
                     .flex_wrap()
-                    .child(
-                        Button::new("artifact-back")
-                            .ghost()
-                            .label("← All artifacts")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.selected_id = None;
-                                this.selected = None;
-                                this.preview = None;
-                                this.selected_error = None;
-                                this.mutation_error = None;
-                                this.refresh(cx);
-                            })),
-                    )
-                    .child(div().child(id))
+                    .items_center()
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(id))
                     .child(Button::new("copy-artifact-id").label("Copy ID").on_click(
                         move |_, window, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy_id.clone()));
@@ -361,11 +367,8 @@ impl Render for ArtifactBrowser {
                     .child(div().flex_1().min_h_0().child(preview.clone()));
             }
         } else {
-            body = body.child(Button::new("include-archived").label(if self.include_archived { "Showing active + archived" } else { "Show archived too" })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.include_archived = !this.include_archived; this.limit = PAGE_SIZE; this.refresh(cx);
-                })))
-                .child("Tab to navigate · Enter/Space to open or copy · Documents refresh every 2 seconds");
+            // Archived filter lives in the titlebar; the active poll keeps
+            // the list live without manual refresh or hints.
             let mut list = v_flex()
                 .id("artifact-list")
                 .flex_1()

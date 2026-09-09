@@ -16,7 +16,9 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use gpui_kit::base::Scrollbar;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
+use gpui_kit::component::text::{
+    FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState, TextViewStyle,
+};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -73,7 +75,7 @@ struct TocEntry {
 }
 
 /// Collect the table of contents from `source`, parsed with the same parser
-/// and options (`ParseOptions::gfm`) the renderer uses so heading positions
+/// and options (GFM with frontmatter) the renderer uses so heading positions
 /// can never drift from the rendered blocks. Runs once per window on up to
 /// 4 MiB — a brief one-time cost, never per-frame.
 ///
@@ -84,7 +86,9 @@ struct TocEntry {
 /// held for scroll processing and panic (`RefCell already mutably
 /// borrowed`).
 fn extract_toc(source: &str) -> (Vec<TocEntry>, usize) {
-    let Ok(root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.frontmatter = true;
+    let Ok(root) = markdown::to_mdast(source, &options) else {
         return (Vec::new(), 0);
     };
     let Some(children) = root.children() else {
@@ -450,6 +454,8 @@ impl Render for PreviewView {
                         // selection, and keyboard scrolling.
                         div().size_full().overflow_hidden().child(
                             TextView::new(&self.state)
+                                .markdown_extensions(MarkdownExtensions::default().frontmatter())
+                                .plugin(FrontmatterPlugin)
                                 .style(style)
                                 .scrollable(true)
                                 .w(reading_width + px(16.))
@@ -547,6 +553,19 @@ mod tests {
             error.to_string().contains("UTF-8"),
             "expected UTF-8 error, got: {error:#}"
         );
+    }
+
+    #[test]
+    fn toc_counts_frontmatter_as_one_block_without_metadata_headings() {
+        for metadata in ["title: Example", "config:\n  theme: dark"] {
+            let source = format!("---\n{metadata}\n---\n\n# Title\n\nBody\n\n## Section\n");
+            let (toc, blocks) = extract_toc(&source);
+            assert_eq!(blocks, 4);
+            assert_eq!(toc.len(), 2);
+            assert_eq!(toc[0].title, "Title");
+            assert_eq!(toc[0].item_ix, 1);
+            assert_eq!(toc[1].item_ix, 3);
+        }
     }
 
     #[test]

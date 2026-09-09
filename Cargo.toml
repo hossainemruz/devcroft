@@ -12,7 +12,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 gix = { version = "0.87.1", default-features = false, features = ["parallel", "revision", "sha1", "status"] }
-gpui-kit = "0.6.0"
+gpui-kit = "0.6.1"
 ignore = "0.4.33"
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "5988a0b78b4aa804d1c12e66bbfe662bd97d81c0", default-features = false }
 markdown = "1.0"

@@ -1118,7 +1118,11 @@ impl Render for TerminalPane {
             .size_full()
             .p(px(TERMINAL_PADDING))
             .overflow_hidden()
-            .bg(rgb(0x090a0a))
+            // Extend the terminal background through its text inset so the
+            // shared Agent, Editor, and Terminal panes meet the window edges.
+            .bg(rgb(self.session.as_ref().map_or(0x000000, |session| {
+                session.background_color()
+            })))
             .font_family(TERMINAL_FONT_FAMILY)
             .track_focus(&self.focus_handle)
             .on_prepaint(move |bounds, _, cx| {

@@ -543,6 +543,12 @@ impl TerminalSession {
         Ok(())
     }
 
+    /// Background of the last presented frame, including application theme changes.
+    pub(crate) fn background_color(&self) -> u32 {
+        self.cached_defaults
+            .map_or(0x000000, |(_, background)| background)
+    }
+
     pub(crate) fn snapshot(&mut self) -> Result<Option<Vec<Vec<RenderRun>>>> {
         // Respect synchronized output (DEC 2026): applications such as opencode
         // wrap each frame in begin/end sync so capable terminals present it

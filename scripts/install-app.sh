@@ -5,7 +5,7 @@
 #   mise run install [--debug]          # --debug installs a debug build (faster iteration)
 #
 # Linux:  binary   -> ~/.local/bin/devcroft
-#         launcher -> ~/.local/share/applications/Devcroft.desktop (Name=Devcroft)
+#         launcher -> ~/.local/share/applications/devcroft.desktop (Name=Devcroft)
 #         icon     -> ~/.local/share/icons/hicolor/512x512/apps/devcroft.png
 #         removes the legacy com.devcroft.desktop.desktop entry and leftover
 #         Electron bundle files under ~/.local/share/devcroft, while keeping
@@ -45,7 +45,10 @@ fi
 
 install_linux() {
   local bin="$HOME/.local/bin/devcroft"
-  local desktop="$HOME/.local/share/applications/Devcroft.desktop"
+  # The desktop filename must match WindowOptions::app_id (case-sensitive)
+  # so Wayland taskbars can associate the window with its icon.
+  local desktop="$HOME/.local/share/applications/devcroft.desktop"
+  local previous_desktop="$HOME/.local/share/applications/Devcroft.desktop"
   local legacy="$HOME/.local/share/applications/com.devcroft.desktop.desktop"
   local icon_dir="$HOME/.local/share/icons/hicolor/512x512/apps"
   local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/devcroft"
@@ -69,6 +72,9 @@ Categories=Development;
 StartupNotify=true
 StartupWMClass=devcroft
 EOF
+
+  # Migrate the previous mixed-case launcher without leaving duplicate entries.
+  rm -f "$previous_desktop"
 
   # Replace the old Electron launcher so only one "Devcroft" remains.
   if [[ -f "$legacy" ]]; then

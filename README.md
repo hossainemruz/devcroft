@@ -66,7 +66,7 @@ Install as the **Devcroft** desktop app (replaces the old Electron-based install
 mise run install          # release build; use --debug for a faster debug install
 ```
 
-On Linux this installs `~/.local/bin/devcroft`, the `Devcroft.desktop` launcher with the icon from `assets/icons/logo.png`, and removes the legacy `com.devcroft.desktop.desktop` entry plus leftover Electron bundle files. Your data in `~/.local/share/devcroft` (`device.json`, `portable/`, caches) is kept. On macOS it (re)creates `/Applications/Devcroft.app` (`~/Applications` fallback when `/Applications` is not writable) with an `AppIcon.icns` generated from the same logo.
+On Linux this installs `~/.local/bin/devcroft`, the `devcroft.desktop` launcher with the icon from `assets/icons/logo.png`, and removes the previous `Devcroft.desktop` and legacy `com.devcroft.desktop.desktop` entries plus leftover Electron bundle files. The lowercase launcher filename matches the window app ID so Wayland taskbars can find its icon. Your data in `~/.local/share/devcroft` (`device.json`, `portable/`, caches) is kept. On macOS it (re)creates `/Applications/Devcroft.app` (`~/Applications` fallback when `/Applications` is not writable) with an `AppIcon.icns` generated from the same logo.
 
 Useful development tasks:
 

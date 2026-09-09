@@ -2,6 +2,14 @@
 
 Use this same document with **OpenCode or Claude CLI**, whether the agent runs in Devcroft's Agent tab, another terminal tab, or an external terminal. Devcroft need not be running. There is no provider-specific runtime integration, socket, MCP server, prompt generator, or automatic agent configuration change.
 
+## Skill installation
+
+For automatic discovery, use **Settings → Agent → Devcroft skill** or run
+`devcroft skill install`. This installs the bundled instructions and references
+for Claude Code and Codex/shared agents; OpenCode also reads these locations.
+Use `devcroft skill status` to inspect installation and environment diagnostics.
+The manual reference-based setup below remains available.
+
 ## One-time setup (human-controlled)
 
 Make the built `devcroft` binary available on the agent terminal's `PATH`, or tell the agent its absolute path. Build from this repository with `mise run build` if needed; do not launch `devcroft app` to use store commands. Select the same data root as the desktop: the normal per-OS default, or an explicit **absolute** `DEVCROFT_DATA_DIR` inherited by the agent terminal. Do not point the variable at a source checkout or create repository-local copies of planning records.

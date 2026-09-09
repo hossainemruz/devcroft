@@ -1,6 +1,7 @@
 mod add_repository;
 mod agent;
 mod agent_activity;
+mod agent_skill;
 mod artifacts;
 mod cli;
 mod command_palette;
@@ -61,6 +62,7 @@ fn main() -> Result<()> {
         Command::Subtask(args) => commands::subtask(args).context("devcroft subtask"),
         Command::Artifact(args) => commands::artifact(args).context("devcroft artifact"),
         Command::Review(args) => cli::review::run(args).context("devcroft review"),
+        Command::Skill(args) => agent_skill::run(args).context("devcroft skill"),
     }
 }
 

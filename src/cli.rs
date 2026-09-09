@@ -52,6 +52,8 @@ pub(crate) enum Command {
     Artifact(planning::ArtifactArgs),
     /// List and manage local branch-pair review comments.
     Review(review::ReviewArgs),
+    /// Install, inspect, or remove the bundled agent skill.
+    Skill(crate::agent_skill::Args),
 }
 
 /// Arguments for `devcroft app`.

@@ -12,6 +12,7 @@
 //! open/close while the view keeps the selected section and edits across
 //! reopenings.
 
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -104,6 +105,9 @@ pub(crate) struct SettingsView {
     branch_error: Option<String>,
     branch_notice: Option<String>,
     workspace: Option<WeakEntity<Workspace>>,
+    skill_busy: bool,
+    skill_report: String,
+    skill_environment: String,
 }
 
 impl SettingsView {
@@ -157,6 +161,10 @@ impl SettingsView {
             branch_error: None,
             branch_notice: None,
             workspace: None,
+            skill_busy: false,
+            skill_report: crate::agent_skill::perform(crate::agent_skill::Action::Status, None)
+                .text,
+            skill_environment: crate::agent_skill::environment(),
         }
     }
 
@@ -192,6 +200,11 @@ impl SettingsView {
         self.branch_input.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
+        if !self.skill_busy {
+            self.skill_report =
+                crate::agent_skill::perform(crate::agent_skill::Action::Status, None).text;
+            self.skill_environment = crate::agent_skill::environment();
+        }
         self.origin_busy = false;
         self.origin_error = None;
         self.origin_notice = None;
@@ -578,7 +591,7 @@ impl SettingsView {
                                 }
                                 SettingsSection::Sync => self.render_sync(cx).into_any_element(),
                                 SettingsSection::Editor => self.render_editor().into_any_element(),
-                                SettingsSection::Agent => self.render_agent().into_any_element(),
+                                SettingsSection::Agent => self.render_agent(cx).into_any_element(),
                                 SettingsSection::Terminal => {
                                     self.render_terminal().into_any_element()
                                 }
@@ -1000,8 +1013,104 @@ impl SettingsView {
         )
     }
 
-    fn render_agent(&self) -> impl IntoElement {
-        v_flex().gap_4().child(
+    fn manage_skill(
+        &mut self,
+        action: crate::agent_skill::Action,
+        target: Option<crate::agent_skill::Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.skill_busy {
+            return;
+        }
+        self.skill_busy = true;
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let (report, environment) = cx
+                .background_spawn(async move {
+                    let mut report = crate::agent_skill::perform(action, target);
+                    if action != crate::agent_skill::Action::Status {
+                        let status =
+                            crate::agent_skill::perform(crate::agent_skill::Action::Status, None);
+                        report.text = format!("{}\n\n{}", report.text, status.text);
+                    }
+                    (report, crate::agent_skill::environment())
+                })
+                .await;
+            let _ = cx.update(|_, cx| {
+                view.update(cx, |this, cx| {
+                    this.skill_busy = false;
+                    this.skill_report = report.text;
+                    this.skill_environment = environment;
+                    cx.notify();
+                })
+                .ok();
+            });
+        })
+        .detach();
+    }
+
+    fn render_agent(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::agent_skill::{Action, Target};
+        let busy = self.skill_busy;
+        let mut skill = group(
+            "Devcroft skill",
+            Some(
+                "Teach agents to use Devcroft tasks, artifacts, and local review comments. OpenCode also reads these skill locations.",
+            ),
+        );
+        for (index, target) in Target::ALL.into_iter().enumerate() {
+            skill = skill.child(live_row(
+                target.label(),
+                "Install for all projects on this machine.",
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new(("skill-install", index))
+                            .label("Install / update")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.manage_skill(Action::Install, Some(target), window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(("skill-remove", index))
+                            .label("Remove")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.manage_skill(Action::Uninstall, Some(target), window, cx);
+                            })),
+                    ),
+            ));
+        }
+        skill = skill
+            .child(
+                Button::new("skill-status")
+                    .label(if busy { "Working…" } else { "Refresh status" })
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.manage_skill(Action::Status, None, window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xe7e7e7))
+                    .child(self.skill_report.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x858989))
+                    .child(self.skill_environment.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x858989))
+                    .child("Updates and removal preserve modified or unmanaged skill folders."),
+            );
+        v_flex().gap_4().child(skill).child(
             dummy_group("Agent", "Coming soon — these controls are placeholders.")
                 .child(dummy_row(
                     "Default command",

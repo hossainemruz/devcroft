@@ -77,3 +77,35 @@ mise run test
 ```
 
 The initial terminal renderer supports ANSI color, keyboard input, bracketed paste, focus, resizing, scrollback, and scroll-wheel reporting to full-screen applications. Keyboard input automatically returns a scrolled terminal viewport to the active prompt. It shapes each terminal row as one GPUI text layout with Ghostty styles applied as highlights, avoiding both per-cell elements and clipping at style boundaries. Image protocols and general mouse click/drag reporting are intentionally left for a later version. The Ghostty binding is pinned to a reviewed upstream revision so builds remain reproducible.
+
+## Agent skill
+
+In **Settings → Agent → Devcroft skill**, install or update the bundled CLI
+skill for Claude Code and/or Codex/shared agents. OpenCode also discovers these
+locations. The skill explains tasks, subtasks, artifacts, and local review
+comments, with examples; all operations use the existing CLI.
+
+The same installer works without the desktop:
+
+```sh
+devcroft skill install
+devcroft skill status
+devcroft skill install --target claude
+devcroft skill uninstall --target agents
+```
+
+Without `--target`, commands process both `~/.claude/skills/devcroft` and
+`~/.agents/skills/devcroft`. Install also updates an older managed bundle.
+Status reports destination paths, bundle status, CLI availability on the current
+process's PATH, and the selected data root. External agent shells may have a
+different environment: ensure `devcroft` is available there and use the same
+absolute `DEVCROFT_DATA_DIR` as the desktop when overriding the default.
+Restart the agent if the skill does not appear.
+
+Modified or unmanaged skill folders are preserved; move your custom copy aside
+before reinstalling. Results are reported separately for both destinations; the
+CLI exits nonzero if either fails. Remove only deletes an unmodified managed
+bundle. Installation does not edit project instruction files or agent settings.
+
+The maintained bundle lives in `assets/skills/devcroft/` and is embedded in the
+binary, so installation requires neither network access nor a source checkout.

@@ -59,6 +59,14 @@ mise run build
 mise run app
 ```
 
+Install as the **Devcroft** desktop app (replaces the old Electron-based install):
+
+```sh
+mise run install          # release build; use --debug for a faster debug install
+```
+
+On Linux this installs `~/.local/bin/devcroft`, the `Devcroft.desktop` launcher with the icon from `assets/icons/logo.png`, and removes the legacy `com.devcroft.desktop.desktop` entry plus leftover Electron bundle files. Your data in `~/.local/share/devcroft` (`device.json`, `portable/`, caches) is kept. On macOS it (re)creates `/Applications/Devcroft.app` (`~/Applications` fallback when `/Applications` is not writable) with an `AppIcon.icns` generated from the same logo.
+
 Useful development tasks:
 
 ```sh

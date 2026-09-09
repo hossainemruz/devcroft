@@ -17,6 +17,11 @@ description = "Preview a file in a dialog"
 usage = 'arg "<path>" help="File to preview"'
 run = 'cargo run -- preview "${usage_path?}"'
 
+[tasks.install]
+description = "Install Devcroft as a desktop app, replacing the old Electron install (Linux + macOS)"
+usage = 'flag "--debug" help="Install a debug build instead of release"'
+run = "./scripts/install-app.sh ${usage_debug:+--debug}"
+
 [tasks.check]
 description = "Run formatting, compilation, and lints"
 run = [

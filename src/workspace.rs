@@ -736,7 +736,6 @@ impl Workspace {
         // invalidates the tick that was in flight for the old checkout.
         self.refresh_git_status(cx);
         self.recent_repositories = recent_repositories(&root, usize::MAX);
-        window.push_notification(format!("Switched to {label}"), cx);
         self.focus_active_pane(window, cx);
         cx.notify();
     }

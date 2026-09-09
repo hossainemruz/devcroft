@@ -111,6 +111,52 @@ fn open(repo_path: &Path) -> Result<gix::Repository> {
         .with_context(|| format!("opening git repository at {}", repo_path.display()))
 }
 
+/// Read the complete side of an anchor, including lines outside visible hunks.
+pub(crate) fn anchor_source(
+    cwd: &Path,
+    diff: &ReviewDiff,
+    path: &str,
+    side: super::comments::Side,
+) -> Result<Option<String>> {
+    let repo = open(cwd)?;
+    let bytes = match side {
+        super::comments::Side::New => {
+            let root = repo.workdir().context("review requires a worktree")?;
+            if Path::new(path).is_absolute()
+                || Path::new(path)
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                bail!("Invalid anchor path");
+            }
+            match read_worktree(&root.join(path)) {
+                WorkContent::Bytes(bytes) | WorkContent::Symlink(bytes) => Some(bytes),
+                _ => None,
+            }
+        }
+        super::comments::Side::Old => {
+            let tree =
+                commit_tree_id(&repo, gix::ObjectId::from_hex(diff.base_commit.as_bytes())?)?;
+            let entries = list_tree(&repo, tree)?;
+            let old_path = diff
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .and_then(|f| f.old_path.as_deref())
+                .unwrap_or(path);
+            entries
+                .get(old_path)
+                .and_then(|e| match read_blob(&repo, e.oid) {
+                    BlobRead::Hit(bytes) => Some(bytes),
+                    _ => None,
+                })
+        }
+    };
+    Ok(bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.contains('\0')))
+}
+
 fn current_branch(repo: &gix::Repository) -> Option<String> {
     repo.head_name()
         .ok()
@@ -819,6 +865,46 @@ mod tests {
             .iter()
             .find(|file| file.path == path)
             .unwrap_or_else(|| panic!("expected {path} in diff"))
+    }
+
+    #[test]
+    fn anchor_sources_cover_both_sides_renames_and_unchanged_files() {
+        use super::super::comments::{Anchor, Side, Store};
+        let dir = init_repo();
+        write(dir.path(), "old.txt", b"one\ntwo\n");
+        commit_all(dir.path(), "initial");
+        let scope = uncommitted();
+        let initial = load_review(dir.path(), &scope).unwrap();
+        let store = Store::open(dir.path(), "main", "origin", &scope, &initial).unwrap();
+        for side in [Side::Old, Side::New] {
+            store
+                .create(
+                    Anchor {
+                        path: "old.txt".into(),
+                        side,
+                        start: 2,
+                        end: 2,
+                        source: "one\ntwo\n".into(),
+                        outdated: false,
+                    },
+                    "feedback".into(),
+                )
+                .unwrap();
+        }
+        fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
+        let diff = load_review(dir.path(), &scope).unwrap();
+        let comments = store.refresh(dir.path(), &diff).unwrap();
+        assert!(
+            comments
+                .iter()
+                .all(|c| c.anchor.path == "new.txt" && !c.anchor.outdated)
+        );
+        fs::remove_file(dir.path().join("new.txt")).unwrap();
+        let comments = store.refresh(dir.path(), &diff).unwrap();
+        assert!(!comments[0].anchor.outdated);
+        assert!(comments[1].anchor.outdated);
+        git(dir.path(), &["checkout", "-b", "other"]);
+        assert!(store.ensure_checkout(dir.path()).is_err());
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! owns loading, scope selection, the tree/stream layout, viewed-file state,
 //! and refresh.
 
+pub(crate) mod comments;
+mod feedback;
 pub(crate) mod git;
 mod icons;
 pub(crate) mod model;
@@ -27,8 +29,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollStrategy, SharedString,
-    Styled, UniformListScrollHandle, Window, div, img, px, rgb, uniform_list,
+    IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, ParentElement,
+    Render, ScrollStrategy, SharedString, Styled, Window, div, img, list, px, rgb, svg,
 };
 
 use crate::command_palette::{
@@ -42,6 +44,11 @@ use self::icons::{FALLBACK, ICON_PX, IconTiles, ensure_tiles, icon_key};
 use self::model::ReviewDiff;
 use self::stream::{flatten, render_row, status_color};
 use self::tree::{TreeRowMeta, build_file_tree, file_item_id, file_path_from_id};
+
+/// Lucide `message-square` outline, inlined because `gpui-kit-assets`
+/// ships no comment glyph. `stroke="currentColor"` lets the toolbar
+/// `text_color` tint it like the neighboring `Icon` glyphs.
+const COMMENT_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScopeTab {
@@ -80,18 +87,16 @@ pub(crate) struct ReviewView {
     /// every row render. Rasterizing here (not per frame) keeps scrolling
     /// smooth; the `Rc` lets the virtualized row closures share the cache.
     icon_tiles: Rc<IconTiles>,
-    list_handle: UniformListScrollHandle,
-    /// Absolute index of the first visible stream row, recorded by the
-    /// list's row processor on every layout. This is the scroll-spy source:
-    /// the list measures only one item height and renders a moving window,
-    /// so handle offsets can't be mapped back to rows from outside.
-    /// Recorded values lag the latest input by one frame at most; the tree
-    /// selection update itself schedules the render that observes the fresh
-    /// value, so the two converge instead of fighting.
+    list_handle: ListState,
+    editor_row: Cell<Option<usize>>,
+    comment_layout: RefCell<Vec<(String, u64)>>,
+    /// First visible logical row from ListState, used for tree scroll sync.
     stream_top: Rc<Cell<usize>>,
     last_scrolled: Option<String>,
     /// Monotonic load id; stale background loads never overwrite newer state.
     generation: u64,
+    feedback: feedback::Feedback,
+    show_comments: bool,
 }
 
 impl ReviewView {
@@ -108,10 +113,14 @@ impl ReviewView {
             tree_metas: Rc::new(HashMap::new()),
             viewed: Rc::default(),
             icon_tiles: Rc::default(),
-            list_handle: UniformListScrollHandle::new(),
+            list_handle: ListState::new(0, ListAlignment::Top, px(300.)),
+            editor_row: Cell::new(None),
+            comment_layout: RefCell::default(),
             stream_top: Rc::default(),
             last_scrolled: None,
             generation: 0,
+            feedback: feedback::Feedback::default(),
+            show_comments: true,
         };
         view.reload(cx);
         view
@@ -134,16 +143,28 @@ impl ReviewView {
         cx.notify();
         let cwd = self.cwd.clone();
         let scope = self.scope();
+        let base = self.base_branch.clone();
+        let remote = self.remote.clone();
         cx.spawn(async move |this, cx| {
             let loaded = cx
-                .background_spawn(async move { load_review(&cwd, &scope) })
+                .background_spawn(async move {
+                    let diff = load_review(&cwd, &scope)?;
+                    let feedback = comments::Store::open(&cwd, &base, &remote, &scope, &diff)
+                        .and_then(|store| {
+                            store.refresh(&cwd, &diff).map(|comments| (store, comments))
+                        });
+                    anyhow::Ok((diff, feedback))
+                })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.generation != generation {
                     return;
                 }
                 match loaded {
-                    Ok(diff) => view.apply_diff(diff, cx),
+                    Ok((diff, feedback)) => {
+                        view.load_comments(feedback);
+                        view.apply_diff(diff, cx);
+                    }
                     Err(error) => {
                         view.state = ReviewState::Failed(format!("{error:#}").into());
                         cx.notify();
@@ -166,6 +187,8 @@ impl ReviewView {
     fn apply_diff(&mut self, diff: ReviewDiff, cx: &mut Context<Self>) {
         let (items, metas) = build_file_tree(&diff.files);
         let (rows, file_row_start) = flatten(&diff);
+        self.list_handle.reset(rows.len() + 1);
+        self.editor_row.set(None);
         let mut tiles = (*self.icon_tiles).clone();
         ensure_tiles(
             diff.files.iter().map(|file| file.path.as_str()),
@@ -296,6 +319,11 @@ impl ReviewView {
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let scope_index = self.scope_tab as usize;
+        let comment_tint = rgb(if self.show_comments {
+            0xe7e7e7
+        } else {
+            0x737878
+        });
         h_flex()
             .h(px(40.))
             .flex_none()
@@ -336,6 +364,37 @@ impl ReviewView {
                     .text_xs()
                     .text_color(rgb(0x737878))
                     .child(self.summary()),
+            )
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .gap_1()
+                    .items_center()
+                    .border_color(rgb(if self.show_comments {
+                        0x7dd3fc
+                    } else {
+                        0x292b2b
+                    }))
+                    .text_xs()
+                    .text_color(comment_tint)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.show_comments = !this.show_comments;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .data(COMMENT_ICON)
+                            .size(px(14.))
+                            .text_color(comment_tint),
+                    )
+                    .child(format!("{}", self.comment_count())),
             )
             .child(
                 div()
@@ -452,8 +511,10 @@ impl ReviewView {
                 && let Some(path) = &selected
                 && let Some(file) = loaded.diff.files.iter().position(|file| &file.path == path)
             {
-                self.list_handle
-                    .scroll_to_item(loaded.file_row_start[file], ScrollStrategy::Top);
+                self.list_handle.scroll_to(ListOffset {
+                    item_ix: loaded.file_row_start[file],
+                    offset_in_item: px(0.),
+                });
             }
             self.last_scrolled = selected;
             return;
@@ -480,36 +541,120 @@ impl ReviewView {
 
     /// The virtualized diff stream: only the visible row window is built.
     ///
-    /// The row processor also records the visible window's start, which is
-    /// the absolute scroll position `sync_tree_and_stream` reads back.
+    /// Variable-height virtualization lets the editor live below its anchor.
     fn render_stream(&self, loaded: &Rc<LoadedReview>, cx: &mut Context<Self>) -> impl IntoElement {
-        let row_count = loaded.rows.len();
+        let revisions = self.comment_revisions();
+        if *self.comment_layout.borrow() != revisions {
+            *self.comment_layout.borrow_mut() = revisions;
+            let top = self.list_handle.logical_scroll_top();
+            self.list_handle.reset(loaded.rows.len() + 1);
+            self.list_handle.scroll_to(top);
+        }
+        let editor = self.inline_editor_row();
+        let previous = self.editor_row.replace(editor);
+        if previous != editor {
+            for ix in [previous, editor].into_iter().flatten() {
+                if ix <= loaded.rows.len() {
+                    self.list_handle.splice(ix..ix + 1, 1);
+                }
+            }
+            if let Some(ix) = editor {
+                self.list_handle.scroll_to(ListOffset {
+                    item_ix: ix.saturating_sub(3),
+                    offset_in_item: px(0.),
+                });
+            }
+        }
         let loaded = loaded.clone();
         let viewed = self.viewed.clone();
+        let thread_groups = self.inline_thread_groups();
         let view = cx.entity();
-        let stream_top = self.stream_top.clone();
-        uniform_list("review-stream", row_count, move |range, _window, _cx| {
-            stream_top.set(range.start);
-            let seen = viewed.borrow();
-            range
-                .map(|ix| render_row(&loaded, loaded.rows[ix], &seen, &view))
-                .collect()
+        let weak = view.downgrade();
+        self.list_handle.set_scroll_handler(move |_, _, cx| {
+            let _ = weak.update(cx, |_, cx| cx.notify());
+        });
+        list(self.list_handle.clone(), move |ix, _window, cx| {
+            if ix == loaded.rows.len() {
+                return view.update(cx, |this, cx| {
+                    v_flex()
+                        .w_full()
+                        .p_3()
+                        .child(div().text_xs().text_color(rgb(0x858989)).child(
+                            if loaded.rows.is_empty() {
+                                "No changes in this scope. Saved review comments:"
+                            } else {
+                                "Comments outside the current diff"
+                            },
+                        ))
+                        .child(
+                            this.render_inline_threads(
+                                thread_groups
+                                    .get(&ix)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or_default(),
+                                cx,
+                            ),
+                        )
+                        .into_any_element()
+                });
+            }
+            let row = loaded.rows[ix];
+            let (selected, count) = view.read(cx).line_feedback(row);
+            let target = view.clone();
+            let line = h_flex()
+                .h(px(stream::ROW_H))
+                .flex_none()
+                .w_full()
+                .when(selected, |d| d.bg(rgb(0x203442)))
+                .border_l_2()
+                .border_color(rgb(if selected {
+                    0x7dd3fc
+                } else if count > 0 {
+                    0xfbbf24
+                } else {
+                    0x090a0a
+                }))
+                .child(div().flex_1().min_w_0().child(render_row(
+                    &loaded,
+                    row,
+                    &viewed.borrow(),
+                    &view,
+                    selected,
+                )))
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    if matches!(row, stream::StreamRow::Line { .. }) {
+                        cx.stop_propagation();
+                        target.update(cx, |this, cx| {
+                            this.select_line(row, event.modifiers.shift, window, cx)
+                        });
+                    }
+                });
+            let mut item = v_flex().w_full().child(line);
+            let threads = view.update(cx, |this, cx| {
+                this.render_inline_threads(
+                    thread_groups
+                        .get(&ix)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    cx,
+                )
+            });
+            item = item.child(threads);
+            if editor == Some(ix) && view.read(cx).is_new_comment() {
+                let editor = view.update(cx, |this, cx| this.render_comment_editor(cx));
+                item = item.child(editor);
+            }
+            item.into_any_element()
         })
         .size_full()
-        .track_scroll(&self.list_handle)
-        // The list scrolls internally without notifying us; forward wheel
-        // activity so the scroll-spy in `sync_tree_and_stream` keeps up.
-        // (No scrollbar-drag path exists: the list has no scrollbar
-        // decoration, so wheel/trackpad plus programmatic scrolls cover it.)
-        .on_scroll_wheel(cx.listener(|_, _, _, cx| {
-            cx.notify();
-        }))
     }
 }
 
 impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sync scroll before borrowing the diff for the body below.
+        self.stream_top
+            .set(self.list_handle.logical_scroll_top().item_ix);
         self.sync_tree_and_stream(cx);
         let focus = self.focus_handle.clone();
         let track = self.focus_handle.clone();
@@ -558,19 +703,12 @@ impl Render for ReviewView {
                     .child(retry)
                     .into_any_element()
             }
-            ReviewState::Loaded(loaded) if loaded.diff.files.is_empty() => div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(rgb(0x737878))
-                .child("No changes in this scope.")
-                .into_any_element(),
             ReviewState::Loaded(loaded) => {
                 let file_count = loaded.diff.files.len();
                 h_flex()
                     .flex_1()
+                    .h_full()
+                    .min_w_0()
                     .min_h_0()
                     .child(
                         v_flex()
@@ -617,7 +755,17 @@ impl Render for ReviewView {
             )
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_toolbar(cx))
-            .child(body)
+            .child(
+                h_flex()
+                    .flex_1()
+                    // h_flex centers by default; the nested tree/diff pane
+                    // needs the entire cross axis for its virtualized lists.
+                    .items_stretch()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(body)
+                    .when(self.show_comments, |d| d.child(self.render_comments(cx))),
+            )
     }
 }
 

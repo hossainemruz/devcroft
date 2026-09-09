@@ -2,8 +2,8 @@
 //!
 //! The stream flattens a loaded diff into [`StreamRow`]s once per load
 //! ([`flatten`]); the view renders only the visible window through
-//! `uniform_list`. Every row is exactly [`ROW_H`] tall — the list measures
-//! a single item height, so variable heights would corrupt scrolling.
+//! a variable-height list. Diff rows are [`ROW_H`] tall; the view can append
+//! an inline comment editor to the row at the end of a selected range.
 //! Per-load flattening plus per-frame visible-only rendering is what keeps
 //! large diffs smooth: fully expanded, a big review would otherwise be tens
 //! of thousands of flex elements laid out on every frame.
@@ -138,6 +138,7 @@ pub(crate) fn render_row(
     row: StreamRow,
     viewed: &HashSet<String>,
     view: &Entity<ReviewView>,
+    selected: bool,
 ) -> AnyElement {
     let file = &loaded.diff.files[row.file()];
     match row {
@@ -147,7 +148,9 @@ pub(crate) fn render_row(
             super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
         },
         StreamRow::Line { hunk, line, .. } => match &file.content {
-            super::model::FileContent::Text { hunks, .. } => line_row(&hunks[hunk].lines[line]),
+            super::model::FileContent::Text { hunks, .. } => {
+                line_row(&hunks[hunk].lines[line], selected)
+            }
             super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
         },
         StreamRow::Collapsed { hunk, .. } => match &file.content {
@@ -230,7 +233,7 @@ fn file_header_row(file: &ChangedFile, is_viewed: bool, view: &Entity<ReviewView
         .into_any_element()
 }
 
-fn line_row(line: &HunkLine) -> AnyElement {
+fn line_row(line: &HunkLine, selected: bool) -> AnyElement {
     let (background, sign, sign_color) = match line.tag {
         LineTag::Context => (None, " ", 0x555a5a),
         LineTag::Deletion => (Some(0x33191a), "-", 0xf87171),
@@ -256,6 +259,7 @@ fn line_row(line: &HunkLine) -> AnyElement {
         .text_size(px(review_font_size()))
         .line_height(px(ROW_H))
         .when_some(background, |this, color| this.bg(rgb(color)))
+        .when(selected, |this| this.bg(rgb(0x203442)))
         .child(
             div()
                 .w(px(44.))

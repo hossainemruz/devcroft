@@ -1,5 +1,12 @@
 # Review tab — build plan (diffs.com-style, on gpui-kit)
 
+> September 2026 update: the user's current requirements supersede M2's portable
+> storage requirement below. Comments now use a local Git-common-directory store
+> per branch pair and scope, with a desktop sidebar and headless lifecycle CLI.
+> See [the implemented workflow](review-comments.md). The remaining portable,
+> export, and tutorial items below are historical planning, not acceptance
+> requirements for this comment implementation.
+
 This document plans the Review tab for the Rust/GPUI rewrite: a diffs.com-style review experience built on gpui-kit tree components, informed by reviu, hunk (both of them — see below), and a prior exploration chat on Rust git-diff libraries (shared as "Rust Git Diff Libraries", whose recoverable findings are incorporated in the reference section). The binding capability spec is `feature-parity.md` §§6–7; this plan describes sequencing, architecture, crate choices, and acceptance criteria, not visual pixel-fidelity.
 
 ## Agreed decisions

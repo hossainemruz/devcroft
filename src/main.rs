@@ -59,6 +59,7 @@ fn main() -> Result<()> {
         Command::Task(args) => commands::task(args).context("devcroft task"),
         Command::Subtask(args) => commands::subtask(args).context("devcroft subtask"),
         Command::Artifact(args) => commands::artifact(args).context("devcroft artifact"),
+        Command::Review(args) => cli::review::run(args).context("devcroft review"),
     }
 }
 

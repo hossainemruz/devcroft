@@ -5,7 +5,8 @@
 //! a standalone preview window (no workspace, no socket — the lightweight
 //! MVP standing in for the Phase 2 `preview.open` socket method). Repository
 //! discovery and task/subtask/artifact commands are headless shared-store
-//! operations. Review/sync and live-UI ref/focus commands remain future work.
+//! operations. Local review comments also have headless list/lifecycle commands.
+//! Sync and live-UI ref/focus commands remain future work.
 //! Dispatch in `main()` precedes GPUI initialization.
 
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 pub(crate) mod planning;
+pub(crate) mod review;
 
 /// First-class CLI: `devcroft app` starts the workspace; future subcommands
 /// reuse this parser without changing the dispatch shape in `main()`.
@@ -48,6 +50,8 @@ pub(crate) enum Command {
     Subtask(planning::SubtaskArgs),
     /// Manage standalone Markdown artifacts without a running desktop.
     Artifact(planning::ArtifactArgs),
+    /// List and manage local branch-pair review comments.
+    Review(review::ReviewArgs),
 }
 
 /// Arguments for `devcroft app`.

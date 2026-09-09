@@ -68,6 +68,7 @@ mod tests {
             diff,
             rows,
             file_row_start,
+            syntax: Default::default(),
         };
         let mut anchor = Anchor {
             path: "file.rs".into(),

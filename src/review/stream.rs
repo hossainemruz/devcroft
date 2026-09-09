@@ -13,8 +13,9 @@ use std::collections::HashSet;
 use gpui_kit::component::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Entity, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Styled, div, px, rgb,
+    AnyElement, App, AppContext as _, Entity, FontStyle, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, StyledText,
+    UnderlineStyle, div, px, rgb, rgba,
 };
 
 use crate::fonts::TERMINAL_FONT_FAMILY;
@@ -139,6 +140,7 @@ pub(crate) fn render_row(
     viewed: &HashSet<String>,
     view: &Entity<ReviewView>,
     selected: bool,
+    dark: bool,
 ) -> AnyElement {
     let file = &loaded.diff.files[row.file()];
     match row {
@@ -148,9 +150,11 @@ pub(crate) fn render_row(
             super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
         },
         StreamRow::Line { hunk, line, .. } => match &file.content {
-            super::model::FileContent::Text { hunks, .. } => {
-                line_row(&hunks[hunk].lines[line], selected)
-            }
+            super::model::FileContent::Text { hunks, .. } => line_row(
+                &hunks[hunk].lines[line],
+                loaded.syntax.line(dark, row.file(), hunk, line),
+                selected,
+            ),
             super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
         },
         StreamRow::Collapsed { hunk, .. } => match &file.content {
@@ -233,7 +237,7 @@ fn file_header_row(file: &ChangedFile, is_viewed: bool, view: &Entity<ReviewView
         .into_any_element()
 }
 
-fn line_row(line: &HunkLine, selected: bool) -> AnyElement {
+fn line_row(line: &HunkLine, syntax: &[super::syntax::SyntaxSpan], selected: bool) -> AnyElement {
     let (background, sign, sign_color) = match line.tag {
         LineTag::Context => (None, " ", 0x555a5a),
         LineTag::Deletion => (Some(0x33191a), "-", 0xf87171),
@@ -281,7 +285,29 @@ fn line_row(line: &HunkLine, selected: bool) -> AnyElement {
                 .text_color(rgb(sign_color))
                 .child(sign),
         )
-        .child(div().flex_1().min_w_0().child(line.text.clone()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    StyledText::new(line.text.clone()).with_highlights(syntax.iter().map(|span| {
+                        (
+                            span.range.clone(),
+                            HighlightStyle {
+                                color: Some(rgba(span.rgba).into()),
+                                font_weight: span.bold.then_some(FontWeight::BOLD),
+                                font_style: span.italic.then_some(FontStyle::Italic),
+                                underline: span.underline.then_some(UnderlineStyle {
+                                    thickness: px(1.),
+                                    color: Some(rgba(span.rgba).into()),
+                                    wavy: false,
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                    })),
+                ),
+        )
         .into_any_element()
 }
 

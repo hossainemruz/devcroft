@@ -41,7 +41,8 @@ Records use the selected `DEVCROFT_DATA_DIR` or the normal per-OS data root, ind
 
 ## Code review
 
-The Review tab supports persistent line and range comments. Click a line or
+The Review tab syntax-highlights recognized source files and supports persistent
+line and range comments. Click a line or
 Shift-click a range, then save your feedback. Use the sidebar to navigate, edit,
 resolve, reopen, or delete comments. Agents can use `devcroft review list --open`,
 `devcroft review resolve ID`, and `devcroft review delete ID` without the desktop.

@@ -12,6 +12,7 @@ pub(crate) mod git;
 mod icons;
 pub(crate) mod model;
 mod stream;
+mod syntax;
 mod tree;
 
 use std::cell::{Cell, RefCell};
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::component::{
-    Icon, IconName, StyledExt as _, h_flex,
+    ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex,
     list::ListItem,
     tab::{Tab, TabBar},
     tree::{TreeState, tree},
@@ -71,6 +72,7 @@ pub(crate) struct LoadedReview {
     pub(crate) diff: ReviewDiff,
     pub(crate) rows: Vec<stream::StreamRow>,
     pub(crate) file_row_start: Vec<usize>,
+    pub(crate) syntax: syntax::SyntaxHighlights,
 }
 
 pub(crate) struct ReviewView {
@@ -149,11 +151,12 @@ impl ReviewView {
             let loaded = cx
                 .background_spawn(async move {
                     let diff = load_review(&cwd, &scope)?;
+                    let syntax = syntax::highlight(&diff);
                     let feedback = comments::Store::open(&cwd, &base, &remote, &scope, &diff)
                         .and_then(|store| {
                             store.refresh(&cwd, &diff).map(|comments| (store, comments))
                         });
-                    anyhow::Ok((diff, feedback))
+                    anyhow::Ok((diff, syntax, feedback))
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
@@ -161,9 +164,9 @@ impl ReviewView {
                     return;
                 }
                 match loaded {
-                    Ok((diff, feedback)) => {
+                    Ok((diff, syntax, feedback)) => {
                         view.load_comments(feedback);
-                        view.apply_diff(diff, cx);
+                        view.apply_diff(diff, syntax, cx);
                     }
                     Err(error) => {
                         view.state = ReviewState::Failed(format!("{error:#}").into());
@@ -184,7 +187,12 @@ impl ReviewView {
         self.reload(cx);
     }
 
-    fn apply_diff(&mut self, diff: ReviewDiff, cx: &mut Context<Self>) {
+    fn apply_diff(
+        &mut self,
+        diff: ReviewDiff,
+        syntax: syntax::SyntaxHighlights,
+        cx: &mut Context<Self>,
+    ) {
         let (items, metas) = build_file_tree(&diff.files);
         let (rows, file_row_start) = flatten(&diff);
         self.list_handle.reset(rows.len() + 1);
@@ -205,6 +213,7 @@ impl ReviewView {
             diff,
             rows,
             file_row_start,
+            syntax,
         }));
         cx.notify();
     }
@@ -566,6 +575,7 @@ impl ReviewView {
             }
         }
         let loaded = loaded.clone();
+        let dark = cx.theme().is_dark();
         let viewed = self.viewed.clone();
         let thread_groups = self.inline_thread_groups();
         let view = cx.entity();
@@ -620,6 +630,7 @@ impl ReviewView {
                     &viewed.borrow(),
                     &view,
                     selected,
+                    dark,
                 )))
                 .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     if matches!(row, stream::StreamRow::Line { .. }) {

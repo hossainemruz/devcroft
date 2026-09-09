@@ -128,13 +128,17 @@ install_macos() {
   echo "==> Installing $dest (replaces any existing Devcroft.app)..."
   rm -rf "$dest"
   mkdir -p "$dest/Contents/MacOS" "$dest/Contents/Resources"
-  install -m755 "$TARGET" "$dest/Contents/MacOS/devcroft"
+  # The inner binary must not be named `devcroft` in any casing: the default
+  # macOS filesystem is case-insensitive, so `devcroft` and the bundle
+  # executable `Devcroft` resolve to the same file and the wrapper below
+  # would overwrite the binary with a self-exec loop (dock bounce).
+  install -m755 "$TARGET" "$dest/Contents/MacOS/devcroft-bin"
 
   # Finder launches the bundle executable with no arguments, but bare
   # `devcroft` only prints CLI help -- the GUI needs the `app` subcommand.
   cat > "$dest/Contents/MacOS/Devcroft" <<'EOF'
 #!/bin/sh
-exec "$(dirname "$0")/devcroft" app "$@"
+exec "$(dirname "$0")/devcroft-bin" app "$@"
 EOF
   chmod +x "$dest/Contents/MacOS/Devcroft"
 
@@ -177,7 +181,7 @@ EOF
 
   # CLI convenience link (best effort; ~/.local/bin may need adding to PATH).
   mkdir -p "$HOME/.local/bin"
-  ln -sf "$dest/Contents/MacOS/devcroft" "$HOME/.local/bin/devcroft" || true
+  ln -sf "$dest/Contents/MacOS/devcroft-bin" "$HOME/.local/bin/devcroft" || true
 
   echo "Installed $dest"
 }

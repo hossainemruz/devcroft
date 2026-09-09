@@ -1709,9 +1709,15 @@ impl Render for Workspace {
                                 .flex_none()
                                 .gap_2()
                                 .items_center()
-                                .child(Button::new("go-home").ghost().label("‹ Home").on_click(
-                                    cx.listener(|this, _, window, cx| this.go_home(window, cx)),
-                                ))
+                                .child(
+                                    Button::new("go-home")
+                                        .ghost()
+                                        .accessibility_label("Home")
+                                        .child(div().text_sm().child("‹ Home"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.go_home(window, cx);
+                                        })),
+                                )
                                 .child(
                                     div()
                                         .text_sm()

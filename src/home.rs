@@ -965,6 +965,13 @@ impl Render for HomeView {
         let card_width = recent_card_width(f32::from(window.viewport_size().width));
         let mut body = v_flex()
             .w_full()
+            // Fill the area below the titlebar while allowing the dashboard
+            // to grow and scroll on shorter windows or with more inbox items.
+            .min_h(px(
+                (f32::from(window.viewport_size().height)
+                    - crate::metrics::WORKSPACE_HEADER_HEIGHT)
+                    .max(0.),
+            ))
             .max_w(px(1440.))
             .mx_auto()
             .gap_4()
@@ -1204,6 +1211,8 @@ impl Render for HomeView {
             );
             body = body.child(
                 h_flex()
+                    .flex_grow(1.)
+                    .flex_shrink_0()
                     .items_stretch()
                     .gap_4()
                     .flex_wrap()

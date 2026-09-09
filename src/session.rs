@@ -26,8 +26,8 @@ use libghostty_vt::{
     style::RgbColor,
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
-        PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
-        Terminal,
+        Point, PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
+        SizeReportSize, Terminal,
     },
 };
 use parking_lot::Mutex;
@@ -125,10 +125,24 @@ impl TerminalSession {
     /// Spawn the login shell plus the tab's startup command. The Agent tab
     /// launches `agent` ([`AgentKind::command`]); every other tab uses its
     /// fixed [`WorkspaceTab::command`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn(
         tab: WorkspaceTab,
         cwd: &Path,
         agent: AgentKind,
+    ) -> Result<(Self, async_channel::Receiver<Vec<u8>>)> {
+        Self::spawn_with_startup(tab, cwd, agent, None, &[])
+    }
+
+    /// Spawn with a prepared Agent command. Other tabs ignore the override.
+    /// Keeping the original [`Self::spawn`] entry point makes the terminal
+    /// engine independently testable with the ordinary harness command.
+    pub(crate) fn spawn_with_startup(
+        tab: WorkspaceTab,
+        cwd: &Path,
+        agent: AgentKind,
+        startup_command: Option<&str>,
+        startup_environment: &[(String, String)],
     ) -> Result<(Self, async_channel::Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -147,6 +161,11 @@ impl TerminalSession {
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "devcroft");
         command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        if tab == WorkspaceTab::Agent {
+            for (name, value) in startup_environment {
+                command.env(name, value);
+            }
+        }
         command.arg("-l");
 
         let child = pair
@@ -230,7 +249,7 @@ impl TerminalSession {
             .on_xtversion(|_| Some("devcroft"))?;
 
         if let Some(program) = match tab {
-            WorkspaceTab::Agent => Some(agent.command()),
+            WorkspaceTab::Agent => startup_command.or_else(|| Some(agent.command())),
             _ => tab.command(),
         } {
             let mut pty = writer.lock();
@@ -263,6 +282,57 @@ impl TerminalSession {
 
     pub(crate) fn feed(&mut self, bytes: &[u8]) {
         self.terminal.vt_write(bytes);
+    }
+
+    pub(crate) fn title(&self) -> Result<String> {
+        Ok(self.terminal.title()?.to_owned())
+    }
+
+    /// Read the terminal's live active area independently of the user's
+    /// scrollback viewport. Activity detection needs the current dialog and
+    /// prompt; historical approval text must never become live evidence.
+    pub(crate) fn activity_screen(&self) -> Result<String> {
+        const REGION_ROWS: u16 = 20;
+
+        let cols = self.terminal.cols()?;
+        let rows = self.terminal.rows()?;
+        let mut selected = Vec::with_capacity((REGION_ROWS * 2).min(rows) as usize);
+        if rows <= REGION_ROWS * 2 {
+            selected.extend(0..rows);
+        } else {
+            selected.extend(0..REGION_ROWS);
+            selected.extend(rows - REGION_ROWS..rows);
+        }
+
+        let mut screen = String::new();
+        for (index, row) in selected.into_iter().enumerate() {
+            if index > 0 {
+                screen.push('\n');
+            }
+            if rows > REGION_ROWS * 2 && index == REGION_ROWS as usize {
+                // Preserve the region boundary as a line without exposing
+                // omitted scrollback-like content to the classifier.
+                screen.push_str("…\n");
+            }
+            let row_start = screen.len();
+            for column in 0..cols {
+                let cell = self
+                    .terminal
+                    .grid_ref(Point::Active(PointCoordinate {
+                        x: column,
+                        y: u32::from(row),
+                    }))?
+                    .cell()?;
+                let codepoint = cell.codepoint()?;
+                screen.push(
+                    char::from_u32(codepoint)
+                        .filter(|character| *character != '\0')
+                        .unwrap_or(' '),
+                );
+            }
+            screen.truncate(screen.trim_end().len().max(row_start));
+        }
+        Ok(screen)
     }
 
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -804,6 +874,29 @@ mod tests {
         );
         assert!(row_text(&rows, 1).starts_with("ccc"));
         assert!(rows[1].iter().any(|run| run.style.cursor));
+        session._child.kill().ok();
+    }
+
+    #[test]
+    fn activity_screen_ignores_scrolled_viewport_history() {
+        let cwd = std::env::temp_dir();
+        let (mut session, _output) = TerminalSession::spawn(
+            crate::workspace::WorkspaceTab::Terminal,
+            &cwd,
+            AgentKind::DEFAULT,
+        )
+        .expect("spawning a shell for the active-screen test");
+        session.feed(b"OLD APPROVAL\r\n");
+        for index in 0..(crate::metrics::INITIAL_ROWS + 10) {
+            session.feed(format!("live-{index}\r\n").as_bytes());
+        }
+        session.terminal.scroll_viewport(ScrollViewport::Top);
+
+        let screen = session
+            .activity_screen()
+            .expect("active screen should be readable while scrolled back");
+        assert!(!screen.contains("OLD APPROVAL"));
+        assert!(screen.contains("live-"));
         session._child.kill().ok();
     }
 

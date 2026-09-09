@@ -23,6 +23,7 @@ use gpui_kit::{
 
 use crate::{
     agent::AgentKind,
+    agent_activity::{AgentActivityStore, PreparedAgentLaunch, TerminalObservation},
     command_palette::{
         GoToAgent, GoToEditor, GoToTerminal, PaletteMode, ToggleActionsPalette,
         ToggleProjectsPalette, is_go_to_agent_shortcut, is_go_to_editor_shortcut,
@@ -69,6 +70,14 @@ pub(crate) struct TerminalPane {
     /// Sequence counter for copy confirmations, so a stale dismiss timer
     /// cannot remove a newer copy's toast (see `dismiss_copy_feedback`).
     copy_feedback_seq: u64,
+    /// Present only for the managed Agent tab. Dropping it unregisters the
+    /// launch, while hidden repository panes keep it alive.
+    agent_activity: Option<PreparedAgentLaunch>,
+    last_activity_observation: Option<Instant>,
+    activity_observation_armed: bool,
+    /// Small raw-output overlap so an OSC exit marker split across PTY
+    /// reads is still recognized.
+    activity_output_tail: Vec<u8>,
 }
 
 /// Marker id for the terminal copy confirmation toast. A stable id makes
@@ -82,8 +91,11 @@ impl TerminalPane {
         tab: WorkspaceTab,
         cwd: &Path,
         agent: AgentKind,
+        activity_store: &AgentActivityStore,
         cx: &mut Context<Self>,
     ) -> Self {
+        let agent_activity =
+            (tab == WorkspaceTab::Agent).then(|| activity_store.start(cwd, agent));
         let mut pane = Self {
             focus_handle: cx.focus_handle(),
             tab,
@@ -99,15 +111,27 @@ impl TerminalPane {
             selecting: false,
             pane_bounds: None,
             copy_feedback_seq: 0,
+            agent_activity,
+            last_activity_observation: None,
+            activity_observation_armed: false,
+            activity_output_tail: Vec::new(),
         };
 
-        let output = match TerminalSession::spawn(tab, cwd, agent) {
+        let (startup, startup_environment) = pane
+            .agent_activity
+            .as_ref()
+            .map(|activity| (Some(activity.command_line()), activity.environment()))
+            .unwrap_or((None, &[]));
+        let output = match TerminalSession::spawn_with_startup(tab, cwd, agent, startup, startup_environment) {
             Ok((session, output)) => {
                 pane.session = Some(session);
                 Some(output)
             }
             Err(error) => {
                 pane.error = Some(format!("Could not start {}: {error:#}", tab.label()).into());
+                if let Some(activity) = &pane.agent_activity {
+                    activity.unavailable(format!("Could not start {}", agent.label()));
+                }
                 None
             }
         };
@@ -117,9 +141,13 @@ impl TerminalPane {
                 while let Ok(first) = output.recv().await {
                     if this
                         .update(cx, |pane, cx| {
+                            pane.observe_activity_output(&first);
                             if let Some(session) = pane.session.as_mut() {
                                 session.feed(&first);
-                                while let Ok(bytes) = output.try_recv() {
+                            }
+                            while let Ok(bytes) = output.try_recv() {
+                                pane.observe_activity_output(&bytes);
+                                if let Some(session) = pane.session.as_mut() {
                                     session.feed(&bytes);
                                 }
                             }
@@ -130,6 +158,12 @@ impl TerminalPane {
                         break;
                     }
                 }
+                let _ = this.update(cx, |pane, cx| {
+                    if let Some(activity) = &pane.agent_activity {
+                        activity.exited();
+                    }
+                    cx.notify();
+                });
             })
             .detach();
         }
@@ -151,6 +185,23 @@ impl TerminalPane {
     /// presents stay immediate (see [`present_due`]), so typing and single
     /// actions gain no latency.
     const PRESENT_PACE: Duration = Duration::from_millis(25);
+    const ACTIVITY_OBSERVATION_PACE: Duration = Duration::from_millis(100);
+
+    fn observe_activity_output(&mut self, output: &[u8]) {
+        const OVERLAP: usize = 96;
+
+        if self.agent_activity.is_none() {
+            return;
+        }
+        self.activity_output_tail.extend_from_slice(output);
+        if let Some(activity) = &self.agent_activity {
+            activity.observe_output(&self.activity_output_tail);
+        }
+        let excess = self.activity_output_tail.len().saturating_sub(OVERLAP);
+        if excess > 0 {
+            self.activity_output_tail.drain(..excess);
+        }
+    }
 
     /// Snapshot and repaint unless a present just landed, queuing a trailing
     /// flush instead. Skipped snapshots lose nothing: dirty state accumulates
@@ -199,6 +250,55 @@ impl TerminalPane {
             self.last_present = Some(Instant::now());
             cx.notify();
         }
+        self.observe_activity_paced(cx);
+    }
+
+    fn observe_activity_paced(&mut self, cx: &mut Context<Self>) {
+        if self.agent_activity.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let due = self
+            .last_activity_observation
+            .is_none_or(|last| now.duration_since(last) >= Self::ACTIVITY_OBSERVATION_PACE);
+        if due {
+            self.observe_activity_now();
+            return;
+        }
+        if self.activity_observation_armed {
+            return;
+        }
+        self.activity_observation_armed = true;
+        let delay = Self::ACTIVITY_OBSERVATION_PACE.saturating_sub(
+            now.duration_since(self.last_activity_observation.unwrap_or(now)),
+        );
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |pane, _| {
+                pane.activity_observation_armed = false;
+                pane.observe_activity_now();
+            });
+        })
+        .detach();
+    }
+
+    fn observe_activity_now(&mut self) {
+        let Some(activity) = &self.agent_activity else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let title = match session.title() {
+            Ok(title) => title,
+            Err(_) => return,
+        };
+        let screen = match session.activity_screen() {
+            Ok(screen) => screen,
+            Err(_) => return,
+        };
+        activity.observe(TerminalObservation { title, screen });
+        self.last_activity_observation = Some(Instant::now());
     }
 
     fn resize_for_window(&mut self, window: &Window) {

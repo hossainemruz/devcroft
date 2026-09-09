@@ -10,7 +10,7 @@ use std::{
 use gpui_kit::component::{
     ActiveTheme as _, ColorName, Icon, IconName, IndexPath, Root, Size, Sizable, StyledExt as _,
     WindowExt as _, command::{Command, CommandGroup, CommandItem, CommandState}, h_flex,
-    tab::{Tab, TabBar}, tag::Tag, v_flex,
+    spinner::Spinner, tab::{Tab, TabBar}, tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -20,6 +20,7 @@ use gpui_kit::{
 
 use crate::add_repository::AddRepositoryView;
 use crate::agent::AgentKind;
+use crate::agent_activity::{ActivityState, AgentActivityStore};
 use crate::command_palette::{
     GoToAgent, GoToEditor, GoToTerminal, PaletteCommand, PaletteItem, PaletteMode, PaletteSection,
     ToggleActionsPalette, ToggleProjectsPalette, item_at, palette_sections_for_mode,
@@ -180,7 +181,13 @@ pub(crate) struct Workspace {
     /// mode switches while open); the render model follows it, so confirmations
     /// always resolve against the visible rows.
     palette_mode: PaletteMode,
+    /// The attention indicator reuses Projects mode interaction while
+    /// projecting only blocked agent rows and omitting Add repository.
+    attention_only: bool,
     command_state: Entity<CommandState>,
+    /// One provider-neutral projection for every managed Agent pane retained
+    /// by this window, including panes in background repositories.
+    agent_activity: AgentActivityStore,
     data_root: Option<DataRoot>,
     sync_tracker: SyncTracker,
     /// When the last sync run started (manual or automatic). The automatic
@@ -220,12 +227,18 @@ struct RepositoryTabs {
 }
 
 impl RepositoryTabs {
-    fn new(working_directory: &Path, agent: AgentKind, cx: &mut Context<Workspace>) -> Self {
+    fn new(
+        working_directory: &Path,
+        agent: AgentKind,
+        activity: &AgentActivityStore,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
         let tabs = WorkspaceTab::ALL
             .into_iter()
             .map(|tab| {
-                tab.has_terminal()
-                    .then(|| cx.new(|cx| TerminalPane::new(tab, working_directory, agent, cx)))
+                tab.has_terminal().then(|| {
+                    cx.new(|cx| TerminalPane::new(tab, working_directory, agent, activity, cx))
+                })
             })
             .collect();
         let review = cx.new(|cx| ReviewView::new(working_directory, cx));
@@ -269,6 +282,21 @@ impl Workspace {
         let review = cx.new(|cx| ReviewView::new(working_directory, cx));
         let session_agent = initial_agent;
         let command_state = cx.new(|cx| CommandState::new(window, cx));
+        let (agent_activity, activity_updates) = AgentActivityStore::new();
+        cx.spawn(async move |this, cx| {
+            while activity_updates.recv().await.is_ok() {
+                while activity_updates.try_recv().is_ok() {}
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |this, window, cx| {
+            this.sync_activity_visibility(window);
+            cx.notify();
+        })
+        .detach();
         // Poll branch/dirty/ahead-behind off the main thread; the header
         // repaints only when the snapshot actually changes. The first
         // iteration loads immediately (so no worktree I/O blocks window
@@ -433,7 +461,9 @@ impl Workspace {
             git_poll: GitPoll::default(),
             command_open: false,
             palette_mode: PaletteMode::Actions,
+            attention_only: false,
             command_state,
+            agent_activity,
             data_root,
             sync_tracker,
             last_sync_started: Instant::now(),
@@ -460,6 +490,7 @@ impl Workspace {
     }
 
     fn focus_active_pane(&self, window: &mut Window, cx: &mut App) {
+        self.sync_activity_visibility(window);
         if self.home_visible {
             self.home.read(cx).focus_handle.clone().focus(window, cx);
             return;
@@ -476,6 +507,14 @@ impl Workspace {
             let focus_handle = pane.read(cx).focus_handle.clone();
             focus_handle.focus(window, cx);
         }
+    }
+
+    fn sync_activity_visibility(&self, window: &Window) {
+        let visible = (!self.home_visible
+            && self.active_tab == WorkspaceTab::Agent
+            && window.is_window_active())
+        .then_some(self.working_directory.as_path());
+        self.agent_activity.set_visible_checkout(visible);
     }
 
     /// Jump straight to the Agent tab (`cmd-a`). An open command bar
@@ -514,6 +553,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.attention_only = false;
         if self.command_open {
             // Same shortcut again closes; the other shortcut switches the
             // open bar to its view instead of closing it.
@@ -544,6 +584,7 @@ impl Workspace {
             return;
         }
         self.command_open = true;
+        self.attention_only = false;
         self.palette_mode = mode;
         // A few small JSON reads per opening — not per render — so the
         // switcher always reflects recent adds and switches.
@@ -564,11 +605,15 @@ impl Workspace {
     /// repository (recency-sorted), since Home doesn't exist yet to cover
     /// overflow.
     fn reload_recent_repositories(&mut self) {
-        self.recent_repositories = self
+        let mut repositories = self
             .data_root
             .as_ref()
             .map(|root| recent_repositories(root, usize::MAX))
             .unwrap_or_default();
+        for repository in &mut repositories {
+            repository.checkout_path = checkout_identity(&repository.checkout_path);
+        }
+        self.recent_repositories = repositories;
     }
 
     fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -621,9 +666,19 @@ impl Workspace {
         // Every path below leaves the bar closed; `select_tab` focuses and
         // notifies itself, the other arms do it explicitly.
         self.command_open = false;
+        let focus_attention_target = self.attention_only;
         match item {
             PaletteItem::SwitchRepository { key, label } => {
-                self.switch_repository(&key, &label, window, cx)
+                self.switch_repository(&key, &label, window, cx);
+                if focus_attention_target && !self.home_visible {
+                    self.select_tab(WorkspaceTab::Agent as usize, window, cx);
+                }
+            }
+            PaletteItem::OpenCheckout { checkout_path, .. } => {
+                self.open_managed_checkout(&checkout_path, window, cx);
+                if focus_attention_target && !self.home_visible {
+                    self.select_tab(WorkspaceTab::Agent as usize, window, cx);
+                }
             }
             PaletteItem::Command(command) => match command {
                 PaletteCommand::GoAgent => self.select_tab(0, window, cx),
@@ -735,7 +790,49 @@ impl Workspace {
         // checkout's status until the next poll tick — and the load id
         // invalidates the tick that was in flight for the old checkout.
         self.refresh_git_status(cx);
-        self.recent_repositories = recent_repositories(&root, usize::MAX);
+        self.reload_recent_repositories();
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    /// Activate a retained checkout that has no portable repository entry.
+    /// These rows are synthesized only for live managed agent panes, so this
+    /// path never creates a new arbitrary checkout from palette input.
+    fn open_managed_checkout(
+        &mut self,
+        checkout: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let checkout = checkout_identity(checkout);
+        if checkout != self.working_directory
+            && !self.inactive_repositories.contains_key(&checkout)
+        {
+            window.push_notification("That agent checkout is no longer open", cx);
+            self.focus_active_pane(window, cx);
+            cx.notify();
+            return;
+        }
+        self.restore_repository_tabs(&checkout, cx);
+        self.enter_repository(cx);
+        self.project_name = checkout
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+            .to_owned()
+            .into();
+        self.current_repository = self
+            .data_root
+            .as_ref()
+            .and_then(|root| resolve_current_key(root, &checkout));
+        self.tasks.update(cx, |view, cx| {
+            view.set_scope(
+                crate::tasks::Scope::Repository(self.current_repository.clone()),
+                cx,
+            )
+        });
+        self.refresh_git_status(cx);
+        self.reload_recent_repositories();
         self.focus_active_pane(window, cx);
         cx.notify();
     }
@@ -751,7 +848,9 @@ impl Workspace {
         let next = self
             .inactive_repositories
             .remove(checkout)
-            .unwrap_or_else(|| RepositoryTabs::new(checkout, default_agent, cx));
+            .unwrap_or_else(|| {
+                RepositoryTabs::new(checkout, default_agent, &self.agent_activity, cx)
+            });
         self.default_agent = default_agent;
         let previous = RepositoryTabs {
             active_tab: std::mem::replace(&mut self.active_tab, next.active_tab),
@@ -779,7 +878,13 @@ impl Workspace {
         for tab in WorkspaceTab::ALL {
             if tab.has_terminal() && self.tabs[tab as usize].is_none() {
                 self.tabs[tab as usize] = Some(cx.new(|cx| {
-                    TerminalPane::new(tab, &self.working_directory, self.default_agent, cx)
+                    TerminalPane::new(
+                        tab,
+                        &self.working_directory,
+                        self.default_agent,
+                        &self.agent_activity,
+                        cx,
+                    )
                 }));
             }
         }
@@ -986,7 +1091,13 @@ impl Workspace {
         if let Some(slot) = self.tabs.get_mut(WorkspaceTab::Agent as usize) {
             *slot =
                 Some(cx.new(|cx| {
-                    TerminalPane::new(WorkspaceTab::Agent, &working_directory, agent, cx)
+                    TerminalPane::new(
+                        WorkspaceTab::Agent,
+                        &working_directory,
+                        agent,
+                        &self.agent_activity,
+                        cx,
+                    )
                 }));
         }
         if self.active_tab == WorkspaceTab::Agent {
@@ -1123,6 +1234,7 @@ impl Workspace {
     fn render_command_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let workspace = cx.entity().downgrade();
         let confirm_workspace = workspace.clone();
+        let attention_only = self.attention_only;
         let mut command = Command::new(&self.command_state)
             .placeholder(self.palette_mode.placeholder())
             .on_confirm(move |index, window, cx| {
@@ -1148,14 +1260,72 @@ impl Workspace {
                     .child("Enter Select")
                     .child("Esc Close")
             })
+            .empty(move |_, _, cx| {
+                div()
+                    .px_3()
+                    .py_6()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if attention_only {
+                        "No agents need attention"
+                    } else {
+                        "No matching commands"
+                    })
+            })
             .w(px(560.));
         // Install exactly the model confirmations resolve against, so render
         // and confirm can never disagree about what a row means. Labels,
         // keywords, and icons all come from the model item. The model follows
         // the open mode, so each shortcut sees only its own rows.
-        self.palette_model =
-            palette_sections_for_mode(&self.recent_repositories, self.palette_mode);
+        let activity = self.agent_activity.snapshot();
+        let visible_repositories = if attention_only {
+            self.recent_repositories
+                .iter()
+                .filter(|repository| {
+                    activity
+                        .for_checkout(&repository.checkout_path)
+                        .is_some_and(|agent| agent.state == ActivityState::NeedsAttention)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.recent_repositories.clone()
+        };
+        let mut open_checkouts = activity
+            .iter()
+            .filter(|(checkout, agent)| {
+                agent.state != ActivityState::NoAgent
+                    && (!attention_only || agent.state == ActivityState::NeedsAttention)
+                    && !self
+                        .recent_repositories
+                        .iter()
+                        .any(|repository| repository.checkout_path.as_path() == *checkout)
+            })
+            .map(|(checkout, _)| PaletteItem::open_checkout(checkout))
+            .collect::<Vec<_>>();
+        open_checkouts.sort_by(|left, right| left.label().cmp(right.label()));
+        self.palette_model = if attention_only {
+            vec![PaletteSection {
+                heading: "Needs attention",
+                items: visible_repositories
+                    .iter()
+                    .map(PaletteItem::switch_target)
+                    .chain(open_checkouts)
+                    .collect(),
+            }]
+        } else {
+            let mut sections =
+                palette_sections_for_mode(&visible_repositories, self.palette_mode);
+            if self.palette_mode == PaletteMode::Projects && !open_checkouts.is_empty() {
+                sections.push(PaletteSection {
+                    heading: "Open checkouts",
+                    items: open_checkouts,
+                });
+            }
+            sections
+        };
         let current = self.current_repository.clone();
+        let current_checkout = self.working_directory.clone();
         for section in &self.palette_model {
             command = command.group(
                 CommandGroup::new().label(section.heading).items(
@@ -1163,6 +1333,11 @@ impl Workspace {
                         .items
                         .iter()
                         .map(|item| {
+                            let mut keywords = item
+                                .keywords()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>();
                             let rendered = match item {
                                 // Tabs with direct keybindings carry the real
                                 // action: the row renders the binding hint for
@@ -1188,12 +1363,124 @@ impl Workspace {
                                 PaletteItem::Command(command) => CommandItem::new()
                                     .label(item.label())
                                     .icon(palette_icon(*command)),
-                                PaletteItem::SwitchRepository { key, .. } => CommandItem::new()
-                                    .label(item.label())
-                                    .checked(current.as_deref() == Some(key.as_str()))
-                                    .icon(IconName::Folder),
+                                PaletteItem::SwitchRepository { key, .. } => {
+                                    let label = item.label().to_owned();
+                                    let repository = self
+                                        .recent_repositories
+                                        .iter()
+                                        .find(|repository| repository.key == *key);
+                                    let agent = repository
+                                        .and_then(|repository| {
+                                            activity.for_checkout(&repository.checkout_path)
+                                        })
+                                        .cloned();
+                                    let working = agent
+                                        .as_ref()
+                                        .is_some_and(|agent| agent.state == ActivityState::Working);
+                                    let (provider, state, color) = match agent {
+                                        Some(agent) => {
+                                            keywords.push(agent.agent.label().to_owned());
+                                            keywords.push(agent.state.label().to_owned());
+                                            (
+                                                agent.agent.label().to_owned(),
+                                                agent.state.label().to_owned(),
+                                                activity_state_color(agent.state),
+                                            )
+                                        }
+                                        None => (
+                                            "Agent".to_owned(),
+                                            ActivityState::NoAgent.label().to_owned(),
+                                            activity_state_color(ActivityState::NoAgent),
+                                        ),
+                                    };
+                                    let status = format!("{provider} · {state}");
+                                    CommandItem::new()
+                                        .label(label.clone())
+                                        .checked(current.as_deref() == Some(key.as_str()))
+                                        .child(move |_, _| {
+                                            h_flex()
+                                                .flex_1()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    Icon::new(IconName::Folder)
+                                                        .size(px(16.))
+                                                        .text_color(rgb(0x858989)),
+                                                )
+                                                .child(label.clone())
+                                                .child(
+                                                    h_flex()
+                                                        .ml_auto()
+                                                        .gap_1()
+                                                        .text_xs()
+                                                        .text_color(rgb(color))
+                                                        .when(working, |this| {
+                                                            this.child(
+                                                                Spinner::new()
+                                                                    .with_size(px(12.))
+                                                                    .color(rgb(color).into()),
+                                                            )
+                                                        })
+                                                        .child(status.clone()),
+                                                )
+                                        })
+                                }
+                                PaletteItem::OpenCheckout { checkout_path, .. } => {
+                                    let label = item.label().to_owned();
+                                    let agent = activity.for_checkout(checkout_path).cloned();
+                                    let working = agent
+                                        .as_ref()
+                                        .is_some_and(|agent| agent.state == ActivityState::Working);
+                                    let (provider, state, color) = match agent {
+                                        Some(agent) => {
+                                            keywords.push(agent.agent.label().to_owned());
+                                            keywords.push(agent.state.label().to_owned());
+                                            (
+                                                agent.agent.label().to_owned(),
+                                                agent.state.label().to_owned(),
+                                                activity_state_color(agent.state),
+                                            )
+                                        }
+                                        None => (
+                                            "Agent".to_owned(),
+                                            ActivityState::NoAgent.label().to_owned(),
+                                            activity_state_color(ActivityState::NoAgent),
+                                        ),
+                                    };
+                                    let status = format!("{provider} · {state}");
+                                    CommandItem::new()
+                                        .label(label.clone())
+                                        .checked(current_checkout.as_path() == checkout_path.as_path())
+                                        .child(move |_, _| {
+                                            h_flex()
+                                                .flex_1()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    Icon::new(IconName::Folder)
+                                                        .size(px(16.))
+                                                        .text_color(rgb(0x858989)),
+                                                )
+                                                .child(label.clone())
+                                                .child(
+                                                    h_flex()
+                                                        .ml_auto()
+                                                        .gap_1()
+                                                        .text_xs()
+                                                        .text_color(rgb(color))
+                                                        .when(working, |this| {
+                                                            this.child(
+                                                                Spinner::new()
+                                                                    .with_size(px(12.))
+                                                                    .color(rgb(color).into()),
+                                                            )
+                                                        })
+                                                        .child(status.clone()),
+                                                )
+                                        })
+                                }
                             };
-                            rendered.keywords(item.keywords())
+                            rendered.keywords(keywords)
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -1272,6 +1559,16 @@ fn palette_icon(command: PaletteCommand) -> IconName {
     }
 }
 
+fn activity_state_color(state: ActivityState) -> u32 {
+    match state {
+        ActivityState::Starting | ActivityState::Idle | ActivityState::NoAgent => 0x858989,
+        ActivityState::Working => 0x60a5fa,
+        ActivityState::NeedsAttention => 0xf59e0b,
+        ActivityState::Finished => 0x4ade80,
+        ActivityState::Unavailable => 0x9ca3af,
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
@@ -1304,6 +1601,12 @@ impl Render for Workspace {
             SharedString::from("")
         };
         let is_home_page = is_artifacts || is_tasks;
+        let attention_count = self.agent_activity.snapshot().attention_count();
+        let attention_label = if attention_count == 1 {
+            "⚠ 1 agent needs attention".to_owned()
+        } else {
+            format!("⚠ {attention_count} agents need attention")
+        };
 
         v_flex()
             .relative()
@@ -1422,7 +1725,11 @@ impl Render for Workspace {
                         )
                     })
                     .child(
-                        div().flex_1().flex().flex_row().justify_center().child(
+                        h_flex()
+                            .flex_1()
+                            .justify_center()
+                            .gap_2()
+                            .child(
                             Button::new("workspace-command-trigger")
                                 .ghost()
                                 .accessibility_label("Open command palette")
@@ -1465,7 +1772,28 @@ impl Render for Workspace {
                                         .text_color(rgb(0x858989))
                                         .child("⌘P"),
                                 ),
-                        ),
+                            )
+                            .when(attention_count > 0, |bar| {
+                                bar.child(
+                                    Button::new("agent-attention-trigger")
+                                        .ghost()
+                                        .accessibility_label(attention_label.clone())
+                                        .h(px(32.))
+                                        .px_2()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x713f12))
+                                        .bg(rgb(0x211609))
+                                        .text_xs()
+                                        .text_color(rgb(0xf59e0b))
+                                        .label(attention_label.clone())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_command_palette(PaletteMode::Projects, window, cx);
+                                            this.attention_only = true;
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
                     )
                     .when(is_artifacts, |header| {
                         header.child(

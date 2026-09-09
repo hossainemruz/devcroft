@@ -8,6 +8,8 @@
 //! per section in order, and resolves a confirmed `IndexPath` against the
 //! same model it rendered.
 
+use std::path::{Path, PathBuf};
+
 use crate::data::RecentRepository;
 
 gpui_kit::actions!(
@@ -180,6 +182,12 @@ impl PaletteCommand {
 pub(crate) enum PaletteItem {
     Command(PaletteCommand),
     SwitchRepository { key: String, label: String },
+    /// A live checkout whose portable repository metadata is unavailable.
+    /// This keeps a running agent reachable without inventing a persisted key.
+    OpenCheckout {
+        checkout_path: PathBuf,
+        label: String,
+    },
 }
 
 impl PaletteItem {
@@ -190,10 +198,23 @@ impl PaletteItem {
         }
     }
 
+    pub(crate) fn open_checkout(checkout_path: &Path) -> Self {
+        let label = checkout_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| checkout_path.display().to_string());
+        Self::OpenCheckout {
+            checkout_path: checkout_path.to_owned(),
+            label,
+        }
+    }
+
     pub(crate) fn label(&self) -> &str {
         match self {
             Self::Command(command) => command.label(),
-            Self::SwitchRepository { label, .. } => label,
+            Self::SwitchRepository { label, .. } | Self::OpenCheckout { label, .. } => label,
         }
     }
 
@@ -206,6 +227,13 @@ impl PaletteItem {
             Self::SwitchRepository { key, .. } => {
                 vec![key.as_str(), "repo", "repository", "project", "switch"]
             }
+            Self::OpenCheckout { checkout_path, .. } => vec![
+                checkout_path.to_str().unwrap_or_default(),
+                "repo",
+                "repository",
+                "project",
+                "open",
+            ],
         }
     }
 
@@ -382,7 +410,7 @@ mod tests {
             .flat_map(|section| section.items)
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(command),
-                PaletteItem::SwitchRepository { .. } => None,
+                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
             })
             .collect();
         assert_eq!(commands.len(), PaletteCommand::ALL.len());
@@ -435,7 +463,7 @@ mod tests {
             .flat_map(|section| section.items.iter())
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(*command),
-                PaletteItem::SwitchRepository { .. } => None,
+                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
             })
             .collect();
         // Every static command except `AddRepository`, which lives only in

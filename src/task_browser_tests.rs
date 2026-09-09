@@ -357,16 +357,31 @@ fn cards_derive_status_from_subtasks_without_a_task_level_field() {
 }
 
 #[test]
-fn recent_grid_fits_two_small_and_three_large() {
+fn recent_grid_is_a_single_row_up_to_three_across() {
     assert_eq!(recent_task_columns(600.), 1);
     assert_eq!(recent_task_columns(800.), 2);
     assert_eq!(recent_task_columns(900.), 2);
+    assert_eq!(recent_task_columns(1024.), 2);
+    // Typical Mac widths fit 3 across; four would squeeze to ~336px and
+    // crop titles, and the Home body caps at 1440px so wider windows gain
+    // no extra room.
+    assert_eq!(recent_task_columns(1100.), 3);
     assert_eq!(recent_task_columns(1200.), 3);
     assert_eq!(recent_task_columns(1440.), 3);
     assert_eq!(recent_task_columns(2560.), 3);
-    for (viewport, columns) in [(600., 1.), (800., 2.), (1440., 3.)] {
+    for (viewport, columns) in [(600., 1.), (800., 2.), (1200., 3.), (1440., 3.)] {
         let occupied = recent_task_card_width(viewport) * columns + (columns - 1.) * 16.;
-        assert!((occupied - (viewport.min(1440.) - 48.)).abs() < 0.01);
+        let available = viewport.min(1440.) - 48.;
+        // Floored to whole pixels: must fit, leaving less than one pixel of
+        // slack per card for rounding (notably Retina 2x).
+        assert!(
+            occupied <= available + 0.01,
+            "{viewport}: {occupied} > {available}"
+        );
+        assert!(
+            available - occupied < columns,
+            "{viewport}: {occupied} leaves too much slack in {available}"
+        );
     }
 }
 

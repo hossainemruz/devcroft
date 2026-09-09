@@ -2,7 +2,7 @@
 
 ## Navigation and scope
 
-Home's **Recent Tasks** shows up to four real active records, newest-updated first (IDs break timestamp ties), with title, copyable ID, repository badges, and derived progress. Open a summary to read the task or choose **View all →** to browse the global list. Repository-less ideas appear globally with **No repositories** and **Not planned** when there are no subtasks.
+Home's **Recent Tasks** shows a single row of up to 3 real active records, newest-updated first (IDs break timestamp ties), with title, copyable ID, repository badges, and derived progress. Fewer fit on narrow windows; overflow stays reachable through **View all →** into the global list. Open a summary to read the task or choose **View all →** to browse the global list. Repository-less ideas appear globally with **No repositories** and **Not planned** when there are no subtasks.
 
 The workspace **Tasks** tab filters by the linked repository key, using the union of explicit task repositories and all subtask repository keys. Checkout paths and artifact associations do not determine membership. An unlinked checkout displays an actionable message instead of silently showing every task. Switching repositories clears the old selected task and invalidates in-flight results for the previous filter.
 

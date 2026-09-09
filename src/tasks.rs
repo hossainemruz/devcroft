@@ -66,10 +66,16 @@ fn load(
 }
 
 /// Recent-tasks grid sizing: roomier minimum than project cards (titles,
-/// pills and badges need ~340px), capped at 3 columns — 2 across on small
-/// windows, 3 on large ones. The 48px inset is Home body padding; the
-/// embedded browser carries no padding of its own so cards align with the
-/// section title.
+/// pills and badges need ~340px), capped at 3 columns — a single row.
+/// Typical Mac widths fit 3 across; smaller windows fit 2 or 1. Four across
+/// would squeeze cards to ~336px and crop titles (see the Mac screenshot),
+/// and the Home body caps at 1440px so wider windows gain no extra room.
+/// The 48px inset is Home body padding; the embedded browser carries no
+/// padding of its own so cards align with the section title. Card widths are
+/// floored to whole pixels so fractional rounding (notably on Retina 2x)
+/// can't push the last card onto its own row. Recent mode loads up to 4
+/// summaries but only renders the first row, so the section never wraps;
+/// overflow stays reachable via View all.
 fn recent_task_columns(viewport_width: f32) -> usize {
     let available = (viewport_width.min(1440.) - 48.).max(1.);
     ((available + 16.) / (340. + 16.)).floor().clamp(1., 3.) as usize
@@ -78,7 +84,7 @@ fn recent_task_columns(viewport_width: f32) -> usize {
 fn recent_task_card_width(viewport_width: f32) -> f32 {
     let available = (viewport_width.min(1440.) - 48.).max(1.);
     let columns = recent_task_columns(viewport_width) as f32;
-    (available - (columns - 1.) * 16.) / columns
+    ((available - (columns - 1.) * 16.) / columns).floor()
 }
 
 pub(crate) fn progress_label(task: &Task) -> String {
@@ -644,15 +650,21 @@ impl Render for TaskBrowser {
                         })),
                 );
             }
-            body = body.child(
-                row.child(div().text_sm().text_color(cx.theme().muted_foreground).child(id))
+            body =
+                body.child(
+                    row.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(id),
+                    )
                     .child(Button::new("copy-task").label("Copy ID").on_click(
                         move |_, window, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
                             window.push_notification("Task ID copied", cx);
                         },
                     )),
-            );
+                );
             for error in [&self.selected_error, &self.mutation_error]
                 .into_iter()
                 .flatten()
@@ -752,14 +764,18 @@ impl Render for TaskBrowser {
                 });
             }
             // Copying an ID stays in the detail header; rows stay scannable.
-            // Recent mode tiles a grid (2 across on small windows, 3 on
-            // large ones); the full page keeps full-width rows.
-            let card_width = self
-                .recent
-                .then(|| recent_task_card_width(f32::from(window.viewport_size().width)));
+            // Recent mode tiles a single row grid (up to 3 across, fewer on
+            // narrow windows); the full page keeps full-width rows.
+            let viewport = f32::from(window.viewport_size().width);
+            let recent_columns = self.recent.then(|| recent_task_columns(viewport));
+            let card_width = self.recent.then(|| recent_task_card_width(viewport));
             let now_secs = current_unix_secs();
             let mut cards = Vec::with_capacity(self.list.tasks.len());
-            for snapshot in &self.list.tasks {
+            let visible = match recent_columns {
+                Some(columns) => self.list.tasks.iter().take(columns).collect::<Vec<_>>(),
+                None => self.list.tasks.iter().collect::<Vec<_>>(),
+            };
+            for snapshot in visible {
                 let task = &snapshot.task;
                 let id = task.id.clone();
                 let progress = task_card_progress(task);

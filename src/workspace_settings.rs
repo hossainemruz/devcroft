@@ -19,8 +19,9 @@ use std::path::PathBuf;
 
 use crate::agent::AgentKind;
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
-    is_go_to_agent_shortcut, is_go_to_editor_shortcut, is_go_to_terminal_shortcut,
+    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteMode, ToggleActionsPalette,
+    ToggleProjectsPalette, is_go_to_agent_shortcut, is_go_to_editor_shortcut,
+    is_go_to_review_shortcut, is_go_to_tasks_shortcut, is_go_to_terminal_shortcut,
     palette_mode_for_shortcut,
 };
 use crate::workspace::Workspace;
@@ -100,6 +101,26 @@ impl WorkspaceSettingsView {
             event.keystroke.modifiers.alt,
         ) {
             window.dispatch_action(Box::new(GoToTerminal), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_review_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToReview), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_tasks_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToTasks), cx);
             window.prevent_default();
             cx.stop_propagation();
             return;

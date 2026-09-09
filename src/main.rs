@@ -40,7 +40,8 @@ use gpui_kit::{
 use crate::cli::{Cli, Command};
 use crate::{
     command_palette::{
-        GoToAgent, GoToEditor, GoToTerminal, ToggleActionsPalette, ToggleProjectsPalette,
+        GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, ToggleActionsPalette,
+        ToggleProjectsPalette,
     },
     fonts::load_terminal_fonts,
     preview::PreviewView,
@@ -84,9 +85,10 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         // `cmd-p` the project switcher (`cmd` is Super on Linux, so this
         // covers super+k/super+p there too; the `ctrl` variants are fallbacks
         // for environments without a platform modifier). `cmd-a`/`cmd-e` jump
-        // straight to the Agent/Editor tabs and `cmd-/` to the Terminal tab —
-        // all deliberately without `ctrl` fallbacks, so `ctrl-a`/`ctrl-e`
-        // (readline beginning/end-of-line) and `ctrl-/` keep reaching
+        // straight to the Agent/Editor tabs, `cmd-/` to the Terminal tab, and
+        // `cmd-r`/`cmd-t` to the Review/Tasks tabs — all deliberately without
+        // `ctrl` fallbacks, so `ctrl-a`/`ctrl-e` (readline
+        // beginning/end-of-line) and `ctrl-/` keep reaching
         // terminal applications. The terminal pane also forwards these
         // keystrokes explicitly (see `TerminalPane::on_key_down`), since its
         // raw key handler would otherwise swallow the event while focused.
@@ -98,6 +100,8 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
             KeyBinding::new("cmd-a", GoToAgent, None),
             KeyBinding::new("cmd-e", GoToEditor, None),
             KeyBinding::new("cmd-/", GoToTerminal, None),
+            KeyBinding::new("cmd-r", GoToReview, None),
+            KeyBinding::new("cmd-t", GoToTasks, None),
         ]);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
         Theme::change(theme_mode, None, cx);

@@ -6,7 +6,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, ColorName, Disableable as _, Size, Sizable, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, ColorName, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _,
     h_flex, tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -239,7 +239,8 @@ impl HomeView {
         });
         cx.subscribe(&tasks, |this, _, _: &crate::tasks::OpenedTask, cx| {
             this.page = Some("Tasks");
-            this.tasks.update(cx, |view, _| view.set_titlebar_owned(true));
+            this.tasks
+                .update(cx, |view, _| view.set_titlebar_owned(true));
             cx.notify();
         })
         .detach();
@@ -967,11 +968,9 @@ impl Render for HomeView {
             .w_full()
             // Fill the area below the titlebar while allowing the dashboard
             // to grow and scroll on shorter windows or with more inbox items.
-            .min_h(px(
-                (f32::from(window.viewport_size().height)
-                    - crate::metrics::WORKSPACE_HEADER_HEIGHT)
-                    .max(0.),
-            ))
+            .min_h(px((f32::from(window.viewport_size().height)
+                - crate::metrics::WORKSPACE_HEADER_HEIGHT)
+                .max(0.)))
             .max_w(px(1440.))
             .mx_auto()
             .gap_4()
@@ -1256,10 +1255,12 @@ impl Render for HomeView {
 
 /// Use the same grid for projects and tasks, regardless of how many projects
 /// exist. The dashboard has 24px gutters and 16px gaps; spare columns stay empty.
+/// Widths are floored to whole pixels so fractional rounding can't wrap a card
+/// that mathematically fits (notably on Retina 2x).
 fn recent_card_width(viewport_width: f32) -> f32 {
     let available = (viewport_width.min(1440.) - 48.).max(1.);
     let columns = recent_columns(viewport_width) as f32;
-    (available - (columns - 1.) * 16.) / columns
+    ((available - (columns - 1.) * 16.) / columns).floor()
 }
 
 fn recent_columns(viewport_width: f32) -> usize {
@@ -1367,7 +1368,17 @@ mod layout_tests {
     fn recent_grid_fits_smaller_windows() {
         for (viewport, columns) in [(1200., 3.), (900., 2.), (600., 1.), (320., 1.)] {
             let occupied = recent_card_width(viewport) * columns + (columns - 1.) * 16.;
-            assert!((occupied - (viewport - 48.)).abs() < 0.01);
+            let available = viewport - 48.;
+            // Floored to whole pixels: must fit, leaving less than one pixel
+            // of slack per card for rounding (notably Retina 2x).
+            assert!(
+                occupied <= available + 0.01,
+                "{viewport}: {occupied} > {available}"
+            );
+            assert!(
+                available - occupied < columns,
+                "{viewport}: {occupied} leaves too much slack in {available}"
+            );
         }
     }
 

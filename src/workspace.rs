@@ -8,22 +8,29 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, ColorName, Icon, IconName, IndexPath, Root, Size, Sizable, StyledExt as _,
-    WindowExt as _, command::{Command, CommandGroup, CommandItem, CommandState}, h_flex,
-    spinner::Spinner, tab::{Tab, TabBar}, tag::Tag, v_flex,
+    ActiveTheme as _, ColorName, Icon, IconName, IndexPath, Root, Sizable, Size, StyledExt as _,
+    WindowExt as _,
+    command::{Command, CommandGroup, CommandItem, CommandState},
+    h_flex,
+    spinner::Spinner,
+    tab::{Tab, TabBar},
+    tag::Tag,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, deferred, div, px, rgb,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, deferred, div,
+    px, rgb,
 };
 
 use crate::add_repository::AddRepositoryView;
 use crate::agent::AgentKind;
 use crate::agent_activity::{ActivityState, AgentActivityStore};
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToTerminal, PaletteCommand, PaletteItem, PaletteMode, PaletteSection,
-    ToggleActionsPalette, ToggleProjectsPalette, item_at, palette_sections_for_mode,
+    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteCommand, PaletteItem,
+    PaletteMode, PaletteSection, ToggleActionsPalette, ToggleProjectsPalette, item_at,
+    palette_sections_for_mode,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
@@ -547,6 +554,26 @@ impl Workspace {
         }
     }
 
+    /// Jump straight to the Review tab (`cmd-r`). An open command bar
+    /// closes first, so the shortcut never leaves the palette stranded over
+    /// the new tab.
+    fn go_to_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab(WorkspaceTab::Review as usize, window, cx);
+        if self.command_open {
+            self.close_command_palette(window, cx);
+        }
+    }
+
+    /// Jump straight to the Tasks tab (`cmd-t`). An open command bar
+    /// closes first, so the shortcut never leaves the palette stranded over
+    /// the new tab.
+    fn go_to_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab(WorkspaceTab::Tasks as usize, window, cx);
+        if self.command_open {
+            self.close_command_palette(window, cx);
+        }
+    }
+
     fn toggle_command_palette(
         &mut self,
         mode: PaletteMode,
@@ -685,6 +712,7 @@ impl Workspace {
                 PaletteCommand::GoEditor => self.select_tab(1, window, cx),
                 PaletteCommand::GoTerminal => self.select_tab(2, window, cx),
                 PaletteCommand::GoReview => self.select_tab(3, window, cx),
+                PaletteCommand::GoTasks => self.select_tab(4, window, cx),
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
                 PaletteCommand::GoHome => self.go_home(window, cx),
@@ -805,8 +833,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let checkout = checkout_identity(checkout);
-        if checkout != self.working_directory
-            && !self.inactive_repositories.contains_key(&checkout)
+        if checkout != self.working_directory && !self.inactive_repositories.contains_key(&checkout)
         {
             window.push_notification("That agent checkout is no longer open", cx);
             self.focus_active_pane(window, cx);
@@ -933,8 +960,7 @@ impl Workspace {
     /// while Home is visible. Captures the origin so the titlebar back
     /// button returns where the user came from.
     fn browse_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let already_there =
-            self.home_visible && self.home.read(cx).is_artifacts_page();
+        let already_there = self.home_visible && self.home.read(cx).is_artifacts_page();
         if !already_there {
             let origin = if !self.home_visible {
                 PageOrigin::Repository
@@ -960,7 +986,8 @@ impl Workspace {
     /// origin (repository workspace, global tasks, or Home dashboard).
     fn go_back_from_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.home.read(cx).artifacts_has_selection(cx) {
-            self.home.update(cx, |view, cx| view.clear_artifact_selection(cx));
+            self.home
+                .update(cx, |view, cx| view.clear_artifact_selection(cx));
             self.focus_active_pane(window, cx);
             cx.notify();
             return;
@@ -1003,13 +1030,15 @@ impl Workspace {
     /// captured origin (repository workspace, artifacts, or Home).
     fn go_back_from_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.home.read(cx).tasks_is_artifact_open(cx) {
-            self.home.update(cx, |view, cx| view.close_task_artifact(cx));
+            self.home
+                .update(cx, |view, cx| view.close_task_artifact(cx));
             self.focus_active_pane(window, cx);
             cx.notify();
             return;
         }
         if self.home.read(cx).tasks_has_selection(cx) {
-            self.home.update(cx, |view, cx| view.clear_task_selection(cx));
+            self.home
+                .update(cx, |view, cx| view.clear_task_selection(cx));
             self.focus_active_pane(window, cx);
             cx.notify();
             return;
@@ -1028,7 +1057,8 @@ impl Workspace {
                 self.tasks.update(cx, |view, cx| view.set_active(false, cx));
                 self.home_visible = true;
                 self.command_open = false;
-                self.home.update(cx, |view, cx| view.show_artifacts_page(cx));
+                self.home
+                    .update(cx, |view, cx| view.show_artifacts_page(cx));
                 self.focus_active_pane(window, cx);
                 cx.notify();
             }
@@ -1089,16 +1119,15 @@ impl Workspace {
         let working_directory = self.working_directory.clone();
         let agent = self.default_agent;
         if let Some(slot) = self.tabs.get_mut(WorkspaceTab::Agent as usize) {
-            *slot =
-                Some(cx.new(|cx| {
-                    TerminalPane::new(
-                        WorkspaceTab::Agent,
-                        &working_directory,
-                        agent,
-                        &self.agent_activity,
-                        cx,
-                    )
-                }));
+            *slot = Some(cx.new(|cx| {
+                TerminalPane::new(
+                    WorkspaceTab::Agent,
+                    &working_directory,
+                    agent,
+                    &self.agent_activity,
+                    cx,
+                )
+            }));
         }
         if self.active_tab == WorkspaceTab::Agent {
             self.focus_active_pane(window, cx);
@@ -1314,8 +1343,11 @@ impl Workspace {
                     .collect(),
             }]
         } else {
-            let mut sections =
-                palette_sections_for_mode(&visible_repositories, self.palette_mode);
+            let mut sections = palette_sections_for_mode(
+                &visible_repositories,
+                self.palette_mode,
+                self.home_visible,
+            );
             if self.palette_mode == PaletteMode::Projects && !open_checkouts.is_empty() {
                 sections.push(PaletteSection {
                     heading: "Open checkouts",
@@ -1360,6 +1392,16 @@ impl Workspace {
                                         .icon(palette_icon(PaletteCommand::GoTerminal))
                                         .action(Box::new(GoToTerminal))
                                 }
+                                PaletteItem::Command(PaletteCommand::GoReview) => {
+                                    CommandItem::new()
+                                        .label(item.label())
+                                        .icon(palette_icon(PaletteCommand::GoReview))
+                                        .action(Box::new(GoToReview))
+                                }
+                                PaletteItem::Command(PaletteCommand::GoTasks) => CommandItem::new()
+                                    .label(item.label())
+                                    .icon(palette_icon(PaletteCommand::GoTasks))
+                                    .action(Box::new(GoToTasks)),
                                 PaletteItem::Command(command) => CommandItem::new()
                                     .label(item.label())
                                     .icon(palette_icon(*command)),
@@ -1395,44 +1437,42 @@ impl Workspace {
                                     };
                                     let status = format!("{provider} · {state}");
                                     let is_current = current.as_deref() == Some(key.as_str());
-                                    CommandItem::new()
-                                        .label(label.clone())
-                                        .child(move |_, _| {
-                                            h_flex()
-                                                .flex_1()
-                                                .gap_2()
-                                                .items_center()
-                                                .child(
-                                                    Icon::new(IconName::Folder)
-                                                        .size(px(16.))
-                                                        .text_color(rgb(0x858989)),
+                                    CommandItem::new().label(label.clone()).child(move |_, _| {
+                                        h_flex()
+                                            .flex_1()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                Icon::new(IconName::Folder)
+                                                    .size(px(16.))
+                                                    .text_color(rgb(0x858989)),
+                                            )
+                                            .child(label.clone())
+                                            .when(is_current, |row| {
+                                                row.child(
+                                                    div()
+                                                        .size(px(6.))
+                                                        .flex_shrink_0()
+                                                        .rounded_full()
+                                                        .bg(rgb(0x4ade80)),
                                                 )
-                                                .child(label.clone())
-                                                .when(is_current, |row| {
-                                                    row.child(
-                                                        div()
-                                                            .size(px(6.))
-                                                            .flex_shrink_0()
-                                                            .rounded_full()
-                                                            .bg(rgb(0x4ade80)),
-                                                    )
-                                                })
-                                                .child(
-                                                    h_flex()
-                                                        .ml_auto()
-                                                        .gap_1()
-                                                        .text_xs()
-                                                        .text_color(rgb(color))
-                                                        .when(working, |this| {
-                                                            this.child(
-                                                                Spinner::new()
-                                                                    .with_size(px(12.))
-                                                                    .color(rgb(color).into()),
-                                                            )
-                                                        })
-                                                        .child(status.clone()),
-                                                )
-                                        })
+                                            })
+                                            .child(
+                                                h_flex()
+                                                    .ml_auto()
+                                                    .gap_1()
+                                                    .text_xs()
+                                                    .text_color(rgb(color))
+                                                    .when(working, |this| {
+                                                        this.child(
+                                                            Spinner::new()
+                                                                .with_size(px(12.))
+                                                                .color(rgb(color).into()),
+                                                        )
+                                                    })
+                                                    .child(status.clone()),
+                                            )
+                                    })
                                 }
                                 PaletteItem::OpenCheckout { checkout_path, .. } => {
                                     let label = item.label().to_owned();
@@ -1457,45 +1497,44 @@ impl Workspace {
                                         ),
                                     };
                                     let status = format!("{provider} · {state}");
-                                    let is_current = current_checkout.as_path() == checkout_path.as_path();
-                                    CommandItem::new()
-                                        .label(label.clone())
-                                        .child(move |_, _| {
-                                            h_flex()
-                                                .flex_1()
-                                                .gap_2()
-                                                .items_center()
-                                                .child(
-                                                    Icon::new(IconName::Folder)
-                                                        .size(px(16.))
-                                                        .text_color(rgb(0x858989)),
+                                    let is_current =
+                                        current_checkout.as_path() == checkout_path.as_path();
+                                    CommandItem::new().label(label.clone()).child(move |_, _| {
+                                        h_flex()
+                                            .flex_1()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                Icon::new(IconName::Folder)
+                                                    .size(px(16.))
+                                                    .text_color(rgb(0x858989)),
+                                            )
+                                            .child(label.clone())
+                                            .when(is_current, |row| {
+                                                row.child(
+                                                    div()
+                                                        .size(px(6.))
+                                                        .flex_shrink_0()
+                                                        .rounded_full()
+                                                        .bg(rgb(0x4ade80)),
                                                 )
-                                                .child(label.clone())
-                                                .when(is_current, |row| {
-                                                    row.child(
-                                                        div()
-                                                            .size(px(6.))
-                                                            .flex_shrink_0()
-                                                            .rounded_full()
-                                                            .bg(rgb(0x4ade80)),
-                                                    )
-                                                })
-                                                .child(
-                                                    h_flex()
-                                                        .ml_auto()
-                                                        .gap_1()
-                                                        .text_xs()
-                                                        .text_color(rgb(color))
-                                                        .when(working, |this| {
-                                                            this.child(
-                                                                Spinner::new()
-                                                                    .with_size(px(12.))
-                                                                    .color(rgb(color).into()),
-                                                            )
-                                                        })
-                                                        .child(status.clone()),
-                                                )
-                                        })
+                                            })
+                                            .child(
+                                                h_flex()
+                                                    .ml_auto()
+                                                    .gap_1()
+                                                    .text_xs()
+                                                    .text_color(rgb(color))
+                                                    .when(working, |this| {
+                                                        this.child(
+                                                            Spinner::new()
+                                                                .with_size(px(12.))
+                                                                .color(rgb(color).into()),
+                                                        )
+                                                    })
+                                                    .child(status.clone()),
+                                            )
+                                    })
                                 }
                             };
                             rendered.keywords(keywords)
@@ -1568,6 +1607,7 @@ fn palette_icon(command: PaletteCommand) -> IconName {
         PaletteCommand::GoEditor => IconName::FileText,
         PaletteCommand::GoTerminal => IconName::SquareTerminal,
         PaletteCommand::GoReview => IconName::Eye,
+        PaletteCommand::GoTasks => IconName::CircleCheck,
         PaletteCommand::GoHome => IconName::LayoutDashboard,
         PaletteCommand::BrowseArtifacts => IconName::BookOpen,
         PaletteCommand::ViewTasks => IconName::CircleCheck,
@@ -1650,6 +1690,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GoToTerminal, window, cx| {
                 this.go_to_terminal(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &GoToReview, window, cx| {
+                this.go_to_review(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToTasks, window, cx| {
+                this.go_to_tasks(window, cx);
+            }))
             .child(
                 h_flex()
                     .h(px(58.))
@@ -1668,11 +1714,12 @@ impl Render for Workspace {
                                 .gap_2()
                                 .items_center()
                                 .child(
-                                    Button::new("artifacts-back").ghost().label(artifacts_back).on_click(
-                                        cx.listener(|this, _, window, cx| {
+                                    Button::new("artifacts-back")
+                                        .ghost()
+                                        .label(artifacts_back)
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.go_back_from_artifacts(window, cx)
-                                        }),
-                                    ),
+                                        })),
                                 )
                                 .child(
                                     div()
@@ -1689,11 +1736,12 @@ impl Render for Workspace {
                                 .gap_2()
                                 .items_center()
                                 .child(
-                                    Button::new("tasks-back").ghost().label(tasks_back).on_click(
-                                        cx.listener(|this, _, window, cx| {
+                                    Button::new("tasks-back")
+                                        .ghost()
+                                        .label(tasks_back)
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.go_back_from_tasks(window, cx)
-                                        }),
-                                    ),
+                                        })),
                                 )
                                 .child(
                                     div()
@@ -1840,7 +1888,11 @@ impl Render for Workspace {
                                         .text_color(rgb(0xf59e0b))
                                         .label(attention_label.clone())
                                         .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_command_palette(PaletteMode::Projects, window, cx);
+                                            this.open_command_palette(
+                                                PaletteMode::Projects,
+                                                window,
+                                                cx,
+                                            );
                                             this.attention_only = true;
                                             cx.notify();
                                         })),

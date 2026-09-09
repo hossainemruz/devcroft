@@ -309,7 +309,12 @@ impl Render for ArtifactBrowser {
                     .gap_3()
                     .flex_wrap()
                     .items_center()
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(id))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(id),
+                    )
                     .child(Button::new("copy-artifact-id").label("Copy ID").on_click(
                         move |_, window, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy_id.clone()));

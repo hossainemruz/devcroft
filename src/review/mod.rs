@@ -35,8 +35,9 @@ use gpui_kit::{
 };
 
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToTerminal, PaletteMode, ToggleActionsPalette, ToggleProjectsPalette,
-    is_go_to_agent_shortcut, is_go_to_editor_shortcut, is_go_to_terminal_shortcut,
+    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteMode, ToggleActionsPalette,
+    ToggleProjectsPalette, is_go_to_agent_shortcut, is_go_to_editor_shortcut,
+    is_go_to_review_shortcut, is_go_to_tasks_shortcut, is_go_to_terminal_shortcut,
     palette_mode_for_shortcut,
 };
 
@@ -231,7 +232,7 @@ impl ReviewView {
     /// the workspace, mirroring `TerminalPane::on_key_down`. The tree/stream
     /// children don't swallow keys today, but without this any future child
     /// that stops propagation would silently break `cmd-k`/`cmd-p`/`cmd-a`/
-    /// `cmd-e`/`cmd-/` on this tab again. All other keys bubble normally (no
+    /// `cmd-e`/`cmd-/`/`cmd-r`/`cmd-t` on this tab again. All other keys bubble normally (no
     /// `prevent_default`/`stop_propagation`) so tree navigation and list
     /// scrolling keep working.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -261,6 +262,26 @@ impl ReviewView {
             event.keystroke.modifiers.alt,
         ) {
             window.dispatch_action(Box::new(GoToTerminal), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_review_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToReview), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_tasks_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToTasks), cx);
             window.prevent_default();
             cx.stop_propagation();
             return;

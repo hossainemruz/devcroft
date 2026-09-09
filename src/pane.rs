@@ -25,8 +25,9 @@ use crate::{
     agent::AgentKind,
     agent_activity::{AgentActivityStore, PreparedAgentLaunch, TerminalObservation},
     command_palette::{
-        GoToAgent, GoToEditor, GoToTerminal, PaletteMode, ToggleActionsPalette,
-        ToggleProjectsPalette, is_go_to_agent_shortcut, is_go_to_editor_shortcut,
+        GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteMode,
+        ToggleActionsPalette, ToggleProjectsPalette, is_go_to_agent_shortcut,
+        is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_tasks_shortcut,
         is_go_to_terminal_shortcut, palette_mode_for_shortcut,
     },
     fonts::TERMINAL_FONT_FAMILY,
@@ -94,8 +95,7 @@ impl TerminalPane {
         activity_store: &AgentActivityStore,
         cx: &mut Context<Self>,
     ) -> Self {
-        let agent_activity =
-            (tab == WorkspaceTab::Agent).then(|| activity_store.start(cwd, agent));
+        let agent_activity = (tab == WorkspaceTab::Agent).then(|| activity_store.start(cwd, agent));
         let mut pane = Self {
             focus_handle: cx.focus_handle(),
             tab,
@@ -122,7 +122,13 @@ impl TerminalPane {
             .as_ref()
             .map(|activity| (Some(activity.command_line()), activity.environment()))
             .unwrap_or((None, &[]));
-        let output = match TerminalSession::spawn_with_startup(tab, cwd, agent, startup, startup_environment) {
+        let output = match TerminalSession::spawn_with_startup(
+            tab,
+            cwd,
+            agent,
+            startup,
+            startup_environment,
+        ) {
             Ok((session, output)) => {
                 pane.session = Some(session);
                 Some(output)
@@ -269,9 +275,8 @@ impl TerminalPane {
             return;
         }
         self.activity_observation_armed = true;
-        let delay = Self::ACTIVITY_OBSERVATION_PACE.saturating_sub(
-            now.duration_since(self.last_activity_observation.unwrap_or(now)),
-        );
+        let delay = Self::ACTIVITY_OBSERVATION_PACE
+            .saturating_sub(now.duration_since(self.last_activity_observation.unwrap_or(now)));
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |pane, _| {
@@ -334,8 +339,9 @@ impl TerminalPane {
         // terminal input. The global `cmd-k`/`ctrl-k` and `cmd-p`/`ctrl-p`
         // bindings cover every other focus site, and dispatching here is
         // idempotent with them — whichever path runs first stops the event.
-        // The tab jumps (`cmd-a`/`cmd-e`/`cmd-/`) are platform-only with no
-        // `ctrl` fallback, so `ctrl-a`/`ctrl-e`/`ctrl-/` keep reaching the pty.
+        // The tab jumps (`cmd-a`/`cmd-e`/`cmd-/`/`cmd-r`/`cmd-t`) are
+        // platform-only with no `ctrl` fallback, so `ctrl-a`/`ctrl-e`/`ctrl-/`
+        // keep reaching the pty.
         if is_go_to_agent_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
@@ -362,6 +368,26 @@ impl TerminalPane {
             event.keystroke.modifiers.alt,
         ) {
             window.dispatch_action(Box::new(GoToTerminal), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_review_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToReview), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if is_go_to_tasks_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(GoToTasks), cx);
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -1120,9 +1146,10 @@ impl Render for TerminalPane {
             .overflow_hidden()
             // Extend the terminal background through its text inset so the
             // shared Agent, Editor, and Terminal panes meet the window edges.
-            .bg(rgb(self.session.as_ref().map_or(0x000000, |session| {
-                session.background_color()
-            })))
+            .bg(rgb(self
+                .session
+                .as_ref()
+                .map_or(0x000000, |session| session.background_color())))
             .font_family(TERMINAL_FONT_FAMILY)
             .track_focus(&self.focus_handle)
             .on_prepaint(move |bounds, _, cx| {

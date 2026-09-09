@@ -25,8 +25,8 @@ use libghostty_vt::{
     screen::CellWide,
     style::RgbColor,
     terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
-        Point, PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
+        PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
         SizeReportSize, Terminal,
     },
 };

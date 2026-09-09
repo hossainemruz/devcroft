@@ -19,7 +19,9 @@ gpui_kit::actions!(
         ToggleProjectsPalette,
         GoToAgent,
         GoToEditor,
-        GoToTerminal
+        GoToTerminal,
+        GoToReview,
+        GoToTasks
     ]
 );
 
@@ -101,6 +103,26 @@ pub(crate) fn is_go_to_terminal_shortcut(key: &str, platform: bool, alt: bool) -
     key == "/" || key == "?"
 }
 
+/// Match the go-to-review shortcut (`cmd-r`, Super on Linux) from a raw
+/// keystroke. Same shape as [`is_go_to_agent_shortcut`]: platform-only with
+/// no `ctrl` fallback so the keystroke never collides with terminal input.
+pub(crate) fn is_go_to_review_shortcut(key: &str, platform: bool, alt: bool) -> bool {
+    if alt || !platform {
+        return false;
+    }
+    key.eq_ignore_ascii_case("r")
+}
+
+/// Match the go-to-tasks shortcut (`cmd-t`, Super on Linux) from a raw
+/// keystroke. Same shape as [`is_go_to_agent_shortcut`]: platform-only with
+/// no `ctrl` fallback so the keystroke never collides with terminal input.
+pub(crate) fn is_go_to_tasks_shortcut(key: &str, platform: bool, alt: bool) -> bool {
+    if alt || !platform {
+        return false;
+    }
+    key.eq_ignore_ascii_case("t")
+}
+
 /// Every static command the bar can run, in canonical order. Repository
 /// switching is dynamic (one [`PaletteItem::SwitchRepository`] per recent
 /// repository) and lives outside this enum.
@@ -110,6 +132,7 @@ pub(crate) enum PaletteCommand {
     GoEditor,
     GoTerminal,
     GoReview,
+    GoTasks,
     GoHome,
     BrowseArtifacts,
     ViewTasks,
@@ -119,12 +142,22 @@ pub(crate) enum PaletteCommand {
 }
 
 impl PaletteCommand {
+    /// Workspace tab jumps: they select a repository tab, so they only make
+    /// sense inside a repository workspace — never on Home.
+    pub(crate) fn is_workspace_tab(self) -> bool {
+        matches!(
+            self,
+            Self::GoAgent | Self::GoEditor | Self::GoTerminal | Self::GoReview | Self::GoTasks
+        )
+    }
+
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::GoAgent,
         Self::GoEditor,
         Self::GoTerminal,
         Self::GoReview,
+        Self::GoTasks,
         Self::GoHome,
         Self::BrowseArtifacts,
         Self::ViewTasks,
@@ -139,6 +172,7 @@ impl PaletteCommand {
             Self::GoEditor => "Go to Editor",
             Self::GoTerminal => "Go to Terminal",
             Self::GoReview => "Go to Review",
+            Self::GoTasks => "Go to Tasks",
             Self::GoHome => "Go to Home",
             Self::BrowseArtifacts => "Browse artifacts",
             Self::ViewTasks => "View tasks",
@@ -157,6 +191,7 @@ impl PaletteCommand {
             Self::GoEditor => &["tab", "editor", "nvim"],
             Self::GoTerminal => &["tab", "terminal", "shell"],
             Self::GoReview => &["tab", "review", "diff"],
+            Self::GoTasks => &["tab", "tasks"],
             Self::GoHome => &["tab", "home", "dashboard"],
             Self::BrowseArtifacts => &[
                 "artifact",
@@ -181,7 +216,10 @@ impl PaletteCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteItem {
     Command(PaletteCommand),
-    SwitchRepository { key: String, label: String },
+    SwitchRepository {
+        key: String,
+        label: String,
+    },
     /// A live checkout whose portable repository metadata is unavailable.
     /// This keeps a running agent reachable without inventing a persisted key.
     OpenCheckout {
@@ -291,27 +329,38 @@ pub(crate) fn palette_sections(recents: &[RecentRepository]) -> Vec<PaletteSecti
 /// Build the rendered sections for one [`PaletteMode`]: actions show the
 /// go-to, settings, and sync groups (no repositories group at all);
 /// projects show just the repositories group (switch targets plus the add
-/// command). Confirmations resolve against exactly this model, same contract
-/// as [`palette_sections`].
+/// command). On Home (`home_visible`) the workspace tab jumps are omitted —
+/// they select a repository tab, so offering them there would silently change
+/// `active_tab` behind the still-visible Home. Confirmations resolve against
+/// exactly this model, same contract as [`palette_sections`].
 pub(crate) fn palette_sections_for_mode(
     recents: &[RecentRepository],
     mode: PaletteMode,
+    home_visible: bool,
 ) -> Vec<PaletteSection> {
     match mode {
-        PaletteMode::Actions => vec![
-            PaletteSection {
-                heading: "Go to",
-                items: command_items(&GO_TO_COMMANDS),
-            },
-            PaletteSection {
-                heading: "Settings",
-                items: command_items(&SETTINGS_COMMANDS),
-            },
-            PaletteSection {
-                heading: "Sync",
-                items: command_items(&SYNC_COMMANDS),
-            },
-        ],
+        PaletteMode::Actions => {
+            let mut go_to = command_items(&GO_TO_COMMANDS);
+            if home_visible {
+                go_to.retain(|item| {
+                    !matches!(item, PaletteItem::Command(command) if command.is_workspace_tab())
+                });
+            }
+            vec![
+                PaletteSection {
+                    heading: "Go to",
+                    items: go_to,
+                },
+                PaletteSection {
+                    heading: "Settings",
+                    items: command_items(&SETTINGS_COMMANDS),
+                },
+                PaletteSection {
+                    heading: "Sync",
+                    items: command_items(&SYNC_COMMANDS),
+                },
+            ]
+        }
         PaletteMode::Projects => vec![PaletteSection {
             heading: "Repositories",
             items: repository_items(recents),
@@ -344,11 +393,12 @@ pub(crate) fn item_at(
     sections.get(section)?.items.get(row).cloned()
 }
 
-const GO_TO_COMMANDS: [PaletteCommand; 7] = [
+const GO_TO_COMMANDS: [PaletteCommand; 8] = [
     PaletteCommand::GoAgent,
     PaletteCommand::GoEditor,
     PaletteCommand::GoTerminal,
     PaletteCommand::GoReview,
+    PaletteCommand::GoTasks,
     PaletteCommand::GoHome,
     PaletteCommand::BrowseArtifacts,
     PaletteCommand::ViewTasks,
@@ -453,7 +503,7 @@ mod tests {
 
     #[test]
     fn actions_mode_holds_every_command_but_add_repository() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions);
+        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false);
         assert_eq!(sections.len(), 3);
         assert_eq!(sections[0].heading, "Go to");
         assert_eq!(sections[1].heading, "Settings");
@@ -486,8 +536,53 @@ mod tests {
     }
 
     #[test]
+    fn home_hides_workspace_tab_jumps_but_keeps_home_destinations() {
+        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true);
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].heading, "Go to");
+        let commands: Vec<PaletteCommand> = sections[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PaletteItem::Command(command) => Some(*command),
+                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
+            })
+            .collect();
+        // Tab jumps make no sense on Home: selecting one would flip
+        // `active_tab` behind the still-visible dashboard.
+        for tab in [
+            PaletteCommand::GoAgent,
+            PaletteCommand::GoEditor,
+            PaletteCommand::GoTerminal,
+            PaletteCommand::GoReview,
+            PaletteCommand::GoTasks,
+        ] {
+            assert!(
+                !commands.contains(&tab),
+                "{tab:?} must stay out of Home's command bar"
+            );
+            assert!(tab.is_workspace_tab());
+        }
+        // Home destinations and global commands stay reachable everywhere.
+        assert_eq!(
+            commands,
+            vec![
+                PaletteCommand::GoHome,
+                PaletteCommand::BrowseArtifacts,
+                PaletteCommand::ViewTasks,
+            ]
+        );
+        // Projects mode is page-agnostic: switching checkouts is how you
+        // leave Home, so recents stay put there too.
+        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, true);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].heading, "Repositories");
+        assert_eq!(sections[0].items.len(), 3);
+    }
+
+    #[test]
     fn projects_mode_holds_only_the_repositories_group() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects);
+        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, false);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].heading, "Repositories");
         assert_eq!(
@@ -581,6 +676,34 @@ mod tests {
     }
 
     #[test]
+    fn review_shortcut_matches_r_with_platform_modifier_only() {
+        assert!(is_go_to_review_shortcut("r", true, false));
+        assert!(is_go_to_review_shortcut("R", true, false));
+        // No `ctrl` fallback: the keystroke must keep reaching the terminal.
+        assert!(!is_go_to_review_shortcut("r", false, false));
+        assert!(!is_go_to_review_shortcut("R", false, false));
+        // Alt held, or any other key, never jumps to review.
+        assert!(!is_go_to_review_shortcut("r", true, true));
+        assert!(!is_go_to_review_shortcut("t", true, false));
+        assert!(!is_go_to_review_shortcut("k", true, false));
+        assert!(!is_go_to_review_shortcut("Enter", true, false));
+    }
+
+    #[test]
+    fn tasks_shortcut_matches_t_with_platform_modifier_only() {
+        assert!(is_go_to_tasks_shortcut("t", true, false));
+        assert!(is_go_to_tasks_shortcut("T", true, false));
+        // No `ctrl` fallback: the keystroke must keep reaching the terminal.
+        assert!(!is_go_to_tasks_shortcut("t", false, false));
+        assert!(!is_go_to_tasks_shortcut("T", false, false));
+        // Alt held, or any other key, never jumps to tasks.
+        assert!(!is_go_to_tasks_shortcut("t", true, true));
+        assert!(!is_go_to_tasks_shortcut("r", true, false));
+        assert!(!is_go_to_tasks_shortcut("k", true, false));
+        assert!(!is_go_to_tasks_shortcut("Enter", true, false));
+    }
+
+    #[test]
     fn index_paths_round_trip_through_sections() {
         let sections = palette_sections(&fixture_recents());
         // (section, row) matches render order: sections render in order
@@ -591,14 +714,18 @@ mod tests {
         );
         assert_eq!(
             item_at(&sections, 0, 4),
-            Some(PaletteItem::Command(PaletteCommand::GoHome))
+            Some(PaletteItem::Command(PaletteCommand::GoTasks))
         );
         assert_eq!(
             item_at(&sections, 0, 5),
-            Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+            Some(PaletteItem::Command(PaletteCommand::GoHome))
         );
         assert_eq!(
             item_at(&sections, 0, 6),
+            Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+        );
+        assert_eq!(
+            item_at(&sections, 0, 7),
             Some(PaletteItem::Command(PaletteCommand::ViewTasks))
         );
         assert_eq!(
@@ -620,7 +747,7 @@ mod tests {
             item_at(&sections, 3, 0),
             Some(PaletteItem::Command(PaletteCommand::SyncPortable))
         );
-        assert_eq!(item_at(&sections, 0, 7), None);
+        assert_eq!(item_at(&sections, 0, 8), None);
         assert_eq!(item_at(&sections, 4, 0), None);
     }
 
@@ -628,9 +755,9 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 7 go-to + 2 switch + 1 add + 1 settings + 1 sync.
-        assert_eq!(all.len(), 12);
-        assert_eq!(filter_items(&sections, "   ").len(), 12);
+        // 8 go-to + 2 switch + 1 add + 1 settings + 1 sync.
+        assert_eq!(all.len(), 13);
+        assert_eq!(filter_items(&sections, "   ").len(), 13);
     }
 
     #[test]
@@ -654,6 +781,7 @@ mod tests {
                 PaletteItem::Command(PaletteCommand::GoEditor),
                 PaletteItem::Command(PaletteCommand::GoTerminal),
                 PaletteItem::Command(PaletteCommand::GoReview),
+                PaletteItem::Command(PaletteCommand::GoTasks),
                 PaletteItem::Command(PaletteCommand::GoHome),
             ]
         );

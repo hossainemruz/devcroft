@@ -15,7 +15,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px, rgb,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, deferred, div, px, rgb,
 };
 
 use crate::add_repository::AddRepositoryView;
@@ -1272,7 +1272,7 @@ impl Workspace {
                         "No matching commands"
                     })
             })
-            .w(px(560.));
+            .w_full();
         // Install exactly the model confirmations resolve against, so render
         // and confirm can never disagree about what a row means. Labels,
         // keywords, and icons all come from the model item. The model follows
@@ -1394,9 +1394,9 @@ impl Workspace {
                                         ),
                                     };
                                     let status = format!("{provider} · {state}");
+                                    let is_current = current.as_deref() == Some(key.as_str());
                                     CommandItem::new()
                                         .label(label.clone())
-                                        .checked(current.as_deref() == Some(key.as_str()))
                                         .child(move |_, _| {
                                             h_flex()
                                                 .flex_1()
@@ -1408,6 +1408,15 @@ impl Workspace {
                                                         .text_color(rgb(0x858989)),
                                                 )
                                                 .child(label.clone())
+                                                .when(is_current, |row| {
+                                                    row.child(
+                                                        div()
+                                                            .size(px(6.))
+                                                            .flex_shrink_0()
+                                                            .rounded_full()
+                                                            .bg(rgb(0x4ade80)),
+                                                    )
+                                                })
                                                 .child(
                                                     h_flex()
                                                         .ml_auto()
@@ -1448,9 +1457,9 @@ impl Workspace {
                                         ),
                                     };
                                     let status = format!("{provider} · {state}");
+                                    let is_current = current_checkout.as_path() == checkout_path.as_path();
                                     CommandItem::new()
                                         .label(label.clone())
-                                        .checked(current_checkout.as_path() == checkout_path.as_path())
                                         .child(move |_, _| {
                                             h_flex()
                                                 .flex_1()
@@ -1462,6 +1471,15 @@ impl Workspace {
                                                         .text_color(rgb(0x858989)),
                                                 )
                                                 .child(label.clone())
+                                                .when(is_current, |row| {
+                                                    row.child(
+                                                        div()
+                                                            .size(px(6.))
+                                                            .flex_shrink_0()
+                                                            .rounded_full()
+                                                            .bg(rgb(0x4ade80)),
+                                                    )
+                                                })
                                                 .child(
                                                     h_flex()
                                                         .ml_auto()
@@ -1730,48 +1748,76 @@ impl Render for Workspace {
                             .justify_center()
                             .gap_2()
                             .child(
-                            Button::new("workspace-command-trigger")
-                                .ghost()
-                                .accessibility_label("Open command palette")
-                                .w(px(380.))
-                                .h(px(32.))
-                                .px_3()
-                                .gap_2()
-                                .items_center()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x292b2b))
-                                .bg(rgb(0x0e0f0f))
-                                .text_xs()
-                                .text_color(rgb(0x737878))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_command_palette(PaletteMode::Actions, window, cx);
-                                }))
-                                .child(
-                                    Icon::new(IconName::Search)
-                                        .size(px(14.))
-                                        .text_color(rgb(0x737878)),
-                                )
-                                .child(div().flex_1().child("Type a command…"))
-                                .child(
-                                    div()
-                                        .px_1()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x292b2b))
-                                        .text_color(rgb(0x858989))
-                                        .child("⌘K"),
-                                )
-                                .child(
-                                    div()
-                                        .px_1()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x292b2b))
-                                        .text_color(rgb(0x858989))
-                                        .child("⌘P"),
-                                ),
+                                div()
+                                    .relative()
+                                    .w(px(380.))
+                                    .flex_shrink_0()
+                                    .child(
+                                        Button::new("workspace-command-trigger")
+                                            .ghost()
+                                            .accessibility_label("Open command palette")
+                                            .w(px(380.))
+                                            .h(px(32.))
+                                            .px_3()
+                                            .gap_2()
+                                            .items_center()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(0x292b2b))
+                                            .bg(rgb(0x0e0f0f))
+                                            .text_xs()
+                                            .text_color(rgb(0x737878))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.toggle_command_palette(
+                                                    PaletteMode::Actions,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(
+                                                Icon::new(IconName::Search)
+                                                    .size(px(14.))
+                                                    .text_color(rgb(0x737878)),
+                                            )
+                                            .child(div().flex_1().child("Type a command…"))
+                                            .child(
+                                                div()
+                                                    .px_1()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(rgb(0x292b2b))
+                                                    .text_color(rgb(0x858989))
+                                                    .child("⌘K"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(rgb(0x292b2b))
+                                                    .text_color(rgb(0x858989))
+                                                    .child("⌘P"),
+                                            ),
+                                    )
+                                    // Keep the open search field on the trigger's exact
+                                    // bounds, even when neighboring header controls change.
+                                    .when(self.command_open, |anchor| {
+                                        anchor.child(deferred(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .w_full()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|_, _, _, cx| {
+                                                        cx.stop_propagation()
+                                                    }),
+                                                )
+                                                .child(self.render_command_bar(cx)),
+                                        ))
+                                    }),
                             )
                             .when(attention_count > 0, |bar| {
                                 bar.child(
@@ -1928,19 +1974,7 @@ impl Render for Workspace {
                                 this.close_command_palette(window, cx);
                             }),
                         )
-                        .child(div().absolute().size_full().bg(rgb(0x000000)).opacity(0.4))
-                        .child(
-                            h_flex().justify_center().pt(px(8.)).child(
-                                div()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_, _, _, cx| {
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child(self.render_command_bar(cx)),
-                            ),
-                        ),
+                        .child(div().absolute().size_full().bg(rgb(0x000000)).opacity(0.4)),
                 )
             })
             // Notification layer (`push_notification`, e.g. the terminal copy

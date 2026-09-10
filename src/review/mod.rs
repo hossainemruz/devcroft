@@ -35,10 +35,10 @@ use gpui_kit::{
 };
 
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteMode, ToggleActionsPalette,
-    ToggleProjectsPalette, is_go_to_agent_shortcut, is_go_to_editor_shortcut,
-    is_go_to_review_shortcut, is_go_to_tasks_shortcut, is_go_to_terminal_shortcut,
-    palette_mode_for_shortcut,
+    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteMode,
+    ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette, is_go_to_agent_shortcut,
+    is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_tasks_shortcut,
+    is_go_to_terminal_shortcut, is_new_session_shortcut, palette_mode_for_shortcut,
 };
 
 use self::git::{ReviewScope, load_review, suggest_base_branch};
@@ -232,7 +232,7 @@ impl ReviewView {
     /// the workspace, mirroring `TerminalPane::on_key_down`. The tree/stream
     /// children don't swallow keys today, but without this any future child
     /// that stops propagation would silently break `cmd-k`/`cmd-p`/`cmd-a`/
-    /// `cmd-e`/`cmd-/`/`cmd-r`/`cmd-t` on this tab again. All other keys bubble normally (no
+    /// `cmd-e`/`cmd-/`/`cmd-d`/`cmd-t` on this tab again. All other keys bubble normally (no
     /// `prevent_default`/`stop_propagation`) so tree navigation and list
     /// scrolling keep working.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -286,6 +286,16 @@ impl ReviewView {
             cx.stop_propagation();
             return;
         }
+        if is_new_session_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(NewAgentSession), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if let Some(mode) = palette_mode_for_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
@@ -298,6 +308,9 @@ impl ReviewView {
                 }
                 PaletteMode::Projects => {
                     window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
+                }
+                PaletteMode::Sessions => {
+                    window.dispatch_action(Box::new(ToggleSessionsPalette), cx);
                 }
             }
             window.prevent_default();

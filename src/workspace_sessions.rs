@@ -1,5 +1,98 @@
 use super::*;
+use gpui_kit::WeakEntity;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
+use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
+
+/// Keyboard-navigable agent chooser behind `New session…` and `cmd-n`.
+/// Backed by the kit's `List`, so up/down move the selection, Enter confirms,
+/// Esc closes, and the first agent starts selected. `ListDelegate` callbacks
+/// cannot borrow the workspace, so the delegate holds a weak handle instead.
+struct AgentPicker {
+    default: AgentKind,
+    selected: usize,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl ListDelegate for AgentPicker {
+    type Item = ListItem;
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+        AgentKind::ALL.len()
+    }
+
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        _cx: &mut Context<ListState<Self>>,
+    ) -> Option<Self::Item> {
+        let agent = AgentKind::ALL[ix.row];
+        Some(
+            ListItem::new(("new-session-agent", ix.row)).child(
+                v_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_sm().font_semibold().child(agent.label()))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(0x292b2b))
+                                    .bg(rgb(0x080909))
+                                    .text_xs()
+                                    .text_color(rgb(0x858989))
+                                    .child(format!("`{}`", agent.command())),
+                            )
+                            .when(agent == self.default, |row| {
+                                row.child(
+                                    div().text_xs().text_color(rgb(0x737878)).child("Default"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x737878))
+                            .child(agent.description()),
+                    ),
+            ),
+        )
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: Option<IndexPath>,
+        _window: &mut Window,
+        _cx: &mut Context<ListState<Self>>,
+    ) {
+        if let Some(ix) = ix {
+            self.selected = ix.row;
+        }
+    }
+
+    fn confirm(
+        &mut self,
+        _secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) {
+        let agent = AgentKind::ALL
+            .get(self.selected)
+            .copied()
+            .unwrap_or(AgentKind::DEFAULT);
+        let workspace = self.workspace.clone();
+        window.close_dialog(cx);
+        workspace
+            .update(cx, |this, cx| this.start_agent_session(agent, window, cx))
+            .ok();
+    }
+}
 
 impl Workspace {
     pub(super) fn remember_agent_pane(&mut self, cx: &App) {
@@ -69,23 +162,7 @@ impl Workspace {
         }
         let mut cards = Vec::new();
         for session in &self.session_snapshot.sessions {
-            let project = self
-                .session_projects
-                .iter()
-                .find(|p| p.checkout_path == session.checkout);
-            let label = project.map(|p| p.label().to_owned()).or_else(|| {
-                (self.working_directory == session.checkout
-                    || self.inactive_repositories.contains_key(&session.checkout))
-                .then(|| {
-                    session
-                        .checkout
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-            });
-            if let Some(label) = label {
+            if let Some(label) = self.session_repository_label(&session.checkout) {
                 cards.push((session.clone(), label));
             }
             if cards.len() == HOME_LIMIT {
@@ -101,6 +178,40 @@ impl Workspace {
             )
         });
         cx.notify();
+    }
+
+    /// Display label for one session checkout: a registered repository's
+    /// label when bound, otherwise the ad-hoc checkout's directory name while
+    /// it is current or retained. The palette cache is consulted alongside
+    /// the catalog's project list so `cmd-s` can label rows before the first
+    /// catalog refresh republishes `session_projects`.
+    pub(super) fn session_repository_label(&self, checkout: &Path) -> Option<String> {
+        self.session_projects
+            .iter()
+            .chain(self.recent_repositories.iter())
+            .find(|project| project.checkout_path == checkout)
+            .map(|project| project.label().to_owned())
+            .or_else(|| {
+                (self.working_directory == checkout
+                    || self.inactive_repositories.contains_key(checkout))
+                .then(|| {
+                    checkout
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            })
+    }
+
+    /// Whether a session list is currently on screen: Home's Recent
+    /// Activity, the Agent sidebar, or the sessions command bar. Gates the
+    /// periodic catalog refresh and the relative-time repaint so they run
+    /// exactly while their labels are visible.
+    pub(super) fn sessions_visible(&self) -> bool {
+        self.home_visible
+            || self.active_tab == WorkspaceTab::Agent
+            || (self.command_open && self.palette_mode == PaletteMode::Sessions)
     }
 
     pub(super) fn open_agent_session(
@@ -276,14 +387,78 @@ impl Workspace {
         cx.notify();
     }
 
-    fn new_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ask which harness a new session should use before spawning anything.
+    /// The default is offered as a hint but never auto-selected: starting a
+    /// session launches a process, so an explicit pick beats a mislaunch.
+    /// The persisted default stays untouched; this choice applies to this
+    /// session only, exactly like selecting a historical session. The picker
+    /// is a real `List`, so arrow keys move the highlight, Enter confirms, and
+    /// the first agent is selected as soon as the dialog opens.
+    pub(super) fn prompt_new_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
+        let project = self.project_name.clone();
+        let default = self.default_agent;
+        let list_state = cx.new(|cx| {
+            ListState::new(
+                AgentPicker {
+                    default,
+                    selected: 0,
+                    workspace,
+                },
+                window,
+                cx,
+            )
+        });
+        list_state.update(cx, |state, cx| {
+            state.set_selected_index(Some(IndexPath::default()), window, cx);
+        });
+        let dialog_list = list_state.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .title("New session")
+                .w(px(460.))
+                .child(
+                    div()
+                        .pb_3()
+                        .text_sm()
+                        .text_color(rgb(0x858989))
+                        .child(format!("Choose the agent for a new session in {project}.")),
+                )
+                .child(div().w_full().h(px(288.)).child(List::new(&dialog_list)))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            div()
+                                .mr_auto()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("↑↓ Select · Enter Start"),
+                        )
+                        .child(
+                            Button::new("cancel-new-session")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                )
+        });
+        // Opening the dialog focuses its own trap; hand focus to the list so
+        // up/down and Enter work immediately without a click or Tab.
+        list_state.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    /// Launch a new session with the chosen harness in the current checkout.
+    fn start_agent_session(
+        &mut self,
+        agent: AgentKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.remember_agent_pane(cx);
         // An explicit New wins over an in-flight auto-resume: bump the
         // navigation so a stale open completion cannot replace this pane,
         // and mark the checkout started either way.
         self.session_navigation += 1;
         self.agent_autostart.insert(self.working_directory.clone());
-        let agent = self.default_agent;
         let pane = cx.new(|cx| {
             TerminalPane::new(
                 WorkspaceTab::Agent,
@@ -314,6 +489,12 @@ impl Workspace {
         );
         self.tabs[WorkspaceTab::Agent as usize] = Some(pane);
         self.session_agent = agent;
+        // `cmd-n` can fire from Home or any tab: reveal the Agent tab and
+        // enter the checkout so the new pane is visible. The Agent tab is
+        // already set, so `enter_repository` cannot auto-resume a second
+        // session on the way in.
+        self.active_tab = WorkspaceTab::Agent;
+        self.enter_repository(window, cx);
         self.focus_active_pane(window, cx);
         self.refresh_sessions(cx);
         cx.notify();
@@ -551,9 +732,9 @@ impl Workspace {
                                 .ghost()
                                 .flex_1()
                                 .icon(IconName::Plus)
-                                .label("New session")
+                                .label("New session…")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.new_agent_session(window, cx)
+                                    this.prompt_new_agent_session(window, cx)
                                 })),
                         )
                         .child(

@@ -19,10 +19,10 @@ use std::path::PathBuf;
 
 use crate::agent::AgentKind;
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteMode, ToggleActionsPalette,
-    ToggleProjectsPalette, is_go_to_agent_shortcut, is_go_to_editor_shortcut,
-    is_go_to_review_shortcut, is_go_to_tasks_shortcut, is_go_to_terminal_shortcut,
-    palette_mode_for_shortcut,
+    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteMode,
+    ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette, is_go_to_agent_shortcut,
+    is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_tasks_shortcut,
+    is_go_to_terminal_shortcut, is_new_session_shortcut, palette_mode_for_shortcut,
 };
 use crate::workspace::Workspace;
 
@@ -125,6 +125,16 @@ impl WorkspaceSettingsView {
             cx.stop_propagation();
             return;
         }
+        if is_new_session_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(NewAgentSession), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if let Some(mode) = palette_mode_for_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
@@ -137,6 +147,9 @@ impl WorkspaceSettingsView {
                 }
                 PaletteMode::Projects => {
                     window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
+                }
+                PaletteMode::Sessions => {
+                    window.dispatch_action(Box::new(ToggleSessionsPalette), cx);
                 }
             }
             window.prevent_default();

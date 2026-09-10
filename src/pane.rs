@@ -25,10 +25,11 @@ use crate::{
     agent::AgentKind,
     agent_activity::{AgentActivityStore, PreparedAgentLaunch, TerminalObservation},
     command_palette::{
-        GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteMode,
-        ToggleActionsPalette, ToggleProjectsPalette, is_go_to_agent_shortcut,
-        is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_tasks_shortcut,
-        is_go_to_terminal_shortcut, palette_mode_for_shortcut,
+        GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteMode,
+        ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette,
+        is_go_to_agent_shortcut, is_go_to_editor_shortcut, is_go_to_review_shortcut,
+        is_go_to_tasks_shortcut, is_go_to_terminal_shortcut, is_new_session_shortcut,
+        palette_mode_for_shortcut,
     },
     fonts::TERMINAL_FONT_FAMILY,
     metrics::{
@@ -375,9 +376,11 @@ impl TerminalPane {
         // terminal input. The global `cmd-k`/`ctrl-k` and `cmd-p`/`ctrl-p`
         // bindings cover every other focus site, and dispatching here is
         // idempotent with them — whichever path runs first stops the event.
-        // The tab jumps (`cmd-a`/`cmd-e`/`cmd-/`/`cmd-r`/`cmd-t`) are
-        // platform-only with no `ctrl` fallback, so `ctrl-a`/`ctrl-e`/`ctrl-/`
-        // keep reaching the pty.
+        // The tab jumps (`cmd-a`/`cmd-e`/`cmd-/`/`cmd-d`/`cmd-t`), the
+        // sessions palette (`cmd-s`), and new session (`cmd-n`) are
+        // platform-only with no `ctrl` fallback, so their `ctrl` counterparts
+        // (`ctrl-a`, `ctrl-e`, `ctrl-/`, `ctrl-d`, `ctrl-s`, `ctrl-n`) keep
+        // reaching the pty.
         if is_go_to_agent_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
@@ -428,6 +431,16 @@ impl TerminalPane {
             cx.stop_propagation();
             return;
         }
+        if is_new_session_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(NewAgentSession), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if let Some(mode) = palette_mode_for_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
@@ -440,6 +453,9 @@ impl TerminalPane {
                 }
                 PaletteMode::Projects => {
                     window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
+                }
+                PaletteMode::Sessions => {
+                    window.dispatch_action(Box::new(ToggleSessionsPalette), cx);
                 }
             }
             window.prevent_default();

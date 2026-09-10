@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::agent_sessions::{SessionKey, SessionSummary};
 use crate::data::RecentRepository;
 
 gpui_kit::actions!(
@@ -17,22 +18,27 @@ gpui_kit::actions!(
     [
         ToggleActionsPalette,
         ToggleProjectsPalette,
+        ToggleSessionsPalette,
         GoToAgent,
         GoToEditor,
         GoToTerminal,
         GoToReview,
-        GoToTasks
+        GoToTasks,
+        NewAgentSession
     ]
 );
 
 /// Which filtered view of the command bar is open. `cmd/ctrl-k` opens the
 /// action commands (navigation, settings, sync); `cmd/ctrl-p` opens project
-/// navigation (recent repositories plus adding one). `Add repository…` lives
-/// only in projects mode, so every command has a single home.
+/// navigation (recent repositories plus adding one); `cmd-s` opens recent
+/// sessions across repositories, most recently worked first. `Add
+/// repository…` lives only in projects mode, so every command has a single
+/// home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteMode {
     Actions,
     Projects,
+    Sessions,
 }
 
 impl PaletteMode {
@@ -40,15 +46,18 @@ impl PaletteMode {
         match self {
             Self::Actions => "Type a command or search…",
             Self::Projects => "Type a project name…",
+            Self::Sessions => "Type a session title or repository…",
         }
     }
 }
 
 /// Match the command-bar shortcuts from a raw keystroke: `cmd/ctrl-k` opens
-/// actions, `cmd/ctrl-p` opens projects. Pure over the keystroke pieces (not
-/// `KeyDownEvent`) so every focus site forwards identically and the mapping
-/// stays unit-testable without a window. `alt` combinations never match, so
-/// option-modified typing (e.g. `µ` on macOS) keeps reaching the terminal.
+/// actions, `cmd/ctrl-p` opens projects, `cmd-s` opens sessions. Pure over the
+/// keystroke pieces (not `KeyDownEvent`) so every focus site forwards
+/// identically and the mapping stays unit-testable without a window. `alt`
+/// combinations never match, so option-modified typing (e.g. `µ` on macOS)
+/// keeps reaching the terminal. Sessions are platform-only: `ctrl-s` is XOFF
+/// flow control, so it must keep reaching terminal applications.
 pub(crate) fn palette_mode_for_shortcut(
     key: &str,
     platform: bool,
@@ -62,6 +71,8 @@ pub(crate) fn palette_mode_for_shortcut(
         Some(PaletteMode::Actions)
     } else if key.eq_ignore_ascii_case("p") {
         Some(PaletteMode::Projects)
+    } else if key.eq_ignore_ascii_case("s") {
+        platform.then_some(PaletteMode::Sessions)
     } else {
         None
     }
@@ -103,14 +114,15 @@ pub(crate) fn is_go_to_terminal_shortcut(key: &str, platform: bool, alt: bool) -
     key == "/" || key == "?"
 }
 
-/// Match the go-to-review shortcut (`cmd-r`, Super on Linux) from a raw
+/// Match the go-to-review shortcut (`cmd-d`, Super on Linux) from a raw
 /// keystroke. Same shape as [`is_go_to_agent_shortcut`]: platform-only with
-/// no `ctrl` fallback so the keystroke never collides with terminal input.
+/// no `ctrl` fallback, because `ctrl-d` is end-of-file and must keep reaching
+/// terminal applications.
 pub(crate) fn is_go_to_review_shortcut(key: &str, platform: bool, alt: bool) -> bool {
     if alt || !platform {
         return false;
     }
-    key.eq_ignore_ascii_case("r")
+    key.eq_ignore_ascii_case("d")
 }
 
 /// Match the go-to-tasks shortcut (`cmd-t`, Super on Linux) from a raw
@@ -121,6 +133,17 @@ pub(crate) fn is_go_to_tasks_shortcut(key: &str, platform: bool, alt: bool) -> b
         return false;
     }
     key.eq_ignore_ascii_case("t")
+}
+
+/// Match the new-session shortcut (`cmd-n`, Super on Linux) from a raw
+/// keystroke. Same shape as [`is_go_to_agent_shortcut`]: platform-only with
+/// no `ctrl` fallback, because `ctrl-n` is readline next-line and must keep
+/// reaching terminal applications.
+pub(crate) fn is_new_session_shortcut(key: &str, platform: bool, alt: bool) -> bool {
+    if alt || !platform {
+        return false;
+    }
+    key.eq_ignore_ascii_case("n")
 }
 
 /// Every static command the bar can run, in canonical order. Repository
@@ -210,9 +233,9 @@ impl PaletteCommand {
     }
 }
 
-/// One rendered palette row: either a static command or a switch target
-/// for a recent repository. The key is the stable identity; the label is
-/// display text (display name when set, otherwise the key).
+/// One rendered palette row: a static command, a switch target for a recent
+/// repository, or a historical session. The key is the stable identity; the
+/// label is display text (display name when set, otherwise the key).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteItem {
     Command(PaletteCommand),
@@ -225,6 +248,15 @@ pub(crate) enum PaletteItem {
     OpenCheckout {
         checkout_path: PathBuf,
         label: String,
+    },
+    /// A historical conversation across repositories. Selecting it switches
+    /// to the owning checkout's workspace and opens that exact session.
+    OpenSession {
+        key: SessionKey,
+        title: String,
+        repository: String,
+        agent: String,
+        age: String,
     },
 }
 
@@ -253,6 +285,7 @@ impl PaletteItem {
         match self {
             Self::Command(command) => command.label(),
             Self::SwitchRepository { label, .. } | Self::OpenCheckout { label, .. } => label,
+            Self::OpenSession { title, .. } => title,
         }
     }
 
@@ -272,6 +305,17 @@ impl PaletteItem {
                 "project",
                 "open",
             ],
+            Self::OpenSession {
+                repository, agent, ..
+            } => vec![
+                repository.as_str(),
+                agent.as_str(),
+                "session",
+                "sessions",
+                "conversation",
+                "repo",
+                "repository",
+            ],
         }
     }
 
@@ -290,6 +334,30 @@ impl PaletteItem {
                 .iter()
                 .any(|keyword| keyword.to_lowercase().contains(&query))
     }
+}
+
+/// Build the sessions-mode rows from the catalog snapshot, preserving the
+/// snapshot's recency order (most recently worked first). Sessions whose
+/// checkout has no reachable repository are dropped: selecting them could
+/// not complete a switch, so the model never offers a row confirmation
+/// cannot resolve. `repository` resolves one checkout's display label.
+pub(crate) fn session_items(
+    sessions: &[SessionSummary],
+    repository: impl Fn(&Path) -> Option<String>,
+) -> Vec<PaletteItem> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let repository = repository(&session.checkout)?;
+            Some(PaletteItem::OpenSession {
+                key: session.key.clone(),
+                title: session.title.clone(),
+                repository,
+                agent: session.provider_label().to_owned(),
+                age: session.age(),
+            })
+        })
+        .collect()
 }
 
 /// One rendered palette section: a static heading with its rows.
@@ -329,12 +397,14 @@ pub(crate) fn palette_sections(recents: &[RecentRepository]) -> Vec<PaletteSecti
 /// Build the rendered sections for one [`PaletteMode`]: actions show the
 /// go-to, settings, and sync groups (no repositories group at all);
 /// projects show just the repositories group (switch targets plus the add
-/// command). On Home (`home_visible`) the workspace tab jumps are omitted —
-/// they select a repository tab, so offering them there would silently change
-/// `active_tab` behind the still-visible Home. Confirmations resolve against
-/// exactly this model, same contract as [`palette_sections`].
+/// command); sessions show the prebuilt session rows in recency order. On
+/// Home (`home_visible`) the workspace tab jumps are omitted — they select a
+/// repository tab, so offering them there would silently change `active_tab`
+/// behind the still-visible Home. Confirmations resolve against exactly this
+/// model, same contract as [`palette_sections`].
 pub(crate) fn palette_sections_for_mode(
     recents: &[RecentRepository],
+    sessions: &[PaletteItem],
     mode: PaletteMode,
     home_visible: bool,
 ) -> Vec<PaletteSection> {
@@ -364,6 +434,10 @@ pub(crate) fn palette_sections_for_mode(
         PaletteMode::Projects => vec![PaletteSection {
             heading: "Repositories",
             items: repository_items(recents),
+        }],
+        PaletteMode::Sessions => vec![PaletteSection {
+            heading: "Recent sessions",
+            items: sessions.to_vec(),
         }],
     }
 }
@@ -453,6 +527,21 @@ mod tests {
         ]
     }
 
+    fn fixture_session(id: &str, checkout: &str, title: &str, updated: i64) -> SessionSummary {
+        SessionSummary {
+            key: SessionKey {
+                provider: "opencode".to_owned(),
+                store: PathBuf::from("/store"),
+                id: id.to_owned(),
+            },
+            cwd: PathBuf::from(checkout),
+            checkout: PathBuf::from(checkout),
+            title: title.to_owned(),
+            updated,
+            timestamp_source: "test".to_owned(),
+        }
+    }
+
     #[test]
     fn sections_cover_every_command_exactly_once() {
         let commands: Vec<PaletteCommand> = palette_sections(&[])
@@ -460,7 +549,9 @@ mod tests {
             .flat_map(|section| section.items)
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(command),
-                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
+                PaletteItem::SwitchRepository { .. }
+                | PaletteItem::OpenCheckout { .. }
+                | PaletteItem::OpenSession { .. } => None,
             })
             .collect();
         assert_eq!(commands.len(), PaletteCommand::ALL.len());
@@ -503,7 +594,8 @@ mod tests {
 
     #[test]
     fn actions_mode_holds_every_command_but_add_repository() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), &[], PaletteMode::Actions, false);
         assert_eq!(sections.len(), 3);
         assert_eq!(sections[0].heading, "Go to");
         assert_eq!(sections[1].heading, "Settings");
@@ -513,7 +605,9 @@ mod tests {
             .flat_map(|section| section.items.iter())
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(*command),
-                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
+                PaletteItem::SwitchRepository { .. }
+                | PaletteItem::OpenCheckout { .. }
+                | PaletteItem::OpenSession { .. } => None,
             })
             .collect();
         // Every static command except `AddRepository`, which lives only in
@@ -537,7 +631,8 @@ mod tests {
 
     #[test]
     fn home_hides_workspace_tab_jumps_but_keeps_home_destinations() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), &[], PaletteMode::Actions, true);
         assert_eq!(sections.len(), 3);
         assert_eq!(sections[0].heading, "Go to");
         let commands: Vec<PaletteCommand> = sections[0]
@@ -545,7 +640,9 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(*command),
-                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
+                PaletteItem::SwitchRepository { .. }
+                | PaletteItem::OpenCheckout { .. }
+                | PaletteItem::OpenSession { .. } => None,
             })
             .collect();
         // Tab jumps make no sense on Home: selecting one would flip
@@ -574,7 +671,8 @@ mod tests {
         );
         // Projects mode is page-agnostic: switching checkouts is how you
         // leave Home, so recents stay put there too.
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, true);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), &[], PaletteMode::Projects, true);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].heading, "Repositories");
         assert_eq!(sections[0].items.len(), 3);
@@ -582,7 +680,8 @@ mod tests {
 
     #[test]
     fn projects_mode_holds_only_the_repositories_group() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, false);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), &[], PaletteMode::Projects, false);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].heading, "Repositories");
         assert_eq!(
@@ -602,8 +701,50 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_matcher_routes_k_to_actions_and_p_to_projects() {
-        use PaletteMode::{Actions, Projects};
+    fn sessions_mode_holds_only_session_rows_in_recency_order() {
+        let sessions = vec![
+            fixture_session("newer", "/repos/api", "Fix palette", 300),
+            fixture_session("older", "/repos/web", "Add sessions", 60),
+        ];
+        let rows = session_items(&sessions, |checkout| {
+            Some(format!("label:{}", checkout.display()))
+        });
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), &rows, PaletteMode::Sessions, true);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].heading, "Recent sessions");
+        // Recency order comes straight from the catalog snapshot; the mode
+        // must not reorder or append anything.
+        assert_eq!(sections[0].items, rows);
+        assert_eq!(sections[0].items[0].label(), "Fix palette");
+        assert_eq!(sections[0].items[1].label(), "Add sessions");
+    }
+
+    #[test]
+    fn session_items_drop_unreachable_checkouts_and_stay_searchable() {
+        let sessions = vec![
+            fixture_session("known", "/repos/api", "Fix palette", 300),
+            fixture_session("orphan", "/gone", "Unreachable", 200),
+            fixture_session("also-known", "/repos/web", "Add sessions", 60),
+        ];
+        let rows = session_items(&sessions, |checkout| {
+            (checkout != Path::new("/gone")).then(|| checkout.display().to_string())
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label(), "Fix palette");
+        assert_eq!(rows[1].label(), "Add sessions");
+        // The owning repository and the harness both stay searchable even
+        // though the row shows the session title.
+        assert!(rows[0].matches("fix palette"));
+        assert!(rows[0].matches("api"));
+        assert!(rows[0].matches("opencode"));
+        assert!(rows[0].matches("session"));
+        assert!(!rows[0].matches("unreachable"));
+    }
+
+    #[test]
+    fn shortcut_matcher_routes_k_p_and_s_to_their_modes() {
+        use PaletteMode::{Actions, Projects, Sessions};
 
         assert_eq!(
             palette_mode_for_shortcut("k", true, false, false),
@@ -621,11 +762,25 @@ mod tests {
             palette_mode_for_shortcut("P", false, true, false),
             Some(Projects)
         );
+        assert_eq!(
+            palette_mode_for_shortcut("s", true, false, false),
+            Some(Sessions)
+        );
+        assert_eq!(
+            palette_mode_for_shortcut("S", true, false, false),
+            Some(Sessions)
+        );
+        // No `ctrl` fallback for sessions: `ctrl-s` is XOFF flow control and
+        // must keep reaching terminal applications.
+        assert_eq!(palette_mode_for_shortcut("s", false, true, false), None);
+        assert_eq!(palette_mode_for_shortcut("S", false, true, false), None);
         // No modifier, alt held, or any other key never toggles the bar.
         assert_eq!(palette_mode_for_shortcut("k", false, false, false), None);
         assert_eq!(palette_mode_for_shortcut("p", false, false, false), None);
+        assert_eq!(palette_mode_for_shortcut("s", false, false, false), None);
         assert_eq!(palette_mode_for_shortcut("k", true, false, true), None);
         assert_eq!(palette_mode_for_shortcut("p", true, true, true), None);
+        assert_eq!(palette_mode_for_shortcut("s", true, false, true), None);
         assert_eq!(palette_mode_for_shortcut("o", true, false, false), None);
         assert_eq!(palette_mode_for_shortcut("Enter", true, false, false), None);
     }
@@ -676,14 +831,16 @@ mod tests {
     }
 
     #[test]
-    fn review_shortcut_matches_r_with_platform_modifier_only() {
-        assert!(is_go_to_review_shortcut("r", true, false));
-        assert!(is_go_to_review_shortcut("R", true, false));
-        // No `ctrl` fallback: the keystroke must keep reaching the terminal.
-        assert!(!is_go_to_review_shortcut("r", false, false));
-        assert!(!is_go_to_review_shortcut("R", false, false));
+    fn review_shortcut_matches_d_with_platform_modifier_only() {
+        assert!(is_go_to_review_shortcut("d", true, false));
+        assert!(is_go_to_review_shortcut("D", true, false));
+        // No `ctrl` fallback: `ctrl-d` is end-of-file and must keep reaching
+        // the terminal.
+        assert!(!is_go_to_review_shortcut("d", false, false));
+        assert!(!is_go_to_review_shortcut("D", false, false));
         // Alt held, or any other key, never jumps to review.
-        assert!(!is_go_to_review_shortcut("r", true, true));
+        assert!(!is_go_to_review_shortcut("d", true, true));
+        assert!(!is_go_to_review_shortcut("r", true, false));
         assert!(!is_go_to_review_shortcut("t", true, false));
         assert!(!is_go_to_review_shortcut("k", true, false));
         assert!(!is_go_to_review_shortcut("Enter", true, false));
@@ -698,9 +855,24 @@ mod tests {
         assert!(!is_go_to_tasks_shortcut("T", false, false));
         // Alt held, or any other key, never jumps to tasks.
         assert!(!is_go_to_tasks_shortcut("t", true, true));
-        assert!(!is_go_to_tasks_shortcut("r", true, false));
+        assert!(!is_go_to_tasks_shortcut("d", true, false));
         assert!(!is_go_to_tasks_shortcut("k", true, false));
         assert!(!is_go_to_tasks_shortcut("Enter", true, false));
+    }
+
+    #[test]
+    fn new_session_shortcut_matches_n_with_platform_modifier_only() {
+        assert!(is_new_session_shortcut("n", true, false));
+        assert!(is_new_session_shortcut("N", true, false));
+        // No `ctrl` fallback: `ctrl-n` is readline next-line and must keep
+        // reaching the terminal.
+        assert!(!is_new_session_shortcut("n", false, false));
+        assert!(!is_new_session_shortcut("N", false, false));
+        // Alt held, or any other key, never starts a session.
+        assert!(!is_new_session_shortcut("n", true, true));
+        assert!(!is_new_session_shortcut("t", true, false));
+        assert!(!is_new_session_shortcut("k", true, false));
+        assert!(!is_new_session_shortcut("Enter", true, false));
     }
 
     #[test]

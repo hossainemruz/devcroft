@@ -21,7 +21,7 @@ Two questions were sent during planning. Until answered, use these as explicit p
 
 For repository scope, v1 means the canonical **checkout**, matching existing workspace ownership. Sessions started in a subdirectory belong to that checkout. Linked worktrees and separate clones remain separate destinations even when they share a remote. Broadening the sidebar to all worktrees can follow later without changing session identity.
 
-Selecting a historical session changes the active agent, but does not change the saved default used for new sessions. Add a small **New session** action using that default. Change the settings description and behavior so changing the default affects future launches instead of destroying the visible session.
+Selecting a historical session changes the active agent, but does not change the saved default used for new sessions. Add a small **New session** action that asks which harness to launch, showing the saved default as a hint and leaving it untouched. Change the settings description and behavior so changing the default affects future launches instead of destroying the visible session.
 
 Entering a checkout starts its most recent catalog session rather than a fresh shell, reusing the shared open path (so retained-pane reuse and stale-click protection apply). The auto-start runs once per checkout; afterwards the user owns the pane. Checkouts without history, or entered before the first catalog load, open a fresh pane as before, and an explicit **New session** cancels an in-flight auto-resume.
 

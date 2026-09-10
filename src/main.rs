@@ -41,8 +41,8 @@ use gpui_kit::{
 use crate::cli::{Cli, Command};
 use crate::{
     command_palette::{
-        GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, ToggleActionsPalette,
-        ToggleProjectsPalette,
+        GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession,
+        ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette,
     },
     fonts::load_terminal_fonts,
     preview::PreviewView,
@@ -83,26 +83,31 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
     app.run(move |cx| {
         gpui_kit::init(cx);
         // Global command-bar toggles: `cmd-k` opens the action commands,
-        // `cmd-p` the project switcher (`cmd` is Super on Linux, so this
-        // covers super+k/super+p there too; the `ctrl` variants are fallbacks
+        // `cmd-p` the project switcher, and `cmd-s` recent sessions across
+        // repositories (`cmd` is Super on Linux, so this covers
+        // super+k/super+p/super+s there too; the `ctrl` variants are fallbacks
         // for environments without a platform modifier). `cmd-a`/`cmd-e` jump
-        // straight to the Agent/Editor tabs, `cmd-/` to the Terminal tab, and
-        // `cmd-r`/`cmd-t` to the Review/Tasks tabs — all deliberately without
-        // `ctrl` fallbacks, so `ctrl-a`/`ctrl-e` (readline
-        // beginning/end-of-line) and `ctrl-/` keep reaching
-        // terminal applications. The terminal pane also forwards these
-        // keystrokes explicitly (see `TerminalPane::on_key_down`), since its
-        // raw key handler would otherwise swallow the event while focused.
+        // straight to the Agent/Editor tabs, `cmd-/` to the Terminal tab,
+        // `cmd-d`/`cmd-t` to the Review/Tasks tabs, and `cmd-n` starts a new
+        // session — all deliberately without `ctrl` fallbacks, so
+        // `ctrl-a`/`ctrl-e` (readline beginning/end-of-line), `ctrl-s` (XOFF
+        // flow control), `ctrl-n` (readline next-line), `ctrl-d` (end-of-file),
+        // and `ctrl-/` keep reaching terminal applications. The terminal pane
+        // also forwards these keystrokes explicitly (see
+        // `TerminalPane::on_key_down`), since its raw key handler would
+        // otherwise swallow the event while focused.
         cx.bind_keys([
             KeyBinding::new("cmd-k", ToggleActionsPalette, None),
             KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
             KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
             KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
+            KeyBinding::new("cmd-s", ToggleSessionsPalette, None),
             KeyBinding::new("cmd-a", GoToAgent, None),
             KeyBinding::new("cmd-e", GoToEditor, None),
             KeyBinding::new("cmd-/", GoToTerminal, None),
-            KeyBinding::new("cmd-r", GoToReview, None),
+            KeyBinding::new("cmd-d", GoToReview, None),
             KeyBinding::new("cmd-t", GoToTasks, None),
+            KeyBinding::new("cmd-n", NewAgentSession, None),
         ]);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
         Theme::change(theme_mode, None, cx);

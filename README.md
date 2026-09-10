@@ -2,7 +2,7 @@
 
 Devcroft is a small GPUI desktop workspace with three persistent, Ghostty-powered terminal tabs:
 
-- **Agent** launches the workspace's default agent (`opencode` unless changed to `claude`, `codex`, or `omp` in the workspace settings sheet) in your default shell.
+- **Agent** launches the workspace's default agent (`opencode` unless changed to `claude`, `codex`, or `omp` in the workspace settings sheet) in your default shell. Use **New session…** in the Agent sidebar or `Cmd+N` to pick a harness for a new session without changing the saved default.
 - **Editor** launches `nvim .` in your default shell.
 - **Terminal** launches your default login shell.
 
@@ -12,7 +12,7 @@ The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, 
 
 ## Home
 
-Devcroft opens on Home without starting terminal processes. Open a recent project or use the shared command bar (`Cmd/Ctrl+K` for actions, `Cmd/Ctrl+P` for projects) to enter a repository workspace. The **Home** button and **Go Home** command return to the dashboard without stopping existing sessions.
+Devcroft opens on Home without starting terminal processes. Open a recent project or use the shared command bar (`Cmd/Ctrl+K` for actions, `Cmd/Ctrl+P` for projects, `Cmd+S` for recent sessions across repositories) to enter a repository workspace. The **Home** button and **Go Home** command return to the dashboard without stopping existing sessions.
 
 - **Recent Projects:** up to four linked repositories, ordered by last opened time. Each card shows its checkout's branch (or detached commit), clean/modified state, and available ahead/behind counts. Status refreshes in the background every five seconds while Home is active; this reads local Git state and does not fetch remotes. Click anywhere on a card to open its workspace; **Add project** registers another checkout.
 - **Recent Tasks:** clearly marked dummy cards until desktop task browsing is implemented; persistent planning is available through the headless CLI below.

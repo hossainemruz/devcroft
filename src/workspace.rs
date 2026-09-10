@@ -34,9 +34,9 @@ use crate::agent_sessions::{
     Catalog, HOME_LIMIT, SIDEBAR_LIMIT, SessionKey, SessionSummary, Snapshot as SessionSnapshot,
 };
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteCommand, PaletteItem,
-    PaletteMode, PaletteSection, ToggleActionsPalette, ToggleProjectsPalette, item_at,
-    palette_sections_for_mode,
+    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteCommand,
+    PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette, ToggleProjectsPalette,
+    ToggleSessionsPalette, item_at, palette_sections_for_mode, session_items,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
@@ -501,7 +501,7 @@ impl Workspace {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.home_visible || this.active_tab == WorkspaceTab::Agent {
+                        if this.sessions_visible() {
                             this.refresh_sessions(cx);
                         }
                     })
@@ -522,7 +522,7 @@ impl Workspace {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.home_visible || this.active_tab == WorkspaceTab::Agent {
+                        if this.sessions_visible() {
                             this.publish_sessions(cx);
                         }
                     })
@@ -654,7 +654,7 @@ impl Workspace {
         }
     }
 
-    /// Jump straight to the Review tab (`cmd-r`). An open command bar
+    /// Jump straight to the Review tab (`cmd-d`). An open command bar
     /// closes first, so the shortcut never leaves the palette stranded over
     /// the new tab.
     fn go_to_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -689,6 +689,9 @@ impl Workspace {
             } else {
                 self.palette_mode = mode;
                 self.reload_recent_repositories();
+                if mode == PaletteMode::Sessions {
+                    self.refresh_sessions(cx);
+                }
                 self.command_state.update(cx, |state, cx| {
                     state.set_query("", window, cx);
                 });
@@ -716,6 +719,11 @@ impl Workspace {
         // A few small JSON reads per opening — not per render — so the
         // switcher always reflects recent adds and switches.
         self.reload_recent_repositories();
+        // The sessions list is a live catalog view: kick a refresh on open so
+        // `cmd-s` never shows only the last periodic scan.
+        if mode == PaletteMode::Sessions {
+            self.refresh_sessions(cx);
+        }
         self.command_state.update(cx, |state, cx| {
             state.set_query("", window, cx);
         });
@@ -809,6 +817,9 @@ impl Workspace {
                     self.select_tab(WorkspaceTab::Agent as usize, window, cx);
                 }
             }
+            // The shared open path switches to the session's checkout,
+            // restores its retained tabs, and activates the exact session.
+            PaletteItem::OpenSession { key, .. } => self.open_agent_session(key, window, cx),
             PaletteItem::Command(command) => match command {
                 PaletteCommand::GoAgent => self.select_tab(0, window, cx),
                 PaletteCommand::GoEditor => self.select_tab(1, window, cx),
@@ -1352,6 +1363,8 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let confirm_workspace = workspace.clone();
         let attention_only = self.attention_only;
+        let sessions_mode = self.palette_mode == PaletteMode::Sessions;
+        let sessions_loaded = self.session_snapshot.loaded;
         let mut command = Command::new(&self.command_state)
             .placeholder(self.palette_mode.placeholder())
             .on_confirm(move |index, window, cx| {
@@ -1377,7 +1390,7 @@ impl Workspace {
                     .child("Enter Select")
                     .child("Esc Close")
             })
-            .empty(move |_, _, cx| {
+            .empty(move |state, _, cx| {
                 div()
                     .px_3()
                     .py_6()
@@ -1385,6 +1398,12 @@ impl Workspace {
                     .text_color(cx.theme().muted_foreground)
                     .child(if attention_only {
                         "No agents need attention"
+                    } else if sessions_mode {
+                        if !sessions_loaded && state.query(cx).is_empty() {
+                            "Loading sessions…"
+                        } else {
+                            "No matching sessions"
+                        }
                     } else {
                         "No matching commands"
                     })
@@ -1421,6 +1440,17 @@ impl Workspace {
             .map(|(checkout, _)| PaletteItem::open_checkout(checkout))
             .collect::<Vec<_>>();
         open_checkouts.sort_by(|left, right| left.label().cmp(right.label()));
+        // Sessions mode lists conversations across repositories in the
+        // catalog's recency order. Only reachable checkouts (registered here
+        // or retained as an open ad-hoc checkout) become rows, so every
+        // confirmation can complete the switch. Other modes skip the work.
+        let session_rows = if self.palette_mode == PaletteMode::Sessions && !attention_only {
+            session_items(&self.session_snapshot.sessions, |checkout| {
+                self.session_repository_label(checkout)
+            })
+        } else {
+            Vec::new()
+        };
         self.palette_model = if attention_only {
             vec![PaletteSection {
                 heading: "Needs attention",
@@ -1433,6 +1463,7 @@ impl Workspace {
         } else {
             let mut sections = palette_sections_for_mode(
                 &visible_repositories,
+                &session_rows,
                 self.palette_mode,
                 self.home_visible,
             );
@@ -1624,6 +1655,63 @@ impl Workspace {
                                             )
                                     })
                                 }
+                                PaletteItem::OpenSession {
+                                    title,
+                                    repository,
+                                    agent,
+                                    age,
+                                    ..
+                                } => {
+                                    // Custom content owns the whole row: title
+                                    // on top, repository and harness beneath,
+                                    // last-worked age trailing on the right.
+                                    let title = title.clone();
+                                    let repository = repository.clone();
+                                    let agent = agent.clone();
+                                    let age = age.clone();
+                                    CommandItem::new().label(title.clone()).child(move |_, _| {
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                Icon::new(IconName::Bot)
+                                                    .size(px(16.))
+                                                    .flex_none()
+                                                    .text_color(rgb(0x858989)),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .truncate()
+                                                            .child(title.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .truncate()
+                                                            .text_xs()
+                                                            .text_color(rgb(0x858989))
+                                                            .child(format!(
+                                                                "{repository} · {agent}"
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x737878))
+                                                    .child(age.clone()),
+                                            )
+                                    })
+                                }
                             };
                             rendered.keywords(keywords)
                         })
@@ -1772,6 +1860,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleProjectsPalette, window, cx| {
                 this.toggle_command_palette(PaletteMode::Projects, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleSessionsPalette, window, cx| {
+                this.toggle_command_palette(PaletteMode::Sessions, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &GoToAgent, window, cx| {
                 this.go_to_agent(window, cx);
             }))
@@ -1786,6 +1877,15 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &GoToTasks, window, cx| {
                 this.go_to_tasks(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewAgentSession, window, cx| {
+                // A dialog over the open bar would strand the query, so close
+                // it first. The workspace entry happens when an agent is
+                // picked, not here: cancelling must leave Home untouched.
+                if this.command_open {
+                    this.close_command_palette(window, cx);
+                }
+                this.prompt_new_agent_session(window, cx);
             }))
             .child(
                 h_flex()
@@ -1943,6 +2043,15 @@ impl Render for Workspace {
                                                     .border_color(rgb(0x292b2b))
                                                     .text_color(rgb(0x858989))
                                                     .child("⌘P"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(rgb(0x292b2b))
+                                                    .text_color(rgb(0x858989))
+                                                    .child("⌘S"),
                                             ),
                                     )
                                     // Keep the open search field on the trigger's exact

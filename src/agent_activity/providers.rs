@@ -259,7 +259,13 @@ fn handle_opencode_event(sse_event: Option<&str>, data: &str, emitter: &Activity
     .unwrap_or("request");
     match event_type {
         "tui.session.select" => emitter.session_selected(session),
-        "session.created" => {
+        "session.created" | "session.updated" => {
+            // `createNext` publishes Created *and* Updated, and every later
+            // touch/title change publishes Updated. The SSE stream is volatile
+            // and creation events during connect are missed, so Updated is the
+            // reliable identity signal for new sessions. Only root sessions
+            // (no parentID) establish pane identity; children never match the
+            // catalog's root-only rows.
             if let Some(info) = properties.get("info")
                 && info.get("parentID").and_then(Value::as_str).is_none()
                 && let Some(id) = info.get("id").and_then(Value::as_str)
@@ -267,7 +273,7 @@ fn handle_opencode_event(sse_event: Option<&str>, data: &str, emitter: &Activity
                 emitter.session_selected(id);
             }
         }
-        "session.status" | "session.updated" => {
+        "session.status" => {
             let status = properties
                 .get("status")
                 .and_then(|status| status.as_str().or_else(|| status.get("type")?.as_str()));
@@ -486,6 +492,16 @@ fn handle_claude_event(payload: &Value, emitter: &ActivityEmitter) {
             emitter.session_idle(session, Some("Claude is ready".to_owned()));
         }
         "UserPromptSubmit" => {
+            // SessionStart only supports command/mcp_tool hooks, so its HTTP
+            // handler never fires and new sessions keep native=None (staying
+            // "New session" after refresh). UserPromptSubmit supports HTTP,
+            // fires for the main session with the authoritative id, and
+            // coincides with the first preview title becoming available, so
+            // establish identity here. This also heals a spurious SessionStart
+            // startup id on resume, since subsequent prompts carry the correct
+            // id. Subagents never receive user prompts, so this cannot adopt
+            // a sidechain id.
+            emitter.session_selected(session);
             emitter.resolve_session(session);
             emitter.session_working(session, Some("Claude is working".to_owned()));
         }
@@ -835,6 +851,28 @@ mod tests {
     }
 
     #[test]
+    fn opencode_updated_establishes_root_identity_for_title_reconciliation() {
+        // The SSE stream is volatile and creation events during connect are
+        // missed. Updated fires on create and every later touch/title change,
+        // so it is the reliable identity signal for new sessions.
+        let (_store, _checkout, launch) = test_launch();
+        assert_eq!(launch.native_session(), None);
+        handle_opencode_event(
+            None,
+            r#"{"type":"session.updated","properties":{"sessionID":"new-id","info":{"id":"new-id"}}}"#,
+            &launch.emitter(),
+        );
+        assert_eq!(launch.native_session().as_deref(), Some("new-id"));
+        // Child sessions never match the catalog's root-only rows.
+        handle_opencode_event(
+            None,
+            r#"{"type":"session.updated","properties":{"sessionID":"child","info":{"id":"child","parentID":"new-id"}}}"#,
+            &launch.emitter(),
+        );
+        assert_eq!(launch.native_session().as_deref(), Some("new-id"));
+    }
+
+    #[test]
     fn claude_stop_failure_is_not_successful_completion() {
         let (store, checkout, launch) = test_launch();
         let emitter = launch.emitter();
@@ -909,5 +947,20 @@ mod tests {
             &emitter,
         );
         assert_eq!(store.snapshot().attention_count(), 0);
+    }
+
+    #[test]
+    fn claude_user_prompt_establishes_native_identity_for_title_reconciliation() {
+        // SessionStart only supports command/mcp_tool hooks, so its HTTP
+        // handler never fires. New sessions must still reconcile their
+        // "New session" placeholder with the catalog title on refresh, which
+        // requires the authoritative id from the first user prompt.
+        let (_store, _checkout, launch) = test_launch();
+        assert_eq!(launch.native_session(), None);
+        handle_claude_event(
+            &json!({"hook_event_name": "UserPromptSubmit", "session_id": "new-id"}),
+            &launch.emitter(),
+        );
+        assert_eq!(launch.native_session().as_deref(), Some("new-id"));
     }
 }

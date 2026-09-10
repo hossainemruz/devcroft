@@ -247,6 +247,10 @@ struct OpenAgentSession {
     agent: AgentKind,
     key: Option<SessionKey>,
     title: String,
+    /// Unix seconds when this pane was tracked. Bounds the recency fallback
+    /// for harnesses without an authoritative identity signal (Codex): only
+    /// catalog sessions updated after the pane existed can be its own.
+    created_at: i64,
 }
 
 struct RepositoryTabs {

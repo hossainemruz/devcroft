@@ -110,6 +110,7 @@ impl Workspace {
                 agent: self.session_agent,
                 key: None,
                 title: "New session".into(),
+                created_at: crate::relative_time::current_unix_secs(),
             });
     }
 
@@ -158,6 +159,59 @@ impl Workspace {
                     open.key = Some(session.key.clone());
                     open.title = session.title.clone();
                 }
+            }
+        }
+        // Fallback for harnesses without an identity signal (Codex has no
+        // observer) or missed provider events: when native is still unknown,
+        // adopt the single unclaimed catalog session for the same
+        // provider+checkout updated after the pane existed. Requires exactly
+        // one candidate for the pane and exactly one claimant globally, so
+        // concurrent new sessions never cross-adopt and old history is never
+        // mistaken for the new pane.
+        let claimed: HashSet<SessionKey> = self
+            .open_sessions
+            .values()
+            .filter_map(|open| open.key.clone())
+            .collect();
+        let mut candidates_by_open: HashMap<u64, Vec<SessionKey>> = HashMap::new();
+        for (&id, open) in &self.open_sessions {
+            if open.key.is_some() || open.pane.read(cx).native_session().is_some() {
+                continue;
+            }
+            let threshold = open.created_at.saturating_sub(60);
+            let candidates: Vec<SessionKey> = self
+                .session_snapshot
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.key.provider == open.agent.id()
+                        && session.checkout == open.checkout
+                        && session.updated > 0
+                        && session.updated >= threshold
+                        && !claimed.contains(&session.key)
+                })
+                .map(|session| session.key.clone())
+                .collect();
+            candidates_by_open.insert(id, candidates);
+        }
+        let mut usage: HashMap<SessionKey, usize> = HashMap::new();
+        for candidates in candidates_by_open.values() {
+            for key in candidates {
+                *usage.entry(key.clone()).or_default() += 1;
+            }
+        }
+        for (&id, candidates) in &candidates_by_open {
+            if candidates.len() == 1
+                && usage.get(&candidates[0]) == Some(&1)
+                && let Some(session) = self
+                    .session_snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.key == candidates[0])
+                && let Some(open) = self.open_sessions.get_mut(&id)
+            {
+                open.key = Some(session.key.clone());
+                open.title = session.title.clone();
             }
         }
         let mut cards = Vec::new();
@@ -329,6 +383,7 @@ impl Workspace {
                 agent,
                 key: Some(session.key),
                 title: session.title,
+                created_at: crate::relative_time::current_unix_secs(),
             },
         );
         self.activate_open_session(id, window, cx);
@@ -485,6 +540,7 @@ impl Workspace {
                 agent,
                 key: None,
                 title: "New session".into(),
+                created_at: crate::relative_time::current_unix_secs(),
             },
         );
         self.tabs[WorkspaceTab::Agent as usize] = Some(pane);

@@ -757,7 +757,7 @@ impl Render for ReviewView {
                     .min_h_0()
                     .child(
                         v_flex()
-                            .w(px(280.))
+                            .w(px(320.))
                             .flex_none()
                             .h_full()
                             .border_r_1()

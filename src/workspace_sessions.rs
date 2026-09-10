@@ -628,7 +628,7 @@ impl Workspace {
             .h_full()
             .min_h_0()
             .flex_none()
-            .w(px(260.))
+            .w(px(280.))
             .border_r_1()
             .border_color(cx.theme().border)
             .p_2()
@@ -664,6 +664,7 @@ impl Workspace {
             list = list.child(
                 h_flex()
                     .gap_1()
+                    .rounded_md()
                     .when(is_active, |row| row.bg(cx.theme().secondary))
                     .child(
                         Button::new(SharedString::from(format!("open-agent-{id}")))
@@ -743,7 +744,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_agent_session(key.clone(), window, cx)
             }));
-            let mut row = h_flex().gap_1().child(row);
+            let mut row = h_flex().gap_1().rounded_md().child(row);
             if is_selected {
                 row = row.bg(cx.theme().secondary);
             }

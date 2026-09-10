@@ -95,7 +95,31 @@ impl TerminalPane {
         activity_store: &AgentActivityStore,
         cx: &mut Context<Self>,
     ) -> Self {
-        let agent_activity = (tab == WorkspaceTab::Agent).then(|| activity_store.start(cwd, agent));
+        Self::with_session(tab, cwd, agent, activity_store, None, cx)
+    }
+
+    pub(crate) fn launch_id(&self) -> Option<u64> {
+        self.agent_activity.as_ref().map(|a| a.id())
+    }
+    pub(crate) fn native_session(&self) -> Option<String> {
+        self.agent_activity
+            .as_ref()
+            .and_then(|a| a.native_session())
+    }
+    pub(crate) fn launch_failed(&self) -> bool {
+        self.error.is_some()
+    }
+
+    pub(crate) fn with_session(
+        tab: WorkspaceTab,
+        cwd: &Path,
+        agent: AgentKind,
+        activity_store: &AgentActivityStore,
+        target: Option<&crate::agent_sessions::SessionSummary>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let agent_activity = (tab == WorkspaceTab::Agent)
+            .then(|| activity_store.start_with_session(cwd, agent, target));
         let mut pane = Self {
             focus_handle: cx.focus_handle(),
             tab,
@@ -307,11 +331,23 @@ impl TerminalPane {
     }
 
     fn resize_for_window(&mut self, window: &Window) {
+        // Size from the pane's own painted bounds, not the window viewport:
+        // the Agent tab shares its row with the session sidebar, so the
+        // full viewport width overshoots by the sidebar and clips content
+        // on the right. Bounds lag one frame behind a resize and converge
+        // on the next paint; the viewport fallback covers the first frame
+        // before bounds exist.
         let viewport = window.viewport_size();
+        let (available_width, available_height) = match self.pane_bounds {
+            Some(bounds) => (bounds.size.width.as_f32(), bounds.size.height.as_f32()),
+            None => (
+                viewport.width.as_f32(),
+                (viewport.height.as_f32() - WORKSPACE_HEADER_HEIGHT).max(0.),
+            ),
+        };
         let cell_width = cell_width();
-        let width = (viewport.width.as_f32() - TERMINAL_PADDING * 2.0).max(cell_width);
-        let height = (viewport.height.as_f32() - WORKSPACE_HEADER_HEIGHT - TERMINAL_PADDING * 2.0)
-            .max(cell_height());
+        let width = (available_width - TERMINAL_PADDING * 2.0).max(cell_width);
+        let height = (available_height - TERMINAL_PADDING * 2.0).max(cell_height());
         let cols = (width / cell_width).floor() as u16;
         let rows = (height / cell_height()).floor() as u16;
         let next = (cols.max(1), rows.max(1));

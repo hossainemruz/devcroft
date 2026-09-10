@@ -1,6 +1,7 @@
 mod add_repository;
 mod agent;
 mod agent_activity;
+mod agent_sessions;
 mod agent_skill;
 mod artifacts;
 mod cli;

@@ -121,6 +121,14 @@ pub(crate) struct TerminalSession {
     last_cursor: Option<(u16, u16)>,
 }
 
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        // Closing the terminal also stops its login shell; the PTY hangup
+        // propagates to the foreground agent. Reap away from the UI thread.
+        let _ = self._child.kill();
+    }
+}
+
 impl TerminalSession {
     /// Spawn the login shell plus the tab's startup command. The Agent tab
     /// launches `agent` ([`AgentKind::command`]); every other tab uses its

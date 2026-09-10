@@ -3,7 +3,8 @@
 //! Each workspace remembers one default harness ([`AgentKind`]) in
 //! machine-local `device.json`, keyed by its canonical checkout path (see
 //! [`crate::data`]). Picking a harness in the workspace settings sheet
-//! persists it and restarts the Agent tab with [`AgentKind::command`].
+//! persists it for future sessions; open sessions keep running with the
+//! harness they started with ([`AgentKind::command`]).
 //!
 //! Only `opencode`, `claude`, `codex`, and `omp` exist today. Adding a
 //! harness later is a matter of extending this enum plus its id/command

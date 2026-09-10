@@ -258,6 +258,15 @@ fn handle_opencode_event(sse_event: Option<&str>, data: &str, emitter: &Activity
     )
     .unwrap_or("request");
     match event_type {
+        "tui.session.select" => emitter.session_selected(session),
+        "session.created" => {
+            if let Some(info) = properties.get("info")
+                && info.get("parentID").and_then(Value::as_str).is_none()
+                && let Some(id) = info.get("id").and_then(Value::as_str)
+            {
+                emitter.session_selected(id);
+            }
+        }
         "session.status" | "session.updated" => {
             let status = properties
                 .get("status")
@@ -472,7 +481,10 @@ fn handle_claude_event(payload: &Value, emitter: &ActivityEmitter) {
     let session = string_field(payload, &["session_id", "sessionId"]).unwrap_or("terminal");
     let request = string_field(payload, &["tool_use_id", "notification_id"]);
     match event {
-        "SessionStart" => emitter.session_idle(session, Some("Claude is ready".to_owned())),
+        "SessionStart" => {
+            emitter.session_selected(session);
+            emitter.session_idle(session, Some("Claude is ready".to_owned()));
+        }
         "UserPromptSubmit" => {
             emitter.resolve_session(session);
             emitter.session_working(session, Some("Claude is working".to_owned()));

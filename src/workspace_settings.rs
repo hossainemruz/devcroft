@@ -267,9 +267,12 @@ impl Render for WorkspaceSettingsView {
                             .child("Agent"),
                     )
                     .child(dropdown)
-                    .child(div().text_xs().text_color(rgb(0x737878)).child(
-                        "Changing agent will terminate current session and restart the tab.",
-                    )),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x737878))
+                            .child("New sessions will use this agent. Open sessions keep running."),
+                    ),
             )
             .child(
                 h_flex().justify_end().pt_2().child(

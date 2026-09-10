@@ -187,6 +187,8 @@ fn project_opened_label(last_opened_at: Option<&str>, now_secs: i64) -> Option<S
 pub(crate) enum HomeEvent {
     OpenRepository { key: String, label: String },
     AddRepository,
+    OpenAgentSession(crate::agent_sessions::SessionKey),
+    RefreshSessions,
 }
 
 pub(crate) struct HomeView {
@@ -198,6 +200,9 @@ pub(crate) struct HomeView {
     data: Dashboard,
     error: Option<String>,
     projects: Vec<RecentRepository>,
+    sessions: Vec<(crate::agent_sessions::SessionSummary, String)>,
+    session_errors: Vec<String>,
+    sessions_loaded: bool,
     page: Option<&'static str>,
     show_completed: bool,
     active: bool,
@@ -225,6 +230,19 @@ impl Render for DragTodo {
 }
 
 impl HomeView {
+    pub(crate) fn set_sessions(
+        &mut self,
+        sessions: Vec<(crate::agent_sessions::SessionSummary, String)>,
+        errors: Vec<String>,
+        loaded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.sessions = sessions;
+        self.session_errors = errors;
+        self.sessions_loaded = loaded;
+        cx.notify();
+    }
+
     pub(crate) fn new(
         root: Option<DataRoot>,
         tracker: SyncTracker,
@@ -253,6 +271,9 @@ impl HomeView {
             data: Dashboard::default(),
             error: None,
             projects: Vec::new(),
+            sessions: Vec::new(),
+            session_errors: Vec::new(),
+            sessions_loaded: false,
             page: None,
             show_completed: false,
             active: true,
@@ -994,6 +1015,95 @@ impl Render for HomeView {
         } else {
             if let Some(error) = &self.error {
                 body = body.child(div().text_color(cx.theme().danger).child(error.clone()));
+            }
+            body = body.child(
+                h_flex()
+                    .justify_between()
+                    .child(div().text_lg().font_semibold().child("Recent Activity"))
+                    .child(
+                        Button::new("refresh-home-sessions")
+                            .ghost()
+                            .label("Refresh")
+                            .on_click(
+                                cx.listener(|_, _, _, cx| cx.emit(HomeEvent::RefreshSessions)),
+                            ),
+                    ),
+            );
+            let mut sessions = h_flex().gap_4().flex_wrap();
+            for (session, repository) in &self.sessions {
+                let key = session.key.clone();
+                let id: SharedString = format!(
+                    "home-session-{}-{}-{}",
+                    key.provider,
+                    key.store.display(),
+                    key.id
+                )
+                .into();
+                sessions = sessions.child(
+                    Button::new(id)
+                        .ghost()
+                        .w(px(card_width))
+                        .h_auto()
+                        .p_4()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded_lg()
+                        .tooltip(session.tooltip())
+                        .child(
+                            v_flex()
+                                .items_start()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .font_semibold()
+                                        .child(session.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(repository.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "{} · {}",
+                                            session.provider_label(),
+                                            session.age()
+                                        )),
+                                ),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(HomeEvent::OpenAgentSession(key.clone()))
+                        })),
+                );
+            }
+            if self.sessions.is_empty() {
+                sessions = sessions.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if self.sessions_loaded {
+                            "No recent agent sessions."
+                        } else {
+                            "Loading agent sessions…"
+                        }),
+                );
+            }
+            body = body.child(sessions);
+            for error in &self.session_errors {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(error.clone()),
+                );
             }
             body = body.child(self.heading("Recent Projects", "Projects", cx));
             let mut projects = h_flex().gap_4().flex_wrap();

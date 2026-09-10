@@ -59,15 +59,19 @@ pub(crate) struct AgentActivity {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ActivitySnapshot {
     activities: HashMap<PathBuf, AgentActivity>,
+    launches: HashMap<u64, AgentActivity>,
 }
 
 impl ActivitySnapshot {
+    pub(crate) fn for_launch(&self, launch: u64) -> Option<&AgentActivity> {
+        self.launches.get(&launch)
+    }
     pub(crate) fn for_checkout(&self, checkout: &Path) -> Option<&AgentActivity> {
         self.activities.get(checkout)
     }
 
     pub(crate) fn attention_count(&self) -> usize {
-        self.activities
+        self.launches
             .values()
             .filter(|activity| activity.state == ActivityState::NeedsAttention)
             .count()
@@ -89,7 +93,7 @@ pub(crate) struct AgentActivityStore {
 #[derive(Default)]
 struct StoreInner {
     next_generation: u64,
-    records: HashMap<PathBuf, ActivityRecord>,
+    records: HashMap<(PathBuf, u64), ActivityRecord>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +105,7 @@ enum BaseState {
 
 struct ActivityRecord {
     generation: u64,
+    native_session: Option<String>,
     agent: AgentKind,
     base: BaseState,
     working_sessions: HashSet<String>,
@@ -174,7 +179,17 @@ impl AgentActivityStore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn start(&self, checkout: &Path, agent: AgentKind) -> PreparedAgentLaunch {
+        self.start_with_session(checkout, agent, None)
+    }
+
+    pub(crate) fn start_with_session(
+        &self,
+        checkout: &Path,
+        agent: AgentKind,
+        session: Option<&crate::agent_sessions::SessionSummary>,
+    ) -> PreparedAgentLaunch {
         let checkout = checkout
             .canonicalize()
             .unwrap_or_else(|_| checkout.to_owned());
@@ -183,9 +198,10 @@ impl AgentActivityStore {
             inner.next_generation = inner.next_generation.wrapping_add(1).max(1);
             let generation = inner.next_generation;
             inner.records.insert(
-                checkout.clone(),
+                (checkout.clone(), generation),
                 ActivityRecord {
                     generation,
+                    native_session: session.map(|s| s.key.id.clone()),
                     agent,
                     base: BaseState::Starting,
                     working_sessions: HashSet::new(),
@@ -213,11 +229,15 @@ impl AgentActivityStore {
             generation,
         };
         let cancelled = Arc::new(AtomicBool::new(false));
-        let provider = providers::prepare(agent, generation, &emitter, Arc::clone(&cancelled))
+        let mut provider = providers::prepare(agent, generation, &emitter, Arc::clone(&cancelled))
             .unwrap_or_else(|error| {
                 emitter.unavailable(format!("Activity setup failed: {error}"));
                 providers::ProviderLaunch::default()
             });
+        if let Some(session) = session {
+            provider.arguments.splice(0..0, session.arguments());
+            provider.environment.extend(session.environment());
+        }
         let exit_marker = format!("devcroft-agent-exit-{generation}-");
         let command_line = shell_command(agent, generation, &provider);
         PreparedAgentLaunch {
@@ -237,27 +257,53 @@ impl AgentActivityStore {
 
     pub(crate) fn snapshot(&self) -> ActivitySnapshot {
         let inner = self.inner.lock();
+        let mut activities: HashMap<PathBuf, AgentActivity> = HashMap::new();
+        let mut launches = HashMap::new();
+        for ((checkout, generation), record) in &inner.records {
+            let activity = record.projected();
+            launches.insert(*generation, activity.clone());
+            let priority = |state| match state {
+                ActivityState::NeedsAttention => 6,
+                ActivityState::Working => 5,
+                ActivityState::Finished => 4,
+                ActivityState::Starting => 3,
+                ActivityState::Unavailable => 2,
+                _ => 1,
+            };
+            if activities
+                .get(checkout)
+                .is_none_or(|previous| priority(activity.state) > priority(previous.state))
+            {
+                activities.insert(checkout.clone(), activity);
+            }
+        }
         ActivitySnapshot {
-            activities: inner
-                .records
-                .iter()
-                .map(|(checkout, record)| (checkout.clone(), record.projected()))
-                .collect(),
+            activities,
+            launches,
         }
     }
 
-    /// Only the current checkout's focused Agent pane is visible. Viewing a
-    /// completed pane acknowledges completion; blockers remain until resolved.
+    #[cfg(test)]
     pub(crate) fn set_visible_checkout(&self, checkout: Option<&Path>) {
-        let canonical =
-            checkout.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_owned()));
+        let launch = checkout.and_then(|path| {
+            self.inner
+                .lock()
+                .records
+                .keys()
+                .find(|(p, _)| p == path)
+                .map(|(_, id)| *id)
+        });
+        self.set_visible_launch(launch);
+    }
+
+    pub(crate) fn set_visible_launch(&self, launch: Option<u64>) {
         let mut changed = false;
         {
             let mut inner = self.inner.lock();
-            for (path, record) in &mut inner.records {
+            for ((_, id), record) in &mut inner.records {
                 let before = record.projected();
-                record.visible = canonical.as_ref() == Some(path);
-                if record.visible && record.unseen_completion {
+                record.visible = launch == Some(*id);
+                if record.visible {
                     record.unseen_completion = false;
                 }
                 changed |= before != record.projected();
@@ -271,7 +317,7 @@ impl AgentActivityStore {
     fn update(&self, checkout: &Path, generation: u64, mutate: impl FnOnce(&mut ActivityRecord)) {
         let changed = {
             let mut inner = self.inner.lock();
-            let Some(record) = inner.records.get_mut(checkout) else {
+            let Some(record) = inner.records.get_mut(&(checkout.to_owned(), generation)) else {
                 return;
             };
             if record.generation != generation {
@@ -291,10 +337,10 @@ impl AgentActivityStore {
             let mut inner = self.inner.lock();
             if inner
                 .records
-                .get(checkout)
+                .get(&(checkout.to_owned(), generation))
                 .is_some_and(|record| record.generation == generation)
             {
-                inner.records.remove(checkout);
+                inner.records.remove(&(checkout.to_owned(), generation));
                 true
             } else {
                 false
@@ -319,6 +365,18 @@ pub(crate) struct PreparedAgentLaunch {
 }
 
 impl PreparedAgentLaunch {
+    pub(crate) fn id(&self) -> u64 {
+        self.emitter.generation
+    }
+    pub(crate) fn native_session(&self) -> Option<String> {
+        self.emitter
+            .store
+            .inner
+            .lock()
+            .records
+            .get(&(self.emitter.checkout.clone(), self.emitter.generation))
+            .and_then(|r| r.native_session.clone())
+    }
     pub(crate) fn command_line(&self) -> &str {
         &self.command_line
     }
@@ -382,7 +440,7 @@ impl ActivityLease {
             .inner
             .lock()
             .records
-            .get(&self.checkout)
+            .get(&(self.checkout.clone(), self.generation))
             .filter(|record| record.generation == self.generation)
             .map(|record| record.agent)
             .unwrap_or(AgentKind::DEFAULT)
@@ -407,6 +465,13 @@ pub(crate) struct ActivityEmitter {
 }
 
 impl ActivityEmitter {
+    pub(super) fn session_selected(&self, id: &str) {
+        if id != "terminal" {
+            self.store.update(&self.checkout, self.generation, |r| {
+                r.native_session = Some(id.to_owned())
+            });
+        }
+    }
     #[cfg(test)]
     pub(crate) fn working(&self, detail: Option<String>) {
         self.store
@@ -751,7 +816,13 @@ mod tests {
     fn opencode_completion_is_not_overwritten_by_a_late_terminal_frame() {
         let (store, checkout) = store();
         let launch = store.start(&checkout, AgentKind::Codex);
-        store.inner.lock().records.get_mut(&checkout).unwrap().agent = AgentKind::Opencode;
+        store
+            .inner
+            .lock()
+            .records
+            .get_mut(&(checkout.clone(), launch.id()))
+            .unwrap()
+            .agent = AgentKind::Opencode;
         let emitter = launch.emitter();
         emitter.session_working("s", None);
         emitter.session_idle("s", None);
@@ -832,8 +903,12 @@ mod tests {
         let replacement = store.start(&checkout, AgentKind::Codex);
         old.emitter().request_opened("s", "old");
         let activity = store.snapshot().for_checkout(&checkout).unwrap().clone();
-        assert_eq!(activity.agent, AgentKind::Codex);
-        assert_eq!(activity.state, ActivityState::Starting);
+        assert_eq!(activity.agent, AgentKind::Claude);
+        assert_eq!(activity.state, ActivityState::NeedsAttention);
+        assert_eq!(
+            store.snapshot().for_launch(replacement.id()).unwrap().state,
+            ActivityState::Starting
+        );
         drop(old);
         assert!(store.snapshot().for_checkout(&checkout).is_some());
         drop(replacement);

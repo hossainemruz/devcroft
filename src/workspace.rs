@@ -1,8 +1,11 @@
 //! The workspace shell: tab definitions plus the surrounding chrome
 //! (project header and tab bar) hosting the active terminal pane.
 
+#[path = "workspace_sessions.rs"]
+mod sessions;
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -27,6 +30,9 @@ use gpui_kit::{
 use crate::add_repository::AddRepositoryView;
 use crate::agent::AgentKind;
 use crate::agent_activity::{ActivityState, AgentActivityStore};
+use crate::agent_sessions::{
+    Catalog, HOME_LIMIT, SIDEBAR_LIMIT, SessionKey, SessionSummary, Snapshot as SessionSnapshot,
+};
 use crate::command_palette::{
     GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, PaletteCommand, PaletteItem,
     PaletteMode, PaletteSection, ToggleActionsPalette, ToggleProjectsPalette, item_at,
@@ -46,6 +52,7 @@ use crate::settings::SettingsView;
 use crate::workspace_settings::WorkspaceSettingsView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::scroll::ScrollableElement as _;
 
 /// How often the header re-reads branch/dirty/ahead-behind state.
 ///
@@ -170,13 +177,13 @@ pub(crate) struct Workspace {
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
     review: Entity<ReviewView>,
-    /// Harness the current Agent pane was spawned with. Preserved across
-    /// repository switches with its tabs; picking a new default restarts
-    /// the pane with it (see `restart_agent_pane`).
+    /// Harness the visible Agent pane was spawned with. Preserved across
+    /// repository switches with its tabs; selecting a historical session
+    /// changes this without touching the persisted default.
     session_agent: AgentKind,
-    /// Persisted default harness for the current checkout: what the Agent
-    /// pane launches. Updated by the workspace settings sheet, which
-    /// restarts the pane so the two always agree for the visible checkout.
+    /// Persisted default harness for the current checkout: what *new*
+    /// sessions launch. Updated by the workspace settings sheet; open
+    /// sessions keep running with the harness they started with.
     default_agent: AgentKind,
     /// Strong entity handles keep hidden PTYs and their output tasks alive.
     inactive_repositories: HashMap<PathBuf, RepositoryTabs>,
@@ -195,6 +202,17 @@ pub(crate) struct Workspace {
     /// One provider-neutral projection for every managed Agent pane retained
     /// by this window, including panes in background repositories.
     agent_activity: AgentActivityStore,
+    session_catalog: Catalog,
+    session_snapshot: SessionSnapshot,
+    session_projects: Vec<RecentRepository>,
+    session_refreshing: bool,
+    session_navigation: u64,
+    open_sessions: HashMap<u64, OpenAgentSession>,
+    /// Checkouts where the Agent pane has been started (fresh or resumed).
+    /// Entering a checkout auto-resumes its most recent catalog session
+    /// once; afterwards the user owns the pane (New session, history
+    /// clicks, close), so later entries never retro-start.
+    agent_autostart: HashSet<PathBuf>,
     data_root: Option<DataRoot>,
     sync_tracker: SyncTracker,
     /// When the last sync run started (manual or automatic). The automatic
@@ -223,6 +241,14 @@ pub(crate) struct Workspace {
     tasks_origin: Option<PageOrigin>,
 }
 
+struct OpenAgentSession {
+    pane: Entity<TerminalPane>,
+    checkout: PathBuf,
+    agent: AgentKind,
+    key: Option<SessionKey>,
+    title: String,
+}
+
 struct RepositoryTabs {
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
@@ -243,7 +269,7 @@ impl RepositoryTabs {
         let tabs = WorkspaceTab::ALL
             .into_iter()
             .map(|tab| {
-                tab.has_terminal().then(|| {
+                (tab.has_terminal() && tab != WorkspaceTab::Agent).then(|| {
                     cx.new(|cx| TerminalPane::new(tab, working_directory, agent, activity, cx))
                 })
             })
@@ -293,14 +319,19 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             while activity_updates.recv().await.is_ok() {
                 while activity_updates.try_recv().is_ok() {}
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |this, cx| {
+                        this.publish_sessions(cx);
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
         })
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {
-            this.sync_activity_visibility(window);
+            this.sync_activity_visibility(window, cx);
             cx.notify();
         })
         .detach();
@@ -428,6 +459,8 @@ impl Workspace {
                 this.switch_repository(key, label, window, cx)
             }
             HomeEvent::AddRepository => this.open_add_repository(window, cx),
+            HomeEvent::OpenAgentSession(key) => this.open_agent_session(key.clone(), window, cx),
+            HomeEvent::RefreshSessions => this.refresh_sessions(cx),
         })
         .detach();
         let settings = cx.new(|cx| {
@@ -446,6 +479,60 @@ impl Workspace {
             .as_ref()
             .and_then(|root| resolve_current_key(root, working_directory));
 
+        let session_catalog = Catalog::new(data_root.as_ref());
+        let initial_catalog = session_catalog.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                initial_catalog.load_cache();
+            })
+            .await;
+            if this
+                .update(cx, |this, cx| {
+                    this.publish_sessions(cx);
+                    this.refresh_sessions(cx);
+                })
+                .is_err()
+            {
+                return;
+            }
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(15))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.home_visible || this.active_tab == WorkspaceTab::Agent {
+                            this.refresh_sessions(cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        // Lightweight minute timer for relative-time labels. This only
+        // re-projects the in-memory snapshot (no provider scans), so stale
+        // `12m ago` rows refresh while visible without churning subprocesses.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.home_visible || this.active_tab == WorkspaceTab::Agent {
+                            this.publish_sessions(cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             home,
             tasks: cx.new(|cx| {
@@ -471,6 +558,13 @@ impl Workspace {
             attention_only: false,
             command_state,
             agent_activity,
+            session_catalog,
+            session_snapshot: SessionSnapshot::default(),
+            session_projects: Vec::new(),
+            session_refreshing: false,
+            session_navigation: 0,
+            open_sessions: HashMap::new(),
+            agent_autostart: HashSet::new(),
             data_root,
             sync_tracker,
             last_sync_started: Instant::now(),
@@ -488,7 +582,7 @@ impl Workspace {
             return;
         };
         self.active_tab = tab;
-        self.enter_repository(cx);
+        self.enter_repository(window, cx);
         if tab == WorkspaceTab::Review {
             self.review.update(cx, |view, cx| view.activate(cx));
         }
@@ -496,8 +590,9 @@ impl Workspace {
         cx.notify();
     }
 
-    fn focus_active_pane(&self, window: &mut Window, cx: &mut App) {
-        self.sync_activity_visibility(window);
+    fn focus_active_pane(&mut self, window: &mut Window, cx: &mut App) {
+        self.remember_agent_pane(cx);
+        self.sync_activity_visibility(window, cx);
         if self.home_visible {
             self.home.read(cx).focus_handle.clone().focus(window, cx);
             return;
@@ -516,12 +611,17 @@ impl Workspace {
         }
     }
 
-    fn sync_activity_visibility(&self, window: &Window) {
+    fn sync_activity_visibility(&self, window: &Window, cx: &App) {
         let visible = (!self.home_visible
             && self.active_tab == WorkspaceTab::Agent
             && window.is_window_active())
-        .then_some(self.working_directory.as_path());
-        self.agent_activity.set_visible_checkout(visible);
+        .then(|| {
+            self.tabs[WorkspaceTab::Agent as usize]
+                .as_ref()
+                .and_then(|p| p.read(cx).launch_id())
+        })
+        .flatten();
+        self.agent_activity.set_visible_launch(visible);
     }
 
     /// Jump straight to the Agent tab (`cmd-a`). An open command bar
@@ -698,12 +798,14 @@ impl Workspace {
             PaletteItem::SwitchRepository { key, label } => {
                 self.switch_repository(&key, &label, window, cx);
                 if focus_attention_target && !self.home_visible {
+                    self.focus_attention_session(window, cx);
                     self.select_tab(WorkspaceTab::Agent as usize, window, cx);
                 }
             }
             PaletteItem::OpenCheckout { checkout_path, .. } => {
                 self.open_managed_checkout(&checkout_path, window, cx);
                 if focus_attention_target && !self.home_visible {
+                    self.focus_attention_session(window, cx);
                     self.select_tab(WorkspaceTab::Agent as usize, window, cx);
                 }
             }
@@ -799,7 +901,7 @@ impl Workspace {
         }
         let checkout = checkout_identity(&checkout);
         self.restore_repository_tabs(&checkout, cx);
-        self.enter_repository(cx);
+        self.enter_repository(window, cx);
         self.project_name = checkout
             .file_name()
             .and_then(|name| name.to_str())
@@ -841,7 +943,7 @@ impl Workspace {
             return;
         }
         self.restore_repository_tabs(&checkout, cx);
-        self.enter_repository(cx);
+        self.enter_repository(window, cx);
         self.project_name = checkout
             .file_name()
             .and_then(|name| name.to_str())
@@ -894,7 +996,7 @@ impl Workspace {
             .insert(previous_directory, previous);
     }
 
-    fn enter_repository(&mut self, cx: &mut Context<Self>) {
+    fn enter_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.artifacts_origin = None;
         self.tasks_origin = None;
         self.tasks.update(cx, |view, cx| {
@@ -904,6 +1006,25 @@ impl Workspace {
         self.home.update(cx, |view, cx| view.deactivate(cx));
         for tab in WorkspaceTab::ALL {
             if tab.has_terminal() && self.tabs[tab as usize].is_none() {
+                if tab == WorkspaceTab::Agent
+                    && self.agent_autostart.insert(self.working_directory.clone())
+                    && let Some(last) = self
+                        .session_snapshot
+                        .recent(&self.working_directory, 1)
+                        .into_iter()
+                        .next()
+                {
+                    // First entry starts the last session, not a fresh
+                    // shell. The shared open path owns async validation
+                    // and pane creation; a failed resume keeps the
+                    // placeholder with Retry guidance instead of silently
+                    // opening a new conversation.
+                    self.open_agent_session(last.key, window, cx);
+                    continue;
+                }
+                if tab == WorkspaceTab::Agent {
+                    self.session_agent = self.default_agent;
+                }
                 self.tabs[tab as usize] = Some(cx.new(|cx| {
                     TerminalPane::new(
                         tab,
@@ -924,6 +1045,7 @@ impl Workspace {
         self.home_visible = true;
         self.command_open = false;
         self.home.update(cx, |view, cx| view.activate(cx));
+        self.refresh_sessions(cx);
         self.focus_active_pane(window, cx);
         cx.notify();
     }
@@ -994,7 +1116,7 @@ impl Workspace {
         }
         match self.artifacts_origin.take() {
             Some(PageOrigin::Repository) => {
-                self.enter_repository(cx);
+                self.enter_repository(window, cx);
                 self.focus_active_pane(window, cx);
                 cx.notify();
             }
@@ -1045,7 +1167,7 @@ impl Workspace {
         }
         match self.tasks_origin.take() {
             Some(PageOrigin::Repository) => {
-                self.enter_repository(cx);
+                self.enter_repository(window, cx);
                 self.focus_active_pane(window, cx);
                 cx.notify();
             }
@@ -1098,44 +1220,10 @@ impl Workspace {
             return;
         }
         self.default_agent = agent;
-        self.session_agent = agent;
-        self.restart_agent_pane(window, cx);
-        window.push_notification(
-            format!(
-                "Default agent is now {} — Agent tab restarted with `{}`",
-                agent.label(),
-                agent.command()
-            ),
-            cx,
-        );
+        window.push_notification(format!("New sessions will use {}", agent.label()), cx);
         cx.notify();
     }
 
-    /// Replace the current checkout's Agent pane with a fresh one launching
-    /// the default harness. Dropping the old entity ends its PTY session;
-    /// focus follows only when the Agent tab is showing, so a restart from
-    /// the sheet never yanks focus away from another tab.
-    fn restart_agent_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let working_directory = self.working_directory.clone();
-        let agent = self.default_agent;
-        if let Some(slot) = self.tabs.get_mut(WorkspaceTab::Agent as usize) {
-            *slot = Some(cx.new(|cx| {
-                TerminalPane::new(
-                    WorkspaceTab::Agent,
-                    &working_directory,
-                    agent,
-                    &self.agent_activity,
-                    cx,
-                )
-            }));
-        }
-        if self.active_tab == WorkspaceTab::Agent {
-            self.focus_active_pane(window, cx);
-        }
-    }
-
-    /// Persisted default harness for the current checkout, for the settings
-    /// sheet's live selection.
     pub(crate) fn default_agent(&self) -> AgentKind {
         self.default_agent
     }
@@ -1546,7 +1634,7 @@ impl Workspace {
         command
     }
 
-    fn render_active_content(&self) -> AnyElement {
+    fn render_active_content(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.home_visible {
             return self.home.clone().into_any_element();
         }
@@ -1555,6 +1643,9 @@ impl Workspace {
         }
         if self.active_tab == WorkspaceTab::Review {
             return self.review.clone().into_any_element();
+        }
+        if self.active_tab == WorkspaceTab::Agent {
+            return self.render_agent_sessions(cx);
         }
         match self
             .tabs
@@ -1630,7 +1721,7 @@ fn activity_state_color(state: ActivityState) -> u32 {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
-        let active_content = self.render_active_content();
+        let active_content = self.render_active_content(cx);
         // Tasks and Artifacts full-pages share the repository workspace
         // chrome: title and back navigation live here, not in a second row.
         // The archived filter also lives here; the portable git status is

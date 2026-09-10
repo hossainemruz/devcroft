@@ -1,0 +1,586 @@
+use super::*;
+use gpui_kit::component::dialog::{Confirm, DialogFooter};
+
+impl Workspace {
+    pub(super) fn remember_agent_pane(&mut self, cx: &App) {
+        let Some(pane) = self.tabs[WorkspaceTab::Agent as usize].clone() else {
+            return;
+        };
+        let Some(id) = pane.read(cx).launch_id() else {
+            return;
+        };
+        self.open_sessions
+            .entry(id)
+            .or_insert_with(|| OpenAgentSession {
+                pane,
+                checkout: self.working_directory.clone(),
+                agent: self.session_agent,
+                key: None,
+                title: "New session".into(),
+            });
+    }
+
+    pub(super) fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.session_refreshing {
+            return;
+        }
+        self.session_refreshing = true;
+        let catalog = self.session_catalog.clone();
+        let root = self.data_root.clone();
+        cx.spawn(async move |this, cx| {
+            let projects = cx
+                .background_spawn(async move {
+                    let mut projects = root
+                        .as_ref()
+                        .map(|r| recent_repositories(r, usize::MAX))
+                        .unwrap_or_default();
+                    for project in &mut projects {
+                        project.checkout_path = checkout_identity(&project.checkout_path);
+                    }
+                    catalog.refresh();
+                    projects
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.session_refreshing = false;
+                this.session_projects = projects;
+                this.publish_sessions(cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn publish_sessions(&mut self, cx: &mut Context<Self>) {
+        self.session_snapshot = self.session_catalog.snapshot();
+        self.remember_agent_pane(cx);
+        for open in self.open_sessions.values_mut() {
+            if let Some(native) = open.pane.read(cx).native_session() {
+                // The provider signal, not recency or title, establishes identity.
+                if let Some(session) = self.session_snapshot.sessions.iter().find(|s| {
+                    s.key.provider == open.agent.id()
+                        && s.key.id == native
+                        && s.checkout == open.checkout
+                }) {
+                    open.key = Some(session.key.clone());
+                    open.title = session.title.clone();
+                }
+            }
+        }
+        let mut cards = Vec::new();
+        for session in &self.session_snapshot.sessions {
+            let project = self
+                .session_projects
+                .iter()
+                .find(|p| p.checkout_path == session.checkout);
+            let label = project.map(|p| p.label().to_owned()).or_else(|| {
+                (self.working_directory == session.checkout
+                    || self.inactive_repositories.contains_key(&session.checkout))
+                .then(|| {
+                    session
+                        .checkout
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            });
+            if let Some(label) = label {
+                cards.push((session.clone(), label));
+            }
+            if cards.len() == HOME_LIMIT {
+                break;
+            }
+        }
+        self.home.update(cx, |view, cx| {
+            view.set_sessions(
+                cards,
+                self.session_snapshot.errors.clone(),
+                self.session_snapshot.loaded,
+                cx,
+            )
+        });
+        cx.notify();
+    }
+
+    pub(super) fn open_agent_session(
+        &mut self,
+        key: SessionKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remember_agent_pane(cx);
+        if let Some((&id, _)) = self
+            .open_sessions
+            .iter()
+            .find(|(_, s)| s.key.as_ref() == Some(&key))
+        {
+            self.activate_open_session(id, window, cx);
+            return;
+        }
+        let Some(session) = self
+            .session_snapshot
+            .sessions
+            .iter()
+            .find(|s| s.key == key)
+            .cloned()
+        else {
+            window.push_notification("Session is no longer listed. Refresh and try again.", cx);
+            return;
+        };
+        self.session_navigation = self.session_navigation.wrapping_add(1);
+        let generation = self.session_navigation;
+        let root = self.data_root.clone();
+        let catalog = self.session_catalog.clone();
+        let ad_hoc = self.working_directory == session.checkout
+            || self.inactive_repositories.contains_key(&session.checkout);
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move {
+                    let session = catalog.prepare_open(&session.key)?;
+                    let project = root.as_ref().and_then(|root| {
+                        recent_repositories(root, usize::MAX)
+                            .into_iter()
+                            .find(|p| p.checkout_path == session.checkout)
+                    });
+                    anyhow::ensure!(
+                        project.is_some() || ad_hoc,
+                        "This checkout is no longer registered or open"
+                    );
+                    if let (Some(root), Some(project)) = (&root, &project) {
+                        record_repository_open(root, &project.key)?;
+                    }
+                    Ok::<_, anyhow::Error>((session, project.map(|p| p.key)))
+                })
+                .await;
+            let _ = cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    if this.session_navigation != generation {
+                        return;
+                    }
+                    match outcome {
+                        Ok((session, repository)) => {
+                            this.launch_recent_session(session, repository, window, cx)
+                        }
+                        Err(error) => {
+                            window.push_notification(format!("Could not open session: {error}"), cx)
+                        }
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
+    fn launch_recent_session(
+        &mut self,
+        session: SessionSummary,
+        repository: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((&id, _)) = self
+            .open_sessions
+            .iter()
+            .find(|(_, s)| s.key.as_ref() == Some(&session.key))
+        {
+            self.activate_open_session(id, window, cx);
+            return;
+        }
+        let Some(agent) = session.agent() else {
+            return;
+        };
+        let pane = cx.new(|cx| {
+            TerminalPane::with_session(
+                WorkspaceTab::Agent,
+                &session.cwd,
+                agent,
+                &self.agent_activity,
+                Some(&session),
+                cx,
+            )
+        });
+        if pane.read(cx).launch_failed() {
+            window.push_notification(
+                "Could not launch the session terminal. Your previous session is still open.",
+                cx,
+            );
+            return;
+        }
+        let Some(id) = pane.read(cx).launch_id() else {
+            return;
+        };
+        self.open_sessions.insert(
+            id,
+            OpenAgentSession {
+                pane,
+                checkout: session.checkout.clone(),
+                agent,
+                key: Some(session.key),
+                title: session.title,
+            },
+        );
+        self.activate_open_session(id, window, cx);
+        self.current_repository = repository;
+        self.refresh_sessions(cx);
+    }
+
+    pub(super) fn focus_attention_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.agent_activity.snapshot();
+        let id = self
+            .open_sessions
+            .iter()
+            .filter(|(_, session)| session.checkout == self.working_directory)
+            .filter(|(id, _)| {
+                snapshot
+                    .for_launch(**id)
+                    .is_some_and(|a| a.state == ActivityState::NeedsAttention)
+            })
+            .map(|(id, _)| *id)
+            .min();
+        if let Some(id) = id {
+            self.activate_open_session(id, window, cx);
+        }
+    }
+
+    fn activate_open_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_agent_pane(cx);
+        let Some(open) = self.open_sessions.get(&id) else {
+            return;
+        };
+        let (pane, checkout, agent) = (open.pane.clone(), open.checkout.clone(), open.agent);
+        self.restore_repository_tabs(&checkout, cx);
+        self.tabs[WorkspaceTab::Agent as usize] = Some(pane);
+        self.session_agent = agent;
+        self.active_tab = WorkspaceTab::Agent;
+        self.current_repository = self
+            .session_projects
+            .iter()
+            .find(|p| p.checkout_path == checkout)
+            .map(|p| p.key.clone());
+        self.project_name = checkout
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        self.tasks.update(cx, |view, cx| {
+            view.set_scope(
+                crate::tasks::Scope::Repository(self.current_repository.clone()),
+                cx,
+            )
+        });
+        self.enter_repository(window, cx);
+        self.refresh_git_status(cx);
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    fn new_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_agent_pane(cx);
+        // An explicit New wins over an in-flight auto-resume: bump the
+        // navigation so a stale open completion cannot replace this pane,
+        // and mark the checkout started either way.
+        self.session_navigation += 1;
+        self.agent_autostart.insert(self.working_directory.clone());
+        let agent = self.default_agent;
+        let pane = cx.new(|cx| {
+            TerminalPane::new(
+                WorkspaceTab::Agent,
+                &self.working_directory,
+                agent,
+                &self.agent_activity,
+                cx,
+            )
+        });
+        if pane.read(cx).launch_failed() {
+            window.push_notification("Could not create a session terminal", cx);
+            return;
+        }
+        let Some(id) = pane.read(cx).launch_id() else {
+            return;
+        };
+        // Track immediately: the async catalog publish must never be the
+        // only owner a repository switch could strand in a hidden tab set.
+        self.open_sessions.insert(
+            id,
+            OpenAgentSession {
+                pane: pane.clone(),
+                checkout: self.working_directory.clone(),
+                agent,
+                key: None,
+                title: "New session".into(),
+            },
+        );
+        self.tabs[WorkspaceTab::Agent as usize] = Some(pane);
+        self.session_agent = agent;
+        self.focus_active_pane(window, cx);
+        self.refresh_sessions(cx);
+        cx.notify();
+    }
+
+    fn close_agent_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let busy = self
+            .agent_activity
+            .snapshot()
+            .for_launch(id)
+            .is_some_and(|a| {
+                matches!(
+                    a.state,
+                    ActivityState::Working
+                        | ActivityState::NeedsAttention
+                        | ActivityState::Starting
+                        | ActivityState::Unavailable
+                )
+            });
+        if busy {
+            let workspace = cx.entity().downgrade();
+            window.open_dialog(cx,move |dialog,_,_| {
+                let workspace=workspace.clone();
+                dialog.title("Close agent session?").child("This stops its terminal process. The saved conversation stays in the agent's history.")
+                    .footer(DialogFooter::new()
+                        .child(Button::new("cancel-close-session").label("Cancel").on_click(|_,window,cx|window.close_dialog(cx)))
+                        .child(Button::new("confirm-close-session").primary().label("Close session").on_click(|_,window,cx|window.dispatch_action(Box::new(Confirm{secondary:false}),cx))))
+                    .on_ok(move |_,window,cx| {let _=workspace.update(cx,|this,cx|this.remove_agent_session(id,window,cx));true})
+            });
+        } else {
+            self.remove_agent_session(id, window, cx);
+        }
+    }
+    fn remove_agent_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_sessions.remove(&id);
+        let agent_index = WorkspaceTab::Agent as usize;
+        let active = self.tabs[agent_index]
+            .as_ref()
+            .and_then(|p| p.read(cx).launch_id())
+            == Some(id);
+        if active {
+            self.tabs[agent_index] = None;
+        }
+        for repository in self.inactive_repositories.values_mut() {
+            if repository.tabs[agent_index]
+                .as_ref()
+                .and_then(|p| p.read(cx).launch_id())
+                == Some(id)
+            {
+                repository.tabs[agent_index] = None;
+            }
+        }
+        if active
+            && let Some((&next, _)) = self
+                .open_sessions
+                .iter()
+                .find(|(_, s)| s.checkout == self.working_directory)
+        {
+            self.activate_open_session(next, window, cx);
+        }
+        self.sync_activity_visibility(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn render_agent_sessions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let agent_index = WorkspaceTab::Agent as usize;
+        let active = self.tabs[agent_index]
+            .as_ref()
+            .and_then(|p| p.read(cx).launch_id());
+        let selected = active
+            .and_then(|id| self.open_sessions.get(&id))
+            .and_then(|s| s.key.as_ref());
+        let activity = self.agent_activity.snapshot();
+        let mut sidebar = v_flex()
+            .h_full()
+            .min_h_0()
+            .flex_none()
+            .w(px(260.))
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .p_2()
+            .gap_2();
+        let recent = self
+            .session_snapshot
+            .recent(&self.working_directory, SIDEBAR_LIMIT);
+        let mut list = v_flex()
+            .id("agent-session-list")
+            .flex_1()
+            .min_h_0()
+            .gap_1()
+            .overflow_y_scrollbar();
+        // Open sessions outside the recent limit remain reachable, including new unsaved sessions.
+        let mut open: Vec<_> = self
+            .open_sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.checkout == self.working_directory
+                    && !recent.iter().any(|r| s.key.as_ref() == Some(&r.key))
+            })
+            .collect();
+        open.sort_by_key(|(id, _)| std::cmp::Reverse(**id));
+        if !open.is_empty() {
+            list = list.child(div().text_xs().child("Open sessions"));
+        }
+        for (&id, session) in open {
+            let status = activity
+                .for_launch(id)
+                .map(|a| a.state.label())
+                .unwrap_or("Status unavailable");
+            let is_active = active == Some(id);
+            list = list.child(
+                h_flex()
+                    .gap_1()
+                    .when(is_active, |row| row.bg(cx.theme().secondary))
+                    .child(
+                        Button::new(SharedString::from(format!("open-agent-{id}")))
+                            .ghost()
+                            .flex_1()
+                            .min_w_0()
+                            .h_auto()
+                            .p_2()
+                            .tooltip(format!(
+                                "{}\n{} · {status}",
+                                session.title,
+                                session.agent.label()
+                            ))
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .items_start()
+                                    .gap_1()
+                                    .child(div().w_full().truncate().child(session.title.clone()))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .child(format!("{} · {status}", session.agent.label())),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate_open_session(id, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("close-agent-{id}")))
+                            .ghost()
+                            .label("×")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_agent_session(id, window, cx)
+                            })),
+                    ),
+            );
+        }
+        list = list.child(div().text_xs().child("Recent sessions"));
+        for session in &recent {
+            let key = session.key.clone();
+            let open = self
+                .open_sessions
+                .iter()
+                .find(|(_, s)| s.key.as_ref() == Some(&key))
+                .map(|(&id, _)| id);
+            let status = open
+                .and_then(|id| activity.for_launch(id))
+                .map(|a| format!(" · {}", a.state.label()))
+                .unwrap_or_default();
+            let is_selected = selected == Some(&key);
+            let row = Button::new(SharedString::from(format!(
+                "recent-agent-{}-{}-{}",
+                key.provider,
+                key.store.display(),
+                key.id
+            )))
+            .ghost()
+            .flex_1()
+            .min_w_0()
+            .h_auto()
+            .p_2()
+            .tooltip(session.tooltip())
+            .child(
+                v_flex()
+                    .items_start()
+                    .w_full()
+                    .gap_1()
+                    .child(div().w_full().truncate().child(session.title.clone()))
+                    .child(div().text_xs().child(format!(
+                        "{} · {}{status}",
+                        session.provider_label(),
+                        session.age()
+                    ))),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_agent_session(key.clone(), window, cx)
+            }));
+            let mut row = h_flex().gap_1().child(row);
+            if is_selected {
+                row = row.bg(cx.theme().secondary);
+            }
+            if let Some(id) = open {
+                row = row.child(
+                    Button::new(SharedString::from(format!("close-recent-{id}")))
+                        .ghost()
+                        .label("×")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_agent_session(id, window, cx)
+                        })),
+                );
+            }
+            list = list.child(row);
+        }
+        if recent.is_empty() {
+            list = list.child(div().text_sm().child(if self.session_snapshot.loaded {
+                "No recent sessions."
+            } else {
+                "Loading sessions…"
+            }));
+        }
+        for error in &self.session_snapshot.errors {
+            list = list.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(error.clone()),
+            );
+        }
+        sidebar = sidebar.child(list);
+        sidebar = sidebar.child(
+            div()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .pt_2()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("new-agent-session")
+                                .ghost()
+                                .flex_1()
+                                .icon(IconName::Plus)
+                                .label("New session")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.new_agent_session(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("refresh-agent-sessions")
+                                .ghost()
+                                .icon(IconName::RotateCw)
+                                .tooltip("Refresh sessions")
+                                .loading(self.session_refreshing)
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh_sessions(cx))),
+                        ),
+                ),
+        );
+        let terminal = self.tabs[agent_index]
+            .clone()
+            .map(|p| p.into_any_element())
+            .unwrap_or_else(|| {
+                div()
+                    .p_4()
+                    .child("Select a session or start a new one.")
+                    .into_any_element()
+            });
+        h_flex()
+            .items_stretch()
+            .size_full()
+            .min_h_0()
+            .child(sidebar)
+            .child(div().flex_1().min_w_0().h_full().child(terminal))
+            .into_any_element()
+    }
+}

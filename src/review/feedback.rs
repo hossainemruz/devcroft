@@ -63,12 +63,12 @@ mod tests {
             base_ref: None,
             head_branch: None,
         };
-        let (rows, file_row_start) = flatten(&diff);
+        let (rows, file_row_start) = flatten(&diff, &Default::default());
         let loaded = LoadedReview {
-            diff,
+            diff: Rc::new(diff),
             rows,
             file_row_start,
-            syntax: Default::default(),
+            syntax: Rc::new(Default::default()),
         };
         let mut anchor = Anchor {
             path: "file.rs".into(),

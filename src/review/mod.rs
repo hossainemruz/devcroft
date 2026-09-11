@@ -44,7 +44,7 @@ use crate::command_palette::{
 use self::git::{ReviewScope, load_review, suggest_base_branch};
 use self::icons::{FALLBACK, ICON_PX, IconTiles, ensure_tiles, icon_key};
 use self::model::ReviewDiff;
-use self::stream::{flatten, render_row, status_color};
+use self::stream::{file_header_row, flatten, render_row, status_color};
 use self::tree::{TreeRowMeta, build_file_tree, file_item_id, file_path_from_id};
 
 /// Lucide `message-square` outline, inlined because `gpui-kit-assets`
@@ -66,14 +66,16 @@ enum ReviewState {
 
 /// A loaded diff plus its virtualized stream rows.
 ///
-/// `rows` flattens every file section into uniform-height rows once per
-/// load; `file_row_start[file]` is that file's first row (its header), so
-/// tree↔stream scrolling maps between file indices and row indices.
+/// `rows` flattens every file section once per load (or per collapse toggle);
+/// `file_row_start[file]` is that file's first row (its header), so
+/// tree↔stream scrolling maps between file indices and row indices. `diff`
+/// and `syntax` are shared across collapse rebuilds so toggling a file never
+/// re-clones file text or highlight spans.
 pub(crate) struct LoadedReview {
-    pub(crate) diff: ReviewDiff,
+    pub(crate) diff: Rc<ReviewDiff>,
     pub(crate) rows: Vec<stream::StreamRow>,
     pub(crate) file_row_start: Vec<usize>,
-    pub(crate) syntax: syntax::SyntaxHighlights,
+    pub(crate) syntax: Rc<syntax::SyntaxHighlights>,
 }
 
 pub(crate) struct ReviewView {
@@ -86,6 +88,15 @@ pub(crate) struct ReviewView {
     tree_state: Entity<TreeState>,
     tree_metas: Rc<HashMap<String, TreeRowMeta>>,
     viewed: Rc<RefCell<HashSet<String>>>,
+    /// Collapsed files by repo-relative path, GitHub PR style. Scoped to the
+    /// current review (see `review_key`): survives refreshes of the same
+    /// branch pair, resets on branch/scope change, and re-flattens `rows` on
+    /// toggle without re-running git or syntax highlighting.
+    collapsed: Rc<RefCell<HashSet<String>>>,
+    /// Identifies the review that `viewed`/`collapsed` belong to
+    /// (`scope|base|head`). A branch or scope switch is a different review,
+    /// so stale marks must not leak across it.
+    review_key: Option<String>,
     /// Full-color raster tiles per icon key, filled at load and shared by
     /// every row render. Rasterizing here (not per frame) keeps scrolling
     /// smooth; the `Rc` lets the virtualized row closures share the cache.
@@ -115,6 +126,8 @@ impl ReviewView {
             tree_state: cx.new(|cx| TreeState::new(cx)),
             tree_metas: Rc::new(HashMap::new()),
             viewed: Rc::default(),
+            collapsed: Rc::default(),
+            review_key: None,
             icon_tiles: Rc::default(),
             list_handle: ListState::new(0, ListAlignment::Top, px(300.)),
             editor_row: Cell::new(None),
@@ -188,14 +201,45 @@ impl ReviewView {
         self.reload(cx);
     }
 
+    fn review_identity(&self, diff: &ReviewDiff) -> String {
+        let scope = match self.scope_tab {
+            ScopeTab::FullDiff => format!("full:{}:{}", self.remote, self.base_branch),
+            ScopeTab::Uncommitted => "uncommitted".to_owned(),
+        };
+        format!(
+            "{scope}|{}|{}|{}|{}",
+            diff.base_commit,
+            diff.head_commit,
+            diff.head_branch.as_deref().unwrap_or(""),
+            diff.base_ref.as_deref().unwrap_or(""),
+        )
+    }
+
     fn apply_diff(
         &mut self,
         diff: ReviewDiff,
         syntax: syntax::SyntaxHighlights,
         cx: &mut Context<Self>,
     ) {
+        let key = self.review_identity(&diff);
+        if self.review_key.as_deref() == Some(&key) {
+            // Same review, fresh worktree content: keep progress, drop marks
+            // for files that no longer exist in the diff.
+            self.collapsed
+                .borrow_mut()
+                .retain(|path| diff.files.iter().any(|file| &file.path == path));
+            self.viewed
+                .borrow_mut()
+                .retain(|path| diff.files.iter().any(|file| &file.path == path));
+        } else {
+            // Branch, base, or scope changed: a different review, so stale
+            // viewed/collapsed marks must not leak across it.
+            self.collapsed.borrow_mut().clear();
+            self.viewed.borrow_mut().clear();
+            self.review_key = Some(key);
+        }
         let (items, metas) = build_file_tree(&diff.files);
-        let (rows, file_row_start) = flatten(&diff);
+        let (rows, file_row_start) = flatten(&diff, &self.collapsed.borrow());
         self.list_handle.reset(rows.len() + 1);
         self.editor_row.set(None);
         let mut tiles = (*self.icon_tiles).clone();
@@ -211,20 +255,83 @@ impl ReviewView {
         });
         self.stream_top.set(0);
         self.state = ReviewState::Loaded(Rc::new(LoadedReview {
-            diff,
+            diff: Rc::new(diff),
             rows,
             file_row_start,
-            syntax,
+            syntax: Rc::new(syntax),
         }));
         cx.notify();
     }
 
     fn toggle_viewed(&mut self, path: &str, cx: &mut Context<Self>) {
-        let mut viewed = self.viewed.borrow_mut();
-        if !viewed.remove(path) {
-            viewed.insert(path.to_owned());
+        let now_viewed = {
+            let mut viewed = self.viewed.borrow_mut();
+            if viewed.remove(path) {
+                false
+            } else {
+                viewed.insert(path.to_owned());
+                true
+            }
+        };
+        // GitHub PR behavior: marking a file viewed collapses it;
+        // unmarking expands it again. A manual chevron toggle stays
+        // independent (it only touches `collapsed`, never `viewed`).
+        {
+            let mut collapsed = self.collapsed.borrow_mut();
+            if now_viewed {
+                collapsed.insert(path.to_owned());
+            } else {
+                collapsed.remove(path);
+            }
         }
-        drop(viewed);
+        self.rebuild_rows_around(path, cx);
+    }
+
+    pub(crate) fn toggle_collapsed(&mut self, path: &str, cx: &mut Context<Self>) {
+        {
+            let mut collapsed = self.collapsed.borrow_mut();
+            if !collapsed.remove(path) {
+                collapsed.insert(path.to_owned());
+            }
+        }
+        self.rebuild_rows_around(path, cx);
+    }
+
+    /// Re-flatten `rows` from the loaded diff plus the current `collapsed`
+    /// set, then restore the viewport on the given file header.
+    fn rebuild_rows_around(&mut self, path: &str, cx: &mut Context<Self>) {
+        let ReviewState::Loaded(loaded) = &self.state else {
+            cx.notify();
+            return;
+        };
+        let collapsed = self.collapsed.borrow().clone();
+        let (rows, file_row_start) = flatten(&loaded.diff, &collapsed);
+        let scroll_to = loaded
+            .diff
+            .files
+            .iter()
+            .position(|file| file.path == path)
+            .map(|file_ix| file_row_start[file_ix]);
+        self.state = ReviewState::Loaded(Rc::new(LoadedReview {
+            diff: loaded.diff.clone(),
+            rows,
+            file_row_start,
+            syntax: loaded.syntax.clone(),
+        }));
+        // The row count changed; reset virtualization then restore context on
+        // the toggled file header so the viewport doesn't jump elsewhere.
+        self.editor_row.set(None);
+        if let ReviewState::Loaded(loaded) = &self.state {
+            self.list_handle.reset(loaded.rows.len() + 1);
+            if let Some(item_ix) = scroll_to {
+                self.list_handle.scroll_to(ListOffset {
+                    item_ix,
+                    offset_in_item: px(0.),
+                });
+                self.stream_top.set(item_ix);
+                self.last_scrolled = Some(path.to_owned());
+            }
+        }
         cx.notify();
     }
 
@@ -582,6 +689,43 @@ impl ReviewView {
         }
     }
 
+    /// File whose header should stick to the top of the diff pane, if any.
+    ///
+    /// Returns `None` when the stream is empty or when the viewport sits
+    /// exactly on a file header (the in-flow header is fully visible, so a
+    /// duplicate sticky bar would just double-render). Otherwise returns the
+    /// file owning the top visible row, GitHub PR style.
+    fn sticky_file_ix(&self, loaded: &LoadedReview) -> Option<usize> {
+        let top = self.list_handle.logical_scroll_top();
+        let row = loaded.rows.get(top.item_ix)?;
+        let file = row.file();
+        let at_header_top =
+            matches!(row, stream::StreamRow::FileHeader { .. }) && top.offset_in_item == px(0.);
+        if at_header_top { None } else { Some(file) }
+    }
+
+    fn render_sticky_header(
+        &self,
+        loaded: &Rc<LoadedReview>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let file_ix = self.sticky_file_ix(loaded)?;
+        let file = &loaded.diff.files[file_ix];
+        let view = cx.entity();
+        Some(
+            div()
+                .flex_none()
+                .w_full()
+                .child(file_header_row(
+                    file,
+                    self.viewed.borrow().contains(&file.path),
+                    self.collapsed.borrow().contains(&file.path),
+                    &view,
+                ))
+                .into_any_element(),
+        )
+    }
+
     /// The virtualized diff stream: only the visible row window is built.
     ///
     /// Variable-height virtualization lets the editor live below its anchor.
@@ -611,6 +755,7 @@ impl ReviewView {
         let loaded = loaded.clone();
         let dark = cx.theme().is_dark();
         let viewed = self.viewed.clone();
+        let collapsed = self.collapsed.clone();
         let thread_groups = self.inline_thread_groups();
         let view = cx.entity();
         let weak = view.downgrade();
@@ -645,8 +790,12 @@ impl ReviewView {
             let row = loaded.rows[ix];
             let (selected, count) = view.read(cx).line_feedback(row);
             let target = view.clone();
+            let row_h = match row {
+                stream::StreamRow::FileHeader { .. } => stream::FILE_HEADER_H,
+                _ => stream::ROW_H,
+            };
             let line = h_flex()
-                .h(px(stream::ROW_H))
+                .h(px(row_h))
                 .flex_none()
                 .w_full()
                 .when(selected, |d| d.bg(rgb(0x203442)))
@@ -662,6 +811,7 @@ impl ReviewView {
                     &loaded,
                     row,
                     &viewed.borrow(),
+                    &collapsed.borrow(),
                     &view,
                     selected,
                     dark,
@@ -750,6 +900,7 @@ impl Render for ReviewView {
             }
             ReviewState::Loaded(loaded) => {
                 let file_count = loaded.diff.files.len();
+                let sticky = self.render_sticky_header(loaded, cx);
                 h_flex()
                     .flex_1()
                     .h_full()
@@ -780,11 +931,20 @@ impl Render for ReviewView {
                             .child(div().flex_1().min_h_0().child(self.render_tree(cx))),
                     )
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.render_stream(loaded, cx)),
+                            .min_h_0()
+                            .when_some(sticky, |this, header| this.child(header))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .w_full()
+                                    .child(self.render_stream(loaded, cx)),
+                            ),
                     )
                     .into_any_element()
             }

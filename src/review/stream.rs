@@ -26,9 +26,12 @@ use super::model::{
     ChangedFile, FileStatus, Hunk, HunkLine, LineTag, ReviewDiff, UnavailableReason,
 };
 
-/// Height of every stream row. File headers are condensed to a single row
-/// so the whole stream stays uniform (see module docs).
+/// Height of every diff content row. File headers use [`FILE_HEADER_H`] so
+/// they stand out from code lines (see module docs).
 pub(crate) const ROW_H: f32 = 24.0;
+/// Height of file section headers. Taller than [`ROW_H`] so each file
+/// boundary is noticeable while scrolling.
+pub(crate) const FILE_HEADER_H: f32 = 36.0;
 
 /// One virtualized row of the diff stream, addressing file/hunk/line by
 /// index into a [`LoadedReview`](super::LoadedReview).
@@ -79,13 +82,20 @@ impl StreamRow {
 ///
 /// Row order mirrors the input file order, so callers must pass files in
 /// [`compare_review_paths`](super::model::compare_review_paths) order to
-/// match the sidebar.
-pub(crate) fn flatten(diff: &ReviewDiff) -> (Vec<StreamRow>, Vec<usize>) {
+/// match the sidebar. Files in `collapsed` (by repo-relative path) emit only
+/// their [`StreamRow::FileHeader`]; expanding re-flattens to restore content.
+pub(crate) fn flatten(
+    diff: &ReviewDiff,
+    collapsed: &HashSet<String>,
+) -> (Vec<StreamRow>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_row_start = Vec::with_capacity(diff.files.len());
     for (file_ix, file) in diff.files.iter().enumerate() {
         file_row_start.push(rows.len());
         rows.push(StreamRow::FileHeader { file: file_ix });
+        if collapsed.contains(&file.path) {
+            continue;
+        }
         match &file.content {
             super::model::FileContent::Text { hunks, truncated } => {
                 for (hunk_ix, hunk) in hunks.iter().enumerate() {
@@ -133,18 +143,24 @@ pub(crate) fn status_color(status: FileStatus) -> u32 {
 }
 
 /// Render one flattened row. Pure over the loaded diff except the file
-/// header's viewed toggle, which updates the view through its entity.
+/// header's viewed/collapsed toggles, which update the view through its entity.
 pub(crate) fn render_row(
     loaded: &super::LoadedReview,
     row: StreamRow,
     viewed: &HashSet<String>,
+    collapsed: &HashSet<String>,
     view: &Entity<ReviewView>,
     selected: bool,
     dark: bool,
 ) -> AnyElement {
     let file = &loaded.diff.files[row.file()];
     match row {
-        StreamRow::FileHeader { .. } => file_header_row(file, viewed.contains(&file.path), view),
+        StreamRow::FileHeader { .. } => file_header_row(
+            file,
+            viewed.contains(&file.path),
+            collapsed.contains(&file.path),
+            view,
+        ),
         StreamRow::HunkHeader { hunk, .. } => match &file.content {
             super::model::FileContent::Text { hunks, .. } => hunk_header_row(&hunks[hunk]),
             super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
@@ -169,9 +185,16 @@ pub(crate) fn render_row(
     }
 }
 
-fn file_header_row(file: &ChangedFile, is_viewed: bool, view: &Entity<ReviewView>) -> AnyElement {
+pub(crate) fn file_header_row(
+    file: &ChangedFile,
+    is_viewed: bool,
+    is_collapsed: bool,
+    view: &Entity<ReviewView>,
+) -> AnyElement {
     let path = file.path.clone();
+    let collapse_path = file.path.clone();
     let toggle_view = view.clone();
+    let toggle_collapse = view.clone();
     let stats = if file.additions > 0 || file.deletions > 0 {
         format!("+{} −{}", file.additions, file.deletions)
     } else {
@@ -182,16 +205,30 @@ fn file_header_row(file: &ChangedFile, is_viewed: bool, view: &Entity<ReviewView
         _ => file.path.clone(),
     };
     div()
-        .h(px(ROW_H))
+        .h(px(FILE_HEADER_H))
         .flex_none()
         .flex()
         .flex_row()
         .items_center()
         .px_3()
         .gap_2()
-        .bg(rgb(0x0d0f0f))
+        .bg(rgb(0x151a1a))
         .border_b_1()
-        .border_color(rgb(0x1d1f1f))
+        .border_color(rgb(0x2a2e2e))
+        .child(
+            div()
+                .flex_none()
+                .w(px(20.))
+                .text_sm()
+                .text_color(rgb(0x858989))
+                .cursor_pointer()
+                .child(if is_collapsed { "▸" } else { "▾" })
+                .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                    cx.update_entity(&toggle_collapse, |view, cx| {
+                        view.toggle_collapsed(&collapse_path, cx);
+                    });
+                }),
+        )
         .child(
             div()
                 .text_xs()
@@ -450,7 +487,7 @@ mod tests {
             base_ref: None,
             head_branch: None,
         };
-        let (rows, starts) = flatten(&diff);
+        let (rows, starts) = flatten(&diff, &HashSet::new());
         assert_eq!(
             rows,
             vec![
@@ -478,5 +515,69 @@ mod tests {
         );
         assert_eq!(starts, vec![0, 6]);
         assert!(rows.iter().all(|row| row.file() < diff.files.len()));
+    }
+
+    #[test]
+    fn flatten_collapsed_file_emits_only_its_header() {
+        let diff = ReviewDiff {
+            files: vec![
+                ChangedFile {
+                    path: "a.rs".to_owned(),
+                    old_path: None,
+                    status: FileStatus::Modified,
+                    additions: 1,
+                    deletions: 1,
+                    content: FileContent::Text {
+                        hunks: vec![Hunk {
+                            old_start: 1,
+                            old_lines: 3,
+                            new_start: 1,
+                            new_lines: 3,
+                            collapsed_before: 0,
+                            lines: vec![line(LineTag::Context)],
+                        }],
+                        truncated: false,
+                    },
+                },
+                ChangedFile {
+                    path: "b.rs".to_owned(),
+                    old_path: None,
+                    status: FileStatus::Modified,
+                    additions: 1,
+                    deletions: 0,
+                    content: FileContent::Text {
+                        hunks: vec![Hunk {
+                            old_start: 1,
+                            old_lines: 1,
+                            new_start: 1,
+                            new_lines: 2,
+                            collapsed_before: 0,
+                            lines: vec![line(LineTag::Addition)],
+                        }],
+                        truncated: false,
+                    },
+                },
+            ],
+            base_commit: String::new(),
+            head_commit: String::new(),
+            base_ref: None,
+            head_branch: None,
+        };
+        let collapsed = HashSet::from(["a.rs".to_owned()]);
+        let (rows, starts) = flatten(&diff, &collapsed);
+        assert_eq!(
+            rows,
+            vec![
+                StreamRow::FileHeader { file: 0 },
+                StreamRow::FileHeader { file: 1 },
+                StreamRow::HunkHeader { file: 1, hunk: 0 },
+                StreamRow::Line {
+                    file: 1,
+                    hunk: 0,
+                    line: 0
+                },
+            ]
+        );
+        assert_eq!(starts, vec![0, 1]);
     }
 }

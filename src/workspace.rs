@@ -31,7 +31,8 @@ use crate::add_repository::AddRepositoryView;
 use crate::agent::AgentKind;
 use crate::agent_activity::{ActivityState, AgentActivityStore};
 use crate::agent_sessions::{
-    Catalog, HOME_LIMIT, SIDEBAR_LIMIT, SessionKey, SessionSummary, Snapshot as SessionSnapshot,
+    Catalog, DEFAULT_SIDEBAR_LIMIT, HOME_LIMIT, SessionKey, SessionSummary,
+    Snapshot as SessionSnapshot,
 };
 use crate::command_palette::{
     GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteCommand,
@@ -207,6 +208,10 @@ pub(crate) struct Workspace {
     session_projects: Vec<RecentRepository>,
     session_refreshing: bool,
     session_navigation: u64,
+    /// Recent-session rows per repository in the Agent sidebar. Loaded from
+    /// `device.json` at startup and pushed live by Settings > Agent; the
+    /// sidebar re-projects the in-memory snapshot on change, no rescan.
+    session_limit: usize,
     open_sessions: HashMap<u64, OpenAgentSession>,
     /// Checkouts where the Agent pane has been started (fresh or resumed).
     /// Entering a checkout auto-resumes its most recent catalog session
@@ -453,6 +458,13 @@ impl Workspace {
             .and_then(|root| DeviceStore::new(root).load().ok())
             .map(|state| state.app_font_size_or_default())
             .unwrap_or(DEFAULT_APP_FONT_SIZE);
+        // Initial Agent sidebar limit, mirroring the font size above. Later
+        // edits come through `set_session_limit` (Settings > Agent).
+        let session_limit = data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok())
+            .map(|state| state.recent_sessions_limit_or_default())
+            .unwrap_or(DEFAULT_SIDEBAR_LIMIT);
         // One shared tracker: the palette guard, the scheduler skip, and the
         // Settings status line all read the same run state.
         let sync_tracker = SyncTracker::default();
@@ -567,6 +579,7 @@ impl Workspace {
             session_projects: Vec::new(),
             session_refreshing: false,
             session_navigation: 0,
+            session_limit,
             open_sessions: HashMap::new(),
             agent_autostart: HashSet::new(),
             data_root,
@@ -777,7 +790,7 @@ impl Workspace {
         // gone stale behind the dialog (e.g. after external git edits).
         settings.update(cx, |view, cx| {
             view.set_workspace(workspace);
-            view.refresh_sync_from_disk(window, cx);
+            view.refresh_from_disk(window, cx);
         });
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
@@ -1241,6 +1254,19 @@ impl Workspace {
 
     pub(crate) fn default_agent(&self) -> AgentKind {
         self.default_agent
+    }
+
+    /// Apply a Settings > Agent sidebar limit live: re-project the
+    /// in-memory snapshot so the sidebar updates immediately. The caller
+    /// owns persistence; values are clamped for defense in depth.
+    pub(crate) fn set_session_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
+        use crate::agent_sessions::clamp_sidebar_limit;
+        let limit = clamp_sidebar_limit(limit);
+        if self.session_limit == limit {
+            return;
+        }
+        self.session_limit = limit;
+        self.publish_sessions(cx);
     }
 
     /// Open the per-workspace settings sheet with a fresh view: the sheet

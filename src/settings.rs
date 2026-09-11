@@ -24,6 +24,9 @@ use gpui_kit::{
     div, px, rgb,
 };
 
+use crate::agent_sessions::{
+    DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, clamp_sidebar_limit,
+};
 use crate::command_palette::{
     GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteMode,
     ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette, is_go_to_agent_shortcut,
@@ -109,6 +112,8 @@ pub(crate) struct SettingsView {
     skill_busy: bool,
     skill_report: String,
     skill_environment: String,
+    session_limit: usize,
+    session_limit_error: Option<String>,
 }
 
 impl SettingsView {
@@ -141,6 +146,11 @@ impl SettingsView {
         });
         let branch_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. experiment"));
         let (branches, current_branch, branch_upstream) = load_branch_state(data_root.as_ref());
+        let session_limit = data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok())
+            .map(|state| state.recent_sessions_limit_or_default())
+            .unwrap_or(DEFAULT_SIDEBAR_LIMIT);
         Self {
             focus_handle: cx.focus_handle(),
             active_section: SettingsSection::General,
@@ -166,6 +176,8 @@ impl SettingsView {
             skill_report: crate::agent_skill::perform(crate::agent_skill::Action::Status, None)
                 .text,
             skill_environment: crate::agent_skill::environment(),
+            session_limit,
+            session_limit_error: None,
         }
     }
 
@@ -175,19 +187,25 @@ impl SettingsView {
         self.workspace = Some(workspace);
     }
 
-    /// Re-read the persisted sync interval and the saved `origin` remote so
-    /// the Sync section never shows stale state (e.g. after external git or
-    /// CLI edits). Called before the dialog opens.
-    pub(crate) fn refresh_sync_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Re-read persisted Sync state plus the Agent sidebar limit so the
+    /// dialog never shows stale state (e.g. after external git or CLI
+    /// edits). Called before the dialog opens.
+    pub(crate) fn refresh_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(root) = self.data_root.clone() {
             self.sync_interval = DeviceStore::new(&root)
                 .load()
                 .ok()
                 .and_then(|state| state.sync_interval_minutes);
             self.saved_origin = get_origin(&root).unwrap_or(None);
+            self.session_limit = DeviceStore::new(&root)
+                .load()
+                .ok()
+                .map(|state| state.recent_sessions_limit_or_default())
+                .unwrap_or(DEFAULT_SIDEBAR_LIMIT);
         } else {
             self.sync_interval = None;
             self.saved_origin = None;
+            self.session_limit = DEFAULT_SIDEBAR_LIMIT;
         }
         let saved = self.saved_origin.clone().unwrap_or_default();
         self.origin_input.update(cx, |state, cx| {
@@ -206,6 +224,7 @@ impl SettingsView {
                 crate::agent_skill::perform(crate::agent_skill::Action::Status, None).text;
             self.skill_environment = crate::agent_skill::environment();
         }
+        self.session_limit_error = None;
         self.origin_busy = false;
         self.origin_error = None;
         self.origin_notice = None;
@@ -447,6 +466,38 @@ impl SettingsView {
             let _ = DeviceStore::new(&root).update(|state| {
                 state.app_font_size = Some(size);
             });
+        }
+        cx.notify();
+    }
+
+    /// Step the Agent sidebar limit in fives, clamped into range. Pure so
+    /// the bounds stay unit-testable without a window.
+    fn stepped_session_limit(current: usize, delta: i32) -> usize {
+        clamp_sidebar_limit(current.saturating_add_signed(delta as isize))
+    }
+
+    /// Persist the Agent sidebar limit and push it to the owning workspace
+    /// so the sidebar re-projects immediately. The live value applies even
+    /// when the write fails (same spirit as the font size); the error line
+    /// says persistence is what broke.
+    fn set_session_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
+        let limit = clamp_sidebar_limit(limit);
+        if self.session_limit == limit {
+            return;
+        }
+        self.session_limit = limit;
+        self.session_limit_error = None;
+        if let Some(root) = self.data_root.clone()
+            && let Err(error) = DeviceStore::new(&root).update(|state| {
+                state.recent_sessions_limit = Some(limit as u32);
+            })
+        {
+            self.session_limit_error = Some(format!("Could not save the session limit: {error:#}"));
+        }
+        if let Some(workspace) = self.workspace.clone() {
+            workspace
+                .update(cx, |this, cx| this.set_session_limit(limit, cx))
+                .ok();
         }
         cx.notify();
     }
@@ -1087,6 +1138,66 @@ impl SettingsView {
     fn render_agent(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::agent_skill::{Action, Target};
         let busy = self.skill_busy;
+        let limit = self.session_limit;
+        let is_default = limit == DEFAULT_SIDEBAR_LIMIT;
+        let sessions = group(
+            "Sessions",
+            Some("How many recent sessions the Agent sidebar lists per repository."),
+        )
+        .child(live_row(
+            "Recent sessions in sidebar",
+            "Applies immediately; open sessions always stay reachable.",
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(step_button(
+                    "-",
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_session_limit(SettingsView::stepped_session_limit(limit, -5), cx)
+                    }),
+                ))
+                .child(
+                    div()
+                        .w(px(48.))
+                        .text_center()
+                        .text_sm()
+                        .text_color(rgb(0xe7e7e7))
+                        .child(format!("{limit}")),
+                )
+                .child(step_button(
+                    "+",
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_session_limit(SettingsView::stepped_session_limit(limit, 5), cx)
+                    }),
+                ))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x555a5a))
+                        .child(format!("{MIN_SIDEBAR_LIMIT}–{MAX_SIDEBAR_LIMIT}")),
+                )
+                .when(!is_default, |this| {
+                    this.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(rgb(0x858989))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_session_limit(DEFAULT_SIDEBAR_LIMIT, cx)
+                                }),
+                            )
+                            .child(format!("Reset to {DEFAULT_SIDEBAR_LIMIT}")),
+                    )
+                }),
+        ))
+        .when_some(self.session_limit_error.clone(), |this, error| {
+            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+        });
         let mut skill = group(
             "Devcroft skill",
             Some(
@@ -1144,7 +1255,7 @@ impl SettingsView {
                     .text_color(rgb(0x858989))
                     .child("Updates and removal preserve modified or unmanaged skill folders."),
             );
-        v_flex().gap_4().child(skill).child(
+        v_flex().gap_4().child(sessions).child(skill).child(
             dummy_group("Agent", "Coming soon — these controls are placeholders.")
                 .child(dummy_row(
                     "Default command",
@@ -1642,6 +1753,24 @@ mod tests {
         assert_eq!(
             SettingsView::stepped_font_size(MIN_APP_FONT_SIZE, -5.0),
             MIN_APP_FONT_SIZE
+        );
+    }
+
+    #[test]
+    fn session_limit_steps_stay_in_bounds() {
+        assert_eq!(SettingsView::stepped_session_limit(25, 5), 30);
+        assert_eq!(SettingsView::stepped_session_limit(25, -5), 20);
+        assert_eq!(
+            SettingsView::stepped_session_limit(MAX_SIDEBAR_LIMIT, 5),
+            MAX_SIDEBAR_LIMIT
+        );
+        assert_eq!(
+            SettingsView::stepped_session_limit(MIN_SIDEBAR_LIMIT, -50),
+            MIN_SIDEBAR_LIMIT
+        );
+        assert_eq!(
+            SettingsView::stepped_session_limit(usize::MAX, 5),
+            MAX_SIDEBAR_LIMIT
         );
     }
 }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{DataRoot, write_json_atomic};
+use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, clamp_sidebar_limit};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
 /// Selectable automatic portable-sync intervals, in minutes (see
@@ -47,6 +48,11 @@ pub(crate) struct DeviceState {
     /// out-of-range values are clamped on read, never rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) app_font_size: Option<f32>,
+    /// Recent-session rows per repository in the Agent sidebar (Agents
+    /// settings). Absent means the default; out-of-range values are clamped
+    /// on read, never rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recent_sessions_limit: Option<u32>,
     /// Per-workspace default agent harness, keyed by canonical checkout
     /// path string (see `workspace_agents`). Machine-local like the rest of
     /// this file: different machines may have different harnesses
@@ -87,6 +93,15 @@ impl DeviceState {
     pub(crate) fn app_font_size_or_default(&self) -> f32 {
         self.app_font_size
             .map_or(DEFAULT_APP_FONT_SIZE, clamp_app_font_size)
+    }
+
+    /// Effective Agent sidebar limit: the stored value clamped to the
+    /// settable range, or the default when unset.
+    pub(crate) fn recent_sessions_limit_or_default(&self) -> usize {
+        self.recent_sessions_limit
+            .map_or(DEFAULT_SIDEBAR_LIMIT, |limit| {
+                clamp_sidebar_limit(limit as usize)
+            })
     }
 
     /// Drop legacy selection fields: derived paths are never honored, and
@@ -188,6 +203,7 @@ mod tests {
             theme: Some("dark".to_owned()),
             sync_interval_minutes: Some(15),
             app_font_size: Some(17.0),
+            recent_sessions_limit: Some(40),
             ..DeviceState::default()
         };
         state
@@ -200,6 +216,8 @@ mod tests {
         assert_eq!(loaded.sync_interval_minutes, Some(15));
         assert_eq!(loaded.app_font_size, Some(17.0));
         assert_eq!(loaded.app_font_size_or_default(), 17.0);
+        assert_eq!(loaded.recent_sessions_limit, Some(40));
+        assert_eq!(loaded.recent_sessions_limit_or_default(), 40);
         assert_eq!(loaded.extra.get("futureField"), Some(&json!({"v": [1, 2]})));
 
         // The file itself is two-space JSON with a trailing newline.
@@ -229,6 +247,30 @@ mod tests {
             tiny.app_font_size_or_default(),
             crate::metrics::MIN_APP_FONT_SIZE
         );
+    }
+
+    #[test]
+    fn recent_sessions_limit_defaults_and_clamps_on_read() {
+        use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT};
+        assert_eq!(
+            DeviceState::default().recent_sessions_limit_or_default(),
+            DEFAULT_SIDEBAR_LIMIT
+        );
+        let huge = DeviceState {
+            recent_sessions_limit: Some(9999),
+            ..DeviceState::default()
+        };
+        assert_eq!(huge.recent_sessions_limit_or_default(), MAX_SIDEBAR_LIMIT);
+        let tiny = DeviceState {
+            recent_sessions_limit: Some(1),
+            ..DeviceState::default()
+        };
+        assert_eq!(tiny.recent_sessions_limit_or_default(), MIN_SIDEBAR_LIMIT);
+        let exact = DeviceState {
+            recent_sessions_limit: Some(40),
+            ..DeviceState::default()
+        };
+        assert_eq!(exact.recent_sessions_limit_or_default(), 40);
     }
 
     #[test]

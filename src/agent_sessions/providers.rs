@@ -1,6 +1,6 @@
 use super::{
     model::{SessionKey, SessionSummary, canonical, title},
-    process::{self, Rpc},
+    process::Rpc,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -64,80 +64,63 @@ pub(super) fn discover(
     }
 }
 
-/// How many sessions to request from CLIs that only expose a global
-/// most-recent listing. The catalog filters by checkout after fetching, so
-/// this bound must comfortably exceed any single checkout's recent history.
-/// Hitting it exactly would present a truncated list as complete; the bound
-/// is documented alongside the other v1 limitations in
-/// `docs/agent-sessions-plan.md`.
-const OPENCODE_MAX_COUNT: u32 = 2000;
-
 fn opencode(source: &Source) -> Result<Vec<SessionSummary>> {
-    if !source.root.join("opencode").is_dir() {
+    let database = source.root.join("opencode/opencode.db");
+    if !database.is_file() {
         return Ok(Vec::new());
     }
-    let data = process::output(
-        Command::new("opencode")
-            .args([
-                "session",
-                "list",
-                "--format",
-                "json",
-                "--max-count",
-                &OPENCODE_MAX_COUNT.to_string(),
-            ])
-            .env("XDG_DATA_HOME", &source.root)
-            // Launcher shims (e.g. mise) may print a notice to stdout ahead
-            // of the JSON payload; request quiet and strip it defensively.
-            .env("MISE_QUIET", "1"),
-    )?;
-    parse_opencode(source, json_from_stdout(&data)?)
-}
-
-/// Parse CLI JSON that may be preceded by launcher-shim notices on stdout.
-/// Finds the first `[` or `{` and parses from there so a preamble line
-/// cannot fail the whole provider scan.
-fn json_from_stdout(data: &[u8]) -> Result<Value> {
-    let start = data
-        .iter()
-        .position(|byte| *byte == b'[' || *byte == b'{')
-        .context("Unsupported OpenCode session listing")?;
-    serde_json::from_slice(&data[start..]).context("Unsupported OpenCode session listing")
-}
-fn parse_opencode(source: &Source, data: Value) -> Result<Vec<SessionSummary>> {
-    let rows = data
-        .as_array()
-        .context("Unsupported OpenCode session listing")?;
-    rows.iter()
-        .filter(|r| {
-            r.get("parentID").and_then(Value::as_str).is_none()
-                && r.pointer("/time/archived").is_none()
+    // `opencode session list` only reports the single project containing the
+    // caller's working directory, so a subprocess can never cover every
+    // checkout at once (verified on 1.18.30: launching from $HOME hides a
+    // repository's sessions, launching from the repository hides the rest).
+    // The local store is read directly instead: one read-only query across
+    // all projects, independent of this process's working directory.
+    let connection = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .with_context(|| format!("opening OpenCode session store {}", database.display()))?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, directory, title, time_updated FROM session WHERE parent_id IS NULL AND time_archived IS NULL",
+        )
+        .context("reading OpenCode sessions")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
         })
-        .map(|r| {
-            Ok(SessionSummary {
-                key: SessionKey {
-                    provider: "opencode".into(),
-                    store: source.root.clone(),
-                    id: r["id"]
-                        .as_str()
-                        .context("Missing OpenCode session ID")?
-                        .into(),
-                },
-                checkout: PathBuf::new(),
-                cwd: PathBuf::from(
-                    r["directory"]
-                        .as_str()
-                        .context("Missing OpenCode session directory")?,
-                ),
-                title: title(r["title"].as_str().unwrap_or("")),
-                updated: r["updated"]
-                    .as_i64()
-                    .context("Missing OpenCode update time")?
-                    / 1000,
-                timestamp_source: "provider_updated".into(),
-            })
-        })
-        .collect()
+        .context("reading OpenCode sessions")?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        // A malformed row must not fail the whole provider scan the way a
+        // malformed CLI payload would: skip it and keep the rest.
+        let Ok((id, directory, row_title, updated)) = row else {
+            continue;
+        };
+        if id.is_empty() || directory.is_empty() {
+            continue;
+        }
+        sessions.push(SessionSummary {
+            key: SessionKey {
+                provider: "opencode".into(),
+                store: source.root.clone(),
+                id,
+            },
+            checkout: PathBuf::new(),
+            cwd: PathBuf::from(directory),
+            title: title(&row_title),
+            // The store records milliseconds, matching the old CLI payload.
+            updated: updated / 1000,
+            timestamp_source: "provider_updated".into(),
+        });
+    }
+    Ok(sessions)
 }
 
 fn codex(source: &Source) -> Result<Vec<SessionSummary>> {
@@ -375,31 +358,119 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn opencode_normalizes_milliseconds_and_rejects_unknown_schema() {
+    fn opencode_fixture() -> (tempfile::TempDir, Source) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("opencode")).unwrap();
+        let connection =
+            rusqlite::Connection::open(dir.path().join("opencode/opencode.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL, title TEXT NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER)",
+            )
+            .unwrap();
+        connection.close().unwrap();
         let source = Source {
             provider: "opencode",
-            root: "/data".into(),
+            root: dir.path().into(),
         };
-        let rows=parse_opencode(&source,json!([{"id":"s","directory":"/repo","title":" fix\n bug ","updated":1700000000123_i64}])).unwrap();
-        assert_eq!(rows[0].updated, 1700000000);
-        assert_eq!(rows[0].title, "fix bug");
-        assert!(parse_opencode(&source, json!([{"id":"s"}])).is_err());
+        (dir, source)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn insert_opencode_session(
+        dir: &tempfile::TempDir,
+        id: &str,
+        parent: Option<&str>,
+        directory: &str,
+        title: &str,
+        updated_ms: i64,
+        archived: Option<i64>,
+    ) {
+        let connection =
+            rusqlite::Connection::open(dir.path().join("opencode/opencode.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session (id, parent_id, directory, title, time_updated, time_archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, parent, directory, title, updated_ms, archived],
+            )
+            .unwrap();
+        connection.close().unwrap();
     }
     #[test]
-    fn opencode_ignores_launcher_preamble_before_json() {
+    fn opencode_reads_every_project_normalizes_milliseconds_and_titles() {
+        // The CLI only reports the project containing the caller's cwd, so
+        // the store read must cover sessions from unrelated directories in
+        // one pass with no working-directory involvement at all.
+        let (dir, source) = opencode_fixture();
+        insert_opencode_session(
+            &dir,
+            "s1",
+            None,
+            "/repo",
+            " fix\n bug ",
+            1700000000123,
+            None,
+        );
+        insert_opencode_session(&dir, "s2", None, "/elsewhere", "other", 1700000001000, None);
+        let mut files = HashMap::new();
+        let sessions = discover(&source, &mut files).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let first = sessions.iter().find(|s| s.key.id == "s1").unwrap();
+        assert_eq!(first.updated, 1700000000);
+        assert_eq!(first.title, "fix bug");
+        assert_eq!(first.cwd, PathBuf::from("/repo"));
+        assert_eq!(first.key.store, source.root);
+    }
+    #[test]
+    fn opencode_excludes_children_and_archived_sessions() {
+        let (dir, source) = opencode_fixture();
+        insert_opencode_session(&dir, "root", None, "/repo", "keep", 1700000000000, None);
+        insert_opencode_session(
+            &dir,
+            "child",
+            Some("root"),
+            "/repo",
+            "child",
+            1700000001000,
+            None,
+        );
+        insert_opencode_session(
+            &dir,
+            "archived",
+            None,
+            "/repo",
+            "old",
+            1700000002000,
+            Some(1700000003000),
+        );
+        let mut files = HashMap::new();
+        let sessions = discover(&source, &mut files).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| s.key.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+    }
+    #[test]
+    fn opencode_missing_store_is_empty_but_broken_schema_is_an_error() {
         let source = Source {
             provider: "opencode",
             root: "/data".into(),
         };
-        let mut bytes = b"mise ~/.config/mise/config.toml tools: opencode@1.18.30\n".to_vec();
-        bytes.extend_from_slice(
-            br#"[{"id":"s","directory":"/repo","title":"hi","updated":1700000000123}]"#,
-        );
-        let rows = parse_opencode(&source, json_from_stdout(&bytes).unwrap()).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].updated, 1700000000);
-        assert!(json_from_stdout(b"no json here").is_err());
+        let mut files = HashMap::new();
+        assert!(discover(&source, &mut files).unwrap().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("opencode")).unwrap();
+        fs::write(dir.path().join("opencode/opencode.db"), "not a database").unwrap();
+        let source = Source {
+            provider: "opencode",
+            root: dir.path().into(),
+        };
+        // Schema drift must surface as a provider error (stale cache plus a
+        // sidebar notice), never as a silently empty list.
+        assert!(discover(&source, &mut files).is_err());
     }
     #[test]
     fn claude_reads_titles_and_excludes_children_and_partial_append() {

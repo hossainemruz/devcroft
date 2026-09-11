@@ -20,48 +20,6 @@ impl Drop for Process {
     }
 }
 
-pub(super) fn output(command: &mut Command) -> Result<Vec<u8>> {
-    let mut child = Process(
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("starting local session reader")?,
-    );
-    let stdout = child.0.stdout.take().unwrap();
-    let (tx, rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take(LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = tx.send(result);
-    });
-    let bytes = rx
-        .recv_timeout(TIMEOUT)
-        .context("session listing timed out")??;
-    if bytes.len() as u64 > LIMIT {
-        bail!("Session listing exceeded the metadata limit");
-    }
-    // EOF may precede process exit. Bound that wait too.
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.0.try_wait()? {
-            if !status.success() {
-                bail!("Session reader exited with {status}");
-            }
-            break;
-        }
-        if start.elapsed() > TIMEOUT {
-            bail!("Session reader did not exit");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    Ok(bytes)
-}
-
 pub(super) struct Rpc {
     child: Process,
     lines: mpsc::Receiver<Result<Value>>,

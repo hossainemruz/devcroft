@@ -9,7 +9,18 @@ use crate::{
 };
 
 pub(crate) const HOME_LIMIT: usize = 4;
-pub(crate) const SIDEBAR_LIMIT: usize = 15;
+/// Default recent-session rows per repository in the Agent sidebar.
+/// Persisted per machine as `recent_sessions_limit` (see
+/// [`crate::data::DeviceState`]); out-of-range values clamp on read.
+pub(crate) const DEFAULT_SIDEBAR_LIMIT: usize = 25;
+pub(crate) const MIN_SIDEBAR_LIMIT: usize = 5;
+pub(crate) const MAX_SIDEBAR_LIMIT: usize = 100;
+
+/// Clamp a stored or stepped sidebar limit into the settable range. Pure
+/// so Settings stepping stays unit-testable without a window.
+pub(crate) fn clamp_sidebar_limit(limit: usize) -> usize {
+    limit.clamp(MIN_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct SessionKey {

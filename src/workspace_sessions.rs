@@ -635,7 +635,7 @@ impl Workspace {
             .gap_2();
         let recent = self
             .session_snapshot
-            .recent(&self.working_directory, SIDEBAR_LIMIT);
+            .recent(&self.working_directory, self.session_limit);
         let mut list = v_flex()
             .id("agent-session-list")
             .flex_1()

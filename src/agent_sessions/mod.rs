@@ -4,7 +4,10 @@ mod process;
 mod providers;
 
 use crate::data::DataRoot;
-pub(crate) use model::{HOME_LIMIT, SIDEBAR_LIMIT, SessionKey, SessionSummary};
+pub(crate) use model::{
+    DEFAULT_SIDEBAR_LIMIT, HOME_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, SessionKey,
+    SessionSummary, clamp_sidebar_limit,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};

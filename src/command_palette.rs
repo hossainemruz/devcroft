@@ -23,7 +23,7 @@ gpui_kit::actions!(
         GoToEditor,
         GoToTerminal,
         GoToReview,
-        GoToTasks,
+        GoToResources,
         NewAgentSession
     ]
 );
@@ -125,10 +125,10 @@ pub(crate) fn is_go_to_review_shortcut(key: &str, platform: bool, alt: bool) -> 
     key.eq_ignore_ascii_case("d")
 }
 
-/// Match the go-to-tasks shortcut (`cmd-t`, Super on Linux) from a raw
+/// Match the go-to-resources shortcut (`cmd-t`, Super on Linux) from a raw
 /// keystroke. Same shape as [`is_go_to_agent_shortcut`]: platform-only with
 /// no `ctrl` fallback so the keystroke never collides with terminal input.
-pub(crate) fn is_go_to_tasks_shortcut(key: &str, platform: bool, alt: bool) -> bool {
+pub(crate) fn is_go_to_resources_shortcut(key: &str, platform: bool, alt: bool) -> bool {
     if alt || !platform {
         return false;
     }
@@ -155,10 +155,9 @@ pub(crate) enum PaletteCommand {
     GoEditor,
     GoTerminal,
     GoReview,
-    GoTasks,
+    GoResources,
     GoHome,
     BrowseArtifacts,
-    ViewTasks,
     AddRepository,
     OpenSettings,
     SyncPortable,
@@ -170,20 +169,19 @@ impl PaletteCommand {
     pub(crate) fn is_workspace_tab(self) -> bool {
         matches!(
             self,
-            Self::GoAgent | Self::GoEditor | Self::GoTerminal | Self::GoReview | Self::GoTasks
+            Self::GoAgent | Self::GoEditor | Self::GoTerminal | Self::GoReview | Self::GoResources
         )
     }
 
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::GoAgent,
         Self::GoEditor,
         Self::GoTerminal,
         Self::GoReview,
-        Self::GoTasks,
+        Self::GoResources,
         Self::GoHome,
         Self::BrowseArtifacts,
-        Self::ViewTasks,
         Self::AddRepository,
         Self::OpenSettings,
         Self::SyncPortable,
@@ -195,10 +193,9 @@ impl PaletteCommand {
             Self::GoEditor => "Go to Editor",
             Self::GoTerminal => "Go to Terminal",
             Self::GoReview => "Go to Review",
-            Self::GoTasks => "Go to Tasks",
+            Self::GoResources => "Go to Resources",
             Self::GoHome => "Go to Home",
             Self::BrowseArtifacts => "Browse artifacts",
-            Self::ViewTasks => "View tasks",
             Self::AddRepository => "Add repository…",
             Self::OpenSettings => "Open settings…",
             Self::SyncPortable => "Sync portable data now",
@@ -214,7 +211,7 @@ impl PaletteCommand {
             Self::GoEditor => &["tab", "editor", "nvim"],
             Self::GoTerminal => &["tab", "terminal", "shell"],
             Self::GoReview => &["tab", "review", "diff"],
-            Self::GoTasks => &["tab", "tasks"],
+            Self::GoResources => &["tab", "resources", "artifacts"],
             Self::GoHome => &["tab", "home", "dashboard"],
             Self::BrowseArtifacts => &[
                 "artifact",
@@ -225,7 +222,6 @@ impl PaletteCommand {
                 "browse",
                 "read",
             ],
-            Self::ViewTasks => &["task", "tasks", "todo", "plan", "view", "browse", "list"],
             Self::AddRepository => &["repo", "repository", "project", "add", "new", "checkout"],
             Self::OpenSettings => &["settings", "preferences", "config"],
             Self::SyncPortable => &["sync", "portable", "push", "pull", "backup"],
@@ -467,15 +463,14 @@ pub(crate) fn item_at(
     sections.get(section)?.items.get(row).cloned()
 }
 
-const GO_TO_COMMANDS: [PaletteCommand; 8] = [
+const GO_TO_COMMANDS: [PaletteCommand; 7] = [
     PaletteCommand::GoAgent,
     PaletteCommand::GoEditor,
     PaletteCommand::GoTerminal,
     PaletteCommand::GoReview,
-    PaletteCommand::GoTasks,
+    PaletteCommand::GoResources,
     PaletteCommand::GoHome,
     PaletteCommand::BrowseArtifacts,
-    PaletteCommand::ViewTasks,
 ];
 
 const REPOSITORY_COMMANDS: [PaletteCommand; 1] = [PaletteCommand::AddRepository];
@@ -652,7 +647,7 @@ mod tests {
             PaletteCommand::GoEditor,
             PaletteCommand::GoTerminal,
             PaletteCommand::GoReview,
-            PaletteCommand::GoTasks,
+            PaletteCommand::GoResources,
         ] {
             assert!(
                 !commands.contains(&tab),
@@ -666,7 +661,6 @@ mod tests {
             vec![
                 PaletteCommand::GoHome,
                 PaletteCommand::BrowseArtifacts,
-                PaletteCommand::ViewTasks,
             ]
         );
         // Projects mode is page-agnostic: switching checkouts is how you
@@ -847,17 +841,17 @@ mod tests {
     }
 
     #[test]
-    fn tasks_shortcut_matches_t_with_platform_modifier_only() {
-        assert!(is_go_to_tasks_shortcut("t", true, false));
-        assert!(is_go_to_tasks_shortcut("T", true, false));
+    fn resources_shortcut_matches_t_with_platform_modifier_only() {
+        assert!(is_go_to_resources_shortcut("t", true, false));
+        assert!(is_go_to_resources_shortcut("T", true, false));
         // No `ctrl` fallback: the keystroke must keep reaching the terminal.
-        assert!(!is_go_to_tasks_shortcut("t", false, false));
-        assert!(!is_go_to_tasks_shortcut("T", false, false));
-        // Alt held, or any other key, never jumps to tasks.
-        assert!(!is_go_to_tasks_shortcut("t", true, true));
-        assert!(!is_go_to_tasks_shortcut("d", true, false));
-        assert!(!is_go_to_tasks_shortcut("k", true, false));
-        assert!(!is_go_to_tasks_shortcut("Enter", true, false));
+        assert!(!is_go_to_resources_shortcut("t", false, false));
+        assert!(!is_go_to_resources_shortcut("T", false, false));
+        // Alt held, or any other key, never jumps to Resources.
+        assert!(!is_go_to_resources_shortcut("t", true, true));
+        assert!(!is_go_to_resources_shortcut("d", true, false));
+        assert!(!is_go_to_resources_shortcut("k", true, false));
+        assert!(!is_go_to_resources_shortcut("Enter", true, false));
     }
 
     #[test]
@@ -886,7 +880,7 @@ mod tests {
         );
         assert_eq!(
             item_at(&sections, 0, 4),
-            Some(PaletteItem::Command(PaletteCommand::GoTasks))
+            Some(PaletteItem::Command(PaletteCommand::GoResources))
         );
         assert_eq!(
             item_at(&sections, 0, 5),
@@ -897,8 +891,7 @@ mod tests {
             Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
         );
         assert_eq!(
-            item_at(&sections, 0, 7),
-            Some(PaletteItem::Command(PaletteCommand::ViewTasks))
+            item_at(&sections, 0, 7), None
         );
         assert_eq!(
             item_at(&sections, 1, 0),
@@ -927,9 +920,9 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 8 go-to + 2 switch + 1 add + 1 settings + 1 sync.
-        assert_eq!(all.len(), 13);
-        assert_eq!(filter_items(&sections, "   ").len(), 13);
+        // 7 go-to + 2 switch + 1 add + 1 settings + 1 sync.
+        assert_eq!(all.len(), 12);
+        assert_eq!(filter_items(&sections, "   ").len(), 12);
     }
 
     #[test]
@@ -953,7 +946,7 @@ mod tests {
                 PaletteItem::Command(PaletteCommand::GoEditor),
                 PaletteItem::Command(PaletteCommand::GoTerminal),
                 PaletteItem::Command(PaletteCommand::GoReview),
-                PaletteItem::Command(PaletteCommand::GoTasks),
+                PaletteItem::Command(PaletteCommand::GoResources),
                 PaletteItem::Command(PaletteCommand::GoHome),
             ]
         );
@@ -989,17 +982,9 @@ mod tests {
             filter_items(&sections, "browse artifacts")
                 .contains(&PaletteItem::Command(PaletteCommand::BrowseArtifacts))
         );
-        assert!(
-            filter_items(&sections, "view tasks")
-                .contains(&PaletteItem::Command(PaletteCommand::ViewTasks))
-        );
         assert_eq!(
             filter_items(&sections, "BROWSE ARTIFACTS"),
             vec![PaletteItem::Command(PaletteCommand::BrowseArtifacts)]
-        );
-        assert_eq!(
-            filter_items(&sections, "VIEW TASKS"),
-            vec![PaletteItem::Command(PaletteCommand::ViewTasks)]
         );
     }
 

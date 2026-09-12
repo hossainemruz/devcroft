@@ -1,10 +1,10 @@
-//! Command-line surface; headless planning contract in `docs/task-cli.md`.
+//! Command-line surface; headless planning contract in `docs/resources.md`.
 //!
 //! Day-one contract: `devcroft app [--checkout <path>]` boots the GUI,
 //! bare `devcroft` prints help. `devcroft preview <path>` opens the file in
 //! a standalone preview window (no workspace, no socket — the lightweight
 //! MVP standing in for the Phase 2 `preview.open` socket method). Repository
-//! discovery and task/subtask/artifact commands are headless shared-store
+//! discovery and artifact commands are headless shared-store
 //! operations. Local review comments also have headless list/lifecycle commands.
 //! Sync and live-UI ref/focus commands remain future work.
 //! Dispatch in `main()` precedes GPUI initialization.
@@ -44,10 +44,8 @@ pub(crate) enum Command {
     GitStatus(GitStatusArgs),
     /// Discover portable repository keys (no local checkout required).
     Repository(planning::RepositoryArgs),
-    /// Manage persistent tasks without a running desktop.
-    Task(planning::TaskArgs),
-    /// Manage task-local subtasks using the containing task's revision.
-    Subtask(planning::SubtaskArgs),
+    /// Discover agent session identities for artifact origin links.
+    Session(planning::RepositoryArgs),
     /// Manage standalone Markdown artifacts without a running desktop.
     Artifact(planning::ArtifactArgs),
     /// List and manage local branch-pair review comments.

@@ -2,7 +2,6 @@
 mod artifacts;
 mod input;
 mod output;
-mod tasks;
 
 use anyhow::Result;
 use serde_json::json;
@@ -10,7 +9,6 @@ use serde_json::json;
 use crate::cli::planning::{RepositoryArgs, RepositoryCommand};
 
 pub(crate) use artifacts::artifact;
-pub(crate) use tasks::{subtask, task};
 
 pub(crate) fn repository(args: RepositoryArgs) -> Result<()> {
     let root = crate::data::resolve_data_root()?;
@@ -33,5 +31,23 @@ pub(crate) fn repository(args: RepositoryArgs) -> Result<()> {
         &human,
         &warnings,
         &list.errors,
+    )
+}
+
+pub(crate) fn sessions(args: RepositoryArgs) -> Result<()> {
+    let root = crate::data::resolve_data_root()?;
+    let catalog = crate::agent_sessions::Catalog::new(Some(&root));
+    catalog.load_cache();
+    catalog.refresh();
+    let mut snapshot = catalog.snapshot();
+    let RepositoryCommand::List(bounds) = args.command;
+    let truncated = snapshot.sessions.len() > bounds.limit as usize;
+    snapshot.sessions.truncate(bounds.limit as usize);
+    output::emit(
+        args.json,
+        json!({"formatVersion": 1, "sessions": snapshot.sessions, "errors": snapshot.errors, "truncated": truncated}),
+        &serde_json::to_string_pretty(&snapshot.sessions)?,
+        &[],
+        &snapshot.errors,
     )
 }

@@ -192,7 +192,6 @@ pub(crate) enum HomeEvent {
 }
 
 pub(crate) struct HomeView {
-    tasks: gpui_kit::Entity<crate::tasks::TaskBrowser>,
     artifacts: gpui_kit::Entity<crate::artifacts::ArtifactBrowser>,
     pub(crate) focus_handle: FocusHandle,
     root: Option<DataRoot>,
@@ -248,23 +247,10 @@ impl HomeView {
         tracker: SyncTracker,
         cx: &mut Context<Self>,
     ) -> Self {
-        let tasks = cx.new(|cx| {
-            crate::tasks::TaskBrowser::new(root.clone(), crate::tasks::Scope::Global, cx)
-        });
-        tasks.update(cx, |view, cx| {
-            view.show_recent(true, cx);
-            view.set_titlebar_owned(false);
-        });
-        cx.subscribe(&tasks, |this, _, _: &crate::tasks::OpenedTask, cx| {
-            this.page = Some("Tasks");
-            this.tasks
-                .update(cx, |view, _| view.set_titlebar_owned(true));
-            cx.notify();
-        })
-        .detach();
+        let artifacts = cx.new(|cx| crate::artifacts::ArtifactBrowser::new(root.clone(), cx));
+        cx.subscribe(&artifacts, |_, _, event: &crate::artifacts::OpenSession, cx| cx.emit(HomeEvent::OpenAgentSession(event.0.key.clone()))).detach();
         let mut view = Self {
-            tasks,
-            artifacts: cx.new(|cx| crate::artifacts::ArtifactBrowser::new(root.clone(), cx)),
+            artifacts,
             focus_handle: cx.focus_handle(),
             root,
             tracker,
@@ -299,10 +285,6 @@ impl HomeView {
     }
 
     pub(crate) fn activate(&mut self, cx: &mut Context<Self>) {
-        self.tasks.update(cx, |view, cx| {
-            view.show_recent(true, cx);
-            view.set_titlebar_owned(false);
-        });
         self.artifacts
             .update(cx, |view, cx| view.set_active(false, cx));
         self.active = true;
@@ -312,38 +294,18 @@ impl HomeView {
     }
 
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
-        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
         self.artifacts
             .update(cx, |view, cx| view.set_active(false, cx));
         self.active = false;
     }
 
-    /// Show the global task list: the same destination as Recent Tasks'
-    /// **View all →**. Used by the command palette so tasks are reachable
-    /// without scrolling Home. Mirrors the heading button: the full list
-    /// replaces recent summaries, the artifact browser stays inactive, and
-    /// a reload refreshes projects/dashboard plus the now-visible list.
-    pub(crate) fn show_tasks_page(&mut self, cx: &mut Context<Self>) {
-        self.active = true;
-        self.page = Some("Tasks");
-        self.tasks.update(cx, |view, cx| {
-            view.show_recent(false, cx);
-            view.set_titlebar_owned(true);
-        });
-        self.artifacts
-            .update(cx, |view, cx| view.set_active(false, cx));
-        self.scroll.set_offset(point(px(0.), px(0.)));
-        self.reload(cx);
-    }
-
     /// Show the artifact browser, reachable through the command palette's
-    /// **Browse artifacts** entry. The task list deactivates, the artifact
+    /// **Browse artifacts** entry. The artifact
     /// browser activates, and a reload refreshes projects/dashboard plus
     /// the now-visible browser.
     pub(crate) fn show_artifacts_page(&mut self, cx: &mut Context<Self>) {
         self.active = true;
         self.page = Some("Artifacts");
-        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
         self.artifacts
             .update(cx, |view, cx| view.set_active(true, cx));
         self.scroll.set_offset(point(px(0.), px(0.)));
@@ -354,10 +316,6 @@ impl HomeView {
         self.page == Some("Artifacts")
     }
 
-    pub(crate) fn is_tasks_page(&self) -> bool {
-        self.page == Some("Tasks")
-    }
-
     pub(crate) fn artifacts_include_archived(&self, cx: &gpui_kit::App) -> bool {
         self.artifacts.read(cx).include_archived()
     }
@@ -365,40 +323,6 @@ impl HomeView {
     pub(crate) fn set_artifacts_archived(&self, include: bool, cx: &mut Context<Self>) {
         self.artifacts
             .update(cx, |view, cx| view.set_include_archived(include, cx));
-    }
-
-    pub(crate) fn artifacts_has_selection(&self, cx: &gpui_kit::App) -> bool {
-        self.artifacts.read(cx).has_selection()
-    }
-
-    pub(crate) fn clear_artifact_selection(&self, cx: &mut Context<Self>) {
-        self.artifacts
-            .update(cx, |view, cx| view.clear_selection(cx));
-    }
-
-    pub(crate) fn tasks_include_archived(&self, cx: &gpui_kit::App) -> bool {
-        self.tasks.read(cx).include_archived()
-    }
-
-    pub(crate) fn set_tasks_archived(&self, include: bool, cx: &mut Context<Self>) {
-        self.tasks
-            .update(cx, |view, cx| view.set_include_archived(include, cx));
-    }
-
-    pub(crate) fn tasks_is_artifact_open(&self, cx: &gpui_kit::App) -> bool {
-        self.tasks.read(cx).is_artifact_open()
-    }
-
-    pub(crate) fn tasks_has_selection(&self, cx: &gpui_kit::App) -> bool {
-        self.tasks.read(cx).has_selection()
-    }
-
-    pub(crate) fn close_task_artifact(&self, cx: &mut Context<Self>) {
-        self.tasks.update(cx, |view, cx| view.close_artifact(cx));
-    }
-
-    pub(crate) fn clear_task_selection(&self, cx: &mut Context<Self>) {
-        self.tasks.update(cx, |view, cx| view.back_to_list(cx));
     }
 
     fn refresh_project_git(&mut self, cx: &mut Context<Self>) {
@@ -473,12 +397,7 @@ impl HomeView {
     }
 
     pub(crate) fn refresh_planning(&mut self, cx: &mut Context<Self>) {
-        if self.active && (self.page.is_none() || self.page == Some("Tasks")) {
-            self.tasks.update(cx, |view, cx| view.refresh_all(cx));
-        }
-        if self.active && self.page == Some("Artifacts") {
-            self.artifacts.update(cx, |view, cx| view.refresh(cx));
-        }
+        if self.active && self.page == Some("Artifacts") { self.artifacts.update(cx, |view, cx| view.refresh(cx)); }
     }
 
     fn change(
@@ -584,14 +503,6 @@ impl HomeView {
                     .label("View all →")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.page = Some(destination);
-                        this.tasks.update(cx, |view, cx| {
-                            if destination == "Tasks" {
-                                view.show_recent(false, cx);
-                                view.set_titlebar_owned(true);
-                            } else {
-                                view.set_active(false, cx);
-                            }
-                        });
                         this.scroll.set_offset(point(px(0.), px(0.)));
                         cx.notify();
                     })),
@@ -964,16 +875,6 @@ impl HomeView {
 
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.page == Some("Tasks") {
-            // Navigation and filter live in the workspace titlebar, matching
-            // the repository workspace and artifact browser layout.
-            return div()
-                .size_full()
-                .min_h_0()
-                .flex_1()
-                .child(self.tasks.clone())
-                .into_any_element();
-        }
         if self.page == Some("Artifacts") {
             // Navigation and filter live in the workspace titlebar, matching
             // the repository workspace layout.
@@ -1299,9 +1200,6 @@ impl Render for HomeView {
                     .label("+ Add project")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository))),
             );
-            body = body
-                .child(self.heading("Recent Tasks", "Tasks", cx))
-                .child(self.tasks.clone());
             body = body.child(
                 h_flex()
                     .justify_between()
@@ -1363,7 +1261,7 @@ impl Render for HomeView {
     }
 }
 
-/// Use the same grid for projects and tasks, regardless of how many projects
+/// Use the same grid for projects and activity, regardless of how many projects
 /// exist. The dashboard has 24px gutters and 16px gaps; spare columns stay empty.
 /// Widths are floored to whole pixels so fractional rounding can't wrap a card
 /// that mathematically fits (notably on Retina 2x).

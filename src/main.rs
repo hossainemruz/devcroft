@@ -11,7 +11,7 @@ mod commands;
 /// resolution, device store, first-run init, portable-only sync.
 /// Startup consumes resolution/init/device-load; origin and sync gain
 /// Settings consumers (manual run, schedule, remote) while workspace
-/// loading gains UI consumers with Home/Tasks/Review, so the not-yet-wired
+/// loading gains UI consumers with Home/Resources/Review, so the not-yet-wired
 /// surface is allow-listed until then — tests cover it now.
 #[allow(dead_code, unused_imports)]
 mod data;
@@ -26,7 +26,6 @@ mod relative_time;
 mod review;
 mod session;
 mod settings;
-mod tasks;
 mod workspace;
 mod workspace_settings;
 
@@ -41,7 +40,7 @@ use gpui_kit::{
 use crate::cli::{Cli, Command};
 use crate::{
     command_palette::{
-        GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession,
+        GoToAgent, GoToEditor, GoToReview, GoToResources, GoToTerminal, NewAgentSession,
         ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette,
     },
     fonts::load_terminal_fonts,
@@ -59,9 +58,8 @@ fn main() -> Result<()> {
         Command::App(args) => run_app(args.checkout),
         Command::Preview(args) => run_preview(args.path),
         Command::GitStatus(args) => run_git_status(args.checkout, args.limit),
+        Command::Session(args) => commands::sessions(args).context("devcroft session"),
         Command::Repository(args) => commands::repository(args).context("devcroft repository"),
-        Command::Task(args) => commands::task(args).context("devcroft task"),
-        Command::Subtask(args) => commands::subtask(args).context("devcroft subtask"),
         Command::Artifact(args) => commands::artifact(args).context("devcroft artifact"),
         Command::Review(args) => cli::review::run(args).context("devcroft review"),
         Command::Skill(args) => agent_skill::run(args).context("devcroft skill"),
@@ -88,7 +86,7 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         // super+k/super+p/super+s there too; the `ctrl` variants are fallbacks
         // for environments without a platform modifier). `cmd-a`/`cmd-e` jump
         // straight to the Agent/Editor tabs, `cmd-/` to the Terminal tab,
-        // `cmd-d`/`cmd-t` to the Review/Tasks tabs, and `cmd-n` starts a new
+        // `cmd-d`/`cmd-t` to the Review/Resources tabs, and `cmd-n` starts a new
         // session — all deliberately without `ctrl` fallbacks, so
         // `ctrl-a`/`ctrl-e` (readline beginning/end-of-line), `ctrl-s` (XOFF
         // flow control), `ctrl-n` (readline next-line), `ctrl-d` (end-of-file),
@@ -106,7 +104,7 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
             KeyBinding::new("cmd-e", GoToEditor, None),
             KeyBinding::new("cmd-/", GoToTerminal, None),
             KeyBinding::new("cmd-d", GoToReview, None),
-            KeyBinding::new("cmd-t", GoToTasks, None),
+            KeyBinding::new("cmd-t", GoToResources, None),
             KeyBinding::new("cmd-n", NewAgentSession, None),
         ]);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");

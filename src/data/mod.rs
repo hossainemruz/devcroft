@@ -17,7 +17,7 @@ mod portable;
 mod repositories;
 mod store_lock;
 mod sync;
-pub(crate) mod tasks;
+mod record;
 mod workspace_agents;
 
 use std::env;

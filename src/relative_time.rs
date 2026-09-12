@@ -1,4 +1,4 @@
-//! Relative time labels shared by Home project cards and task cards.
+//! Relative time labels shared by Home project cards and activity cards.
 //!
 //! Both surfaces show recency (`Opened 2h ago`, `Updated 3h ago`) from
 //! different timestamp shapes (RFC-3339 strings vs unix seconds), so the

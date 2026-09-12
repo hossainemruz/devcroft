@@ -28,9 +28,9 @@ use crate::agent_sessions::{
     DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, clamp_sidebar_limit,
 };
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteMode,
+    GoToAgent, GoToEditor, GoToReview, GoToResources, GoToTerminal, NewAgentSession, PaletteMode,
     ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette, is_go_to_agent_shortcut,
-    is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_tasks_shortcut,
+    is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_resources_shortcut,
     is_go_to_terminal_shortcut, is_new_session_shortcut, palette_mode_for_shortcut,
 };
 use crate::data::{
@@ -553,12 +553,12 @@ impl SettingsView {
             cx.stop_propagation();
             return;
         }
-        if is_go_to_tasks_shortcut(
+        if is_go_to_resources_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
             event.keystroke.modifiers.alt,
         ) {
-            window.dispatch_action(Box::new(GoToTasks), cx);
+            window.dispatch_action(Box::new(GoToResources), cx);
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -1201,7 +1201,7 @@ impl SettingsView {
         let mut skill = group(
             "Devcroft skill",
             Some(
-                "Teach agents to use Devcroft tasks, artifacts, and local review comments. OpenCode also reads these skill locations.",
+                "Teach agents to use repository artifacts and artifact/review comments. OpenCode also reads these skill locations.",
             ),
         );
         for (index, target) in Target::ALL.into_iter().enumerate() {

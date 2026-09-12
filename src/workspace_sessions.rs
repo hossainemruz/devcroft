@@ -283,33 +283,23 @@ impl Workspace {
             self.activate_open_session(id, window, cx);
             return;
         }
-        let Some(session) = self
-            .session_snapshot
-            .sessions
-            .iter()
-            .find(|s| s.key == key)
-            .cloned()
-        else {
-            window.push_notification("Session is no longer listed. Refresh and try again.", cx);
-            return;
-        };
         self.session_navigation = self.session_navigation.wrapping_add(1);
         let generation = self.session_navigation;
         let root = self.data_root.clone();
         let catalog = self.session_catalog.clone();
-        let ad_hoc = self.working_directory == session.checkout
-            || self.inactive_repositories.contains_key(&session.checkout);
+        let mut open_checkouts: HashSet<PathBuf> = self.inactive_repositories.keys().cloned().collect();
+        open_checkouts.insert(self.working_directory.clone());
         cx.spawn_in(window, async move |this, cx| {
             let outcome = cx
                 .background_spawn(async move {
-                    let session = catalog.prepare_open(&session.key)?;
+                    let session = catalog.prepare_open(&key)?;
                     let project = root.as_ref().and_then(|root| {
                         recent_repositories(root, usize::MAX)
                             .into_iter()
                             .find(|p| p.checkout_path == session.checkout)
                     });
                     anyhow::ensure!(
-                        project.is_some() || ad_hoc,
+                        project.is_some() || open_checkouts.contains(&session.checkout),
                         "This checkout is no longer registered or open"
                     );
                     if let (Some(root), Some(project)) = (&root, &project) {
@@ -430,9 +420,9 @@ impl Workspace {
             .to_string_lossy()
             .into_owned()
             .into();
-        self.tasks.update(cx, |view, cx| {
+        self.resources.update(cx, |view, cx| {
             view.set_scope(
-                crate::tasks::Scope::Repository(self.current_repository.clone()),
+                crate::artifacts::Scope::Repository(self.current_repository.clone()),
                 cx,
             )
         });

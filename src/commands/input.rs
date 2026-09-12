@@ -4,7 +4,6 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, ensure};
 
-use crate::cli::planning::{DescriptionInput, DescriptionPatch};
 
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -45,30 +44,10 @@ fn read_utf8(reader: impl Read, label: &str) -> Result<String> {
     })
 }
 
-pub(super) fn description(input: DescriptionInput) -> Result<String> {
-    Ok(input
-        .description_file
-        .as_deref()
-        .map(markdown)
-        .transpose()?
-        .unwrap_or_default())
-}
-
-pub(super) fn description_patch(patch: DescriptionPatch) -> Result<Option<String>> {
-    text_patch(
-        patch.input.description_file.as_deref(),
-        patch.clear_description,
-    )
-}
-
 pub(super) fn text_patch(path: Option<&Path>, clear: bool) -> Result<Option<String>> {
     if clear {
         Ok(Some(String::new()))
     } else {
         path.map(markdown).transpose()
     }
-}
-
-pub(super) fn list_patch(values: Vec<String>, clear: bool) -> Option<Vec<String>> {
-    (clear || !values.is_empty()).then_some(values)
 }

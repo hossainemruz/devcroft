@@ -60,7 +60,7 @@ impl SyncTracker {
 }
 
 /// What one sync did. `reload_required` marks outcomes where the rebase may
-/// have changed portable files, so Home/Tasks/Review projections must
+/// have changed portable files, so Home/Resources/Review projections must
 /// reload — the plan checklist item 6 hook.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SyncOutcome {

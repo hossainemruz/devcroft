@@ -1,25 +1,19 @@
-//! Read-focused global artifact browser. All store work is serialized off the
-//! UI thread; the selected ID is read independently of the browse filter.
-use std::time::Duration;
-
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+//! Repository resources, shared by the workspace and global artifact browser.
+use crate::data::DataRoot;
+use crate::data::artifacts::{
+    ArtifactList, ArtifactPatch, ArtifactStore, CommentChange, ListOptions, Snapshot,
 };
+use crate::preview::PreviewView;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _,
-    InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window, div,
+    AppContext as _, Context, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
-
-use crate::data::DataRoot;
-use crate::data::artifacts::{ArtifactList, ArtifactStore, Kind, ListOptions, Snapshot};
-use crate::preview::PreviewView;
-
-const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+use std::time::Duration;
 const PAGE_SIZE: usize = 100;
-
 #[derive(Default)]
 pub(crate) struct Refresh {
     pub(crate) busy: bool,
@@ -45,61 +39,50 @@ impl Refresh {
     }
 }
 
-struct Loaded {
-    list: Result<ArtifactList, String>,
-    selected: Option<Result<Snapshot, String>>,
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Scope {
+    Global,
+    Repository(Option<String>),
 }
+pub(crate) struct OpenSession(pub(crate) crate::data::artifacts::OriginSession);
+impl EventEmitter<OpenSession> for ArtifactBrowser {}
 
-fn load(root: &DataRoot, include_archived: bool, limit: usize, selected: Option<&str>) -> Loaded {
-    let store = ArtifactStore::new(root);
-    Loaded {
-        list: store
-            .list(&ListOptions {
-                include_archived,
-                limit: Some(limit),
-            })
-            .map_err(|e| format!("Could not list artifacts: {e:#}")),
-        selected: selected.map(|id| {
-            store
-                .get(id)
-                .map_err(|e| format!("Artifact {id} is missing or unreadable: {e:#}"))
-        }),
-    }
-}
-
-fn kind_label(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Rfc => "RFC",
-        Kind::Plan => "Plan",
-        Kind::Note => "Note",
-    }
+struct Draft {
+    input: Entity<TextareaState>,
+    snapshot: Snapshot,
+    comment: Option<String>,
+    document: bool,
 }
 
 pub(crate) struct ArtifactBrowser {
     root: Option<DataRoot>,
+    scope: Scope,
     active: bool,
     refresh: Refresh,
     include_archived: bool,
     limit: usize,
     list: ArtifactList,
-    list_error: Option<String>,
     selected_id: Option<String>,
     selected: Option<Snapshot>,
-    selected_error: Option<String>,
-    mutation_error: Option<String>,
+    error: Option<String>,
     preview: Option<Entity<PreviewView>>,
-    scroll: ScrollHandle,
-    focus_handle: FocusHandle,
+    draft: Option<Draft>,
+    saved_drafts: std::collections::HashMap<Scope, Draft>,
+    saving: bool,
+    pub(crate) focus_handle: FocusHandle,
 }
 
 impl ArtifactBrowser {
     pub(crate) fn new(root: Option<DataRoot>, cx: &mut Context<Self>) -> Self {
+        Self::scoped(root, Scope::Global, cx)
+    }
+    pub(crate) fn scoped(root: Option<DataRoot>, scope: Scope, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(REFRESH_INTERVAL).await;
+                cx.background_executor().timer(Duration::from_secs(2)).await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.active && !this.refresh.busy {
+                        if this.active && !this.saving && !this.refresh.busy {
                             this.refresh(cx);
                         }
                     })
@@ -112,92 +95,126 @@ impl ArtifactBrowser {
         .detach();
         Self {
             root,
+            scope,
             active: false,
             refresh: Refresh::default(),
             include_archived: false,
             limit: PAGE_SIZE,
             list: ArtifactList::default(),
-            list_error: None,
             selected_id: None,
             selected: None,
-            selected_error: None,
-            mutation_error: None,
+            error: None,
             preview: None,
-            scroll: ScrollHandle::new(),
+            draft: None,
+            saved_drafts: Default::default(),
+            saving: false,
             focus_handle: cx.focus_handle(),
         }
     }
-
+    pub(crate) fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            if let Some(draft) = self.draft.take() {
+                self.saved_drafts.insert(self.scope.clone(), draft);
+            }
+            self.scope = scope;
+            self.draft = self.saved_drafts.remove(&self.scope);
+            self.selected_id = self.draft.as_ref().map(|d| d.snapshot.artifact.id.clone());
+            self.selected = None;
+            self.preview = None;
+            self.error = None;
+            self.list = ArtifactList::default();
+            self.limit = PAGE_SIZE;
+            self.refresh(cx);
+        }
+    }
     pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.active = active;
         if active {
             self.refresh(cx);
         }
     }
-
     pub(crate) fn include_archived(&self) -> bool {
         self.include_archived
     }
-
-    pub(crate) fn set_include_archived(&mut self, include: bool, cx: &mut Context<Self>) {
-        if self.include_archived == include {
-            return;
-        }
-        self.include_archived = include;
+    pub(crate) fn set_include_archived(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.include_archived = value;
         self.limit = PAGE_SIZE;
         self.refresh(cx);
     }
-
-    pub(crate) fn has_selection(&self) -> bool {
-        self.selected_id.is_some()
-    }
-
-    pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        self.selected_id = None;
-        self.selected = None;
-        self.preview = None;
-        self.selected_error = None;
-        self.mutation_error = None;
-        self.refresh(cx);
-    }
-
-    /// Shared ID-based viewer entry point for future task/subtask links. Archived
-    /// records resolve even when they are excluded from the browser list.
-    pub(crate) fn open(&mut self, id: String, cx: &mut Context<Self>) {
-        self.selected_id = Some(id);
-        self.selected = None;
-        self.preview = None;
-        self.selected_error = None;
-        self.mutation_error = None;
-        self.refresh(cx);
-    }
-
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
         let Some(root) = self.root.clone() else {
-            self.list_error = Some("Portable data is unavailable".into());
-            self.selected_error = self
-                .selected_id
-                .as_ref()
-                .map(|_| "Portable data is unavailable".into());
-            cx.notify();
+            self.error = Some("Portable data is unavailable".into());
             return;
         };
         let Some(generation) = self.refresh.request() else {
-            cx.notify();
             return;
         };
-        let include_archived = self.include_archived;
-        let limit = self.limit;
-        let selected = self.selected_id.clone();
+        let scope = self.scope.clone();
+        let selected_id = self.selected_id.clone();
+        let options = ListOptions {
+            repository: match &scope {
+                Scope::Repository(key) => key.clone(),
+                Scope::Global => None,
+            },
+            include_archived: self.include_archived,
+            limit: Some(self.limit),
+        };
         cx.spawn(async move |this, cx| {
-            let loaded = cx
+            let result = cx
                 .background_spawn(async move {
-                    load(&root, include_archived, limit, selected.as_deref())
+                    if scope == Scope::Repository(None) {
+                        return Ok((ArtifactList::default(), None));
+                    }
+                    let store = ArtifactStore::new(&root);
+                    let list = store.list(&options).map_err(|e| format!("{e:#}"))?;
+                    let selected = selected_id
+                        .as_ref()
+                        .map(|id| store.get(id).map_err(|e| format!("{e:#}")));
+                    Ok::<_, String>((list, selected))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.refresh.finish(generation) {
-                    this.apply(loaded, cx);
+                    match result {
+                        Ok((list, selected)) => {
+                            this.list = list;
+                            let pinned = selected.and_then(|result| match result {
+                                Ok(snapshot)
+                                    if Some(&snapshot.artifact.id) == this.selected_id.as_ref()
+                                        && (this.include_archived
+                                            || !snapshot.artifact.archived)
+                                        && match &this.scope {
+                                            Scope::Global => true,
+                                            Scope::Repository(key) => {
+                                                snapshot.artifact.repository == *key
+                                            }
+                                        } =>
+                                {
+                                    Some(snapshot)
+                                }
+                                Err(error) => {
+                                    this.error = Some(error);
+                                    None
+                                }
+                                _ => None,
+                            });
+                            let selection = this
+                                .selected_id
+                                .as_ref()
+                                .and_then(|id| {
+                                    this.list.artifacts.iter().find(|s| &s.artifact.id == id)
+                                })
+                                .cloned()
+                                .or(pinned)
+                                .or_else(|| this.draft.as_ref().map(|d| d.snapshot.clone()))
+                                .or_else(|| this.list.artifacts.first().cloned());
+                            this.select(selection, cx);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
                 }
                 if this.refresh.pending {
                     this.refresh(cx);
@@ -206,260 +223,399 @@ impl ArtifactBrowser {
             });
         })
         .detach();
-        cx.notify();
     }
-
-    fn apply(&mut self, loaded: Loaded, cx: &mut Context<Self>) {
-        match loaded.list {
-            Ok(list) => {
-                self.list = list;
-                self.list_error = None;
-            }
-            Err(error) => {
-                self.list = ArtifactList::default();
-                self.list_error = Some(error);
-            }
-        }
-        match loaded.selected {
-            Some(Ok(snapshot)) => {
-                if self
-                    .selected
-                    .as_ref()
-                    .is_none_or(|old| old.artifact.content != snapshot.artifact.content)
-                {
-                    let content = snapshot.artifact.content.clone();
-                    if let Some(preview) = &self.preview {
-                        preview.update(cx, |view, cx| view.set_content(content.into(), cx));
-                    } else {
-                        self.preview = Some(cx.new(|cx| PreviewView::embedded(content.into(), cx)));
-                    }
+    fn select(&mut self, snapshot: Option<Snapshot>, cx: &mut Context<Self>) {
+        if self.selected.as_ref().map(|s| &s.artifact.content)
+            != snapshot.as_ref().map(|s| &s.artifact.content)
+            || self.preview.is_none()
+        {
+            match (self.preview.as_ref(), snapshot.as_ref()) {
+                (Some(preview), Some(s)) if self.selected_id.as_ref() == Some(&s.artifact.id) => {
+                    preview.update(cx, |view, cx| {
+                        view.set_content(s.artifact.content.clone().into(), cx)
+                    })
                 }
-                self.selected = Some(snapshot);
-                self.selected_error = None;
+                (_, Some(s)) => {
+                    self.preview = Some(
+                        cx.new(|cx| PreviewView::embedded(s.artifact.content.clone().into(), cx)),
+                    )
+                }
+                _ => self.preview = None,
             }
-            Some(Err(error)) => {
-                self.selected = None;
-                self.preview = None;
-                self.selected_error = Some(error);
-            }
-            None => {}
         }
+        self.selected_id = snapshot.as_ref().map(|s| s.artifact.id.clone());
+        self.selected = snapshot;
     }
-
-    fn archive(&mut self, cx: &mut Context<Self>) {
-        if self.refresh.busy {
-            return;
-        }
-        let (Some(root), Some(snapshot)) = (self.root.clone(), self.selected.clone()) else {
+    fn edit(
+        &mut self,
+        document: bool,
+        comment: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = self.selected.clone() else {
             return;
         };
-        self.refresh.busy = true;
-        self.mutation_error = None;
+        let value = if document {
+            snapshot.artifact.content.clone()
+        } else {
+            comment
+                .as_ref()
+                .and_then(|id| snapshot.artifact.comments.iter().find(|c| &c.id == id))
+                .map(|c| c.body.clone())
+                .unwrap_or_default()
+        };
+        let input = cx.new(|cx| {
+            let mut input = TextareaState::new(window, cx).rows(if document { 24 } else { 4 });
+            input.set_value(value, window, cx);
+            input
+        });
+        self.draft = Some(Draft {
+            input,
+            snapshot,
+            comment,
+            document,
+        });
+        self.error = None;
+        cx.notify();
+    }
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = &self.draft else {
+            return;
+        };
+        let value = draft.input.read(cx).value().to_string();
+        let snapshot = draft.snapshot.clone();
+        let edit = if draft.document {
+            Mutation::Document(value)
+        } else if let Some(id) = &draft.comment {
+            Mutation::Comment(CommentChange::Edit(id.clone(), value))
+        } else {
+            Mutation::Comment(CommentChange::Create(value))
+        };
+        self.mutate(snapshot, edit, true, cx);
+    }
+    fn mutate(
+        &mut self,
+        snapshot: Snapshot,
+        mutation: Mutation,
+        close_draft: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.saving {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.saving = true;
+        self.error = None;
+        self.refresh.generation = self.refresh.generation.wrapping_add(1);
+        let scope = self.scope.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    ArtifactStore::new(&root)
-                        .set_archived(
-                            &snapshot.artifact.id,
-                            &snapshot.revision,
-                            !snapshot.artifact.archived,
-                        )
-                        .map_err(|e| format!("Archive change failed; reload and retry: {e:#}"))
+                    let store = ArtifactStore::new(&root);
+                    let id = &snapshot.artifact.id;
+                    let revision = &snapshot.revision;
+                    match mutation {
+                        Mutation::Document(content) => store.update(
+                            id,
+                            revision,
+                            ArtifactPatch {
+                                content: Some(content),
+                                ..Default::default()
+                            },
+                        ),
+                        Mutation::Comment(change) => store.comment(id, revision, change),
+                        Mutation::Archive => {
+                            store.set_archived(id, revision, !snapshot.artifact.archived)
+                        }
+                    }
+                    .map_err(|e| format!("{e:#}"))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.refresh.busy = false;
-                this.mutation_error = result.err();
+                this.saving = false;
+                if this.scope != scope && result.is_ok() && close_draft {
+                    this.saved_drafts.remove(&scope);
+                }
+                if this.scope == scope {
+                    match result {
+                        Ok(snapshot) => {
+                            if close_draft {
+                                this.draft = None;
+                            }
+                            this.select(Some(snapshot), cx);
+                        }
+                        Err(error) => {
+                            this.error =
+                                Some(format!("Could not save. Your draft is retained. {error}"))
+                        }
+                    }
+                }
                 this.refresh(cx);
+                cx.notify();
             });
         })
         .detach();
         cx.notify();
     }
 }
+enum Mutation {
+    Document(String),
+    Comment(CommentChange),
+    Archive,
+}
 
 impl Render for ArtifactBrowser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Title, back navigation, and the archived filter live in the
-        // workspace titlebar (see `Workspace::render`). New and updated
-        // artifacts arrive through the active 2-second poll, so no manual
-        // refresh control is needed here.
-        let mut body = v_flex()
-            .id("artifact-browser")
-            .track_focus(&self.focus_handle)
-            .on_key_down(
-                cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.focus_handle.focus(window, cx);
-                        window.prevent_default();
-                        cx.stop_propagation();
-                    }
-                }),
-            )
-            .size_full()
-            .min_h_0()
-            .gap_3()
-            .p_4();
-        if let Some(id) = self.selected_id.clone() {
-            let copy_id = id.clone();
-            // Titlebar back handles drill-out (detail → list → origin), so
-            // no duplicate back button here.
-            body = body.child(
-                h_flex()
-                    .gap_3()
-                    .flex_wrap()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(id),
-                    )
-                    .child(Button::new("copy-artifact-id").label("Copy ID").on_click(
-                        move |_, window, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_id.clone()));
-                            window.push_notification("Artifact ID copied", cx);
-                        },
-                    )),
+        let mut sidebar = v_flex()
+            .id("resource-sidebar")
+            .w(px(260.))
+            .flex_none()
+            .h_full()
+            .overflow_y_scroll()
+            .p_3()
+            .gap_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(div().font_semibold().child("Resources"))
+            .child(
+                Button::new("resource-archived")
+                    .ghost()
+                    .label(if self.include_archived {
+                        "Hide archived"
+                    } else {
+                        "Show archived"
+                    })
+                    .disabled(self.draft.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_include_archived(!this.include_archived, cx)
+                    })),
             );
-            if let Some(snapshot) = &self.selected {
-                body = body.child(
+        for snapshot in &self.list.artifacts {
+            let snapshot = snapshot.clone();
+            let artifact = &snapshot.artifact;
+            sidebar = sidebar.child(
+                Button::new(SharedString::from(artifact.id.clone()))
+                    .ghost()
+                    .w_full()
+                    .label(artifact.title.clone())
+                    .disabled(self.draft.is_some() || self.saving)
+                    .when(self.selected_id.as_ref() == Some(&artifact.id), |b| {
+                        b.bg(cx.theme().secondary)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select(Some(snapshot.clone()), cx);
+                        this.error = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        if self.list.truncated {
+            sidebar = sidebar.child(Button::new("more-resources").label("Load more").on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.limit += PAGE_SIZE;
+                    this.refresh(cx);
+                }),
+            ));
+        }
+        for error in &self.list.errors {
+            sidebar = sidebar.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone()),
+            );
+        }
+        let mut detail = v_flex().flex_1().min_w_0().h_full().p_4().gap_3();
+        if let Some(error) = &self.error {
+            detail = detail.child(div().text_color(cx.theme().danger).child(error.clone()));
+        }
+        if let Some(snapshot) = self.selected.clone() {
+            let artifact = &snapshot.artifact;
+            detail =
+                detail.child(
                     h_flex()
-                        .gap_3()
-                        .flex_wrap()
+                        .gap_2()
+                        .items_center()
                         .child(
                             div()
+                                .flex_1()
                                 .text_lg()
                                 .font_semibold()
-                                .child(snapshot.artifact.title.clone()),
+                                .child(artifact.title.clone()),
                         )
-                        .child(kind_label(snapshot.artifact.kind))
-                        .when(snapshot.artifact.archived, |row| row.child("Archived"))
                         .child(
-                            Button::new("archive-artifact")
-                                .label(if snapshot.artifact.archived {
+                            Button::new("edit-resource")
+                                .label("Edit Markdown")
+                                .disabled(self.draft.is_some() || self.saving)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edit(true, None, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("archive-resource")
+                                .label(if artifact.archived {
                                     "Unarchive"
                                 } else {
                                     "Archive"
                                 })
-                                .disabled(self.refresh.busy)
-                                .on_click(cx.listener(|this, _, _, cx| this.archive(cx))),
+                                .disabled(self.draft.is_some() || self.saving)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(s) = this.selected.clone() {
+                                        this.mutate(s, Mutation::Archive, false, cx);
+                                    }
+                                })),
                         ),
                 );
-                if snapshot.artifact.content.is_empty() {
-                    body = body.child("This artifact has no Markdown content.");
+            if !artifact.sessions.is_empty() {
+                let mut origins = h_flex().gap_2().flex_wrap().child("Originating sessions:");
+                for (index, origin) in artifact.sessions.iter().enumerate() {
+                    let origin = origin.clone();
+                    origins =
+                        origins.child(
+                            Button::new(("origin-session", index))
+                                .ghost()
+                                .label(if origin.title.is_empty() {
+                                    origin.key.id.clone()
+                                } else {
+                                    origin.title.clone()
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(OpenSession(origin.clone()))
+                                })),
+                        );
                 }
-            } else if self.selected_error.is_none() {
-                body = body.child("Loading artifact…");
+                detail = detail.child(origins);
             }
-            for error in [&self.selected_error, &self.mutation_error]
-                .into_iter()
-                .flatten()
-            {
-                body = body.child(div().text_color(cx.theme().danger).child(error.clone()));
-            }
-            if let Some(preview) = &self.preview {
-                let focus = preview.clone();
-                body = body
+            if let Some(draft) = &self.draft {
+                detail = detail
                     .child(
-                        Button::new("read-artifact")
-                            .ghost()
-                            .label("Read document (focus keyboard scrolling)")
-                            .on_click(move |_, window, cx| {
-                                focus.focus_handle(cx).focus(window, cx)
-                            }),
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(Textarea::new(&draft.input).h_full()),
                     )
-                    .child(div().flex_1().min_h_0().child(preview.clone()));
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("save-resource")
+                                    .label("Save")
+                                    .disabled(self.saving)
+                                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                            )
+                            .child(
+                                Button::new("cancel-resource-edit")
+                                    .label("Cancel")
+                                    .disabled(self.saving)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.draft = None;
+                                        this.error = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+            } else {
+                if let Some(preview) = &self.preview {
+                    detail = detail.child(div().flex_1().min_h_0().child(preview.clone()));
+                }
+                let mut comments = v_flex()
+                    .id("artifact-comments")
+                    .max_h(px(240.))
+                    .overflow_y_scroll()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().font_semibold().child("Comments"))
+                            .child(
+                                Button::new("new-artifact-comment")
+                                    .label("Add comment")
+                                    .disabled(self.saving)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.edit(false, None, window, cx)
+                                    })),
+                            ),
+                    );
+                for (index, comment) in artifact.comments.iter().enumerate() {
+                    let edit_id = comment.id.clone();
+                    let resolve_id = comment.id.clone();
+                    let delete_id = comment.id.clone();
+                    let resolved = comment.resolved;
+                    comments = comments.child(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .child(div().text_sm().child(comment.body.clone()))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .when(resolved, |row| row.child("Resolved"))
+                                    .child(
+                                        Button::new(("edit-comment", index))
+                                            .ghost()
+                                            .label("Edit")
+                                            .disabled(self.saving)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.edit(false, Some(edit_id.clone()), window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("resolve-comment", index))
+                                            .ghost()
+                                            .label(if resolved { "Reopen" } else { "Resolve" })
+                                            .disabled(self.saving)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(s) = this.selected.clone() {
+                                                    this.mutate(
+                                                        s,
+                                                        Mutation::Comment(CommentChange::Resolve(
+                                                            resolve_id.clone(),
+                                                            !resolved,
+                                                        )),
+                                                        false,
+                                                        cx,
+                                                    );
+                                                }
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("delete-comment", index))
+                                            .ghost()
+                                            .label("Delete")
+                                            .disabled(self.saving)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(s) = this.selected.clone() {
+                                                    this.mutate(
+                                                        s,
+                                                        Mutation::Comment(CommentChange::Delete(
+                                                            delete_id.clone(),
+                                                        )),
+                                                        false,
+                                                        cx,
+                                                    );
+                                                }
+                                            })),
+                                    ),
+                            ),
+                    );
+                }
+                detail = detail.child(comments);
             }
         } else {
-            // Archived filter lives in the titlebar; the active poll keeps
-            // the list live without manual refresh or hints.
-            let mut list = v_flex()
-                .id("artifact-list")
-                .flex_1()
-                .min_h_0()
-                .gap_2()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll);
-            if let Some(error) = &self.list_error {
-                list = list.child(div().text_color(cx.theme().danger).child(error.clone()));
-            }
-            for error in &self.list.errors {
-                list = list.child(div().text_color(cx.theme().danger).child(error.clone()));
-            }
-            if self.list.artifacts.is_empty() && self.list_error.is_none() {
-                list = list.child(if self.refresh.busy { "Loading artifacts…" } else { "No artifacts. Ask an agent to create an RFC, plan, or note with devcroft artifact create." });
-            }
-            for snapshot in &self.list.artifacts {
-                let artifact = &snapshot.artifact;
-                let id = artifact.id.clone();
-                let copy_id = id.clone();
-                list = list.child(
-                    h_flex()
-                        .gap_2()
-                        .flex_none()
-                        .flex_wrap()
-                        .child(
-                            gpui_kit::base::Button::new(SharedString::from(format!("open-{id}")))
-                                .accessibility_label(format!("Open {} · {id}", artifact.title))
-                                .flex_1()
-                                .min_w_0()
-                                .flex_col()
-                                .items_start()
-                                .p_3()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .hover(|style| style.bg(cx.theme().secondary))
-                                .focus(|style| style.border_color(cx.theme().ring))
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .font_semibold()
-                                        .child(artifact.title.clone()),
-                                )
-                                .child(div().text_sm().child(format!(
-                                    "{} · {id}{}",
-                                    kind_label(artifact.kind),
-                                    if artifact.archived {
-                                        " · Archived"
-                                    } else {
-                                        ""
-                                    }
-                                )))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open(id.clone(), cx);
-                                    this.focus_handle.focus(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("copy-{copy_id}")))
-                                .label("Copy ID")
-                                .on_click(move |_, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_id.clone(),
-                                    ));
-                                    window.push_notification("Artifact ID copied", cx);
-                                }),
-                        ),
-                );
-            }
-            if self.list.truncated {
-                list = list.child(
-                    Button::new("more-artifacts")
-                        .label("Load 100 more")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.limit = this.limit.saturating_add(PAGE_SIZE);
-                            this.refresh(cx);
-                        })),
-                );
-            }
-            body = body.child(list);
+            detail = detail.child(if self.refresh.busy { "Loading resources…" } else { "No resources for this repository. Ask an agent to create an artifact with devcroft artifact create --repository <key>." });
         }
-        body
+        h_flex()
+            .id("resources")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .min_h_0()
+            .child(sidebar)
+            .child(detail)
     }
 }
 

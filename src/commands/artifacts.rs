@@ -20,6 +20,7 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
         ArtifactCommand::List(options) => {
             let list = store
                 .list(&artifacts::ListOptions {
+                    repository: options.repository,
                     include_archived: options.include_archived,
                     limit: Some(options.bounds.limit.into()),
                 })
@@ -37,9 +38,36 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
                 &list.errors,
             );
         }
+        ArtifactCommand::Comment(options) => {
+            use crate::cli::planning::CommentCommand::*;
+            use artifacts::CommentChange as Change;
+            let (record, change) = match options.command {
+                List(record) => {
+                    let snapshot = store.get(&record.id)?;
+                    return output::emit(
+                        args.json,
+                        json!({"formatVersion": 1, "artifactId": record.id, "revision": snapshot.revision, "comments": snapshot.artifact.comments}),
+                        &serde_json::to_string_pretty(&snapshot.artifact.comments)?,
+                        &[],
+                        &[],
+                    );
+                }
+                Create(input) => (input.record, Change::Create(input.body)),
+                Edit(input) => (
+                    input.comment.record,
+                    Change::Edit(input.comment.comment_id, input.body),
+                ),
+                Resolve(input) => (input.record, Change::Resolve(input.comment_id, true)),
+                Reopen(input) => (input.record, Change::Resolve(input.comment_id, false)),
+                Delete(input) => (input.record, Change::Delete(input.comment_id)),
+            };
+            store.comment(&record.id, &record.revision, change)?
+        }
         ArtifactCommand::Get(record) => store.get(&record.id).context("getting artifact")?,
         ArtifactCommand::Create(input_args) => store
             .create(NewArtifact {
+                repository: Some(input_args.repository),
+                sessions: sessions(input_args.sessions_file)?.unwrap_or_default(),
                 title: input_args.title,
                 kind: kind(input_args.kind),
                 content: input::markdown(&input_args.content_file)?,
@@ -50,6 +78,8 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
                 &patch.record.id,
                 &patch.record.revision,
                 ArtifactPatch {
+                    repository: patch.repository,
+                    sessions: sessions(patch.sessions_file)?,
                     title: patch.title,
                     kind: patch.kind.map(kind),
                     content: input::text_patch(patch.content_file.as_deref(), patch.clear_content)?,
@@ -64,4 +94,9 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
             .context("unarchiving artifact")?,
     };
     output::artifact_snapshot(snapshot, args.json)
+}
+
+fn sessions(path: Option<std::path::PathBuf>) -> Result<Option<Vec<artifacts::OriginSession>>> {
+    path.map(|path| Ok(serde_json::from_str(&input::markdown(&path)?)?))
+        .transpose()
 }

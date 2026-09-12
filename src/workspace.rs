@@ -35,7 +35,7 @@ use crate::agent_sessions::{
     Snapshot as SessionSnapshot,
 };
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToTasks, GoToTerminal, NewAgentSession, PaletteCommand,
+    GoToAgent, GoToEditor, GoToReview, GoToResources, GoToTerminal, NewAgentSession, PaletteCommand,
     PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette, ToggleProjectsPalette,
     ToggleSessionsPalette, item_at, palette_sections_for_mode, session_items,
 };
@@ -77,7 +77,7 @@ pub(crate) enum WorkspaceTab {
     Editor,
     Terminal,
     Review,
-    Tasks,
+    Resources,
 }
 
 impl WorkspaceTab {
@@ -86,7 +86,7 @@ impl WorkspaceTab {
         Self::Editor,
         Self::Terminal,
         Self::Review,
-        Self::Tasks,
+        Self::Resources,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -95,7 +95,7 @@ impl WorkspaceTab {
             Self::Editor => "Editor",
             Self::Terminal => "Terminal",
             Self::Review => "Review",
-            Self::Tasks => "Tasks",
+            Self::Resources => "Resources",
         }
     }
 
@@ -105,24 +105,22 @@ impl WorkspaceTab {
             // label in Settings and the spawned command cannot drift.
             Self::Agent => Some(AgentKind::DEFAULT.command()),
             Self::Editor => Some("nvim ."),
-            Self::Terminal | Self::Review | Self::Tasks => None,
+            Self::Terminal | Self::Review | Self::Resources => None,
         }
     }
 
-    /// Review and Tasks render native content instead of hosting a shell.
+    /// Review and Resources render native content instead of hosting a shell.
     pub(crate) fn has_terminal(self) -> bool {
-        !matches!(self, Self::Review | Self::Tasks)
+        !matches!(self, Self::Review | Self::Resources)
     }
 }
 
-/// Where a home full-page (Tasks or Artifacts) should return to. Captured on
+/// Where the global artifact browser should return to. Captured on
 /// entry so the titlebar back button behaves like a browser back button
 /// instead of always landing on Home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageOrigin {
     Home,
-    Tasks,
-    Artifacts,
     Repository,
 }
 
@@ -171,7 +169,7 @@ impl GitPoll {
 }
 
 pub(crate) struct Workspace {
-    tasks: Entity<crate::tasks::TaskBrowser>,
+    resources: Entity<crate::artifacts::ArtifactBrowser>,
     home: Entity<HomeView>,
     home_visible: bool,
     portable_git_poll: GitPoll,
@@ -241,9 +239,6 @@ pub(crate) struct Workspace {
     /// back button returns where the user came from. `Some` only while the
     /// artifact page is visible.
     artifacts_origin: Option<PageOrigin>,
-    /// Origin captured when entering the global Tasks page. `Some` only
-    /// while that page is visible.
-    tasks_origin: Option<PageOrigin>,
 }
 
 struct OpenAgentSession {
@@ -395,8 +390,8 @@ impl Workspace {
                 if this
                     .update(cx, |this, cx| {
                         if this.portable_git_poll.commit(generation, status) {
-                            if !this.home_visible && this.active_tab == WorkspaceTab::Tasks {
-                                this.tasks.update(cx, |view, cx| view.refresh_all(cx));
+                            if !this.home_visible && this.active_tab == WorkspaceTab::Resources {
+                                this.resources.update(cx, |view, cx| view.refresh(cx));
                             }
                             this.home.update(cx, |view, cx| view.refresh_planning(cx));
                             cx.notify();
@@ -549,15 +544,19 @@ impl Workspace {
             }
         })
         .detach();
+        let resources = cx.new(|cx| {
+            crate::artifacts::ArtifactBrowser::scoped(
+                data_root.clone(),
+                crate::artifacts::Scope::Repository(current_repository.clone()),
+                cx,
+            )
+        });
+        cx.subscribe_in(&resources, window, |this, _, event: &crate::artifacts::OpenSession, window, cx| {
+            this.open_agent_session(event.0.key.clone(), window, cx);
+        }).detach();
         Self {
             home,
-            tasks: cx.new(|cx| {
-                crate::tasks::TaskBrowser::new(
-                    data_root.clone(),
-                    crate::tasks::Scope::Repository(current_repository.clone()),
-                    cx,
-                )
-            }),
+            resources,
             home_visible: true,
             portable_git_poll: GitPoll::default(),
             active_tab,
@@ -590,7 +589,6 @@ impl Workspace {
             recent_repositories: Vec::new(),
             palette_model: Vec::new(),
             artifacts_origin: None,
-            tasks_origin: None,
         }
     }
 
@@ -618,8 +616,8 @@ impl Workspace {
             self.review.read(cx).focus_handle.clone().focus(window, cx);
             return;
         }
-        if self.active_tab == WorkspaceTab::Tasks {
-            self.tasks.read(cx).focus_handle.clone().focus(window, cx);
+        if self.active_tab == WorkspaceTab::Resources {
+            self.resources.read(cx).focus_handle.clone().focus(window, cx);
             return;
         }
         if let Some(Some(pane)) = self.tabs.get(self.active_tab as usize) {
@@ -681,11 +679,11 @@ impl Workspace {
         }
     }
 
-    /// Jump straight to the Tasks tab (`cmd-t`). An open command bar
+    /// Jump straight to the Resources tab (`cmd-t`). An open command bar
     /// closes first, so the shortcut never leaves the palette stranded over
     /// the new tab.
-    fn go_to_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_tab(WorkspaceTab::Tasks as usize, window, cx);
+    fn go_to_resources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab(WorkspaceTab::Resources as usize, window, cx);
         if self.command_open {
             self.close_command_palette(window, cx);
         }
@@ -842,12 +840,11 @@ impl Workspace {
                 PaletteCommand::GoEditor => self.select_tab(1, window, cx),
                 PaletteCommand::GoTerminal => self.select_tab(2, window, cx),
                 PaletteCommand::GoReview => self.select_tab(3, window, cx),
-                PaletteCommand::GoTasks => self.select_tab(4, window, cx),
+                PaletteCommand::GoResources => self.select_tab(4, window, cx),
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
                 PaletteCommand::GoHome => self.go_home(window, cx),
                 PaletteCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
-                PaletteCommand::ViewTasks => self.view_tasks(window, cx),
                 PaletteCommand::SyncPortable => {
                     self.request_sync(window, cx);
                     self.focus_active_pane(window, cx);
@@ -937,9 +934,9 @@ impl Workspace {
             .to_owned()
             .into();
         self.current_repository = Some(key.to_owned());
-        self.tasks.update(cx, |view, cx| {
+        self.resources.update(cx, |view, cx| {
             view.set_scope(
-                crate::tasks::Scope::Repository(self.current_repository.clone()),
+                crate::artifacts::Scope::Repository(self.current_repository.clone()),
                 cx,
             )
         });
@@ -982,9 +979,9 @@ impl Workspace {
             .data_root
             .as_ref()
             .and_then(|root| resolve_current_key(root, &checkout));
-        self.tasks.update(cx, |view, cx| {
+        self.resources.update(cx, |view, cx| {
             view.set_scope(
-                crate::tasks::Scope::Repository(self.current_repository.clone()),
+                crate::artifacts::Scope::Repository(self.current_repository.clone()),
                 cx,
             )
         });
@@ -1026,9 +1023,8 @@ impl Workspace {
 
     fn enter_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.artifacts_origin = None;
-        self.tasks_origin = None;
-        self.tasks.update(cx, |view, cx| {
-            view.set_active(self.active_tab == WorkspaceTab::Tasks, cx)
+        self.resources.update(cx, |view, cx| {
+            view.set_active(self.active_tab == WorkspaceTab::Resources, cx)
         });
         self.home_visible = false;
         self.home.update(cx, |view, cx| view.deactivate(cx));
@@ -1068,8 +1064,7 @@ impl Workspace {
 
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.artifacts_origin = None;
-        self.tasks_origin = None;
-        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
+        self.resources.update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
         self.home.update(cx, |view, cx| view.activate(cx));
@@ -1078,35 +1073,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Jump to Home's global task list (Recent Tasks' **View all →**
-    /// destination). The repository Tasks tab keeps its own scope; this is
-    /// the cross-repository list. Deactivates the workspace task view so its
-    /// poll stops while Home is visible. Captures the origin so the titlebar
-    /// back button returns where the user came from.
-    fn view_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let already_there = self.home_visible && self.home.read(cx).is_tasks_page();
-        if !already_there {
-            let origin = if !self.home_visible {
-                PageOrigin::Repository
-            } else if self.home.read(cx).is_artifacts_page() {
-                PageOrigin::Artifacts
-            } else {
-                PageOrigin::Home
-            };
-            self.tasks_origin = Some(origin);
-        }
-        self.artifacts_origin = None;
-        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
-        self.home_visible = true;
-        self.command_open = false;
-        self.home.update(cx, |view, cx| view.show_tasks_page(cx));
-        self.focus_active_pane(window, cx);
-        cx.notify();
-    }
-
     /// Jump to Home's artifact browser (the command palette's
-    /// **Browse artifacts** entry). Standalone RFCs/plans/notes need no task or repository
-    /// association. Deactivates the workspace task view so its poll stops
+    /// **Browse artifacts** entry). The global view includes unassociated legacy artifacts.
+    /// Deactivates the repository resources view so its poll stops
     /// while Home is visible. Captures the origin so the titlebar back
     /// button returns where the user came from.
     fn browse_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1114,15 +1083,12 @@ impl Workspace {
         if !already_there {
             let origin = if !self.home_visible {
                 PageOrigin::Repository
-            } else if self.home.read(cx).is_tasks_page() {
-                PageOrigin::Tasks
             } else {
                 PageOrigin::Home
             };
             self.artifacts_origin = Some(origin);
         }
-        self.tasks_origin = None;
-        self.tasks.update(cx, |view, cx| view.set_active(false, cx));
+        self.resources.update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
         self.home
@@ -1131,37 +1097,15 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Titlebar back for the artifact browser. Mirrors browser history:
-    /// drill out of an open artifact first, otherwise return to the captured
-    /// origin (repository workspace, global tasks, or Home dashboard).
+    /// Return from the global artifact browser to its captured origin.
     fn go_back_from_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.home.read(cx).artifacts_has_selection(cx) {
-            self.home
-                .update(cx, |view, cx| view.clear_artifact_selection(cx));
-            self.focus_active_pane(window, cx);
-            cx.notify();
-            return;
-        }
         match self.artifacts_origin.take() {
             Some(PageOrigin::Repository) => {
                 self.enter_repository(window, cx);
                 self.focus_active_pane(window, cx);
                 cx.notify();
             }
-            Some(PageOrigin::Tasks) => {
-                // Direct switch without capturing a new origin: this is a
-                // back navigation, not a forward entry. Clear both so the
-                // next back falls through to Home.
-                self.artifacts_origin = None;
-                self.tasks_origin = None;
-                self.tasks.update(cx, |view, cx| view.set_active(false, cx));
-                self.home_visible = true;
-                self.command_open = false;
-                self.home.update(cx, |view, cx| view.show_tasks_page(cx));
-                self.focus_active_pane(window, cx);
-                cx.notify();
-            }
-            Some(PageOrigin::Home) | Some(PageOrigin::Artifacts) | None => {
+            Some(PageOrigin::Home) | None => {
                 self.go_home(window, cx);
             }
         }
@@ -1170,59 +1114,7 @@ impl Workspace {
     fn artifacts_back_label(&self) -> SharedString {
         match self.artifacts_origin {
             Some(PageOrigin::Repository) => format!("‹ {}", self.project_name).into(),
-            Some(PageOrigin::Tasks) => "‹ Tasks".into(),
-            Some(PageOrigin::Home) | Some(PageOrigin::Artifacts) | None => "‹ Home".into(),
-        }
-    }
-
-    /// Titlebar back for the global Tasks page. Drills out stepwise first
-    /// (linked artifact → task detail → task list), otherwise returns to the
-    /// captured origin (repository workspace, artifacts, or Home).
-    fn go_back_from_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.home.read(cx).tasks_is_artifact_open(cx) {
-            self.home
-                .update(cx, |view, cx| view.close_task_artifact(cx));
-            self.focus_active_pane(window, cx);
-            cx.notify();
-            return;
-        }
-        if self.home.read(cx).tasks_has_selection(cx) {
-            self.home
-                .update(cx, |view, cx| view.clear_task_selection(cx));
-            self.focus_active_pane(window, cx);
-            cx.notify();
-            return;
-        }
-        match self.tasks_origin.take() {
-            Some(PageOrigin::Repository) => {
-                self.enter_repository(window, cx);
-                self.focus_active_pane(window, cx);
-                cx.notify();
-            }
-            Some(PageOrigin::Artifacts) => {
-                // Direct switch without capturing: back navigation clears
-                // both origins so the next back falls through to Home.
-                self.artifacts_origin = None;
-                self.tasks_origin = None;
-                self.tasks.update(cx, |view, cx| view.set_active(false, cx));
-                self.home_visible = true;
-                self.command_open = false;
-                self.home
-                    .update(cx, |view, cx| view.show_artifacts_page(cx));
-                self.focus_active_pane(window, cx);
-                cx.notify();
-            }
-            Some(PageOrigin::Home) | Some(PageOrigin::Tasks) | None => {
-                self.go_home(window, cx);
-            }
-        }
-    }
-
-    fn tasks_back_label(&self) -> SharedString {
-        match self.tasks_origin {
-            Some(PageOrigin::Repository) => format!("‹ {}", self.project_name).into(),
-            Some(PageOrigin::Artifacts) => "‹ Artifacts".into(),
-            Some(PageOrigin::Home) | Some(PageOrigin::Tasks) | None => "‹ Home".into(),
+            Some(PageOrigin::Home) | None => "‹ Home".into(),
         }
     }
 
@@ -1343,8 +1235,8 @@ impl Workspace {
     /// underneath them may have moved — a sync rebase or a Settings branch
     /// switch. Shared so both paths reload exactly the same set.
     pub(crate) fn reload_portable_projections(&mut self, cx: &mut Context<Self>) {
-        if !self.home_visible && self.active_tab == WorkspaceTab::Tasks {
-            self.tasks.update(cx, |view, cx| view.refresh_all(cx));
+        if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
+            self.resources.update(cx, |view, cx| view.refresh(cx));
         }
         self.home.update(cx, |view, cx| view.reload(cx));
         self.reload_recent_repositories();
@@ -1547,10 +1439,10 @@ impl Workspace {
                                         .icon(palette_icon(PaletteCommand::GoReview))
                                         .action(Box::new(GoToReview))
                                 }
-                                PaletteItem::Command(PaletteCommand::GoTasks) => CommandItem::new()
+                                PaletteItem::Command(PaletteCommand::GoResources) => CommandItem::new()
                                     .label(item.label())
-                                    .icon(palette_icon(PaletteCommand::GoTasks))
-                                    .action(Box::new(GoToTasks)),
+                                    .icon(palette_icon(PaletteCommand::GoResources))
+                                    .action(Box::new(GoToResources)),
                                 PaletteItem::Command(command) => CommandItem::new()
                                     .label(item.label())
                                     .icon(palette_icon(*command)),
@@ -1756,8 +1648,8 @@ impl Workspace {
         if self.home_visible {
             return self.home.clone().into_any_element();
         }
-        if self.active_tab == WorkspaceTab::Tasks {
-            return self.tasks.clone().into_any_element();
+        if self.active_tab == WorkspaceTab::Resources {
+            return self.resources.clone().into_any_element();
         }
         if self.active_tab == WorkspaceTab::Review {
             return self.review.clone().into_any_element();
@@ -1816,10 +1708,9 @@ fn palette_icon(command: PaletteCommand) -> IconName {
         PaletteCommand::GoEditor => IconName::FileText,
         PaletteCommand::GoTerminal => IconName::SquareTerminal,
         PaletteCommand::GoReview => IconName::Eye,
-        PaletteCommand::GoTasks => IconName::CircleCheck,
+        PaletteCommand::GoResources => IconName::CircleCheck,
         PaletteCommand::GoHome => IconName::LayoutDashboard,
         PaletteCommand::BrowseArtifacts => IconName::BookOpen,
-        PaletteCommand::ViewTasks => IconName::CircleCheck,
         PaletteCommand::AddRepository => IconName::Plus,
         PaletteCommand::OpenSettings => IconName::Settings,
         PaletteCommand::SyncPortable => IconName::RotateCw,
@@ -1840,20 +1731,14 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_index = self.active_tab as usize;
         let active_content = self.render_active_content(cx);
-        // Tasks and Artifacts full-pages share the repository workspace
+        // Resources and Artifacts full-pages share the repository workspace
         // chrome: title and back navigation live here, not in a second row.
         // The archived filter also lives here; the portable git status is
         // hidden on these pages and the lists stay live through their active
         // polls.
         let is_artifacts = self.home_visible && self.home.read(cx).is_artifacts_page();
-        let is_tasks = self.home_visible && self.home.read(cx).is_tasks_page();
         let show_archived = if is_artifacts {
             self.home.read(cx).artifacts_include_archived(cx)
-        } else {
-            false
-        };
-        let show_tasks_archived = if is_tasks {
-            self.home.read(cx).tasks_include_archived(cx)
         } else {
             false
         };
@@ -1862,12 +1747,7 @@ impl Render for Workspace {
         } else {
             SharedString::from("")
         };
-        let tasks_back = if is_tasks {
-            self.tasks_back_label()
-        } else {
-            SharedString::from("")
-        };
-        let is_home_page = is_artifacts || is_tasks;
+        let is_home_page = is_artifacts;
         let attention_count = self.agent_activity.snapshot().attention_count();
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
@@ -1878,7 +1758,7 @@ impl Render for Workspace {
         v_flex()
             .relative()
             .when(
-                self.home_visible || self.active_tab == WorkspaceTab::Tasks,
+                self.home_visible || self.active_tab == WorkspaceTab::Resources,
                 |this| this.tab_group(),
             )
             .size_full()
@@ -1905,8 +1785,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GoToReview, window, cx| {
                 this.go_to_review(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToTasks, window, cx| {
-                this.go_to_tasks(window, cx);
+            .on_action(cx.listener(|this, _: &GoToResources, window, cx| {
+                this.go_to_resources(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NewAgentSession, window, cx| {
                 // A dialog over the open bar would strand the query, so close
@@ -1947,28 +1827,6 @@ impl Render for Workspace {
                                         .text_sm()
                                         .font_semibold()
                                         .child(SharedString::from("Artifacts")),
-                                ),
-                        )
-                    })
-                    .when(is_tasks, |header| {
-                        header.child(
-                            h_flex()
-                                .flex_none()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Button::new("tasks-back")
-                                        .ghost()
-                                        .label(tasks_back)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.go_back_from_tasks(window, cx)
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .child(SharedString::from("Tasks")),
                                 ),
                         )
                     })
@@ -2142,19 +2000,6 @@ impl Render for Workspace {
                                 })),
                         )
                     })
-                    .when(is_tasks, |header| {
-                        header.child(
-                            Checkbox::new("show-archived-tasks")
-                                .label("Show archived")
-                                .checked(show_tasks_archived)
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                    let checked = *checked;
-                                    this.home.update(cx, |view, cx| {
-                                        view.set_tasks_archived(checked, cx)
-                                    });
-                                })),
-                        )
-                    })
                     .when(self.home_visible && !is_home_page, |header| {
                         let status = self.portable_git_poll.status();
                         // Just the state tag — branch and counts live in the
@@ -2322,9 +2167,9 @@ mod tests {
         assert_eq!(WorkspaceTab::Review.command(), None);
         assert_eq!(WorkspaceTab::Review.label(), "Review");
         assert!(!WorkspaceTab::Review.has_terminal());
-        assert_eq!(WorkspaceTab::Tasks.label(), "Tasks");
-        assert_eq!(WorkspaceTab::Tasks.command(), None);
-        assert!(!WorkspaceTab::Tasks.has_terminal());
+        assert_eq!(WorkspaceTab::Resources.label(), "Resources");
+        assert_eq!(WorkspaceTab::Resources.command(), None);
+        assert!(!WorkspaceTab::Resources.has_terminal());
     }
 
     fn dirty_status() -> GitStatus {

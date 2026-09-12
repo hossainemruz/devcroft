@@ -2,7 +2,7 @@
 
 Devcroft is a small GPUI desktop workspace with three persistent, Ghostty-powered terminal tabs:
 
-- **Agent** launches the workspace's default agent (`opencode` unless changed to `claude`, `codex`, or `omp` in the workspace settings sheet) in your default shell. Use **New session…** in the Agent sidebar or `Cmd+N` to pick a harness for a new session without changing the saved default.
+- **Agent** launches the workspace's default agent (`opencode` unless changed to `claude`, `codex`, or `omp` in the workspace settings sheet) in your default shell. Use **New session…** in the Agent sidebar to pick a harness for a new session without changing the saved default.
 - **Editor** launches `nvim .` in your default shell.
 - **Terminal** launches your default login shell.
 
@@ -12,7 +12,7 @@ The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, 
 
 ## Home
 
-Devcroft opens on Home without starting terminal processes. Open a recent project or use the shared command bar (`Cmd/Ctrl+K` for actions, `Cmd/Ctrl+P` for projects, `Cmd+S` for recent sessions across repositories) to enter a repository workspace. The **Home** button and **Go Home** command return to the dashboard without stopping existing sessions.
+Devcroft opens on Home without starting terminal processes. Open a recent project or use the shared command bar (`Cmd/Ctrl+K` for actions, `Cmd/Ctrl+P` for projects) to enter a repository workspace. The **Home** button and **Go Home** command return to the dashboard without stopping existing sessions.
 
 - **Recent Projects:** up to four linked repositories, ordered by last opened time. Each card shows its checkout's branch (or detached commit), clean/modified state, and available ahead/behind counts. Status refreshes in the background every five seconds while Home is active; this reads local Git state and does not fetch remotes. Click anywhere on a card to open its workspace; **Add project** registers another checkout.
 - **Resources:** repository Markdown artifacts with originating sessions, editing, and agent-accessible comments.
@@ -25,6 +25,8 @@ Home lists and todo ordering are saved in `portable/dashboard.json` and particip
 ### Keyboard navigation
 
 Use **Tab / Shift+Tab** to move through Home's controls, including the command bar and whole project cards, and **Enter / Space** to activate buttons or toggle checkboxes. Focused project cards support **arrow keys** (following the current grid) and **Home / End** (first/last project). **Page Up / Page Down** scroll the dashboard. Existing command-palette shortcuts remain available, and dialogs retain gpui-kit's keyboard focus handling.
+
+Press **Cmd+M** on macOS (**Super+M** on Linux) anywhere in the workspace to enter navigation mode: nothing edits while it owns the keyboard, and a `NAVIGATION` pill appears right after the command bar. The bottom-right list shows the keys available at the current location: tab and creation commands in a repository, back navigation on the Artifacts page, and edit/comment/save/cancel commands when a resource selection or draft allows them. Palettes stay on their direct shortcuts (`Cmd/Ctrl+K`, `Cmd/Ctrl+P`), which also work inside navigation mode. An action key runs once and returns to normal mode; `h`/`l` move between visible panes and keep the mode open; `Enter` keeps the focused pane; `Escape`, the toggle again, or a click exits without acting. The only direct shortcuts in normal mode are the palettes: `Cmd/Ctrl+K` actions, `Cmd/Ctrl+P` projects. See the [keyboard reference](docs/keyboard-reference.md).
 
 ## Repository resources
 

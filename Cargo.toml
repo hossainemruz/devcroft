@@ -24,6 +24,7 @@ similar = "3.2.0"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 
 [dev-dependencies]
+gpui-kit = { version = "0.6.1", features = ["test-support"] }
 tempfile = "3.27.0"
 
 [profile.dev]

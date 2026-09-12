@@ -3,7 +3,7 @@ use gpui_kit::WeakEntity;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 
-/// Keyboard-navigable agent chooser behind `New session…` and `cmd-n`.
+/// Keyboard-navigable agent chooser behind `New session…`.
 /// Backed by the kit's `List`, so up/down move the selection, Enter confirms,
 /// Esc closes, and the first agent starts selected. `ListDelegate` callbacks
 /// cannot borrow the workspace, so the delegate holds a weak handle instead.
@@ -237,7 +237,7 @@ impl Workspace {
     /// Display label for one session checkout: a registered repository's
     /// label when bound, otherwise the ad-hoc checkout's directory name while
     /// it is current or retained. The palette cache is consulted alongside
-    /// the catalog's project list so `cmd-s` can label rows before the first
+    /// the catalog's project list so session rows can label rows before the first
     /// catalog refresh republishes `session_projects`.
     pub(super) fn session_repository_label(&self, checkout: &Path) -> Option<String> {
         self.session_projects
@@ -259,13 +259,11 @@ impl Workspace {
     }
 
     /// Whether a session list is currently on screen: Home's Recent
-    /// Activity, the Agent sidebar, or the sessions command bar. Gates the
+    /// Activity or the Agent sidebar. Gates the
     /// periodic catalog refresh and the relative-time repaint so they run
     /// exactly while their labels are visible.
     pub(super) fn sessions_visible(&self) -> bool {
-        self.home_visible
-            || self.active_tab == WorkspaceTab::Agent
-            || (self.command_open && self.palette_mode == PaletteMode::Sessions)
+        self.home_visible || self.active_tab == WorkspaceTab::Agent
     }
 
     pub(super) fn open_agent_session(
@@ -274,6 +272,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Location changes (including async completions racing an open HUD)
+        // clear stale navigation state.
+        self.close_navigation(cx);
         self.remember_agent_pane(cx);
         if let Some((&id, _)) = self
             .open_sessions
@@ -287,7 +288,8 @@ impl Workspace {
         let generation = self.session_navigation;
         let root = self.data_root.clone();
         let catalog = self.session_catalog.clone();
-        let mut open_checkouts: HashSet<PathBuf> = self.inactive_repositories.keys().cloned().collect();
+        let mut open_checkouts: HashSet<PathBuf> =
+            self.inactive_repositories.keys().cloned().collect();
         open_checkouts.insert(self.working_directory.clone());
         cx.spawn_in(window, async move |this, cx| {
             let outcome = cx
@@ -400,6 +402,7 @@ impl Workspace {
     }
 
     fn activate_open_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_navigation(cx);
         self.remember_agent_pane(cx);
         let Some(open) = self.open_sessions.get(&id) else {
             return;
@@ -440,6 +443,9 @@ impl Workspace {
     /// is a real `List`, so arrow keys move the highlight, Enter confirms, and
     /// the first agent is selected as soon as the dialog opens.
     pub(super) fn prompt_new_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Opening a dialog clears stale navigation state; the dialog trap
+        // owns the keyboard from here.
+        self.close_navigation(cx);
         let workspace = cx.entity().downgrade();
         let project = self.project_name.clone();
         let default = self.default_agent;
@@ -535,8 +541,8 @@ impl Workspace {
         );
         self.tabs[WorkspaceTab::Agent as usize] = Some(pane);
         self.session_agent = agent;
-        // `cmd-n` can fire from Home or any tab: reveal the Agent tab and
-        // enter the checkout so the new pane is visible. The Agent tab is
+        // A new session can start from Home or any tab: reveal the Agent tab
+        // and enter the checkout so the new pane is visible. The Agent tab is
         // already set, so `enter_repository` cannot auto-resume a second
         // session on the way in.
         self.active_tab = WorkspaceTab::Agent;
@@ -615,6 +621,8 @@ impl Workspace {
             .and_then(|s| s.key.as_ref());
         let activity = self.agent_activity.snapshot();
         let mut sidebar = v_flex()
+            .track_focus(&self.agent_sidebar_focus)
+            .focus(|style| style.border_2().border_color(cx.theme().ring))
             .h_full()
             .min_h_0()
             .flex_none()

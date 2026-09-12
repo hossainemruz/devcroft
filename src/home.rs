@@ -248,7 +248,13 @@ impl HomeView {
         cx: &mut Context<Self>,
     ) -> Self {
         let artifacts = cx.new(|cx| crate::artifacts::ArtifactBrowser::new(root.clone(), cx));
-        cx.subscribe(&artifacts, |_, _, event: &crate::artifacts::OpenSession, cx| cx.emit(HomeEvent::OpenAgentSession(event.0.key.clone()))).detach();
+        cx.subscribe(
+            &artifacts,
+            |_, _, event: &crate::artifacts::OpenSession, cx| {
+                cx.emit(HomeEvent::OpenAgentSession(event.0.key.clone()))
+            },
+        )
+        .detach();
         let mut view = Self {
             artifacts,
             focus_handle: cx.focus_handle(),
@@ -325,6 +331,35 @@ impl HomeView {
             .update(cx, |view, cx| view.set_include_archived(include, cx));
     }
 
+    pub(crate) fn artifacts_navigation_state(
+        &self,
+        cx: &gpui_kit::App,
+    ) -> crate::navigation::ResourceState {
+        self.artifacts.read(cx).navigation_state()
+    }
+
+    pub(crate) fn artifacts_navigation_panes(
+        &self,
+        cx: &gpui_kit::App,
+    ) -> Vec<(&'static str, FocusHandle)> {
+        self.artifacts.read(cx).navigation_panes(cx)
+    }
+
+    pub(crate) fn run_artifact_command(
+        &mut self,
+        command: crate::navigation::Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.artifacts.update(cx, |artifacts, cx| match command {
+            crate::navigation::Command::EditMarkdown => artifacts.begin_markdown_edit(window, cx),
+            crate::navigation::Command::AddComment => artifacts.begin_comment(window, cx),
+            crate::navigation::Command::SaveDraft => artifacts.save_draft(window, cx),
+            crate::navigation::Command::CancelDraft => artifacts.cancel_draft(window, cx),
+            _ => {}
+        });
+    }
+
     fn refresh_project_git(&mut self, cx: &mut Context<Self>) {
         if !self.active || self.page.is_some() || self.git_loading || self.projects.is_empty() {
             return;
@@ -397,7 +432,9 @@ impl HomeView {
     }
 
     pub(crate) fn refresh_artifacts(&mut self, cx: &mut Context<Self>) {
-        if self.active && self.page == Some("Artifacts") { self.artifacts.update(cx, |view, cx| view.refresh(cx)); }
+        if self.active && self.page == Some("Artifacts") {
+            self.artifacts.update(cx, |view, cx| view.refresh(cx));
+        }
     }
 
     fn change(

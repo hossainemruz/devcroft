@@ -35,10 +35,7 @@ use gpui_kit::{
 };
 
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToResources, GoToTerminal, NewAgentSession, PaletteMode,
-    ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette, is_go_to_agent_shortcut,
-    is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_resources_shortcut,
-    is_go_to_terminal_shortcut, is_new_session_shortcut, palette_mode_for_shortcut,
+    PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
 };
 
 use self::git::{ReviewScope, load_review, suggest_base_branch};
@@ -80,6 +77,9 @@ pub(crate) struct LoadedReview {
 
 pub(crate) struct ReviewView {
     pub(crate) focus_handle: FocusHandle,
+    tree_focus: FocusHandle,
+    stream_focus: FocusHandle,
+    comments_focus: FocusHandle,
     cwd: PathBuf,
     scope_tab: ScopeTab,
     base_branch: String,
@@ -118,6 +118,9 @@ impl ReviewView {
         let base_branch = suggest_base_branch(cwd, "origin").unwrap_or_else(|| "main".to_owned());
         let mut view = Self {
             focus_handle: cx.focus_handle(),
+            tree_focus: cx.focus_handle(),
+            stream_focus: cx.focus_handle(),
+            comments_focus: cx.focus_handle(),
             cwd: cwd.to_owned(),
             scope_tab: ScopeTab::FullDiff,
             base_branch,
@@ -190,6 +193,38 @@ impl ReviewView {
             });
         })
         .detach();
+    }
+
+    pub(crate) fn navigation_panes(&self) -> Vec<(&'static str, FocusHandle)> {
+        if !matches!(self.state, ReviewState::Loaded(_)) {
+            return vec![("Review", self.focus_handle.clone())];
+        }
+        let mut panes = vec![
+            ("Files", self.tree_focus.clone()),
+            ("Diff", self.stream_focus.clone()),
+        ];
+        if self.show_comments {
+            panes.push(("Comments", self.comments_focus.clone()));
+        }
+        panes
+    }
+
+    pub(crate) fn focus_navigation_pane(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match index {
+            // TreeState owns keyboard tree traversal; use its actual focus
+            // handle rather than the layout wrapper used for HUD discovery.
+            0 => self
+                .tree_state
+                .update(cx, |tree, cx| tree.focus(window, cx)),
+            1 => self.stream_focus.focus(window, cx),
+            2 if self.show_comments => self.comments_focus.focus(window, cx),
+            _ => {}
+        }
     }
 
     /// Reload when the tab becomes visible, unless a load is in flight.
@@ -335,74 +370,15 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// Forward the command-bar toggles and the go-to-tab shortcuts to
-    /// the workspace, mirroring `TerminalPane::on_key_down`. The tree/stream
-    /// children don't swallow keys today, but without this any future child
-    /// that stops propagation would silently break `cmd-k`/`cmd-p`/`cmd-a`/
-    /// `cmd-e`/`cmd-/`/`cmd-d`/`cmd-t` on this tab again. All other keys bubble normally (no
-    /// `prevent_default`/`stop_propagation`) so tree navigation and list
-    /// scrolling keep working.
+    /// Forward the command-bar toggles to the workspace, mirroring
+    /// `TerminalPane::on_key_down`. The tree/stream children don't swallow
+    /// keys today, but without this any future child that stops propagation
+    /// would silently break `cmd-k`/`cmd-p` on this tab again. Tab
+    /// jumps and session creation are intentionally not forwarded: they live
+    /// in navigation mode and the palettes now. All other keys bubble
+    /// normally (no `prevent_default`/`stop_propagation`) so tree navigation
+    /// and list scrolling keep working.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if is_go_to_agent_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToAgent), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_editor_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToEditor), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_terminal_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToTerminal), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_review_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToReview), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_resources_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToResources), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_new_session_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(NewAgentSession), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
         if let Some(mode) = palette_mode_for_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
@@ -415,9 +391,6 @@ impl ReviewView {
                 }
                 PaletteMode::Projects => {
                     window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
-                }
-                PaletteMode::Sessions => {
-                    window.dispatch_action(Box::new(ToggleSessionsPalette), cx);
                 }
             }
             window.prevent_default();
@@ -853,6 +826,9 @@ impl Render for ReviewView {
         self.sync_tree_and_stream(cx);
         let focus = self.focus_handle.clone();
         let track = self.focus_handle.clone();
+        let tree_focus = self.tree_focus.clone();
+        let stream_focus = self.stream_focus.clone();
+        let comments_focus = self.comments_focus.clone();
         let body: AnyElement = match &self.state {
             ReviewState::Loading => div()
                 .flex_1()
@@ -908,6 +884,8 @@ impl Render for ReviewView {
                     .min_h_0()
                     .child(
                         v_flex()
+                            .track_focus(&tree_focus)
+                            .focus(|style| style.border_2().border_color(cx.theme().ring))
                             .w(px(320.))
                             .flex_none()
                             .h_full()
@@ -932,6 +910,8 @@ impl Render for ReviewView {
                     )
                     .child(
                         v_flex()
+                            .track_focus(&stream_focus)
+                            .focus(|style| style.border_2().border_color(cx.theme().ring))
                             .flex_1()
                             .min_w_0()
                             .h_full()
@@ -969,7 +949,14 @@ impl Render for ReviewView {
                     .min_w_0()
                     .min_h_0()
                     .child(body)
-                    .when(self.show_comments, |d| d.child(self.render_comments(cx))),
+                    .when(self.show_comments, |d| {
+                        d.child(
+                            div()
+                                .track_focus(&comments_focus)
+                                .focus(|style| style.border_2().border_color(cx.theme().ring))
+                                .child(self.render_comments(cx)),
+                        )
+                    }),
             )
     }
 }

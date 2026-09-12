@@ -20,6 +20,7 @@ mod git_status;
 mod home;
 mod keys;
 mod metrics;
+mod navigation;
 mod pane;
 mod preview;
 mod relative_time;
@@ -39,10 +40,7 @@ use gpui_kit::{
 
 use crate::cli::{Cli, Command};
 use crate::{
-    command_palette::{
-        GoToAgent, GoToEditor, GoToReview, GoToResources, GoToTerminal, NewAgentSession,
-        ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette,
-    },
+    command_palette::{ToggleActionsPalette, ToggleProjectsPalette},
     fonts::load_terminal_fonts,
     preview::PreviewView,
     workspace::Workspace,
@@ -80,18 +78,18 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
-        // Global command-bar toggles: `cmd-k` opens the action commands,
-        // `cmd-p` the project switcher, and `cmd-s` recent sessions across
-        // repositories (`cmd` is Super on Linux, so this covers
-        // super+k/super+p/super+s there too; the `ctrl` variants are fallbacks
-        // for environments without a platform modifier). `cmd-a`/`cmd-e` jump
-        // straight to the Agent/Editor tabs, `cmd-/` to the Terminal tab,
-        // `cmd-d`/`cmd-t` to the Review/Resources tabs, and `cmd-n` starts a new
-        // session — all deliberately without `ctrl` fallbacks, so
-        // `ctrl-a`/`ctrl-e` (readline beginning/end-of-line), `ctrl-s` (XOFF
-        // flow control), `ctrl-n` (readline next-line), `ctrl-d` (end-of-file),
-        // and `ctrl-/` keep reaching terminal applications. The terminal pane
-        // also forwards these keystrokes explicitly (see
+        // Direct shortcuts are deliberately few: `cmd-k` opens the action
+        // commands and `cmd-p` the project switcher (`cmd` is Super on
+        // Linux, so this covers super+k/super+p there too; the `ctrl`
+        // variants of k/p are fallbacks for environments without a platform
+        // modifier).
+        // Everything else keyboard-driven lives in navigation mode (`cmd-m`,
+        // see `docs/keyboard-navigation-plan.md`) and the palettes: tab
+        // jumps, session creation, and settings have no direct bindings, so
+        // `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow control),
+        // `ctrl-n` (readline), `ctrl-d` (end-of-file), and `ctrl-/` keep
+        // reaching terminal applications. The terminal pane still forwards
+        // the two palette toggles explicitly (see
         // `TerminalPane::on_key_down`), since its raw key handler would
         // otherwise swallow the event while focused.
         cx.bind_keys([
@@ -99,13 +97,6 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
             KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
             KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
             KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
-            KeyBinding::new("cmd-s", ToggleSessionsPalette, None),
-            KeyBinding::new("cmd-a", GoToAgent, None),
-            KeyBinding::new("cmd-e", GoToEditor, None),
-            KeyBinding::new("cmd-/", GoToTerminal, None),
-            KeyBinding::new("cmd-d", GoToReview, None),
-            KeyBinding::new("cmd-t", GoToResources, None),
-            KeyBinding::new("cmd-n", NewAgentSession, None),
         ]);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
         Theme::change(theme_mode, None, cx);

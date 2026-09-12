@@ -399,10 +399,10 @@ impl ArtifactStore {
         let old_repository = old.artifact.repository.clone();
         let mut artifact = old.artifact;
         change(&mut artifact)?;
-        if artifact.repository != old_repository {
-            if let Some(key) = &artifact.repository {
-                self.require_repository(key)?;
-            }
+        if artifact.repository != old_repository
+            && let Some(key) = &artifact.repository
+        {
+            self.require_repository(key)?;
         }
         artifact.updated_at = timestamp()?.max(
             artifact

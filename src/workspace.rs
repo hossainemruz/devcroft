@@ -22,8 +22,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, deferred, div,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _,
+    InteractiveElement, IntoElement, KeyUpEvent, KeystrokeEvent, ModifiersChangedEvent,
+    MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Window, deferred, div,
     px, rgb,
 };
 
@@ -35,9 +36,9 @@ use crate::agent_sessions::{
     Snapshot as SessionSnapshot,
 };
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToResources, GoToTerminal, NewAgentSession, PaletteCommand,
-    PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette, ToggleProjectsPalette,
-    ToggleSessionsPalette, item_at, palette_sections_for_mode, session_items,
+    GoToAgent, GoToEditor, GoToResources, GoToReview, GoToTerminal, NewAgentSession,
+    PaletteCommand, PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette,
+    ToggleProjectsPalette, item_at, palette_mode_for_shortcut, palette_sections_for_mode,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
@@ -47,6 +48,10 @@ use crate::data::{
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
+use crate::navigation::{
+    self, Command as NavigationCommand, Context as NavigationContext,
+    Decision as NavigationDecision, Input as NavigationInput,
+};
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
 use crate::settings::SettingsView;
@@ -239,6 +244,25 @@ pub(crate) struct Workspace {
     /// back button returns where the user came from. `Some` only while the
     /// artifact page is visible.
     artifacts_origin: Option<PageOrigin>,
+    /// The which-key style navigation overlay. It deliberately owns no focus:
+    /// focus remains on real panes so `h`/`l` can move it and Enter can leave
+    /// the selected pane active after the overlay disappears.
+    navigation_open: bool,
+    navigation_pane: usize,
+    /// Keys consumed by the navigation interceptor and held until release so
+    /// physical repeats cannot toggle twice or leak into a newly focused
+    /// terminal. The flag per key records whether any modifier moved since
+    /// the claim: a later modifier press proves the previous hold ended, so
+    /// a re-pressed *trigger* is honored as fresh even if its key-up was
+    /// lost. Re-arm is trigger-only — a marked non-trigger key stays
+    /// swallowed, since a missed press beats an accidental edit — and a
+    /// trigger repeat with no modifier movement in between stays swallowed,
+    /// which is what keeps a held toggle from flickering.
+    navigation_claimed_keys: HashMap<String, bool>,
+    agent_sidebar_focus: FocusHandle,
+    /// Kept for the workspace lifetime so the app-level pre-keymap hook is
+    /// released with this window rather than leaking into later workspaces.
+    _navigation_interceptor: Subscription,
 }
 
 struct OpenAgentSession {
@@ -319,6 +343,20 @@ impl Workspace {
         let review = cx.new(|cx| ReviewView::new(working_directory, cx));
         let session_agent = initial_agent;
         let command_state = cx.new(|cx| CommandState::new(window, cx));
+        // Interceptors run before GPUI resolves key bindings (unlike element
+        // capture handlers). This is essential while the HUD is open: Escape,
+        // Enter, arrows, and native-input bindings must not act before the
+        // navigation mode consumes them.
+        let interceptor_workspace = cx.entity().downgrade();
+        let interceptor_window = window.window_handle();
+        let navigation_interceptor = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != interceptor_window {
+                return;
+            }
+            let _ = interceptor_workspace.update(cx, |workspace, cx| {
+                workspace.on_navigation_keystroke(event, window, cx);
+            });
+        });
         let (agent_activity, activity_updates) = AgentActivityStore::new();
         cx.spawn(async move |this, cx| {
             while activity_updates.recv().await.is_ok() {
@@ -335,6 +373,10 @@ impl Workspace {
         })
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.close_navigation(cx);
+                this.navigation_claimed_keys.clear();
+            }
             this.sync_activity_visibility(window, cx);
             cx.notify();
         })
@@ -551,9 +593,14 @@ impl Workspace {
                 cx,
             )
         });
-        cx.subscribe_in(&resources, window, |this, _, event: &crate::artifacts::OpenSession, window, cx| {
-            this.open_agent_session(event.0.key.clone(), window, cx);
-        }).detach();
+        cx.subscribe_in(
+            &resources,
+            window,
+            |this, _, event: &crate::artifacts::OpenSession, window, cx| {
+                this.open_agent_session(event.0.key.clone(), window, cx);
+            },
+        )
+        .detach();
         Self {
             home,
             resources,
@@ -589,6 +636,11 @@ impl Workspace {
             recent_repositories: Vec::new(),
             palette_model: Vec::new(),
             artifacts_origin: None,
+            navigation_open: false,
+            navigation_pane: 0,
+            navigation_claimed_keys: HashMap::new(),
+            agent_sidebar_focus: cx.focus_handle().tab_stop(true),
+            _navigation_interceptor: navigation_interceptor,
         }
     }
 
@@ -596,6 +648,7 @@ impl Workspace {
         let Some(tab) = WorkspaceTab::ALL.get(index).copied() else {
             return;
         };
+        self.close_navigation(cx);
         self.active_tab = tab;
         self.enter_repository(window, cx);
         if tab == WorkspaceTab::Review {
@@ -617,7 +670,11 @@ impl Workspace {
             return;
         }
         if self.active_tab == WorkspaceTab::Resources {
-            self.resources.read(cx).focus_handle.clone().focus(window, cx);
+            self.resources
+                .read(cx)
+                .focus_handle
+                .clone()
+                .focus(window, cx);
             return;
         }
         if let Some(Some(pane)) = self.tabs.get(self.active_tab as usize) {
@@ -639,7 +696,7 @@ impl Workspace {
         self.agent_activity.set_visible_launch(visible);
     }
 
-    /// Jump straight to the Agent tab (`cmd-a`). An open command bar
+    /// Jump straight to the Agent tab. An open command bar
     /// closes first, so the shortcut never leaves the palette stranded over
     /// the new tab.
     fn go_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -649,7 +706,7 @@ impl Workspace {
         }
     }
 
-    /// Jump straight to the Editor tab (`cmd-e`). An open command bar
+    /// Jump straight to the Editor tab. An open command bar
     /// closes first, so the shortcut never leaves the palette stranded over
     /// the new tab.
     fn go_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -659,7 +716,7 @@ impl Workspace {
         }
     }
 
-    /// Jump straight to the Terminal tab (`cmd-/`). An open command bar
+    /// Jump straight to the Terminal tab. An open command bar
     /// closes first, so the shortcut never leaves the palette stranded over
     /// the new tab.
     fn go_to_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -669,7 +726,7 @@ impl Workspace {
         }
     }
 
-    /// Jump straight to the Review tab (`cmd-d`). An open command bar
+    /// Jump straight to the Review tab. An open command bar
     /// closes first, so the shortcut never leaves the palette stranded over
     /// the new tab.
     fn go_to_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -679,7 +736,7 @@ impl Workspace {
         }
     }
 
-    /// Jump straight to the Resources tab (`cmd-t`). An open command bar
+    /// Jump straight to the Resources tab. An open command bar
     /// closes first, so the shortcut never leaves the palette stranded over
     /// the new tab.
     fn go_to_resources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -704,9 +761,6 @@ impl Workspace {
             } else {
                 self.palette_mode = mode;
                 self.reload_recent_repositories();
-                if mode == PaletteMode::Sessions {
-                    self.refresh_sessions(cx);
-                }
                 self.command_state.update(cx, |state, cx| {
                     state.set_query("", window, cx);
                 });
@@ -728,17 +782,15 @@ impl Workspace {
         if self.command_open {
             return;
         }
+        // Opening another overlay clears stale navigation state: the palette
+        // trap owns the keyboard from here, so the HUD must not stay behind it.
+        self.close_navigation(cx);
         self.command_open = true;
         self.attention_only = false;
         self.palette_mode = mode;
         // A few small JSON reads per opening — not per render — so the
         // switcher always reflects recent adds and switches.
         self.reload_recent_repositories();
-        // The sessions list is a live catalog view: kick a refresh on open so
-        // `cmd-s` never shows only the last periodic scan.
-        if mode == PaletteMode::Sessions {
-            self.refresh_sessions(cx);
-        }
         self.command_state.update(cx, |state, cx| {
             state.set_query("", window, cx);
         });
@@ -832,9 +884,6 @@ impl Workspace {
                     self.select_tab(WorkspaceTab::Agent as usize, window, cx);
                 }
             }
-            // The shared open path switches to the session's checkout,
-            // restores its retained tabs, and activates the exact session.
-            PaletteItem::OpenSession { key, .. } => self.open_agent_session(key, window, cx),
             PaletteItem::Command(command) => match command {
                 PaletteCommand::GoAgent => self.select_tab(0, window, cx),
                 PaletteCommand::GoEditor => self.select_tab(1, window, cx),
@@ -887,6 +936,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_navigation(cx);
         // Resolve and record even on re-entry from Home. Restoring the same
         // checkout is a no-op, so its running PTYs remain untouched.
         let Some(root) = self.data_root.clone() else {
@@ -959,6 +1009,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A location change clears stale navigation state.
+        self.close_navigation(cx);
         let checkout = checkout_identity(checkout);
         if checkout != self.working_directory && !self.inactive_repositories.contains_key(&checkout)
         {
@@ -1022,6 +1074,9 @@ impl Workspace {
     }
 
     fn enter_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Catch-all for tab/location changes (select, switch, session open):
+        // a stale HUD must not survive the move.
+        self.close_navigation(cx);
         self.artifacts_origin = None;
         self.resources.update(cx, |view, cx| {
             view.set_active(self.active_tab == WorkspaceTab::Resources, cx)
@@ -1063,8 +1118,10 @@ impl Workspace {
     }
 
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_navigation(cx);
         self.artifacts_origin = None;
-        self.resources.update(cx, |view, cx| view.set_active(false, cx));
+        self.resources
+            .update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
         self.home.update(cx, |view, cx| view.activate(cx));
@@ -1079,6 +1136,7 @@ impl Workspace {
     /// while Home is visible. Captures the origin so the titlebar back
     /// button returns where the user came from.
     fn browse_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_navigation(cx);
         let already_there = self.home_visible && self.home.read(cx).is_artifacts_page();
         if !already_there {
             let origin = if !self.home_visible {
@@ -1088,7 +1146,8 @@ impl Workspace {
             };
             self.artifacts_origin = Some(origin);
         }
-        self.resources.update(cx, |view, cx| view.set_active(false, cx));
+        self.resources
+            .update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
         self.home
@@ -1099,6 +1158,7 @@ impl Workspace {
 
     /// Return from the global artifact browser to its captured origin.
     fn go_back_from_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_navigation(cx);
         match self.artifacts_origin.take() {
             Some(PageOrigin::Repository) => {
                 self.enter_repository(window, cx);
@@ -1285,8 +1345,6 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let confirm_workspace = workspace.clone();
         let attention_only = self.attention_only;
-        let sessions_mode = self.palette_mode == PaletteMode::Sessions;
-        let sessions_loaded = self.session_snapshot.loaded;
         let mut command = Command::new(&self.command_state)
             .placeholder(self.palette_mode.placeholder())
             .on_confirm(move |index, window, cx| {
@@ -1312,7 +1370,7 @@ impl Workspace {
                     .child("Enter Select")
                     .child("Esc Close")
             })
-            .empty(move |state, _, cx| {
+            .empty(move |_, _, cx| {
                 div()
                     .px_3()
                     .py_6()
@@ -1320,12 +1378,6 @@ impl Workspace {
                     .text_color(cx.theme().muted_foreground)
                     .child(if attention_only {
                         "No agents need attention"
-                    } else if sessions_mode {
-                        if !sessions_loaded && state.query(cx).is_empty() {
-                            "Loading sessions…"
-                        } else {
-                            "No matching sessions"
-                        }
                     } else {
                         "No matching commands"
                     })
@@ -1362,17 +1414,6 @@ impl Workspace {
             .map(|(checkout, _)| PaletteItem::open_checkout(checkout))
             .collect::<Vec<_>>();
         open_checkouts.sort_by(|left, right| left.label().cmp(right.label()));
-        // Sessions mode lists conversations across repositories in the
-        // catalog's recency order. Only reachable checkouts (registered here
-        // or retained as an open ad-hoc checkout) become rows, so every
-        // confirmation can complete the switch. Other modes skip the work.
-        let session_rows = if self.palette_mode == PaletteMode::Sessions && !attention_only {
-            session_items(&self.session_snapshot.sessions, |checkout| {
-                self.session_repository_label(checkout)
-            })
-        } else {
-            Vec::new()
-        };
         self.palette_model = if attention_only {
             vec![PaletteSection {
                 heading: "Needs attention",
@@ -1385,7 +1426,6 @@ impl Workspace {
         } else {
             let mut sections = palette_sections_for_mode(
                 &visible_repositories,
-                &session_rows,
                 self.palette_mode,
                 self.home_visible,
             );
@@ -1439,10 +1479,12 @@ impl Workspace {
                                         .icon(palette_icon(PaletteCommand::GoReview))
                                         .action(Box::new(GoToReview))
                                 }
-                                PaletteItem::Command(PaletteCommand::GoResources) => CommandItem::new()
-                                    .label(item.label())
-                                    .icon(palette_icon(PaletteCommand::GoResources))
-                                    .action(Box::new(GoToResources)),
+                                PaletteItem::Command(PaletteCommand::GoResources) => {
+                                    CommandItem::new()
+                                        .label(item.label())
+                                        .icon(palette_icon(PaletteCommand::GoResources))
+                                        .action(Box::new(GoToResources))
+                                }
                                 PaletteItem::Command(command) => CommandItem::new()
                                     .label(item.label())
                                     .icon(palette_icon(*command)),
@@ -1577,63 +1619,6 @@ impl Workspace {
                                             )
                                     })
                                 }
-                                PaletteItem::OpenSession {
-                                    title,
-                                    repository,
-                                    agent,
-                                    age,
-                                    ..
-                                } => {
-                                    // Custom content owns the whole row: title
-                                    // on top, repository and harness beneath,
-                                    // last-worked age trailing on the right.
-                                    let title = title.clone();
-                                    let repository = repository.clone();
-                                    let agent = agent.clone();
-                                    let age = age.clone();
-                                    CommandItem::new().label(title.clone()).child(move |_, _| {
-                                        h_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(
-                                                Icon::new(IconName::Bot)
-                                                    .size(px(16.))
-                                                    .flex_none()
-                                                    .text_color(rgb(0x858989)),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .gap_1()
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .truncate()
-                                                            .child(title.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .truncate()
-                                                            .text_xs()
-                                                            .text_color(rgb(0x858989))
-                                                            .child(format!(
-                                                                "{repository} · {agent}"
-                                                            )),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .text_xs()
-                                                    .text_color(rgb(0x737878))
-                                                    .child(age.clone()),
-                                            )
-                                    })
-                                }
                             };
                             rendered.keywords(keywords)
                         })
@@ -1664,6 +1649,396 @@ impl Workspace {
         {
             Some(pane) => pane.into_any_element(),
             None => div().size_full().into_any_element(),
+        }
+    }
+
+    fn navigation_context(&self, cx: &App) -> NavigationContext {
+        if self.home_visible {
+            if self.home.read(cx).is_artifacts_page() {
+                NavigationContext::Artifacts
+            } else {
+                NavigationContext::Home
+            }
+        } else {
+            NavigationContext::Workspace
+        }
+    }
+
+    fn navigation_resource_state(&self, cx: &App) -> navigation::ResourceState {
+        if self.home_visible && self.home.read(cx).is_artifacts_page() {
+            self.home.read(cx).artifacts_navigation_state(cx)
+        } else if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
+            self.resources.read(cx).navigation_state()
+        } else {
+            navigation::ResourceState::default()
+        }
+    }
+
+    fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
+        if self.home_visible {
+            return if self.home.read(cx).is_artifacts_page() {
+                self.home.read(cx).artifacts_navigation_panes(cx)
+            } else {
+                vec![("Home", self.home.read(cx).focus_handle.clone())]
+            };
+        }
+        match self.active_tab {
+            WorkspaceTab::Agent => {
+                let mut panes = vec![("Sessions", self.agent_sidebar_focus.clone())];
+                if let Some(Some(pane)) = self.tabs.get(WorkspaceTab::Agent as usize) {
+                    panes.push(("Agent", pane.read(cx).focus_handle.clone()));
+                }
+                panes
+            }
+            WorkspaceTab::Resources => self.resources.read(cx).navigation_panes(cx),
+            WorkspaceTab::Review => self.review.read(cx).navigation_panes(),
+            WorkspaceTab::Editor | WorkspaceTab::Terminal => self
+                .tabs
+                .get(self.active_tab as usize)
+                .and_then(|pane| pane.as_ref())
+                .map(|pane| vec![(self.active_tab.label(), pane.read(cx).focus_handle.clone())])
+                .unwrap_or_default(),
+        }
+    }
+
+    fn open_navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Dialog and sheet layers own their own keyboard traps. Do not open a
+        // workspace HUD behind either, and close any stale HUD before they can
+        // receive a keystroke.
+        if window.has_active_dialog(cx) || window.has_active_sheet(cx) || self.command_open {
+            self.close_navigation(cx);
+            return;
+        }
+        let panes = self.navigation_panes(cx);
+        self.navigation_pane = panes
+            .iter()
+            // Detail containers contain their comments/outline descendants;
+            // prefer the deepest rendered target so reopening the HUD names
+            // the region the pointer or keyboard actually left focused.
+            .rposition(|(_, focus)| focus.contains_focused(window, cx))
+            .unwrap_or(0);
+        self.navigation_open = true;
+        cx.notify();
+    }
+
+    fn close_navigation(&mut self, cx: &mut Context<Self>) {
+        if self.navigation_open {
+            self.navigation_open = false;
+            cx.notify();
+        }
+    }
+
+    fn move_navigation_focus(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let panes = self.navigation_panes(cx);
+        self.navigation_pane = navigation::move_index(self.navigation_pane, panes.len(), right);
+        if let Some((_, focus)) = panes.get(self.navigation_pane) {
+            focus.focus(window, cx);
+        }
+        if !self.home_visible && self.active_tab == WorkspaceTab::Review {
+            self.review.update(cx, |review, cx| {
+                review.focus_navigation_pane(self.navigation_pane, window, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn run_navigation_command(
+        &mut self,
+        command: NavigationCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Availability was checked to render the HUD, but actions validate it
+        // again here so a refresh/save cannot make a stale row unsafe.
+        self.navigation_open = false;
+        match command {
+            NavigationCommand::AddRepository => self.open_add_repository(window, cx),
+            NavigationCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
+            NavigationCommand::Agent => self.select_tab(WorkspaceTab::Agent as usize, window, cx),
+            NavigationCommand::Editor => self.select_tab(WorkspaceTab::Editor as usize, window, cx),
+            NavigationCommand::Terminal => {
+                self.select_tab(WorkspaceTab::Terminal as usize, window, cx)
+            }
+            NavigationCommand::Review => self.select_tab(WorkspaceTab::Review as usize, window, cx),
+            NavigationCommand::Resources => {
+                self.select_tab(WorkspaceTab::Resources as usize, window, cx)
+            }
+            NavigationCommand::Home => self.go_home(window, cx),
+            NavigationCommand::Back => self.go_back_from_artifacts(window, cx),
+            NavigationCommand::NewSession => self.prompt_new_agent_session(window, cx),
+            command @ (NavigationCommand::EditMarkdown
+            | NavigationCommand::AddComment
+            | NavigationCommand::SaveDraft
+            | NavigationCommand::CancelDraft) => {
+                if self.home_visible && self.home.read(cx).is_artifacts_page() {
+                    self.home.update(cx, |view, cx| {
+                        view.run_artifact_command(command, window, cx)
+                    });
+                } else if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
+                    self.resources.update(cx, |view, cx| match command {
+                        NavigationCommand::EditMarkdown => view.begin_markdown_edit(window, cx),
+                        NavigationCommand::AddComment => view.begin_comment(window, cx),
+                        NavigationCommand::SaveDraft => view.save_draft(window, cx),
+                        NavigationCommand::CancelDraft => view.cancel_draft(window, cx),
+                        _ => unreachable!(),
+                    });
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// The mode toggle: `cmd-m` on macOS, `super-m` on Linux. Plain `m`
+    /// stays free as the Edit Markdown action key (it carries no
+    /// modifiers, so it never matches), and `ctrl-m` must keep reaching
+    /// terminals untouched.
+    fn is_trigger(keystroke: &gpui_kit::Keystroke) -> bool {
+        let modifiers = &keystroke.modifiers;
+        keystroke.key.eq_ignore_ascii_case("m")
+            && modifiers.platform
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.shift
+            && !modifiers.function
+    }
+
+    fn navigation_input(keystroke: &gpui_kit::Keystroke) -> NavigationInput {
+        let modifiers = &keystroke.modifiers;
+        let key = keystroke.key.to_ascii_lowercase();
+        let trigger = Self::is_trigger(keystroke);
+        if trigger {
+            return NavigationInput::Trigger;
+        }
+        if modifiers.modified() {
+            return NavigationInput::Modified;
+        }
+        match key.as_str() {
+            "escape" => NavigationInput::Escape,
+            "enter" => NavigationInput::Enter,
+            "h" | "left" | "arrowleft" => NavigationInput::Left,
+            "l" | "right" | "arrowright" => NavigationInput::Right,
+            _ => {
+                let mut chars = keystroke.key.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(key), None) => NavigationInput::Key(key),
+                    _ => NavigationInput::Modified,
+                }
+            }
+        }
+    }
+
+    fn on_navigation_keystroke(
+        &mut self,
+        event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.to_ascii_lowercase();
+        // `KeystrokeEvent` intentionally omits raw `is_held`; retain each
+        // claimed key until its real KeyUp event so physical repeats cannot
+        // toggle a newly changed navigation state or leak into an overlay.
+        // Escape hatch for a lost key-up: if any modifier moved since the
+        // claim, the previous hold provably ended, so a re-pressed trigger
+        // is honored as fresh instead of staying wedged. Trigger-only, and
+        // only with modifier movement — a genuine held repeat (nothing
+        // moved) stays swallowed, as does any marked non-trigger key.
+        if self.navigation_claimed_keys.contains_key(&key) {
+            let rearm = self.navigation_claimed_keys[&key] && Self::is_trigger(&event.keystroke);
+            if !rearm {
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
+            self.navigation_claimed_keys.remove(&key);
+        }
+        // A dialog/sheet is rendered above the workspace and must retain its
+        // own keyboard trap. It can have appeared through another workflow
+        // while the HUD was open, so clear the stale mode before considering
+        // the current key and let that key reach the overlay.
+        if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
+            self.close_navigation(cx);
+            return;
+        }
+        // The two palette shortcuts stay live inside navigation mode:
+        // opening another overlay clears the mode (same rule as dialogs
+        // above) and the keystroke continues to normal dispatch, which
+        // opens the palette. Every other modified keystroke is still
+        // consumed below, so nothing can edit while navigating.
+        if self.navigation_open
+            && palette_mode_for_shortcut(
+                &event.keystroke.key,
+                event.keystroke.modifiers.platform,
+                event.keystroke.modifiers.control,
+                event.keystroke.modifiers.alt,
+            )
+            .is_some()
+        {
+            self.close_navigation(cx);
+            return;
+        }
+        let input = Self::navigation_input(&event.keystroke);
+        let decision = navigation::decide(
+            self.navigation_open,
+            input,
+            self.navigation_context(cx),
+            self.navigation_resource_state(cx),
+        );
+        if decision == NavigationDecision::Ignore {
+            return;
+        }
+        self.navigation_claimed_keys.insert(key, false);
+        window.prevent_default();
+        cx.stop_propagation();
+        match decision {
+            NavigationDecision::Open => self.open_navigation(window, cx),
+            NavigationDecision::Close | NavigationDecision::AcceptFocus => {
+                self.close_navigation(cx)
+            }
+            NavigationDecision::FocusLeft => self.move_navigation_focus(false, window, cx),
+            NavigationDecision::FocusRight => self.move_navigation_focus(true, window, cx),
+            NavigationDecision::Execute(command) => {
+                self.run_navigation_command(command, window, cx)
+            }
+            NavigationDecision::Consume | NavigationDecision::Ignore => {}
+        }
+    }
+
+    fn render_navigation_hud(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let rows = navigation::rows(
+            self.navigation_context(cx),
+            self.navigation_resource_state(cx),
+        );
+        let panes = self.navigation_panes(cx);
+        let pane = panes
+            .get(self.navigation_pane)
+            .map(|(label, _)| *label)
+            .unwrap_or("workspace");
+        let context_title = match self.navigation_context(cx) {
+            NavigationContext::Home => "Home",
+            NavigationContext::Artifacts => "Artifacts",
+            NavigationContext::Workspace => self.active_tab.label(),
+        };
+        let viewport = window.viewport_size();
+        let hud_width = (f32::from(viewport.width) - 32.).clamp(200., 330.);
+        let hud_height = (f32::from(viewport.height) - WORKSPACE_HEADER_HEIGHT - 36.).max(120.);
+        let mut commands = v_flex().gap_1();
+        let mut previous = "";
+        for row in rows {
+            if row.group != previous {
+                previous = row.group;
+                commands = commands.child(
+                    div()
+                        .pt_2()
+                        .text_xs()
+                        .text_color(rgb(0x858989))
+                        .child(row.group),
+                );
+            }
+            commands = commands.child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(20.))
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(0x60a5fa))
+                            .child(row.key.to_string()),
+                    )
+                    .child(div().text_sm().child(row.label)),
+            );
+        }
+        div()
+            .absolute()
+            .bottom(px(16.))
+            .right(px(16.))
+            .child(
+                v_flex()
+                    .w(px(hud_width))
+                    .max_h(px(hud_height))
+                    .overflow_y_scrollbar()
+                    .p_4()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x3a3d3d))
+                    .bg(rgb(0x151717))
+                    .shadow_lg()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(format!("Navigation · {context_title}")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x858989))
+                                    .child(format!("Pane: {pane}")),
+                            ),
+                    )
+                    .child(commands)
+                    .child(if panes.len() > 1 {
+                        div()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(0x292b2b))
+                            .text_xs()
+                            .text_color(rgb(0x858989))
+                            .child("h/l focus pane · Enter keep focus · Esc/⌘M close")
+                    } else {
+                        div()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(0x292b2b))
+                            .text_xs()
+                            .text_color(rgb(0x858989))
+                            .child("Esc/⌘M close")
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Mode indicator immediately right of the command bar: a highlighted
+    /// `NAVIGATION` pill while navigation mode owns the keyboard, a dim
+    /// `⌘M` hint otherwise, so the slot never shifts layout when toggling.
+    /// Display-only on purpose — pointer presses dismiss the mode through
+    /// the root capture handler, so a click-to-toggle here would race that
+    /// dismissal. `⌘M` stays the way in and out.
+    fn render_navigation_indicator(&self) -> AnyElement {
+        if self.navigation_open {
+            h_flex()
+                .items_center()
+                .h(px(32.))
+                .px_3()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x713f12))
+                .bg(rgb(0x211609))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(rgb(0xf59e0b))
+                        .child("NAVIGATION"),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .items_center()
+                .h(px(32.))
+                .px_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x292b2b))
+                .text_xs()
+                .text_color(rgb(0x737878))
+                .child("⌘M")
+                .into_any_element()
         }
     }
 
@@ -1699,9 +2074,8 @@ impl Workspace {
 }
 
 /// Leading glyph per palette command. A command with a direct keybinding
-/// (like GoAgent's `cmd-a`) additionally carries its real GPUI
-/// `Action` on the row via `CommandItem::action`, which renders the binding
-/// hint for free; `on_confirm` still resolves it afterwards, idempotently.
+/// additionally carries its real GPUI `Action` on the row via
+/// `CommandItem::action`, which renders the binding hint for free; `on_confirm` still resolves it afterwards, idempotently.
 fn palette_icon(command: PaletteCommand) -> IconName {
     match command {
         PaletteCommand::GoAgent => IconName::Bot,
@@ -1764,14 +2138,49 @@ impl Render for Workspace {
             .size_full()
             .bg(rgb(0x080909))
             .text_color(rgb(0xe7e7e7))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                this.close_navigation(cx);
+            }))
+            // Release bookkeeping for the navigation interceptor's held-key
+            // set: an element bubble listener wires up during paint (unlike
+            // `window.on_key_event`, which panics outside paint because view
+            // render runs in layout). Key-up bubbles from any focused
+            // descendant — terminals only handle key-down — so releases are
+            // observed window-wide and repeats stay swallowed until then.
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| {
+                let key = event.keystroke.key.to_ascii_lowercase();
+                this.navigation_claimed_keys.remove(&key);
+            }))
+            // Redundant re-arm for the held-key set: if a key-up is ever
+            // lost by the platform, the modifier release that always
+            // follows a modified press (the trigger included) clears the
+            // set once navigation mode is closed. Closed-only on purpose:
+            // clearing while open would let a still-held key re-fire as a
+            // fresh action. While closed the only entry that must survive
+            // is the trigger's own flicker guard, and its repeats always
+            // carry modifiers — an all-released event can never arrive
+            // mid-flicker. Plain action-key repeats involve no modifiers,
+            // so they cannot trip this either; a modifier tap mid-hold
+            // merely degrades to typing a physically held key.
+            //
+            // Any modifier movement also marks every claim: a later
+            // modifier press proves the previous hold ended, which re-arms
+            // a re-pressed trigger (see `on_navigation_keystroke`) even
+            // when no all-released event ever arrives.
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, _| {
+                if !this.navigation_open && event.modifiers.number_of_modifiers() == 0 {
+                    this.navigation_claimed_keys.clear();
+                } else {
+                    for marked in this.navigation_claimed_keys.values_mut() {
+                        *marked = true;
+                    }
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleActionsPalette, window, cx| {
                 this.toggle_command_palette(PaletteMode::Actions, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleProjectsPalette, window, cx| {
                 this.toggle_command_palette(PaletteMode::Projects, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSessionsPalette, window, cx| {
-                this.toggle_command_palette(PaletteMode::Sessions, window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoToAgent, window, cx| {
                 this.go_to_agent(window, cx);
@@ -1931,15 +2340,6 @@ impl Render for Workspace {
                                                     .border_color(rgb(0x292b2b))
                                                     .text_color(rgb(0x858989))
                                                     .child("⌘P"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_1()
-                                                    .rounded_md()
-                                                    .border_1()
-                                                    .border_color(rgb(0x292b2b))
-                                                    .text_color(rgb(0x858989))
-                                                    .child("⌘S"),
                                             ),
                                     )
                                     // Keep the open search field on the trigger's exact
@@ -1961,6 +2361,7 @@ impl Render for Workspace {
                                         ))
                                     }),
                             )
+                            .child(self.render_navigation_indicator())
                             .when(attention_count > 0, |bar| {
                                 bar.child(
                                     Button::new("agent-attention-trigger")
@@ -2110,6 +2511,9 @@ impl Render for Workspace {
                         .child(div().absolute().size_full().bg(rgb(0x000000)).opacity(0.4)),
                 )
             })
+            .when(self.navigation_open, |this| {
+                this.child(self.render_navigation_hud(window, cx))
+            })
             // Notification layer (`push_notification`, e.g. the terminal copy
             // feedback): like dialogs, `Root` stores these without painting
             // them. Without this layer every notification is silently
@@ -2133,6 +2537,174 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// End-to-end toggle lifecycle through the real dispatch path: press the
+    /// toggle, hold-repeat it (must not double-toggle), release, toggle off,
+    /// release, toggle on again. Guards the reported "triggers once, then
+    /// never again" regression.
+    #[gpui_kit::test]
+    fn navigation_mode_retriggers_after_key_release(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{Capslock, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+        let holder_for_window = holder.clone();
+        let (_root, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            *holder_for_window.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        let is_open = |test_cx: &mut gpui_kit::VisualTestContext| {
+            view.update(test_cx, |view, _| view.navigation_open)
+        };
+        let claimed = |test_cx: &mut gpui_kit::VisualTestContext| {
+            view.update(test_cx, |view, _| {
+                view.navigation_claimed_keys
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        };
+        let release = |test_cx: &mut gpui_kit::VisualTestContext, key: &str| {
+            test_cx.simulate_event(KeyUpEvent {
+                keystroke: Keystroke::parse(key).unwrap(),
+            });
+        };
+
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(is_open(test_cx), "first toggle opens navigation mode");
+        assert!(
+            claimed(test_cx).iter().any(|key| key == "m"),
+            "trigger key is held until release"
+        );
+        // Held repeat before release: swallowed, must not toggle back off.
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(
+            is_open(test_cx),
+            "held trigger repeat must not double-toggle"
+        );
+        release(test_cx, "m");
+        assert!(
+            claimed(test_cx).is_empty(),
+            "release clears the held-key set"
+        );
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(!is_open(test_cx), "second toggle exits navigation mode");
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(
+            is_open(test_cx),
+            "third toggle re-opens navigation mode after release"
+        );
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("escape");
+        assert!(!is_open(test_cx));
+        release(test_cx, "escape");
+
+        // Exit via an overlay (add-repository dialog): closing the dialog
+        // must not leave stale state that refuses the next toggle.
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(is_open(test_cx));
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("a");
+        assert!(!is_open(test_cx), "action exits navigation mode");
+        release(test_cx, "a");
+        // Close the dialog the way a user does: Escape must reach the
+        // dialog trap (the interceptor yields to active overlays).
+        test_cx.simulate_keystrokes("escape");
+        release(test_cx, "escape");
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(
+            is_open(test_cx),
+            "toggle re-opens after a dialog opened and closed"
+        );
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("escape");
+        release(test_cx, "escape");
+
+        // The palette shortcuts stay live inside navigation mode: they exit
+        // to normal mode (in the app the keystroke continues to the
+        // palette, which has no binding in this harness).
+        test_cx.simulate_keystrokes("cmd-m");
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("cmd-p");
+        assert!(!is_open(test_cx), "palette shortcut exits navigation mode");
+        release(test_cx, "p");
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(is_open(test_cx), "toggle re-opens after a palette shortcut");
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("escape");
+        release(test_cx, "escape");
+
+        // Lost key-ups must not wedge the toggle: open and close with no
+        // releases at all, then release only the modifiers. The
+        // all-released signal re-arms the trigger on its own.
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(is_open(test_cx));
+        test_cx.simulate_keystrokes("escape");
+        assert!(!is_open(test_cx));
+        test_cx.simulate_event(ModifiersChangedEvent {
+            modifiers: Modifiers::default(),
+            capslock: Capslock { on: false },
+        });
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(
+            is_open(test_cx),
+            "toggle re-opens after modifier release without key-ups"
+        );
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("escape");
+        release(test_cx, "escape");
+
+        // Lost key-ups with no all-released event: modifier movement alone
+        // marks the claim, so the next trigger press is honored as fresh.
+        // Shift, then Ctrl, then Shift release keeps the modifier set
+        // non-empty throughout — only the marks can re-arm here.
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(is_open(test_cx));
+        test_cx.simulate_keystrokes("escape");
+        assert!(!is_open(test_cx));
+        let modifiers = |shift: bool, control: bool| ModifiersChangedEvent {
+            modifiers: Modifiers {
+                shift,
+                control,
+                ..Default::default()
+            },
+            capslock: Capslock { on: false },
+        };
+        test_cx.simulate_event(modifiers(true, false));
+        test_cx.simulate_event(modifiers(true, true));
+        test_cx.simulate_event(modifiers(false, true));
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(
+            is_open(test_cx),
+            "toggle re-opens after modifier movement without key-ups"
+        );
+        // Drain the simulated loss: real releases clear both claims, so the
+        // next segment starts clean. (A marked non-trigger key stays
+        // swallowed by design — a missed press beats an accidental edit.)
+        release(test_cx, "m");
+        release(test_cx, "escape");
+        test_cx.simulate_keystrokes("escape");
+        assert!(!is_open(test_cx));
+        release(test_cx, "escape");
+
+        // Re-arm must not flicker: a held trigger repeat with no modifier
+        // movement in between stays swallowed after a toggle-close.
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(is_open(test_cx));
+        release(test_cx, "m");
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(!is_open(test_cx), "toggle closes");
+        test_cx.simulate_keystrokes("cmd-m");
+        assert!(
+            !is_open(test_cx),
+            "held trigger repeat without modifier movement stays swallowed"
+        );
+    }
 
     #[test]
     fn checkout_identity_normalizes_paths_and_preserves_missing_paths() {

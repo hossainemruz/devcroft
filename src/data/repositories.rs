@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::device::DeviceRepositoryBinding;
-use super::store_lock::{portable_gate, reject_symlink};
 use super::record::read_bounded;
+use super::store_lock::{portable_gate, reject_symlink};
 use super::{DataRoot, DeviceStore, run_git_in, write_json_atomic};
 
 /// Portable repository metadata. `camelCase` matches the Electron

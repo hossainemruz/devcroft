@@ -16,9 +16,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AppContext as _, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, WeakEntity, Window, div, px,
+    Anchor, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
 };
 use std::time::Duration;
 const PAGE_SIZE: usize = 100;
@@ -81,6 +81,10 @@ pub(crate) struct ArtifactBrowser {
     saved_drafts: std::collections::HashMap<Scope, Draft>,
     saving: bool,
     pub(crate) focus_handle: FocusHandle,
+    sidebar_focus: FocusHandle,
+    detail_focus: FocusHandle,
+    comments_focus: FocusHandle,
+    outline_focus: FocusHandle,
 }
 
 impl ArtifactBrowser {
@@ -123,6 +127,82 @@ impl ArtifactBrowser {
             saved_drafts: Default::default(),
             saving: false,
             focus_handle: cx.focus_handle(),
+            sidebar_focus: cx.focus_handle().tab_stop(true),
+            detail_focus: cx.focus_handle().tab_stop(true),
+            comments_focus: cx.focus_handle().tab_stop(true),
+            outline_focus: cx.focus_handle().tab_stop(true),
+        }
+    }
+
+    pub(crate) fn navigation_state(&self) -> crate::navigation::ResourceState {
+        crate::navigation::ResourceState {
+            selected: self.selected.is_some(),
+            drafting: self.draft.is_some(),
+            saving: self.saving,
+        }
+    }
+
+    pub(crate) fn navigation_panes(&self, cx: &gpui_kit::App) -> Vec<(&'static str, FocusHandle)> {
+        let mut panes = vec![("Resources", self.sidebar_focus.clone())];
+        if self.selected.is_none() {
+            return panes;
+        }
+        let document = self
+            .draft
+            .as_ref()
+            .map(|draft| draft.input.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| self.detail_focus.clone());
+        panes.push((
+            if self.draft.is_some() {
+                "Draft"
+            } else {
+                "Document"
+            },
+            document,
+        ));
+        if self.draft.is_none() {
+            panes.push(("Comments", self.comments_focus.clone()));
+            if !self.toc.is_empty() {
+                panes.push(("Outline", self.outline_focus.clone()));
+            }
+        }
+        panes
+    }
+
+    pub(crate) fn begin_markdown_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_none() || self.draft.is_some() || self.saving {
+            return;
+        }
+        self.edit(true, None, window, cx);
+        if let Some(draft) = &self.draft {
+            draft.input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    pub(crate) fn begin_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_none() || self.draft.is_some() || self.saving {
+            return;
+        }
+        self.edit(false, None, window, cx);
+        if let Some(draft) = &self.draft {
+            draft.input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    pub(crate) fn save_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.is_none() || self.saving {
+            return;
+        }
+        self.detail_focus.focus(window, cx);
+        self.save(cx);
+    }
+
+    pub(crate) fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.is_some() && !self.saving {
+            self.draft = None;
+            self.error = None;
+            self.detail_focus.focus(window, cx);
+            cx.notify();
         }
     }
     pub(crate) fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
@@ -614,6 +694,8 @@ impl Render for ArtifactBrowser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut sidebar = v_flex()
             .id("resource-sidebar")
+            .track_focus(&self.sidebar_focus)
+            .focus(|style| style.border_2().border_color(cx.theme().ring))
             .w(px(260.))
             .flex_none()
             .h_full()
@@ -751,7 +833,13 @@ impl Render for ArtifactBrowser {
                     .child(error.clone()),
             );
         }
-        let mut detail = v_flex().flex_1().min_w_0().h_full().min_h_0();
+        let mut detail = v_flex()
+            .track_focus(&self.detail_focus)
+            .focus(|style| style.border_2().border_color(cx.theme().ring))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0();
         if let Some(snapshot) = self.selected.clone() {
             let artifact = &snapshot.artifact;
             let archived = artifact.archived;
@@ -827,16 +915,16 @@ impl Render for ArtifactBrowser {
                                 Button::new("save-resource")
                                     .label("Save")
                                     .disabled(self.saving)
-                                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_draft(window, cx)
+                                    })),
                             )
                             .child(
                                 Button::new("cancel-resource-edit")
                                     .label("Cancel")
                                     .disabled(self.saving)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.draft = None;
-                                        this.error = None;
-                                        cx.notify();
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel_draft(window, cx)
                                     })),
                             ),
                     );
@@ -847,6 +935,8 @@ impl Render for ArtifactBrowser {
                 }
                 let mut comments = v_flex()
                     .id("artifact-comments")
+                    .track_focus(&self.comments_focus)
+                    .focus(|style| style.border_2().border_color(cx.theme().ring))
                     .max_h(px(240.))
                     .overflow_y_scroll()
                     .gap_2()
@@ -930,6 +1020,8 @@ impl Render for ArtifactBrowser {
                 }
                 main = main.child(comments);
                 let mut rail = v_flex()
+                    .track_focus(&self.outline_focus)
+                    .focus(|style| style.border_2().border_color(cx.theme().ring))
                     .flex_none()
                     .h_full()
                     .when(!self.toc.is_empty(), |rail| {

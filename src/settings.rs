@@ -28,10 +28,7 @@ use crate::agent_sessions::{
     DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, clamp_sidebar_limit,
 };
 use crate::command_palette::{
-    GoToAgent, GoToEditor, GoToReview, GoToResources, GoToTerminal, NewAgentSession, PaletteMode,
-    ToggleActionsPalette, ToggleProjectsPalette, ToggleSessionsPalette, is_go_to_agent_shortcut,
-    is_go_to_editor_shortcut, is_go_to_review_shortcut, is_go_to_resources_shortcut,
-    is_go_to_terminal_shortcut, is_new_session_shortcut, palette_mode_for_shortcut,
+    PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
 };
 use crate::data::{
     CheckoutOutcome, DataRoot, DeviceStore, SYNC_INTERVAL_OPTIONS, SyncStatus, SyncTracker,
@@ -509,70 +506,11 @@ impl SettingsView {
         }
     }
 
-    /// Forward the command-bar toggles and the go-to-tab shortcuts to
-    /// the workspace, mirroring `TerminalPane::on_key_down` /
-    /// `ReviewView::on_key_down`. All other keys bubble normally.
+    /// Forward the command-bar toggles to the workspace, mirroring
+    /// `TerminalPane::on_key_down` / `ReviewView::on_key_down`. Tab jumps and
+    /// session creation are intentionally not forwarded: they live in
+    /// navigation mode and the palettes now. All other keys bubble normally.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if is_go_to_agent_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToAgent), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_editor_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToEditor), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_terminal_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToTerminal), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_review_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToReview), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_go_to_resources_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(GoToResources), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if is_new_session_shortcut(
-            &event.keystroke.key,
-            event.keystroke.modifiers.platform,
-            event.keystroke.modifiers.alt,
-        ) {
-            window.dispatch_action(Box::new(NewAgentSession), cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
         if let Some(mode) = palette_mode_for_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,
@@ -585,9 +523,6 @@ impl SettingsView {
                 }
                 PaletteMode::Projects => {
                     window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
-                }
-                PaletteMode::Sessions => {
-                    window.dispatch_action(Box::new(ToggleSessionsPalette), cx);
                 }
             }
             window.prevent_default();

@@ -14,10 +14,10 @@ pub(crate) mod artifacts;
 pub(crate) mod dashboard;
 mod device;
 mod portable;
+mod record;
 mod repositories;
 mod store_lock;
 mod sync;
-mod record;
 mod workspace_agents;
 
 use std::env;

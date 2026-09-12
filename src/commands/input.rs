@@ -4,7 +4,6 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, ensure};
 
-
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 
 pub(super) fn markdown(path: &Path) -> Result<String> {

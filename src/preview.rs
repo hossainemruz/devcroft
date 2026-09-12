@@ -22,7 +22,7 @@ use gpui_kit::component::text::{
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, HighlightStyle,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
     InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton, Overflow,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
     Styled as _, Window, div, px, rems,
@@ -65,13 +65,13 @@ pub(crate) fn read_markdown_file(path: &Path) -> Result<(String, String)> {
 /// item index. Nested headings (blockquotes, list items, code fences) are
 /// correctly excluded by only walking the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TocEntry {
+pub(crate) struct TocEntry {
     /// Heading depth 1–6.
-    level: u8,
+    pub(crate) level: u8,
     /// Plain-text title with inline markup stripped.
-    title: String,
+    pub(crate) title: String,
     /// Index of the heading's block in the document (== list item index).
-    item_ix: usize,
+    pub(crate) item_ix: usize,
 }
 
 /// Collect the table of contents from `source`, parsed with the same parser
@@ -179,6 +179,10 @@ pub(crate) struct PreviewView {
     embedded: bool,
 }
 
+/// Scrollspy selection, emitted when the visible section changes.
+pub(crate) struct TocActive(pub usize);
+impl EventEmitter<TocActive> for PreviewView {}
+
 impl PreviewView {
     pub(crate) fn new(content: SharedString, cx: &mut Context<Self>) -> Self {
         let (toc, blocks) = extract_toc(&content);
@@ -241,15 +245,24 @@ impl PreviewView {
         let active = active_heading(&self.toc, top, bottom, self.blocks);
         if active != self.active {
             self.active = active;
+            // Hosts that render their own outline (Resources) track this to
+            // highlight the visible section. Standalone has no subscribers.
+            cx.emit(TocActive(active));
             cx.notify();
         }
+    }
+
+    /// Current outline entries plus the scrollspy-selected index, for hosts
+    /// that lay out their own outline panel beside the document.
+    pub(crate) fn toc_snapshot(&self) -> (Vec<TocEntry>, usize) {
+        (self.toc.clone(), self.active)
     }
 
     /// Jump to a TOC entry, pinning its heading to the viewport top so the
     /// spy rule reselects it. (Minimal-reveal would leave the target
     /// mid-viewport under an earlier section's tail, fighting the
     /// highlight.)
-    fn on_toc_click(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_toc_click(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(entry) = self.toc.get(index) else {
             return;
         };
@@ -377,6 +390,10 @@ impl Focusable for PreviewView {
 impl Render for PreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let reading_width = (window.viewport_size().width - px(80.)).clamp(px(1.), px(960.));
+        // Embedded readers sit below the host view's own header, so they skip
+        // the standalone window's generous top margin. Bottom keeps 32px to
+        // match the scrollbar insets below.
+        let reader_top = if self.embedded { px(8.) } else { px(32.) };
         let list_state = self.state.read(cx).list_state().clone();
         let mut table = StyleRefinement::default();
         table.overflow.x = Some(Overflow::Scroll);
@@ -418,6 +435,10 @@ impl Render for PreviewView {
             .table(table)
             .table_head(table_head)
             .table_cell(table_cell);
+        // Embedded readers (Resources) let the document take the full width:
+        // the host lays out its own outline rail beside this view. The
+        // standalone window keeps its centered column, clipped gutter with
+        // edge scrollbar, and hover outline.
         h_flex()
             .id("preview-reader")
             .track_focus(&self.focus_handle)
@@ -441,9 +462,14 @@ impl Render for PreviewView {
             .child(
                 div()
                     .w(reading_width)
+                    // flex_1's zero basis overrides the fixed width above,
+                    // so embedded documents fill the host-provided width
+                    // instead of centering a 960px column.
+                    .when(self.embedded, |this| this.flex_1())
                     .min_w_0()
                     .h_full()
-                    .py(px(32.))
+                    .pt(reader_top)
+                    .pb(px(32.))
                     .text_size(px(17.))
                     .line_height(px(29.))
                     .child(
@@ -459,24 +485,31 @@ impl Render for PreviewView {
                                 .style(style)
                                 .scrollable(true)
                                 .w(reading_width + px(16.))
+                                // Fluid embedded columns cannot precompute the
+                                // +16 clip, so they use the TextView's own
+                                // scrollbar (the pr_16 below keeps text clear
+                                // of it) while standalone keeps edge docking.
+                                .when(self.embedded, |this| this.w_full())
                                 .pr(px(16.)),
                         ),
                     ),
             )
-            .child(
-                div()
-                    .absolute()
-                    .right_0()
-                    .top(px(32.))
-                    .bottom(px(32.))
-                    .w(px(16.))
-                    .child(
-                        Scrollbar::vertical(&list_state)
-                            .id("preview-window-scrollbar")
-                            .viewport_from_layout(),
-                    ),
-            )
-            .when(!self.toc.is_empty(), |this| {
+            .when(!self.embedded, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top(px(32.))
+                        .bottom(px(32.))
+                        .w(px(16.))
+                        .child(
+                            Scrollbar::vertical(&list_state)
+                                .id("preview-window-scrollbar")
+                                .viewport_from_layout(),
+                        ),
+                )
+            })
+            .when(!self.toc.is_empty() && !self.embedded, |this| {
                 this.child(
                     v_flex()
                         .absolute()

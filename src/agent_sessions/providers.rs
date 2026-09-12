@@ -124,15 +124,162 @@ fn opencode(source: &Source) -> Result<Vec<SessionSummary>> {
 }
 
 fn codex(source: &Source) -> Result<Vec<SessionSummary>> {
+    // The GUI process often launches without the user's shell PATH (mise shims,
+    // brew, cargo), so `codex app-server` frequently fails with ENOENT even
+    // though the CLI works in a terminal. The local state database carries the
+    // same thread metadata, so it is the primary source; the app-server RPC
+    // remains only for stores predating the sqlite layout.
+    if let Some(sessions) = codex_via_sqlite(source)? {
+        return Ok(sessions);
+    }
     if !source.root.join("sessions").is_dir() {
         return Ok(Vec::new());
     }
+    codex_via_rpc(source)
+}
+
+fn codex_state_files(source: &Source) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(&source.root) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("state_") || !name.ends_with(".sqlite") {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+fn codex_via_sqlite(source: &Source) -> Result<Option<Vec<SessionSummary>>> {
+    let files = codex_state_files(source);
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let mut sessions = Vec::new();
+    for database in &files {
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .with_context(|| format!("opening Codex session store {}", database.display()))?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, cwd, COALESCE(name, ''), COALESCE(preview, ''), COALESCE(title, ''), \
+                 COALESCE(first_user_message, ''), COALESCE(updated_at, 0), COALESCE(updated_at_ms, 0), \
+                 COALESCE(recency_at, 0), COALESCE(archived, 0), COALESCE(source, ''), \
+                 COALESCE(thread_source, '') FROM threads",
+            )
+            .context("reading Codex sessions")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })
+            .context("reading Codex sessions")?;
+        for row in rows {
+            // A malformed row must not fail the whole provider scan the way a
+            // malformed RPC payload would: skip it and keep the rest.
+            let Ok((
+                id,
+                cwd,
+                name,
+                preview,
+                title_text,
+                first,
+                updated,
+                updated_ms,
+                recency,
+                archived,
+                source_kind,
+                thread_source,
+            )) = row
+            else {
+                continue;
+            };
+            if id.is_empty() || cwd.is_empty() || archived != 0 {
+                continue;
+            }
+            // Subagent/guardian threads share the store but are never directly
+            // resumable root conversations (mirrors the app-server
+            // parentThreadId/sourceKinds filter).
+            if thread_source == "subagent"
+                || source_kind.trim_start().starts_with('{')
+                || source_kind.contains("subagent")
+            {
+                continue;
+            }
+            let mut updated = updated.max(updated_ms / 1000).max(recency);
+            // The RPC contract has returned milliseconds while the store
+            // records seconds; normalize either unit to seconds so recency
+            // sorting never clamps every row to now.
+            if updated > 100_000_000_000 {
+                updated /= 1000;
+            }
+            if updated <= 0 {
+                continue;
+            }
+            let raw_title = [name, preview, title_text, first]
+                .into_iter()
+                .find(|s| !s.trim().is_empty())
+                .unwrap_or_default();
+            sessions.push(SessionSummary {
+                key: SessionKey {
+                    provider: "codex".into(),
+                    store: source.root.clone(),
+                    id,
+                },
+                checkout: PathBuf::new(),
+                cwd: PathBuf::from(cwd),
+                title: title(&raw_title),
+                updated,
+                timestamp_source: "provider_updated".into(),
+            });
+        }
+    }
+    Ok(Some(sessions))
+}
+
+fn codex_via_rpc(source: &Source) -> Result<Vec<SessionSummary>> {
     let mut rpc = Rpc::new(
         Command::new("codex")
             .arg("app-server")
             .env("CODEX_HOME", &source.root)
             .env("MISE_QUIET", "1"),
-    )?;
+    )
+    .map_err(|error| {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        {
+            anyhow::anyhow!(
+                "Codex CLI not found on PATH (tried `codex app-server`). Install Codex or launch Devcroft from a shell with mise/brew on PATH"
+            )
+        } else {
+            error
+        }
+    })?;
     let mut sessions = Vec::new();
     let mut cursor = Value::Null;
     let mut cursors = HashSet::new();
@@ -168,9 +315,19 @@ fn codex(source: &Source) -> Result<Vec<SessionSummary>> {
                         .or_else(|| row["preview"].as_str())
                         .unwrap_or(""),
                 ),
-                updated: row["updatedAt"]
-                    .as_i64()
-                    .context("Missing Codex update time")?,
+                updated: {
+                    let updated = row["updatedAt"]
+                        .as_i64()
+                        .context("Missing Codex update time")?;
+                    // The app-server has returned milliseconds while older
+                    // payloads record seconds; normalize to seconds so
+                    // recency sorting never clamps every row to now.
+                    if updated > 100_000_000_000 {
+                        updated / 1000
+                    } else {
+                        updated
+                    }
+                },
                 timestamp_source: "provider_updated".into(),
             });
         }
@@ -490,5 +647,144 @@ mod tests {
         )
         .unwrap();
         assert!(parse_claude(&source, &path, 0).unwrap().is_none());
+    }
+    fn codex_fixture() -> (tempfile::TempDir, Source) {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(dir.path().join("state_5.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL, name TEXT, preview TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', first_user_message TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL DEFAULT 0, recency_at INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '', thread_source TEXT NOT NULL DEFAULT '')",
+            )
+            .unwrap();
+        connection.close().unwrap();
+        let source = Source {
+            provider: "codex",
+            root: dir.path().into(),
+        };
+        (dir, source)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn insert_codex_thread(
+        dir: &tempfile::TempDir,
+        id: &str,
+        cwd: &str,
+        name: Option<&str>,
+        preview: &str,
+        updated_secs: i64,
+        archived: i64,
+        source: &str,
+        thread_source: &str,
+    ) {
+        let connection = rusqlite::Connection::open(dir.path().join("state_5.sqlite")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, cwd, name, preview, title, first_user_message, updated_at, updated_at_ms, recency_at, archived, source, thread_source) VALUES (?1, ?2, ?3, ?4, '', '', ?5, ?6, 0, ?7, ?8, ?9)",
+                rusqlite::params![
+                    id,
+                    cwd,
+                    name,
+                    preview,
+                    updated_secs,
+                    updated_secs * 1000,
+                    archived,
+                    source,
+                    thread_source
+                ],
+            )
+            .unwrap();
+        connection.close().unwrap();
+    }
+    #[test]
+    fn codex_reads_sqlite_without_sessions_dir_or_binary() {
+        // GUI launches often lack mise/brew on PATH, so `codex app-server`
+        // fails with ENOENT. The sqlite store must back discovery on its own:
+        // no `sessions/` directory and no binary involvement.
+        let (dir, source) = codex_fixture();
+        assert!(!dir.path().join("sessions").exists());
+        insert_codex_thread(
+            &dir,
+            "root",
+            "/repo",
+            Some("Short name"),
+            "Long preview that should lose to the name",
+            1783093401,
+            0,
+            "vscode",
+            "user",
+        );
+        insert_codex_thread(
+            &dir,
+            "archived",
+            "/repo",
+            Some("old"),
+            "old",
+            1783093402,
+            1,
+            "vscode",
+            "user",
+        );
+        insert_codex_thread(
+            &dir,
+            "subagent",
+            "/repo",
+            None,
+            "child work",
+            1783093403,
+            0,
+            r#"{"subagent":{"other":"guardian"}}"#,
+            "subagent",
+        );
+        let mut files = HashMap::new();
+        let sessions = discover(&source, &mut files).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| s.key.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+        let root = &sessions[0];
+        assert_eq!(root.title, "Short name");
+        assert_eq!(root.updated, 1783093401);
+        assert_eq!(root.cwd, PathBuf::from("/repo"));
+        assert_eq!(root.key.store, source.root);
+    }
+    #[test]
+    fn codex_sqlite_normalizes_milliseconds_and_prefers_preview_without_name() {
+        let (dir, source) = codex_fixture();
+        let connection = rusqlite::Connection::open(dir.path().join("state_5.sqlite")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, cwd, name, preview, title, first_user_message, updated_at, updated_at_ms, recency_at, archived, source, thread_source) VALUES ('ms', '/repo', NULL, 'preview title', '', '', 0, 1700000000123, 0, 0, 'cli', 'user')",
+                [],
+            )
+            .unwrap();
+        connection.close().unwrap();
+        let sessions = codex_via_sqlite(&source).unwrap().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "preview title");
+        assert_eq!(sessions[0].updated, 1700000000);
+    }
+    #[test]
+    fn codex_missing_store_falls_back_but_broken_sqlite_is_an_error() {
+        let source = Source {
+            provider: "codex",
+            root: "/data".into(),
+        };
+        // No sqlite files and no sessions directory: empty, never a spawn
+        // error, so other providers stay usable.
+        let mut files = HashMap::new();
+        assert!(discover(&source, &mut files).unwrap().is_empty());
+        assert!(codex_via_sqlite(&source).unwrap().is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("state_5.sqlite"), "not a database").unwrap();
+        let source = Source {
+            provider: "codex",
+            root: dir.path().into(),
+        };
+        // Schema drift must surface as a provider error (stale cache plus a
+        // sidebar notice), never as a silently empty list.
+        assert!(codex_via_sqlite(&source).is_err());
     }
 }

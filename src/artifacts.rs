@@ -3,20 +3,22 @@ use crate::data::DataRoot;
 use crate::data::artifacts::{
     ArtifactList, ArtifactPatch, ArtifactStore, CommentChange, Kind, ListOptions, Snapshot,
 };
-use crate::preview::PreviewView;
+use crate::preview::{PreviewView, TocActive, TocEntry};
 use crate::relative_time::{current_unix_secs, relative_duration_label};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable, Size, StyledExt as _, h_flex, tag::Tag, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _, h_flex,
+    tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AppContext as _, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    WeakEntity, Window, div, px,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, WeakEntity, Window, div, px,
 };
 use std::time::Duration;
 const PAGE_SIZE: usize = 100;
@@ -73,6 +75,8 @@ pub(crate) struct ArtifactBrowser {
     selected: Option<Snapshot>,
     error: Option<String>,
     preview: Option<Entity<PreviewView>>,
+    toc: Vec<TocEntry>,
+    toc_active: usize,
     draft: Option<Draft>,
     saved_drafts: std::collections::HashMap<Scope, Draft>,
     saving: bool,
@@ -113,6 +117,8 @@ impl ArtifactBrowser {
             selected: None,
             error: None,
             preview: None,
+            toc: Vec::new(),
+            toc_active: 0,
             draft: None,
             saved_drafts: Default::default(),
             saving: false,
@@ -129,6 +135,8 @@ impl ArtifactBrowser {
             self.selected_id = self.draft.as_ref().map(|d| d.snapshot.artifact.id.clone());
             self.selected = None;
             self.preview = None;
+            self.toc = Vec::new();
+            self.toc_active = 0;
             self.error = None;
             self.list = ArtifactList::default();
             self.limit = PAGE_SIZE;
@@ -268,15 +276,28 @@ impl ArtifactBrowser {
                     })
                 }
                 (_, Some(s)) => {
-                    self.preview = Some(
-                        cx.new(|cx| PreviewView::embedded(s.artifact.content.clone().into(), cx)),
-                    )
+                    let preview =
+                        cx.new(|cx| PreviewView::embedded(s.artifact.content.clone().into(), cx));
+                    cx.subscribe(&preview, |this, _, event: &TocActive, cx| {
+                        this.toc_active = event.0;
+                        cx.notify();
+                    })
+                    .detach();
+                    self.preview = Some(preview);
                 }
                 _ => self.preview = None,
             }
         }
         self.selected_id = snapshot.as_ref().map(|s| s.artifact.id.clone());
         self.selected = snapshot;
+        if let Some(preview) = self.preview.as_ref() {
+            let (entries, active) = preview.read(cx).toc_snapshot();
+            self.toc = entries;
+            self.toc_active = active;
+        } else {
+            self.toc = Vec::new();
+            self.toc_active = 0;
+        }
     }
     fn edit(
         &mut self,
@@ -392,6 +413,187 @@ impl ArtifactBrowser {
         .detach();
         cx.notify();
     }
+    fn delete(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.saving = true;
+        self.error = None;
+        self.refresh.generation = self.refresh.generation.wrapping_add(1);
+        let scope = self.scope.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let store = ArtifactStore::new(&root);
+                    store
+                        .delete(&snapshot.artifact.id, &snapshot.revision)
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.saving = false;
+                if this.scope == scope {
+                    match result {
+                        Ok(()) => {
+                            this.draft = None;
+                            this.selected_id = None;
+                            this.selected = None;
+                            this.preview = None;
+                            this.toc = Vec::new();
+                            this.toc_active = 0;
+                        }
+                        Err(error) => this.error = Some(format!("Could not delete. {error}")),
+                    }
+                }
+                this.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    /// The artifact options menu, rendered at the top of the reader rail so
+    /// it stays put whether or not the document has headings for an outline.
+    fn render_options_menu(
+        &self,
+        snapshot: Snapshot,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let menu_snapshot = snapshot;
+        let view = cx.entity().downgrade();
+        Button::new("artifact-options")
+            .ghost()
+            .label("⋯")
+            .accessibility_label("Artifact options")
+            .disabled(self.draft.is_some() || self.saving)
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+                menu.item({
+                    let view = view.clone();
+                    PopupMenuItem::new("Edit Markdown")
+                        .on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.edit(true, None, window, cx);
+                            });
+                        })
+                })
+                .item({
+                    let view = view.clone();
+                    let snapshot = menu_snapshot.clone();
+                    let label = if archived { "Unarchive" } else { "Archive" };
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.mutate(snapshot.clone(), Mutation::Archive, false, cx);
+                        });
+                    })
+                })
+                .item({
+                    let view = view.clone();
+                    let snapshot = menu_snapshot.clone();
+                    PopupMenuItem::new("Delete").on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        let snapshot = snapshot.clone();
+                        let title = snapshot.artifact.title.clone();
+                        window.open_dialog(cx, move |dialog, _, _| {
+                            let view = view.clone();
+                            let snapshot = snapshot.clone();
+                            dialog
+                                .title("Delete artifact?")
+                                .child(format!(
+                                    "\"{title}\" and its comments will be permanently deleted. This cannot be undone."
+                                ))
+                                .footer(
+                                    DialogFooter::new()
+                                        .child(
+                                            Button::new("cancel-delete-artifact")
+                                                .label("Cancel")
+                                                .on_click(|_, window, cx| {
+                                                    window.close_dialog(cx)
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("confirm-delete-artifact")
+                                                .primary()
+                                                .label("Delete")
+                                                .on_click(|_, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(Confirm {
+                                                            secondary: false,
+                                                        }),
+                                                        cx,
+                                                    )
+                                                }),
+                                        ),
+                                )
+                                .on_ok(move |_, _, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.delete(snapshot.clone(), cx);
+                                    });
+                                    true
+                                })
+                        });
+                    })
+                })
+            })
+    }
+    /// Full-height outline rail beside the document. Entries and the active
+    /// index mirror the preview's own table of contents (see
+    /// `PreviewView::toc_snapshot`); clicks scroll the document through the
+    /// preview entity so the virtualized list offsets stay exact.
+    fn render_toc_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.toc_active;
+        let preview = self.preview.clone();
+        let entries = self.toc.clone();
+        v_flex()
+            .id("resource-toc")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .pt_2()
+            .pb_4()
+            .gap_1()
+            .children(entries.into_iter().enumerate().map(move |(index, entry)| {
+                let is_active = index == active;
+                // h1 flush; each deeper level indented one step.
+                let indent = px(8. + f32::from(entry.level.saturating_sub(1)) * 12.);
+                let preview = preview.clone();
+                div()
+                    .id(("resource-toc-row", index))
+                    .flex_none()
+                    .w_full()
+                    .py(px(6.))
+                    .pl(indent)
+                    .pr(px(8.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_sm()
+                    .when(is_active, |this| {
+                        this.bg(cx.theme().accent)
+                            .text_color(cx.theme().accent_foreground)
+                    })
+                    .when(!is_active, |this| {
+                        this.text_color(cx.theme().muted_foreground)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            if let Some(preview) = preview.clone() {
+                                preview.update(cx, |view, cx| {
+                                    view.on_toc_click(index, cx);
+                                });
+                            }
+                        }),
+                    )
+                    .child(entry.title.clone())
+            }))
+    }
 }
 enum Mutation {
     Document(String),
@@ -420,7 +622,6 @@ impl Render for ArtifactBrowser {
             .gap_2()
             .border_r_1()
             .border_color(cx.theme().border)
-            .child(div().font_semibold().child("Resources"))
             .child({
                 let active = self.kind_filter;
                 let disabled = self.draft.is_some() || self.saving;
@@ -550,40 +751,47 @@ impl Render for ArtifactBrowser {
                     .child(error.clone()),
             );
         }
-        let mut detail = v_flex().flex_1().min_w_0().h_full().p_4().gap_3();
-        if let Some(error) = &self.error {
-            detail = detail.child(div().text_color(cx.theme().danger).child(error.clone()));
-        }
+        let mut detail = v_flex().flex_1().min_w_0().h_full().min_h_0();
         if let Some(snapshot) = self.selected.clone() {
             let artifact = &snapshot.artifact;
-            detail =
-                detail.child(
-                    h_flex()
-                        .gap_2()
-                        .justify_end()
-                        .child(
-                            Button::new("edit-resource")
-                                .label("Edit Markdown")
-                                .disabled(self.draft.is_some() || self.saving)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.edit(true, None, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("archive-resource")
-                                .label(if artifact.archived {
-                                    "Unarchive"
-                                } else {
-                                    "Archive"
-                                })
-                                .disabled(self.draft.is_some() || self.saving)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(s) = this.selected.clone() {
-                                        this.mutate(s, Mutation::Archive, false, cx);
-                                    }
-                                })),
-                        ),
+            let archived = artifact.archived;
+            let mut main = v_flex().flex_1().min_w_0().h_full().min_h_0().p_4().gap_3();
+            if let Some(error) = &self.error {
+                main = main.child(div().text_color(cx.theme().danger).child(error.clone()));
+            }
+            let mut meta = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Tag::secondary()
+                        .with_size(Size::Small)
+                        .rounded_full()
+                        .flex_none()
+                        .child(artifact.kind.label()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(updated_label(artifact.updated_at, current_unix_secs())),
                 );
+            if let Some(repository) = artifact.repository.clone() {
+                meta = meta.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(repository),
+                );
+            }
+            if archived {
+                meta = meta.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child("Archived"),
+                );
+            }
+            main = main.child(meta);
             if !artifact.sessions.is_empty() {
                 let mut origins = h_flex().gap_2().flex_wrap().child("Originating sessions:");
                 for (index, origin) in artifact.sessions.iter().enumerate() {
@@ -602,10 +810,10 @@ impl Render for ArtifactBrowser {
                                 })),
                         );
                 }
-                detail = detail.child(origins);
+                main = main.child(origins);
             }
             if let Some(draft) = &self.draft {
-                detail = detail
+                main = main
                     .child(
                         div()
                             .flex_1()
@@ -632,9 +840,10 @@ impl Render for ArtifactBrowser {
                                     })),
                             ),
                     );
+                detail = detail.child(main);
             } else {
                 if let Some(preview) = &self.preview {
-                    detail = detail.child(div().flex_1().min_h_0().child(preview.clone()));
+                    main = main.child(div().flex_1().min_h_0().child(preview.clone()));
                 }
                 let mut comments = v_flex()
                     .id("artifact-comments")
@@ -719,9 +928,48 @@ impl Render for ArtifactBrowser {
                             ),
                     );
                 }
-                detail = detail.child(comments);
+                main = main.child(comments);
+                let mut rail = v_flex()
+                    .flex_none()
+                    .h_full()
+                    .when(!self.toc.is_empty(), |rail| {
+                        rail.w(px(260.))
+                            .border_l_1()
+                            .border_color(cx.theme().border)
+                    });
+                rail = rail.child({
+                    let mut head = h_flex().items_center().gap_2().px_4().pt_4();
+                    if !self.toc.is_empty() {
+                        head = head.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("On this page"),
+                        );
+                    } else {
+                        head = head.justify_end();
+                    }
+                    head.child(self.render_options_menu(snapshot.clone(), archived, cx))
+                });
+                if !self.toc.is_empty() {
+                    rail = rail.child(self.render_toc_panel(cx));
+                }
+                detail = detail.child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(main)
+                        .child(rail),
+                );
             }
         } else {
+            detail = detail.p_4().gap_3();
+            if let Some(error) = &self.error {
+                detail = detail.child(div().text_color(cx.theme().danger).child(error.clone()));
+            }
             detail = detail.child(if self.refresh.busy { "Loading resources…" } else { "No resources for this repository. Ask an agent to create an artifact with devcroft artifact create --repository <key>." });
         }
         h_flex()

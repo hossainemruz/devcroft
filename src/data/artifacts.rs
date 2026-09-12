@@ -307,6 +307,23 @@ impl ArtifactStore {
         self.mutate(id, revision, |artifact| artifact.archived = archived)
     }
 
+    pub(crate) fn delete(&self, id: &str, revision: &str) -> Result<()> {
+        validate_id(id)?;
+        let _gate = portable_gate(&self.root, false)?;
+        let _record = artifact_lock(&self.root, id, true)?;
+        let old = self.read(id)?;
+        ensure!(
+            old.revision == revision,
+            "artifact_changed: {id} changed on disk; read the latest version and retry"
+        );
+        let dir = self.checked_path(Some(id))?;
+        if dir.try_exists()? {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("deleting artifact directory {id}"))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn comment(
         &self,
         id: &str,

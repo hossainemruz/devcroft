@@ -92,6 +92,18 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
         ArtifactCommand::Unarchive(record) => store
             .set_archived(&record.id, &record.revision, false)
             .context("unarchiving artifact")?,
+        ArtifactCommand::Delete(record) => {
+            store
+                .delete(&record.id, &record.revision)
+                .context("deleting artifact")?;
+            return output::emit(
+                args.json,
+                json!({"formatVersion": 1, "artifactId": record.id, "deleted": true}),
+                &format!("Deleted {}\n", record.id),
+                &[],
+                &[],
+            );
+        }
     };
     output::artifact_snapshot(snapshot, args.json)
 }

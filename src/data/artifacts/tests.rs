@@ -177,6 +177,18 @@ fn legacy_json_is_readable_and_retained_after_conversion() {
     assert_eq!(store.get(&first.artifact.id).unwrap(), converted);
 }
 #[test]
+fn delete_removes_directory_and_rejects_stale_revisions() {
+    let (_dir, store) = fixture();
+    let first = store.create(input("repo")).unwrap();
+    let id = first.artifact.id.clone();
+    assert!(store.delete(&id, "stale-revision").is_err());
+    assert!(store.checked_path(Some(&id)).unwrap().exists());
+    store.delete(&id, &first.revision).unwrap();
+    assert!(!store.checked_path(Some(&id)).unwrap().exists());
+    assert!(store.get(&id).is_err());
+    assert!(store.delete(&id, &first.revision).is_err());
+}
+#[test]
 fn failed_atomic_write_does_not_replace_document() {
     let (_dir, store) = fixture();
     let first = store.create(input("repo")).unwrap();

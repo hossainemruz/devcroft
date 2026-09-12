@@ -41,6 +41,8 @@ pub(crate) enum ArtifactCommand {
     Archive(RevisionArgs),
     /// Restore an artifact to default lists.
     Unarchive(RevisionArgs),
+    /// Permanently delete an artifact and its comments.
+    Delete(RevisionArgs),
     /// Read and manage artifact feedback.
     Comment(CommentArgs),
 }

@@ -24,6 +24,18 @@ pub(crate) enum Kind {
     Note,
 }
 
+impl Kind {
+    pub(crate) const ALL: [Self; 3] = [Self::Rfc, Self::Plan, Self::Note];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Rfc => "RFC",
+            Self::Plan => "Plan",
+            Self::Note => "Note",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OriginSession {

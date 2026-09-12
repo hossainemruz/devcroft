@@ -168,7 +168,7 @@ In Cmd+P, render a trailing agent label and icon/text status for each checkout r
 
 Keep recency ordering stable during live updates. Do not reorder rows under the user's selection. Make provider names and status words searchable; preserve selection by stable checkout/item identity if a status-filtered result disappears. Normal repository selection keeps its current behavior.
 
-Add the warning immediately after the persistent command trigger, visible even when Cmd+P is closed and on Home/Tasks/Review. Use singular/plural forms and omit the element when no attention or observation-loss indication is needed. Count distinct live Agent panes with confirmed blockers, including the current pane. The count is independent of the palette's search filter.
+Add the warning immediately after the persistent command trigger, visible even when Cmd+P is closed and on Home/Resources/Review. Use singular/plural forms and omit the element when no attention or observation-loss indication is needed. Count distinct live Agent panes with confirmed blockers, including the current pane. The count is independent of the palette's search filter.
 
 Clicking the warning opens Cmd+P in an attention-only view using the same project model; choosing a row switches to that existing checkout and focuses its Agent pane. This explicit action does not acknowledge its blocker. Keep the filtered model and confirmation target synchronized if an agent unblocks while the picker is open. Ensure narrow headers truncate gracefully and expose accessible labels/tooltips with provider, state, and observation health.
 

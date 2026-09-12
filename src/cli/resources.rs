@@ -1,4 +1,4 @@
-//! Parser-only planning arguments. Domain validation remains in shared stores.
+//! Parser-only resource arguments. Domain validation remains in shared stores.
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};

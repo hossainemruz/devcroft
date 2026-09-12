@@ -1,4 +1,4 @@
-//! Command-line surface; headless planning contract in `docs/resources.md`.
+//! Command-line surface; headless resources contract in `docs/resources.md`.
 //!
 //! Day-one contract: `devcroft app [--checkout <path>]` boots the GUI,
 //! bare `devcroft` prints help. `devcroft preview <path>` opens the file in
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
-pub(crate) mod planning;
+pub(crate) mod resources;
 pub(crate) mod review;
 
 /// First-class CLI: `devcroft app` starts the workspace; future subcommands
@@ -27,7 +27,7 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
-/// GUI entry points and headless resources, with planning handlers under
+/// GUI entry points and headless resources, with resource handlers under
 /// `src/commands/`. `GitStatus` is a headless diagnostic in
 /// the spirit of the planned `status | doctor` command that itemizes what
 /// the header dot sees, for loader-vs-CLI disagreements.
@@ -43,11 +43,11 @@ pub(crate) enum Command {
     /// `git status --porcelain` line count for comparison.
     GitStatus(GitStatusArgs),
     /// Discover portable repository keys (no local checkout required).
-    Repository(planning::RepositoryArgs),
+    Repository(resources::RepositoryArgs),
     /// Discover agent session identities for artifact origin links.
-    Session(planning::RepositoryArgs),
+    Session(resources::RepositoryArgs),
     /// Manage standalone Markdown artifacts without a running desktop.
-    Artifact(planning::ArtifactArgs),
+    Artifact(resources::ArtifactArgs),
     /// List and manage local branch-pair review comments.
     Review(review::ReviewArgs),
     /// Install, inspect, or remove the bundled agent skill.

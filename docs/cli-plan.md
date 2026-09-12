@@ -54,7 +54,7 @@ Explicit non-goals for v1: no remote access, no second transport, no daemon mode
 
 - Filesystem scoping is the first boundary: socket dir `0700`, `portable/`-only git scoping already structural per the data plan, temp-sibling-plus-rename atomic writes with per-path serialization reused by every CLI mutation.
 - Inside-only enforcement (so arbitrary local processes cannot drive the UI) is a per-launch token injected only into Agent/Editor PTY env and validated by the socket server, mirroring the Electron loopback reference endpoint's bearer design without HTTP. Store commands need no token (they are just file operations under the user's own data dir).
-- The comment-body boundary, tutorial dialect/ETag/fingerprint concurrency (`review_changed` vs `tutorial_changed`), canonical `task-0001` ID validation, and unknown-repository rejection all live in the shared modules, so GUI, CLI, and future skills cannot diverge.
+- The comment-body boundary, tutorial dialect/ETag/fingerprint concurrency (`review_changed` vs `tutorial_changed`), artifact ID validation, and unknown-repository rejection all live in the shared modules, so GUI, CLI, and future skills cannot diverge.
 
 ## Output and errors
 

@@ -15,8 +15,8 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../assets/skills/devcroft/SKILL.md"),
     ),
     (
-        "references/planning.md",
-        include_str!("../assets/skills/devcroft/references/planning.md"),
+        "references/resources.md",
+        include_str!("../assets/skills/devcroft/references/resources.md"),
     ),
     (
         "references/review.md",

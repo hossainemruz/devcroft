@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use serde_json::json;
 
-use crate::cli::planning::{ArtifactArgs, ArtifactCommand, KindArg};
+use crate::cli::resources::{ArtifactArgs, ArtifactCommand, KindArg};
 use crate::data::artifacts::{self, ArtifactPatch, ArtifactStore, NewArtifact};
 
 use super::{input, output};
@@ -39,7 +39,7 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
             );
         }
         ArtifactCommand::Comment(options) => {
-            use crate::cli::planning::CommentCommand::*;
+            use crate::cli::resources::CommentCommand::*;
             use artifacts::CommentChange as Change;
             let (record, change) = match options.command {
                 List(record) => {

@@ -362,7 +362,7 @@ impl HomeView {
     }
 
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
-        self.refresh_planning(cx);
+        self.refresh_artifacts(cx);
         if let Some(root) = &self.root {
             self.projects = recent_repositories(root, 4);
             match Dashboard::load(root) {
@@ -396,7 +396,7 @@ impl HomeView {
         cx.notify();
     }
 
-    pub(crate) fn refresh_planning(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_artifacts(&mut self, cx: &mut Context<Self>) {
         if self.active && self.page == Some("Artifacts") { self.artifacts.update(cx, |view, cx| view.refresh(cx)); }
     }
 

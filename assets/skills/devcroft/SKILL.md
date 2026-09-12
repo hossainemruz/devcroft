@@ -19,8 +19,8 @@ Use the `devcroft` CLI for Devcroft records. Artifact and review operations work
 | Need | Commands / guidance |
 | --- | --- |
 | Discover repositories | `devcroft repository list --json` |
-| Store RFCs, plans, notes as Markdown artifacts | `devcroft artifact` — read [planning](references/planning.md) |
-| Read and manage artifact comments | `devcroft artifact comment` — read [planning](references/planning.md) |
+| Store RFCs, plans, notes as Markdown artifacts | `devcroft artifact` — read [resources](references/resources.md) |
+| Read and manage artifact comments | `devcroft artifact comment` — read [resources](references/resources.md) |
 | Discover session identities | `devcroft session list --json` |
 | Read and address local review comments | `devcroft review` — read [review](references/review.md) |
 | Show a Markdown file to the user | `devcroft preview /absolute/path/to/file.md` (opens a GUI window) |

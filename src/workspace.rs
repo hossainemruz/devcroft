@@ -393,7 +393,7 @@ impl Workspace {
                             if !this.home_visible && this.active_tab == WorkspaceTab::Resources {
                                 this.resources.update(cx, |view, cx| view.refresh(cx));
                             }
-                            this.home.update(cx, |view, cx| view.refresh_planning(cx));
+                            this.home.update(cx, |view, cx| view.refresh_artifacts(cx));
                             cx.notify();
                         }
                     })

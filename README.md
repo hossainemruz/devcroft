@@ -37,7 +37,7 @@ devcroft artifact list --repository KEY --json
 devcroft artifact comment list ART_ID --json
 ```
 
-The CLI works without a running desktop. Records use the selected `DEVCROFT_DATA_DIR` or the normal per-OS root. See [Resources](docs/resources.md) and the [agent instructions](assets/skills/devcroft/references/planning.md).
+The CLI works without a running desktop. Records use the selected `DEVCROFT_DATA_DIR` or the normal per-OS root. See [Resources](docs/resources.md) and the [agent instructions](assets/skills/devcroft/references/resources.md).
 
 ## Code review
 

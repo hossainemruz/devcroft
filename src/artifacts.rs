@@ -1,16 +1,22 @@
 //! Repository resources, shared by the workspace and global artifact browser.
 use crate::data::DataRoot;
 use crate::data::artifacts::{
-    ArtifactList, ArtifactPatch, ArtifactStore, CommentChange, ListOptions, Snapshot,
+    ArtifactList, ArtifactPatch, ArtifactStore, CommentChange, Kind, ListOptions, Snapshot,
 };
 use crate::preview::PreviewView;
+use crate::relative_time::{current_unix_secs, relative_duration_label};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Sizable, Size, StyledExt as _, h_flex, tag::Tag, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    Anchor, AppContext as _, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, div, px,
 };
 use std::time::Duration;
 const PAGE_SIZE: usize = 100;
@@ -60,6 +66,7 @@ pub(crate) struct ArtifactBrowser {
     active: bool,
     refresh: Refresh,
     include_archived: bool,
+    kind_filter: Option<Kind>,
     limit: usize,
     list: ArtifactList,
     selected_id: Option<String>,
@@ -99,6 +106,7 @@ impl ArtifactBrowser {
             active: false,
             refresh: Refresh::default(),
             include_archived: false,
+            kind_filter: None,
             limit: PAGE_SIZE,
             list: ArtifactList::default(),
             selected_id: None,
@@ -124,6 +132,7 @@ impl ArtifactBrowser {
             self.error = None;
             self.list = ArtifactList::default();
             self.limit = PAGE_SIZE;
+            self.kind_filter = None;
             self.refresh(cx);
         }
     }
@@ -140,6 +149,29 @@ impl ArtifactBrowser {
         self.include_archived = value;
         self.limit = PAGE_SIZE;
         self.refresh(cx);
+    }
+    pub(crate) fn set_kind_filter(&mut self, filter: Option<Kind>, cx: &mut Context<Self>) {
+        if self.kind_filter != filter {
+            self.kind_filter = filter;
+            // Keep the detail in sync with the visible list: if the current
+            // selection is filtered out, fall back to the first visible card.
+            let selected_visible = self.selected_id.as_ref().is_some_and(|id| {
+                self.visible_artifacts()
+                    .any(|snapshot| &snapshot.artifact.id == id)
+            });
+            if !selected_visible {
+                let fallback = self.visible_artifacts().next().cloned();
+                self.select(fallback, cx);
+                self.error = None;
+            }
+            cx.notify();
+        }
+    }
+    fn visible_artifacts(&self) -> impl Iterator<Item = &Snapshot> {
+        self.list.artifacts.iter().filter(|snapshot| {
+            self.kind_filter
+                .is_none_or(|kind| snapshot.artifact.kind == kind)
+        })
     }
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.saving {
@@ -367,6 +399,15 @@ enum Mutation {
     Archive,
 }
 
+/// `Updated 2h ago` for sidebar cards. `updated_at_ms` is unix millis (see
+/// `data::record::timestamp`); future values read as `just now` rather than
+/// a negative duration. Pure over `now_secs` for tests.
+fn updated_label(updated_at_ms: u64, now_secs: i64) -> String {
+    let then_secs = updated_at_ms.saturating_div(1_000) as i64;
+    let diff = now_secs.saturating_sub(then_secs);
+    format!("Updated {}", relative_duration_label(diff))
+}
+
 impl Render for ArtifactBrowser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut sidebar = v_flex()
@@ -380,27 +421,108 @@ impl Render for ArtifactBrowser {
             .border_r_1()
             .border_color(cx.theme().border)
             .child(div().font_semibold().child("Resources"))
-            .child(
-                Button::new("resource-archived")
-                    .ghost()
-                    .label(if self.include_archived {
-                        "Hide archived"
-                    } else {
-                        "Show archived"
-                    })
-                    .disabled(self.draft.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_include_archived(!this.include_archived, cx)
-                    })),
+            .child({
+                let active = self.kind_filter;
+                let disabled = self.draft.is_some() || self.saving;
+                let current = active.map(Kind::label).unwrap_or("All");
+                let view = cx.entity().downgrade();
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Button::new("resource-kind-filter")
+                                .label(current)
+                                .w_full()
+                                .accessibility_label(format!(
+                                    "Filter resources by type, currently {current}"
+                                ))
+                                .dropdown_caret(true)
+                                .outline()
+                                .disabled(disabled)
+                                .dropdown_menu_with_anchor(
+                                    Anchor::BottomLeft,
+                                    move |menu, _, _| {
+                                        let mut menu = menu;
+                                        for kind in [None]
+                                            .into_iter()
+                                            .chain(Kind::ALL.iter().copied().map(Some))
+                                        {
+                                            let view: WeakEntity<Self> = view.clone();
+                                            let checked = active == kind;
+                                            let label = kind.map(Kind::label).unwrap_or("All");
+                                            menu = menu.item(
+                                                PopupMenuItem::new(label)
+                                                    .checked(checked)
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ = view.update(cx, |this, cx| {
+                                                            this.set_kind_filter(kind, cx)
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    },
+                                ),
+                        ),
+                    )
+                    .child(
+                        Checkbox::new("resource-archived")
+                            .label("Archived")
+                            .accessibility_label("Show archived resources")
+                            .checked(self.include_archived)
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.set_include_archived(*checked, cx);
+                            })),
+                    )
+            });
+        let visible: Vec<Snapshot> = self.visible_artifacts().cloned().collect();
+        if visible.is_empty() && !self.list.artifacts.is_empty() {
+            sidebar = sidebar.child(
+                div()
+                    .text_xs()
+                    .child("No matching resources for this filter."),
             );
-        for snapshot in &self.list.artifacts {
+        }
+        for snapshot in &visible {
             let snapshot = snapshot.clone();
             let artifact = &snapshot.artifact;
+            let age = updated_label(artifact.updated_at, current_unix_secs());
+            let mut recency = age.clone();
+            if artifact.archived {
+                recency.push_str(" · Archived");
+            }
+            let tooltip = format!("{}\n{} · {recency}", artifact.title, artifact.kind.label());
             sidebar = sidebar.child(
                 Button::new(SharedString::from(artifact.id.clone()))
                     .ghost()
                     .w_full()
-                    .label(artifact.title.clone())
+                    .h_auto()
+                    .p_2()
+                    .tooltip(tooltip)
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .items_start()
+                            .gap_1()
+                            .child(div().w_full().truncate().child(artifact.title.clone()))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Tag::secondary()
+                                            .with_size(Size::Small)
+                                            .rounded_full()
+                                            .flex_none()
+                                            .child(artifact.kind.label()),
+                                    )
+                                    .child(div().text_xs().child(recency)),
+                            ),
+                    )
                     .disabled(self.draft.is_some() || self.saving)
                     .when(self.selected_id.as_ref() == Some(&artifact.id), |b| {
                         b.bg(cx.theme().secondary)
@@ -438,14 +560,7 @@ impl Render for ArtifactBrowser {
                 detail.child(
                     h_flex()
                         .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_lg()
-                                .font_semibold()
-                                .child(artifact.title.clone()),
-                        )
+                        .justify_end()
                         .child(
                             Button::new("edit-resource")
                                 .label("Edit Markdown")

@@ -1,4 +1,4 @@
-//! Headless planning handlers: translate CLI inputs, call shared stores, render.
+//! Headless resource handlers: translate CLI inputs, call shared stores, render.
 mod artifacts;
 mod input;
 mod output;
@@ -6,7 +6,7 @@ mod output;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::cli::planning::{RepositoryArgs, RepositoryCommand};
+use crate::cli::resources::{RepositoryArgs, RepositoryCommand};
 
 pub(crate) use artifacts::artifact;
 

@@ -14,7 +14,7 @@ Existing schema 3 JSON artifacts are read without modification. The first explic
 
 ## CLI
 
-See the bundled [agent resource instructions](../assets/skills/devcroft/references/planning.md) for creation, editing, session links, and the full comment lifecycle. All operations are headless. `DEVCROFT_DATA_DIR` selects the same root used by the desktop.
+See the bundled [agent resource instructions](../assets/skills/devcroft/references/resources.md) for creation, editing, session links, and the full comment lifecycle. All operations are headless. `DEVCROFT_DATA_DIR` selects the same root used by the desktop.
 
 ## Manual desktop check
 

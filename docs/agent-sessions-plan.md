@@ -6,7 +6,7 @@ Status: implemented (v1), 2026-09-10. Catalog, Home Recent Activity, Agent sideb
 
 Show recent local conversations from OpenCode, Codex, and Claude Code in two places, using one shared session catalog:
 
-- Home: add **Recent Activity** between Recent Projects and Recent Tasks, with up to **4 cards** across projects. Each card shows session title, repository label, and agent. Clicking anywhere on the card opens the matching checkout, selects Agent, and opens that exact conversation.
+- Home: add **Recent Activity** above Recent Projects, with up to **4 cards** across projects. Each card shows session title, repository label, and agent. Clicking anywhere on the card opens the matching checkout, selects Agent, and opens that exact conversation.
 - Agent tab: a left sidebar showing the most recently worked-on sessions for the current checkout (25 by default, adjustable in Settings > Agent), merged across supported agents. Each row shows title, agent, and relative last activity time. Clicking switches the visible agent and conversation. Highlight the selected row across its full width.
 - Both lists sort by last session activity descending, independent of repository opening time. Home's four is a named constant; the sidebar limit persists per machine in `device.json` (`recent_sessions_limit`).
 - Session information remains device-local. Provider stores own transcripts; Devcroft stores only a disposable local metadata cache.
@@ -29,7 +29,7 @@ Entering a checkout starts its most recent catalog session rather than a fresh s
 
 | Existing code | Relevant behavior | Planned change |
 | --- | --- | --- |
-| `src/home.rs` | Recent Projects and Recent Tasks; `HomeEvent::OpenRepository` | Render session cards from catalog snapshots; emit a stable session target |
+| `src/home.rs` | Recent Projects and Inbox; `HomeEvent::OpenRepository` | Render session cards from catalog snapshots; emit a stable session target |
 | `src/workspace.rs` | `RepositoryTabs` retains one Agent pane per checkout; `switch_repository` restores it | Own a per-checkout session host and route exact session navigation |
 | `src/agent.rs`, `src/data/workspace_agents.rs` | Agent identity and device-local default by canonical checkout | Keep defaults separate from active conversation selection |
 | `src/pane.rs` | Creates an activity launch and PTY together | Accept new/resume launch intent and expose lifecycle failures |

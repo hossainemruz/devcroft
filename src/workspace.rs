@@ -2035,7 +2035,10 @@ impl Workspace {
             }
             NavigationCommand::Home => self.go_home(window, cx),
             NavigationCommand::Back => {
-                if self.home_visible && self.home.read(cx).is_projects_page() {
+                if self.home_visible
+                    && (self.home.read(cx).is_projects_page()
+                        || self.home.read(cx).is_pull_requests_page())
+                {
                     self.go_home(window, cx);
                 } else {
                     self.go_back_from_artifacts(window, cx);
@@ -2446,7 +2449,8 @@ impl Render for Workspace {
         } else {
             SharedString::from("")
         };
-        let is_home_page = is_artifacts || is_projects;
+        let is_pull_requests = self.home_visible && self.home.read(cx).is_pull_requests_page();
+        let is_home_page = is_artifacts || is_projects || is_pull_requests;
         let attention_count = self.agent_activity.snapshot().attention_count();
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
@@ -2564,7 +2568,7 @@ impl Render for Workspace {
                                 ),
                         )
                     })
-                    .when(is_projects, |header| {
+                    .when(is_projects || is_pull_requests, |header| {
                         header.child(
                             h_flex()
                                 .flex_none()
@@ -2578,12 +2582,13 @@ impl Render for Workspace {
                                             this.go_home(window, cx)
                                         })),
                                 )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .child(SharedString::from("Projects")),
-                                ),
+                                .child(div().text_sm().font_semibold().child(SharedString::from(
+                                    if is_pull_requests {
+                                        "Pull Requests"
+                                    } else {
+                                        "Projects"
+                                    },
+                                ))),
                         )
                     })
                     .when(!self.home_visible, |header| {

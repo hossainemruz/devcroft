@@ -23,6 +23,7 @@ mod metrics;
 mod navigation;
 mod pane;
 mod preview;
+mod pull_requests;
 mod relative_time;
 mod review;
 mod session;

@@ -23,12 +23,30 @@ pub(crate) enum Category {
 }
 
 impl Category {
-    pub(crate) const ALL: [Self; 3] = [Self::ToReview, Self::WaitingForReview, Self::Watching];
+    pub(crate) const ALL: [Self; 3] = [Self::WaitingForReview, Self::ToReview, Self::Watching];
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::ToReview => "To Review",
-            Self::WaitingForReview => "Waiting for Review",
+            Self::WaitingForReview => "Waiting for Approval",
             Self::Watching => "Watching",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PrGroup {
+    #[default]
+    Personal,
+    Work,
+}
+
+impl PrGroup {
+    pub(crate) const ALL: [Self; 2] = [Self::Personal, Self::Work];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Personal => "Personal",
+            Self::Work => "Work",
         }
     }
 }
@@ -46,6 +64,8 @@ pub(crate) struct Item {
     pub(crate) url: String,
     #[serde(default)]
     pub(crate) category: Category,
+    #[serde(default)]
+    pub(crate) pr_group: PrGroup,
     #[serde(default)]
     pub(crate) completed: bool,
     #[serde(flatten)]
@@ -106,7 +126,7 @@ pub(crate) fn safe_web_url(url: &str) -> bool {
             .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
 }
 
-fn github_pr_url(url: &str) -> Result<String> {
+pub(crate) fn github_pr_url(url: &str) -> Result<String> {
     let parts: Vec<_> = url
         .strip_prefix("https://github.com/")
         .unwrap_or_default()
@@ -179,6 +199,32 @@ impl Dashboard {
         Ok(())
     }
 
+    pub(crate) fn pull_requests(&self, category: Category, group: Option<PrGroup>) -> Vec<Item> {
+        self.items
+            .iter()
+            .filter(|item| {
+                item.kind == Kind::PullRequest
+                    && item.category == category
+                    && group.is_none_or(|group| item.pr_group == group)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn move_pr(&mut self, original: &Item, category: Category) -> Result<()> {
+        let item = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == original.id)
+            .ok_or_else(|| anyhow::anyhow!("This PR was removed. Reload the board"))?;
+        anyhow::ensure!(
+            item.kind == Kind::PullRequest && item == original,
+            "This PR changed. Try moving it again"
+        );
+        item.category = category;
+        Ok(())
+    }
+
     pub(crate) fn move_todo(&mut self, source: &str, target: &str) {
         let eligible = |i: &Item| i.kind == Kind::Todo && !i.completed;
         let from = self
@@ -199,6 +245,46 @@ impl Dashboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_prs_keep_their_column_and_gain_personal_group() {
+        let mut doc: Dashboard = serde_json::from_value(serde_json::json!({"items":[{
+            "id":"legacy", "kind":"PullRequest", "title":"PR", "url":"https://github.com/a/b/pull/1",
+            "category":"WaitingForReview", "futureField":42
+        }]})).unwrap();
+        let original = doc.items[0].clone();
+        assert_eq!(original.pr_group, PrGroup::Personal);
+        assert_eq!(original.category.label(), "Waiting for Approval");
+        assert_eq!(
+            doc.pull_requests(Category::WaitingForReview, Some(PrGroup::Personal))
+                .len(),
+            1
+        );
+        assert!(
+            doc.pull_requests(Category::WaitingForReview, Some(PrGroup::Work))
+                .is_empty()
+        );
+        doc.move_pr(&original, Category::Watching).unwrap();
+        assert!(doc.move_pr(&original, Category::ToReview).is_err());
+        let mut moved = doc.items[0].clone();
+        moved.pr_group = PrGroup::Work;
+        doc.upsert(moved).unwrap();
+        assert_eq!(
+            doc.pull_requests(Category::Watching, Some(PrGroup::Work))
+                .len(),
+            1
+        );
+        assert_eq!(doc.pull_requests(Category::Watching, None).len(), 1);
+        assert!(
+            doc.pull_requests(Category::WaitingForReview, None)
+                .is_empty()
+        );
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["items"][0]["futureField"], 42);
+        assert_eq!(serde_json::from_value::<Dashboard>(json).unwrap(), doc);
+        doc.items.clear();
+        assert!(doc.move_pr(&original, Category::Watching).is_err());
+    }
+
     #[test]
     fn edits_completion_and_unknown_fields_survive_roundtrip() {
         let mut doc: Dashboard = serde_json::from_value(serde_json::json!({

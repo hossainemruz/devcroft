@@ -1,4 +1,5 @@
-//! Home dashboard and deliberately lightweight destination placeholders.
+//! Home dashboard and dedicated destinations.
+mod pull_requests;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
@@ -22,7 +23,7 @@ fn item_id(prefix: &str, id: &str) -> SharedString {
     format!("{prefix}-{id}").into()
 }
 
-use crate::data::dashboard::{Category, Dashboard, Item, Kind, safe_web_url};
+use crate::data::dashboard::{Category, Dashboard, Item, Kind, PrGroup, safe_web_url};
 use crate::data::{
     DataRoot, RecentRepository, RepositoryEntry, SyncStatus, SyncTracker, all_repositories,
     recent_repositories,
@@ -254,6 +255,9 @@ pub(crate) struct HomeView {
     active: bool,
     project_git: ProjectGitCache,
     git_loading: bool,
+    pr_status: crate::pull_requests::Cache,
+    pr_loading: bool,
+    pr_filter: Option<PrGroup>,
     project_focus: HashMap<String, FocusHandle>,
     scroll: ScrollHandle,
     /// Cursor for navigation-mode `j`/`k` through Home cards in visual order
@@ -333,6 +337,9 @@ impl HomeView {
             active: true,
             project_git: ProjectGitCache::default(),
             git_loading: false,
+            pr_status: crate::pull_requests::Cache::default(),
+            pr_loading: false,
+            pr_filter: None,
             project_focus: HashMap::new(),
             scroll: ScrollHandle::new(),
             navigation_cursor: None,
@@ -342,7 +349,10 @@ impl HomeView {
             loop {
                 cx.background_executor().timer(PROJECT_GIT_INTERVAL).await;
                 if this
-                    .update(cx, |this, cx| this.refresh_project_git(cx))
+                    .update(cx, |this, cx| {
+                        this.refresh_project_git(cx);
+                        this.refresh_pull_requests(false, cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -465,8 +475,18 @@ impl HomeView {
     /// Ordered stops for navigation-mode `j`/`k` in visual order: recent
     /// sessions, recent projects, then inbox items (PRs grouped by category,
     /// then todos, then reading) matching the dashboard render order. Only
-    /// the dashboard (not the Artifacts page or placeholders) participates.
+    /// the dashboard and PR board participate; the board follows its filter.
     fn navigation_targets(&self) -> Vec<HomeNavTarget> {
+        if self.is_pull_requests_page() {
+            return Category::ALL
+                .into_iter()
+                .flat_map(|category| {
+                    self.visible_pull_requests(category)
+                        .into_iter()
+                        .map(|item| HomeNavTarget::Item(item.id))
+                })
+                .collect();
+        }
         if self.page.is_some() {
             return Vec::new();
         }
@@ -697,6 +717,7 @@ impl HomeView {
         });
         self.project_git.invalidate(&self.linked_checkout_paths());
         self.refresh_project_git(cx);
+        self.refresh_pull_requests(false, cx);
         cx.notify();
     }
 
@@ -733,6 +754,7 @@ impl HomeView {
         })();
         match result {
             Ok(()) => {
+                self.refresh_pull_requests(false, cx);
                 cx.notify();
                 true
             }
@@ -758,6 +780,7 @@ impl HomeView {
         let url = input(&item.url, "https://…", window, cx);
         let home = cx.entity().downgrade();
         let category = std::rc::Rc::new(std::cell::Cell::new(item.category));
+        let pr_group = std::rc::Rc::new(std::cell::Cell::new(item.pr_group));
         let original = self.data.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let mut form = v_flex().gap_3().child("Title").child(Input::new(&title));
@@ -771,8 +794,16 @@ impl HomeView {
                     let category = category.clone();
                     Button::new(("category", index)).label(if category.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
                         .on_click(move |_, _, cx| { category.set(choice); cx.refresh_windows(); })
-                }))).child("GitHub status fetching is not implemented yet.");
+                })))
+                .child("Group")
+                .child(h_flex().gap_2().children(PrGroup::ALL.into_iter().enumerate().map(|(index, choice)| {
+                    let pr_group = pr_group.clone();
+                    Button::new(("pr-group", index))
+                        .label(if pr_group.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
+                        .on_click(move |_, _, cx| { pr_group.set(choice); cx.refresh_windows(); })
+                })));
             }
+            let pr_group = pr_group.clone();
             let (title, description, label, url, home, category, item, original) = (title.clone(), description.clone(), label.clone(), url.clone(), home.clone(), category.clone(), item.clone(), original.clone());
             dialog.title("Edit Home item").w(px(560.)).child(form)
                 .footer(DialogFooter::new()
@@ -785,6 +816,7 @@ impl HomeView {
                 item.label = label.read(cx).value().to_string();
                 item.url = url.read(cx).value().to_string();
                 item.category = category.get();
+                item.pr_group = pr_group.get();
                 home.update(cx, |this, cx| this.change(window, cx, |data| {
                     anyhow::ensure!(*data == original, "Home changed while this form was open. Close it and reopen the item.");
                     data.upsert(item)
@@ -807,8 +839,11 @@ impl HomeView {
                 Button::new(item_id("view-all", title))
                     .ghost()
                     .label("View all →")
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.focus_handle.focus(window, cx);
                         this.page = Some(destination);
+                        this.navigation_cursor = None;
+                        this.refresh_pull_requests(false, cx);
                         this.scroll.set_offset(point(px(0.), px(0.)));
                         cx.notify();
                     })),
@@ -1431,12 +1466,14 @@ impl HomeView {
             );
         }
         if kind == Kind::PullRequest {
-            panel = panel.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Manually tracked · status not fetched"),
-            );
+            panel = panel
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("GitHub status · refreshes every minute"),
+                )
+                .child(self.pr_refresh_button(cx));
         }
         if items.is_empty() {
             panel = panel.child(
@@ -1454,6 +1491,10 @@ impl HomeView {
                 .iter()
                 .filter(|i| kind != Kind::PullRequest || i.category == category)
             {
+                if kind == Kind::PullRequest {
+                    panel = panel.child(self.pr_card(item, false, cx));
+                    continue;
+                }
                 if kind == Kind::Todo {
                     panel = panel.child(self.todo_card(item, cx));
                     continue;
@@ -1640,6 +1681,8 @@ impl Render for HomeView {
                 // Back navigation and the title live in the workspace
                 // titlebar, matching the Artifacts page.
                 body = body.child(self.projects_page(window, cx));
+            } else if page == "Pull Requests" {
+                body = body.child(self.pull_requests_page(cx));
             } else {
                 body = body
                     .child(

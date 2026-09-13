@@ -257,7 +257,13 @@ pub(crate) struct HomeView {
     git_loading: bool,
     pr_status: crate::pull_requests::Cache,
     pr_loading: bool,
-    pr_filter: Option<PrGroup>,
+    /// Session-local group filter for PRs (`None` shows Personal + Work).
+    /// Shared by the inbox list and the dedicated board.
+    pr_group_filter: Option<PrGroup>,
+    /// Session-local category filter for the PR inbox (`None` shows all
+    /// categories). The dedicated board keeps showing every column; only the
+    /// inbox list applies this filter.
+    pr_category_filter: Option<Category>,
     project_focus: HashMap<String, FocusHandle>,
     scroll: ScrollHandle,
     /// Cursor for navigation-mode `j`/`k` through Home cards in visual order
@@ -339,7 +345,8 @@ impl HomeView {
             git_loading: false,
             pr_status: crate::pull_requests::Cache::default(),
             pr_loading: false,
-            pr_filter: None,
+            pr_group_filter: None,
+            pr_category_filter: None,
             project_focus: HashMap::new(),
             scroll: ScrollHandle::new(),
             navigation_cursor: None,
@@ -505,10 +512,17 @@ impl HomeView {
             .cloned()
             .collect();
         for category in Category::ALL {
+            if self
+                .pr_category_filter
+                .is_some_and(|filter| filter != category)
+            {
+                continue;
+            }
             for item in visible.iter().filter(|i| {
                 i.kind == Kind::PullRequest
                     && (self.show_completed || !i.completed)
                     && i.category == category
+                    && self.pr_group_filter.is_none_or(|group| i.pr_group == group)
             }) {
                 targets.push(HomeNavTarget::Item(item.id.clone()));
             }
@@ -855,6 +869,74 @@ impl HomeView {
                         cx.notify();
                     })),
             )
+    }
+
+    /// Category dropdown for the PR inbox: All plus every category
+    /// (Waiting for Approval, To Review, Watching). Matches the "Category"
+    /// section of the PR editor and the board columns.
+    fn pr_category_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.pr_category_filter;
+        let label = current.map_or("All", Category::label);
+        let home = cx.entity().downgrade();
+        Button::new("pr-category-filter")
+            .ghost()
+            .label(format!("{label} ▾"))
+            .dropdown_menu(move |mut menu, _, _| {
+                for option in [
+                    None,
+                    Some(Category::WaitingForReview),
+                    Some(Category::ToReview),
+                    Some(Category::Watching),
+                ] {
+                    let option_label = option.map_or("All", Category::label);
+                    let home = home.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option_label)
+                            .checked(current == option)
+                            .on_click(move |_, _, cx| {
+                                let _ = home.update(cx, |this, cx| {
+                                    if this.pr_category_filter != option {
+                                        this.pr_category_filter = option;
+                                        this.navigation_cursor = None;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
+    /// Group dropdown for the PR inbox: All, Personal, Work. Matches the
+    /// "Group" section of the PR editor.
+    fn pr_group_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.pr_group_filter;
+        let label = current.map_or("All", PrGroup::label);
+        let home = cx.entity().downgrade();
+        Button::new("pr-group-filter")
+            .ghost()
+            .label(format!("{label} ▾"))
+            .dropdown_menu(move |mut menu, _, _| {
+                for option in [None, Some(PrGroup::Personal), Some(PrGroup::Work)] {
+                    let option_label = option.map_or("All", PrGroup::label);
+                    let home = home.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option_label)
+                            .checked(current == option)
+                            .on_click(move |_, _, cx| {
+                                let _ = home.update(cx, |this, cx| {
+                                    if this.pr_group_filter != option {
+                                        this.pr_group_filter = option;
+                                        this.navigation_cursor = None;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
     }
 
     /// The dedicated Projects page: every portable record, including ones
@@ -1446,11 +1528,20 @@ impl HomeView {
             Kind::PullRequest => ("Pull Requests", "Pull Requests"),
             Kind::Reading => ("To Read", "To Read"),
         };
+        let is_pr = kind == Kind::PullRequest;
         let items: Vec<_> = self
             .data
             .items
             .iter()
-            .filter(|i| i.kind == kind && (self.show_completed || !i.completed))
+            .filter(|i| {
+                i.kind == kind
+                    && (self.show_completed || !i.completed)
+                    && (!is_pr
+                        || self
+                            .pr_category_filter
+                            .is_none_or(|category| i.category == category))
+                    && (!is_pr || self.pr_group_filter.is_none_or(|group| i.pr_group == group))
+            })
             .cloned()
             .collect();
         let mut panel = v_flex()
@@ -1472,15 +1563,28 @@ impl HomeView {
                     .child("Next items to do · drag a card to reorder"),
             );
         }
-        if kind == Kind::PullRequest {
-            panel = panel
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("GitHub status · refreshes every minute"),
-                )
-                .child(self.pr_refresh_button(cx));
+        if is_pr {
+            panel = panel.child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_sm().child("Category:"))
+                            .child(self.pr_category_filter_dropdown(cx)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_sm().child("Group:"))
+                            .child(self.pr_group_filter_dropdown(cx)),
+                    ),
+            );
         }
         if items.is_empty() {
             panel = panel.child(
@@ -1491,9 +1595,6 @@ impl HomeView {
             );
         }
         for category in Category::ALL {
-            if kind == Kind::PullRequest && items.iter().any(|item| item.category == category) {
-                panel = panel.child(div().text_sm().font_semibold().child(category.label()));
-            }
             for item in items
                 .iter()
                 .filter(|i| kind != Kind::PullRequest || i.category == category)
@@ -1649,11 +1750,30 @@ impl HomeView {
                 break;
             }
         }
-        panel.child(h_flex().mt_auto().pt_3().justify_end().child(
-            Button::new(item_id("add", title)).label("+ Add").on_click(
-                cx.listener(move |this, _, window, cx| this.editor(Item::new(kind), window, cx)),
-            ),
-        ))
+        if is_pr {
+            panel.child(
+                h_flex()
+                    .mt_auto()
+                    .pt_3()
+                    .justify_end()
+                    .items_center()
+                    .gap_2()
+                    .child(self.pr_refresh_button(cx))
+                    .child(
+                        Button::new(item_id("add", title)).label("+ Add").on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.editor(Item::new(kind), window, cx)
+                            }),
+                        ),
+                    ),
+            )
+        } else {
+            panel.child(h_flex().mt_auto().pt_3().justify_end().child(
+                Button::new(item_id("add", title)).label("+ Add").on_click(
+                    cx.listener(move |this, _, window, cx| this.editor(Item::new(kind), window, cx)),
+                ),
+            ))
+        }
     }
 }
 

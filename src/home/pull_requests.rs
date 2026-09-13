@@ -21,7 +21,7 @@ impl HomeView {
     }
 
     pub(super) fn visible_pull_requests(&self, category: Category) -> Vec<Item> {
-        self.data.pull_requests(category, self.pr_filter)
+        self.data.pull_requests(category, self.pr_group_filter)
     }
 
     pub(super) fn refresh_pull_requests(&mut self, force: bool, cx: &mut Context<Self>) {
@@ -71,7 +71,6 @@ impl HomeView {
     pub(super) fn pr_refresh_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         Button::new("refresh-pr-status")
             .ghost()
-            .self_start()
             .label(if self.pr_loading {
                 "Refreshing…"
             } else {
@@ -138,11 +137,12 @@ impl HomeView {
                 badges = badges.child(Tag::color(color).with_size(Size::Small).child(label));
             }
         }
-        let edit = item.clone();
         let delete_id = item.id.clone();
-        let url = item.url.clone();
+        let open_url = item.url.clone();
         let menu_item = item.clone();
+        let menu_title = title.clone();
         let entity = cx.entity();
+        let edit_item = item.clone();
         let mut card = v_flex()
             .id(item_id("pr", &item.id))
             .w_full()
@@ -162,7 +162,69 @@ impl HomeView {
                     cx.new(|_| drag.clone())
                 })
             })
-            .child(div().font_medium().child(title))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_medium()
+                            .child(title.clone()),
+                    )
+                    .child(
+                        Button::new(item_id("pr-menu", &item.id))
+                            .ghost()
+                            .label("⋯")
+                            .accessibility_label(format!("Options for {menu_title}"))
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                                let home = entity.clone();
+                                let edit = edit_item.clone();
+                                menu = menu.item(PopupMenuItem::new("Edit").on_click(
+                                    move |_, window, cx| {
+                                        home.update(cx, |this, cx| {
+                                            this.editor(edit.clone(), window, cx);
+                                        });
+                                    },
+                                ));
+                                for category in Category::ALL {
+                                    if category == menu_item.category {
+                                        continue;
+                                    }
+                                    let item = menu_item.clone();
+                                    let home = entity.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(format!(
+                                            "Move to {}",
+                                            category.label()
+                                        ))
+                                        .on_click(move |_, window, cx| {
+                                            home.update(cx, |this, cx| {
+                                                this.move_pr(&item, category, window, cx)
+                                            })
+                                        }),
+                                    );
+                                }
+                                let home = entity.clone();
+                                let id = delete_id.clone();
+                                menu.separator().item(
+                                    PopupMenuItem::new("Remove from tracking").on_click(
+                                        move |_, window, cx| {
+                                            home.update(cx, |this, cx| {
+                                                this.change(window, cx, |data| {
+                                                    data.items.retain(|item| item.id != id);
+                                                    Ok(())
+                                                });
+                                            });
+                                        },
+                                    ),
+                                )
+                            }),
+                    ),
+            )
             .child(
                 div()
                     .text_xs()
@@ -217,84 +279,38 @@ impl HomeView {
         }
         card.child(
             h_flex()
-                .gap_2()
-                .flex_wrap()
+                .w_full()
+                .justify_end()
                 .child(
                     Button::new(item_id("open-pr", &item.id))
                         .ghost()
                         .label("Open ↗")
                         .on_click(move |_, _, cx| {
-                            if safe_web_url(&url) {
-                                cx.open_url(&url);
+                            if safe_web_url(&open_url) {
+                                cx.open_url(&open_url);
                             }
-                        }),
-                )
-                .child(
-                    Button::new(item_id("edit-pr", &item.id))
-                        .ghost()
-                        .label("Edit")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.editor(edit.clone(), window, cx)
-                        })),
-                )
-                .child(
-                    Button::new(item_id("pr-menu", &item.id))
-                        .ghost()
-                        .label("⋯")
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for category in Category::ALL {
-                                if category == menu_item.category {
-                                    continue;
-                                }
-                                let item = menu_item.clone();
-                                let home = entity.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(format!("Move to {}", category.label()))
-                                        .on_click(move |_, window, cx| {
-                                            home.update(cx, |this, cx| {
-                                                this.move_pr(&item, category, window, cx)
-                                            })
-                                        }),
-                                );
-                            }
-                            let home = entity.clone();
-                            let id = delete_id.clone();
-                            menu.separator().item(
-                                PopupMenuItem::new("Remove from tracking").on_click(
-                                    move |_, window, cx| {
-                                        home.update(cx, |this, cx| {
-                                            this.change(window, cx, |data| {
-                                                data.items.retain(|item| item.id != id);
-                                                Ok(())
-                                            });
-                                        });
-                                    },
-                                ),
-                            )
                         }),
                 ),
         )
     }
 
     pub(super) fn pull_requests_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut filters = h_flex().gap_2().flex_wrap();
-        for (index, group) in [None, Some(PrGroup::Personal), Some(PrGroup::Work)]
-            .into_iter()
-            .enumerate()
-        {
+        let mut filters = h_flex().gap_2().flex_wrap().items_center();
+        for group in [None, Some(PrGroup::Personal), Some(PrGroup::Work)] {
             let label = group.map_or("All", PrGroup::label);
+            let checked = self.pr_group_filter == group;
             filters = filters.child(
-                Button::new(("filter-pr", index))
-                    .ghost()
-                    .label(if self.pr_filter == group {
-                        format!("✓ {label}")
-                    } else {
-                        label.to_owned()
-                    })
+                Radio::new(item_id("filter-pr", label))
+                    .label(label.to_owned())
+                    .checked(checked)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.pr_filter = group;
-                        this.navigation_cursor = None;
-                        cx.notify();
+                        // Radios never toggle off: selecting the active one is
+                        // a no-op, any other pick becomes the filter.
+                        if this.pr_group_filter != group {
+                            this.pr_group_filter = group;
+                            this.navigation_cursor = None;
+                            cx.notify();
+                        }
                     })),
             );
         }
@@ -334,7 +350,7 @@ impl HomeView {
             for item in items {
                 column = column.child(self.pr_card(&item, true, cx));
             }
-            let group = self.pr_filter.unwrap_or_default();
+            let group = self.pr_group_filter.unwrap_or_default();
             column = column.child(
                 Button::new(("add-pr-column", index))
                     .ghost()

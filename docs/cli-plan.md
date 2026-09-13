@@ -11,8 +11,8 @@ Give the project a first-class CLI where `devcroft app` starts the current GPUI 
 - [Resources](resources.md) defines Markdown artifacts, repository membership, originating sessions, and revision-checked document/comment mutations.
 
 - `docs/feature-parity.md` §11 already requires the rewrite to expose the thirteen original agent operations as a CLI rather than a loopback MCP server, preserving filters, validation, atomicity, optimistic-concurrency contracts, the human-owned comment-body boundary, the tutorial source-inspection contract, error vocabulary, and live-refresh semantics adapted to a non-running-desktop model. This plan is the concrete shape of that requirement.
-- `docs/data-directory-plan.md` owns root resolution (`DEVCROFT_DATA_DIR` override else per-OS default), `portable/` as the only synced subtree, and atomic JSON writes. The CLI reuses it verbatim and derives its transport from the same root.
-- `docs/review-plan.md` M2 (portable comments, human-owns-bodies store API) and M3 (tutorial get/write with fingerprint + ETag concurrency) define the store semantics the CLI must reuse, not reimplement.
+- `src/data/` owns root resolution (`DEVCROFT_DATA_DIR` override else per-OS default), `portable/` as the only synced subtree, and atomic JSON writes. The CLI reuses it verbatim and derives its transport from the same root.
+- [Review comments](review-comments.md) (local branch-pair store, human-owns-bodies API) and [Resources](resources.md) define the store semantics the CLI reuses, not reimplements.
 
 ## Agreed decisions
 

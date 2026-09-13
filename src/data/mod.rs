@@ -1,11 +1,11 @@
-//! App-owned data directory (see `docs/data-directory-plan.md`).
+//! App-owned data directory: root resolution, device store, and portable sync.
 //!
 //! One root (`DEVCROFT_DATA_DIR` or a per-OS default) holds machine-local
 //! `device.json` next to a Git-backed `portable/` subtree. The root itself
 //! is never a Git repository, so sync scoped to `portable/` structurally
 //! cannot see `device.json` — no `.gitignore` trust required.
 //!
-//! The submodules split the plan checklist: [`device`] owns `device.json`
+//! The submodules split the responsibilities: [`device`] owns `device.json`
 //! load/save, [`portable`] owns first-run init plus the `origin` remote,
 //! [`repositories`] owns portable repository records plus checkout
 //! inspection, and [`sync`] owns the portable-only Git pipeline over the git CLI.

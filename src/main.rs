@@ -7,7 +7,7 @@ mod artifacts;
 mod cli;
 mod command_palette;
 mod commands;
-/// Data-directory foundation (`docs/data-directory-plan.md`): root
+/// Data-directory foundation (`src/data/`): root
 /// resolution, device store, first-run init, portable-only sync.
 /// Startup consumes resolution/init/device-load; origin and sync gain
 /// Settings consumers (manual run, schedule, remote) while workspace
@@ -84,7 +84,7 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         // variants of k/p are fallbacks for environments without a platform
         // modifier).
         // Everything else keyboard-driven lives in navigation mode (`cmd-m`,
-        // see `docs/keyboard-navigation-plan.md`) and the palettes: tab
+        // see `docs/keyboard-reference.md`) and the palettes: tab
         // jumps, session creation, and settings have no direct bindings, so
         // `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow control),
         // `ctrl-n` (readline), `ctrl-d` (end-of-file), and `ctrl-/` keep
@@ -137,8 +137,8 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
 /// non-fatal with dark/default fallbacks — the terminal tabs and the
 /// preview remain usable without persisted state.
 fn resolve_appearance() -> (ThemeMode, f32) {
-    // App-owned data root: resolve, `mkdir -p`, and first-run init
-    // `portable/` (see `docs/data-directory-plan.md`).
+    // App-owned data root: resolve, `mkdir -p`, and first-run init of
+    // `portable/`.
     let root = match data::ensure_ready(None) {
         Ok(root) => root,
         Err(error) => {

@@ -22,11 +22,9 @@ creation, and settings live in navigation mode and the palettes.
 ## While navigation mode is open
 
 - Press an action key to run it exactly once and return to normal mode.
-- `h` and `l` move focus between visible panes (left/right) and keep the
-  mode open so movement can repeat. Movement clamps at the outer panes.
-  `Enter` keeps the focused pane and returns to normal mode.
-- `Escape` or the toggle again returns to normal mode without running
-  anything. Focus stays where pane movement left it, otherwise where it was.
+- `h` and `l` (or `←`/`→`) move focus between visible panes (left/right) and keep the mode open so movement can repeat. Movement clamps at the outer panes.
+- `j` and `k` (or `↓`/`↑`) move within the focused pane and keep the mode open so movement can repeat. Movement clamps at the ends. On the sessions sidebar and on Home cards the cursor only moves keyboard focus highlighting: `Enter` opens the highlighted session, project, or card once and returns to normal mode. On artifact/resource lists and review files the selection applies live while the mode stays open, and on the review diff `j`/`k` scrolls; there `Enter` only keeps the focused pane and returns to normal mode.
+- `Escape` or the toggle again returns to normal mode without running anything. Focus stays where pane movement left it, otherwise where it was. Sidebar and Home cursor highlights clear on exit.
 - Unknown keys, modified keys, and held-key repeats are consumed while the
   mode stays open. They never reach a terminal or an input.
 - Clicking anywhere, switching location, opening another overlay, or
@@ -43,9 +41,14 @@ creation, and settings live in navigation mode and the palettes.
 | Selected resource, no draft or save running | `m` Edit Markdown, `c` Add comment |
 | Resource draft, save not running | `w` Save draft, `q` Cancel draft |
 | Multiple visible panes | `h` Focus left pane, `l` Focus right pane |
+| Sessions sidebar (Agent tab, sidebar focused) | `j` Next session, `k` Previous session, `Enter` Open highlighted session |
+| Home dashboard | `j` Next card, `k` Previous card (sessions, projects, then inbox items in visual order), `Enter` Open or toggle highlighted card |
+| Resources sidebar and global Artifacts list | `j` Next resource, `k` Previous resource (preview follows, mode stays open) |
+| Review files pane | `j` Next file, `k` Previous file (diff follows, mode stays open) |
+| Review diff pane | `j` Scroll down, `k` Scroll up (mode stays open) |
 
 Resource actions appear on the Resources tab and on the global Artifacts page. Drafts survive navigation through the existing save lifecycle, and saving reuses the existing revision checks. Starting an edit focuses the draft input.
 
 ## Panes
 
-Pane movement follows the rendered left-to-right layout and only includes regions on screen. Agent covers the sessions sidebar and the terminal; Review covers files, diff, and comments when shown; Resources and Artifacts cover the list, the document or draft, and the comments and outline rails when shown. Editor and Terminal each have one pane. Home has one pane. The focused pane is named in the list and native panes show a focus ring.
+Pane movement follows the rendered left-to-right layout and only includes regions on screen. Agent covers the sessions sidebar and the terminal; Review covers files, diff, and comments when shown; Resources and Artifacts cover the list, the document or draft, and the comments and outline rails when shown. Editor and Terminal each have one pane. Home has one pane: `j`/`k` there walk every dashboard card (recent sessions, recent projects, then pull requests, todos, and reading items) instead of switching panes. The focused pane is named in the list and native panes show a focus ring; the `j`/`k` cursor shows as a ring around the highlighted sidebar row or card.

@@ -249,6 +249,11 @@ pub(crate) struct Workspace {
     /// the selected pane active after the overlay disappears.
     navigation_open: bool,
     navigation_pane: usize,
+    /// Cursor for navigation-mode `j`/`k` through the Agent sessions sidebar
+    /// in display order (open sessions, then recent). `None` outside the
+    /// sidebar or outside navigation mode; `Enter` opens the cursor session
+    /// once and exits the mode, `Escape` exits without opening.
+    session_cursor: Option<usize>,
     /// Keys consumed by the navigation interceptor and held until release so
     /// physical repeats cannot toggle twice or leak into a newly focused
     /// terminal. The flag per key records whether any modifier moved since
@@ -638,6 +643,7 @@ impl Workspace {
             artifacts_origin: None,
             navigation_open: false,
             navigation_pane: 0,
+            session_cursor: None,
             navigation_claimed_keys: HashMap::new(),
             agent_sidebar_focus: cx.focus_handle().tab_stop(true),
             _navigation_interceptor: navigation_interceptor,
@@ -1718,12 +1724,54 @@ impl Workspace {
             .rposition(|(_, focus)| focus.contains_focused(window, cx))
             .unwrap_or(0);
         self.navigation_open = true;
+        // Start item cursors where `j`/`k` should repeat from: the active
+        // session in the sidebar, the first Home card on the dashboard.
+        // Artifact and review lists reuse their existing selection.
+        if self.home_visible && !self.home.read(cx).is_artifacts_page() {
+            self.home
+                .update(cx, |view, cx| view.set_navigation_active(true, cx));
+            self.session_cursor = None;
+        } else if !self.home_visible
+            && self.active_tab == WorkspaceTab::Agent
+            && self.navigation_pane == 0
+        {
+            let agent_index = WorkspaceTab::Agent as usize;
+            let active = self.tabs[agent_index]
+                .as_ref()
+                .and_then(|pane| pane.read(cx).launch_id());
+            let active_key = active
+                .and_then(|id| self.open_sessions.get(&id))
+                .and_then(|session| session.key.clone());
+            self.init_session_cursor(active, active_key);
+            self.home
+                .update(cx, |view, cx| view.set_navigation_active(false, cx));
+        } else {
+            self.session_cursor = None;
+            self.home
+                .update(cx, |view, cx| view.set_navigation_active(false, cx));
+        }
         cx.notify();
     }
 
     fn close_navigation(&mut self, cx: &mut Context<Self>) {
-        if self.navigation_open {
+        let was_open = self.navigation_open;
+        if was_open {
             self.navigation_open = false;
+        }
+        if self.session_cursor.is_some() {
+            self.session_cursor = None;
+        }
+        // Clearing the Home highlight is cheap and keeps a stale cursor from
+        // reappearing on the next visit; `notify` only when something changed.
+        let home_cleared = self.home.update(cx, |view, cx| {
+            if view.take_navigation_cursor().is_some() {
+                cx.notify();
+                true
+            } else {
+                false
+            }
+        });
+        if was_open || home_cleared {
             cx.notify();
         }
     }
@@ -1742,6 +1790,70 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Move the item cursor within the focused pane for navigation-mode
+    /// `j`/`k`. Keeps the mode open for repeats; locations without a list
+    /// consume the key and stay open. Clamps at the ends like pane movement.
+    fn move_navigation_item(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.home_visible {
+            if self.home.read(cx).is_artifacts_page() {
+                self.home
+                    .update(cx, |view, cx| view.artifacts_move_selection(down, cx));
+            } else {
+                self.home
+                    .update(cx, |view, cx| view.move_navigation_cursor(down, cx));
+            }
+        } else {
+            match self.active_tab {
+                WorkspaceTab::Agent => {
+                    if self.navigation_pane == 0 {
+                        self.move_session_cursor(down);
+                    }
+                }
+                WorkspaceTab::Resources => {
+                    if self.navigation_pane == 0 {
+                        self.resources
+                            .update(cx, |view, cx| view.move_selection(down, cx));
+                    }
+                }
+                WorkspaceTab::Review => match self.navigation_pane {
+                    0 => self
+                        .review
+                        .update(cx, |view, cx| view.move_file_selection(down, cx)),
+                    1 => self
+                        .review
+                        .update(cx, |view, cx| view.move_diff_scroll(down, cx)),
+                    _ => {}
+                },
+                WorkspaceTab::Editor | WorkspaceTab::Terminal => {}
+            }
+        }
+        cx.notify();
+    }
+
+    /// Navigation-mode `Enter`: open the `j`/`k` cursor item when one is
+    /// active (sessions sidebar, Home cards), otherwise keep the focused pane
+    /// like before. Runs once and returns to normal mode either way.
+    fn accept_navigation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.home_visible
+            && self.active_tab == WorkspaceTab::Agent
+            && self.navigation_pane == 0
+            && self.session_cursor.is_some()
+            && self.activate_session_cursor(window, cx)
+        {
+            return;
+        }
+        if self.home_visible && !self.home.read(cx).is_artifacts_page() {
+            let activated = self
+                .home
+                .update(cx, |view, cx| view.activate_navigation_cursor(window, cx));
+            if activated {
+                self.close_navigation(cx);
+                return;
+            }
+        }
+        self.close_navigation(cx);
+    }
+
     fn run_navigation_command(
         &mut self,
         command: NavigationCommand,
@@ -1750,7 +1862,8 @@ impl Workspace {
     ) {
         // Availability was checked to render the HUD, but actions validate it
         // again here so a refresh/save cannot make a stale row unsafe.
-        self.navigation_open = false;
+        // Close through the shared path so item cursors clear with the mode.
+        self.close_navigation(cx);
         match command {
             NavigationCommand::AddRepository => self.open_add_repository(window, cx),
             NavigationCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
@@ -1788,6 +1901,45 @@ impl Workspace {
         }
     }
 
+    /// Whether navigation-mode `j`/`k` moves something at the current
+    /// location: Home cards, the Artifacts list, the sessions sidebar, the
+    /// Resources sidebar, or Review files/diff. Other panes consume the keys
+    /// and stay open.
+    fn navigation_item_available(&self, cx: &App) -> bool {
+        if self.home_visible {
+            if self.home.read(cx).is_artifacts_page() {
+                return true;
+            }
+            return self.home.read(cx).has_navigation_targets();
+        }
+        match self.active_tab {
+            WorkspaceTab::Agent => {
+                self.navigation_pane == 0 && !self.session_nav_order().is_empty()
+            }
+            WorkspaceTab::Resources => self.navigation_pane == 0,
+            WorkspaceTab::Review => matches!(self.navigation_pane, 0 | 1),
+            WorkspaceTab::Editor | WorkspaceTab::Terminal => false,
+        }
+    }
+
+    /// Whether navigation-mode `Enter` opens the `j`/`k` cursor item instead
+    /// of only keeping the focused pane: the sessions sidebar and Home cards.
+    /// Artifact and review lists apply their selection live, so `Enter` there
+    /// only keeps focus.
+    fn navigation_enter_opens(&self, cx: &App) -> bool {
+        if !self.home_visible
+            && self.active_tab == WorkspaceTab::Agent
+            && self.navigation_pane == 0
+            && self.session_cursor.is_some()
+        {
+            return true;
+        }
+        if self.home_visible && !self.home.read(cx).is_artifacts_page() {
+            return self.home.read(cx).navigation_cursor_active();
+        }
+        false
+    }
+
     /// The mode toggle: `cmd-m` on macOS, `super-m` on Linux. Plain `m`
     /// stays free as the Edit Markdown action key (it carries no
     /// modifiers, so it never matches), and `ctrl-m` must keep reaching
@@ -1817,6 +1969,8 @@ impl Workspace {
             "enter" => NavigationInput::Enter,
             "h" | "left" | "arrowleft" => NavigationInput::Left,
             "l" | "right" | "arrowright" => NavigationInput::Right,
+            "j" | "down" | "arrowdown" => NavigationInput::Down,
+            "k" | "up" | "arrowup" => NavigationInput::Up,
             _ => {
                 let mut chars = keystroke.key.chars();
                 match (chars.next(), chars.next()) {
@@ -1891,11 +2045,12 @@ impl Workspace {
         cx.stop_propagation();
         match decision {
             NavigationDecision::Open => self.open_navigation(window, cx),
-            NavigationDecision::Close | NavigationDecision::AcceptFocus => {
-                self.close_navigation(cx)
-            }
+            NavigationDecision::Close => self.close_navigation(cx),
+            NavigationDecision::AcceptFocus => self.accept_navigation_focus(window, cx),
             NavigationDecision::FocusLeft => self.move_navigation_focus(false, window, cx),
             NavigationDecision::FocusRight => self.move_navigation_focus(true, window, cx),
+            NavigationDecision::PrevItem => self.move_navigation_item(false, cx),
+            NavigationDecision::NextItem => self.move_navigation_item(true, cx),
             NavigationDecision::Execute(command) => {
                 self.run_navigation_command(command, window, cx)
             }
@@ -1982,22 +2137,28 @@ impl Workspace {
                             ),
                     )
                     .child(commands)
-                    .child(if panes.len() > 1 {
+                    .child({
+                        let item = self.navigation_item_available(cx);
+                        let enter = if self.navigation_enter_opens(cx) {
+                            "Enter open"
+                        } else {
+                            "Enter keep focus"
+                        };
+                        let hint = match (panes.len() > 1, item) {
+                            (true, true) => {
+                                format!("h/l focus pane · j/k move · {enter} · Esc/⌘M close")
+                            }
+                            (true, false) => format!("h/l focus pane · {enter} · Esc/⌘M close"),
+                            (false, true) => format!("j/k move · {enter} · Esc/⌘M close"),
+                            (false, false) => "Esc/⌘M close".to_owned(),
+                        };
                         div()
                             .pt_2()
                             .border_t_1()
                             .border_color(rgb(0x292b2b))
                             .text_xs()
                             .text_color(rgb(0x858989))
-                            .child("h/l focus pane · Enter keep focus · Esc/⌘M close")
-                    } else {
-                        div()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(rgb(0x292b2b))
-                            .text_xs()
-                            .text_color(rgb(0x858989))
-                            .child("Esc/⌘M close")
+                            .child(hint)
                     }),
             )
             .into_any_element()

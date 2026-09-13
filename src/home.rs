@@ -209,6 +209,18 @@ pub(crate) struct HomeView {
     git_loading: bool,
     project_focus: HashMap<String, FocusHandle>,
     scroll: ScrollHandle,
+    /// Cursor for navigation-mode `j`/`k` through Home cards in visual order
+    /// (sessions, projects, then inbox items). `None` outside navigation mode;
+    /// `Enter` activates the cursor item once and exits the mode.
+    navigation_cursor: Option<usize>,
+}
+
+/// One stop for navigation-mode `j`/`k` on Home, in visual order.
+#[derive(Clone, PartialEq, Eq)]
+enum HomeNavTarget {
+    Session(usize),
+    Project(usize),
+    Item(String),
 }
 
 impl EventEmitter<HomeEvent> for HomeView {}
@@ -273,6 +285,7 @@ impl HomeView {
             git_loading: false,
             project_focus: HashMap::new(),
             scroll: ScrollHandle::new(),
+            navigation_cursor: None,
         };
         view.reload(cx);
         cx.spawn(async move |this, cx| {
@@ -358,6 +371,168 @@ impl HomeView {
             crate::navigation::Command::CancelDraft => artifacts.cancel_draft(window, cx),
             _ => {}
         });
+    }
+
+    /// Navigation-mode `j`/`k` on the global Artifacts page: move the
+    /// artifact sidebar selection, keeping the mode open for repeats.
+    pub(crate) fn artifacts_move_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        self.artifacts
+            .update(cx, |view, cx| view.move_selection(down, cx));
+    }
+
+    /// Ordered stops for navigation-mode `j`/`k` in visual order: recent
+    /// sessions, recent projects, then inbox items (PRs grouped by category,
+    /// then todos, then reading) matching the dashboard render order. Only
+    /// the dashboard (not the Artifacts page or placeholders) participates.
+    fn navigation_targets(&self) -> Vec<HomeNavTarget> {
+        if self.page.is_some() {
+            return Vec::new();
+        }
+        let mut targets = Vec::new();
+        for index in 0..self.sessions.len() {
+            targets.push(HomeNavTarget::Session(index));
+        }
+        for index in 0..self.projects.len() {
+            targets.push(HomeNavTarget::Project(index));
+        }
+        let visible: Vec<Item> = self
+            .data
+            .items
+            .iter()
+            .filter(|i| self.show_completed || !i.completed)
+            .cloned()
+            .collect();
+        for category in Category::ALL {
+            for item in visible.iter().filter(|i| {
+                i.kind == Kind::PullRequest
+                    && (self.show_completed || !i.completed)
+                    && i.category == category
+            }) {
+                targets.push(HomeNavTarget::Item(item.id.clone()));
+            }
+        }
+        for item in visible
+            .iter()
+            .filter(|i| i.kind == Kind::Todo && (self.show_completed || !i.completed))
+        {
+            targets.push(HomeNavTarget::Item(item.id.clone()));
+        }
+        for item in visible
+            .iter()
+            .filter(|i| i.kind == Kind::Reading && (self.show_completed || !i.completed))
+        {
+            targets.push(HomeNavTarget::Item(item.id.clone()));
+        }
+        targets
+    }
+
+    /// Whether a dashboard item id holds the navigation cursor, for card
+    /// highlight while navigation mode owns the keyboard.
+    fn is_cursor_item(&self, id: &str) -> bool {
+        let targets = self.navigation_targets();
+        self.navigation_cursor
+            .and_then(|cursor| targets.get(cursor))
+            .is_some_and(|target| matches!(target, HomeNavTarget::Item(item_id) if item_id == id))
+    }
+
+    /// Enter/exit navigation-mode cursor tracking on Home. Entering starts at
+    /// the first card so `j`/`k` repeat predictably; exiting clears the
+    /// highlight. Reloads keep the cursor clamped rather than dropping it.
+    pub(crate) fn set_navigation_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if active {
+            let count = self.navigation_targets().len();
+            self.navigation_cursor = if count == 0 { None } else { Some(0) };
+        } else {
+            self.navigation_cursor = None;
+        }
+        cx.notify();
+    }
+
+    /// Clear the cursor without notifying; the caller notifies once.
+    pub(crate) fn take_navigation_cursor(&mut self) -> Option<usize> {
+        self.navigation_cursor.take()
+    }
+
+    /// Whether a `j`/`k` cursor is active for navigation-mode `Enter` to open.
+    pub(crate) fn navigation_cursor_active(&self) -> bool {
+        self.navigation_cursor.is_some()
+    }
+
+    /// Whether the dashboard offers any `j`/`k` stops right now.
+    pub(crate) fn has_navigation_targets(&self) -> bool {
+        !self.navigation_targets().is_empty()
+    }
+
+    /// Move the Home cursor one step, clamping at the ends like pane movement.
+    /// Keeps navigation mode open for repeats; a no-op with no targets. A
+    /// first press with no cursor lands at the nearest end.
+    pub(crate) fn move_navigation_cursor(&mut self, down: bool, cx: &mut Context<Self>) {
+        let count = self.navigation_targets().len();
+        if count == 0 {
+            self.navigation_cursor = None;
+            return;
+        }
+        let Some(current) = self.navigation_cursor else {
+            self.navigation_cursor = Some(if down { 0 } else { count - 1 });
+            cx.notify();
+            return;
+        };
+        let current = current.min(count - 1);
+        self.navigation_cursor = Some(crate::navigation::move_index(current, count, down));
+        cx.notify();
+    }
+
+    /// Activate the cursor item for navigation-mode `Enter`: open sessions and
+    /// projects, toggle todo/reading checkboxes, edit PRs. Returns true when
+    /// something ran so the caller exits navigation mode.
+    pub(crate) fn activate_navigation_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let targets = self.navigation_targets();
+        let Some(cursor) = self.navigation_cursor else {
+            return false;
+        };
+        let Some(target) = targets.get(cursor) else {
+            return false;
+        };
+        match target {
+            HomeNavTarget::Session(index) => {
+                if let Some((session, _)) = self.sessions.get(*index) {
+                    let key = session.key.clone();
+                    cx.emit(HomeEvent::OpenAgentSession(key));
+                    return true;
+                }
+                false
+            }
+            HomeNavTarget::Project(index) => {
+                if let Some(project) = self.projects.get(*index) {
+                    let key = project.key.clone();
+                    let label = project.display_name.clone().unwrap_or_else(|| key.clone());
+                    cx.emit(HomeEvent::OpenRepository { key, label });
+                    return true;
+                }
+                false
+            }
+            HomeNavTarget::Item(id) => {
+                let Some(item) = self.data.items.iter().find(|i| &i.id == id).cloned() else {
+                    return false;
+                };
+                if item.kind == Kind::PullRequest {
+                    self.editor(item, window, cx);
+                    return true;
+                }
+                let id = id.clone();
+                self.change(window, cx, |data| {
+                    if let Some(i) = data.items.iter_mut().find(|i| i.id == id) {
+                        i.completed = !i.completed;
+                    }
+                    Ok(())
+                });
+                true
+            }
+        }
     }
 
     fn refresh_project_git(&mut self, cx: &mut Context<Self>) {
@@ -547,13 +722,18 @@ impl HomeView {
     }
 
     fn todo_card(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
+        let cursor = self.is_cursor_item(&item.id);
         let mut row = v_flex()
             .id(item_id("home-item", &item.id))
             .gap_1()
             .p_2()
             .rounded_md()
             .border_1()
-            .border_color(cx.theme().border);
+            .border_color(if cursor {
+                cx.theme().ring
+            } else {
+                cx.theme().border
+            });
         if !item.completed {
             let drag = DragTodo {
                 id: item.id.clone(),
@@ -765,13 +945,18 @@ impl HomeView {
                     continue;
                 }
                 let id = item.id.clone();
+                let cursor = self.is_cursor_item(&id);
                 let mut row = v_flex()
                     .id(item_id("home-item", &id))
                     .gap_2()
                     .p_3()
                     .rounded_md()
                     .border_1()
-                    .border_color(cx.theme().border);
+                    .border_color(if cursor {
+                        cx.theme().ring
+                    } else {
+                        cx.theme().border
+                    });
                 let mut top = h_flex().gap_2();
                 if kind != Kind::PullRequest {
                     top = top.child(
@@ -968,7 +1153,7 @@ impl Render for HomeView {
                     ),
             );
             let mut sessions = h_flex().gap_4().flex_wrap();
-            for (session, repository) in &self.sessions {
+            for (session_index, (session, repository)) in self.sessions.iter().enumerate() {
                 let key = session.key.clone();
                 let id: SharedString = format!(
                     "home-session-{}-{}-{}",
@@ -977,6 +1162,7 @@ impl Render for HomeView {
                     key.id
                 )
                 .into();
+                let cursor = self.navigation_cursor == Some(session_index);
                 sessions = sessions.child(
                     Button::new(id)
                         .ghost()
@@ -984,7 +1170,11 @@ impl Render for HomeView {
                         .h_auto()
                         .p_4()
                         .border_1()
-                        .border_color(cx.theme().border)
+                        .border_color(if cursor {
+                            cx.theme().ring
+                        } else {
+                            cx.theme().border
+                        })
                         .rounded_lg()
                         .tooltip(session.tooltip())
                         .child(
@@ -1071,6 +1261,8 @@ impl Render for HomeView {
                 let opened = project_opened_label(project.last_opened_at.as_deref(), now_secs)
                     .unwrap_or_else(|| "Not opened yet".to_owned());
                 let accessible = format!("Open {label}. {status}. {opened}");
+                let cursor =
+                    self.navigation_cursor == Some(self.sessions.len().saturating_add(index));
                 projects = projects.child(
                     // gpui-kit Base Button supplies pointer, Enter/Space, tab
                     // traversal and accessibility semantics for the whole card.
@@ -1088,7 +1280,11 @@ impl Render for HomeView {
                         .p_4()
                         .rounded_lg()
                         .border_1()
-                        .border_color(cx.theme().border)
+                        .border_color(if cursor {
+                            cx.theme().ring
+                        } else {
+                            cx.theme().border
+                        })
                         .hover(|style| style.bg(cx.theme().secondary))
                         .focus(|style| style.border_color(cx.theme().ring).bg(cx.theme().secondary))
                         .on_click(cx.listener(move |_, _, _, cx| {

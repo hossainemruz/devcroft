@@ -185,6 +185,8 @@ pub(crate) enum Input {
     Enter,
     Left,
     Right,
+    Up,
+    Down,
     Key(char),
     Modified,
     /// Raw held-key events are normalized by the platform before the
@@ -200,6 +202,8 @@ pub(crate) enum Decision {
     Close,
     FocusLeft,
     FocusRight,
+    PrevItem,
+    NextItem,
     AcceptFocus,
     Execute(Command),
     Consume,
@@ -224,6 +228,8 @@ pub(crate) fn decide(
         Input::Enter => Decision::AcceptFocus,
         Input::Left => Decision::FocusLeft,
         Input::Right => Decision::FocusRight,
+        Input::Up => Decision::PrevItem,
+        Input::Down => Decision::NextItem,
         Input::Key(key) => {
             resolve(context, resource, key).map_or(Decision::Consume, Decision::Execute)
         }
@@ -262,6 +268,17 @@ mod tests {
             resolve(Context::Artifacts, ResourceState::default(), 'b'),
             Some(Command::Back)
         );
+    }
+
+    #[test]
+    fn movement_keys_are_reserved_everywhere() {
+        // h/l move between panes and j/k move within the focused list:
+        // none of them may become single-key actions in any context.
+        for context in [Context::Home, Context::Workspace, Context::Artifacts] {
+            for key in ['h', 'l', 'j', 'k'] {
+                assert_eq!(resolve(context, ResourceState::default(), key), None);
+            }
+        }
     }
 
     #[test]
@@ -410,6 +427,33 @@ mod tests {
                 ResourceState::default()
             ),
             Decision::Execute(Command::Editor)
+        );
+        assert_eq!(
+            decide(
+                true,
+                Input::Up,
+                Context::Workspace,
+                ResourceState::default()
+            ),
+            Decision::PrevItem
+        );
+        assert_eq!(
+            decide(
+                true,
+                Input::Down,
+                Context::Workspace,
+                ResourceState::default()
+            ),
+            Decision::NextItem
+        );
+        assert_eq!(
+            decide(
+                false,
+                Input::Up,
+                Context::Workspace,
+                ResourceState::default()
+            ),
+            Decision::Ignore
         );
     }
 

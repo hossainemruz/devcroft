@@ -237,6 +237,70 @@ impl ReviewView {
         }
     }
 
+    /// Move the Files tree selection one step for navigation-mode `j`/`k`.
+    /// Clamps at the ends like pane movement. The stream follows on the next
+    /// render through the existing tree↔stream sync while the mode stays open
+    /// for repeated presses.
+    pub(crate) fn move_file_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        if !matches!(self.state, ReviewState::Loaded(_)) {
+            return;
+        }
+        let (current, count) = {
+            let tree = self.tree_state.read(cx);
+            let mut count = 0;
+            while tree.entry(count).is_some() {
+                count += 1;
+            }
+            (tree.selected_index(), count)
+        };
+        if count == 0 {
+            return;
+        }
+        let next = match current {
+            None => {
+                if down {
+                    0
+                } else {
+                    count - 1
+                }
+            }
+            Some(current) => crate::navigation::move_index(current.min(count - 1), count, down),
+        };
+        self.tree_state.update(cx, |tree, cx| {
+            tree.set_selected_index(Some(next), cx);
+            if let Some(entry) = tree.entry(next) {
+                let id = entry.item().id.clone();
+                tree.reveal_item(&id, ScrollStrategy::Center, cx);
+            }
+        });
+    }
+
+    /// Scroll the Diff stream a few rows for navigation-mode `j`/`k` while
+    /// the Diff pane holds navigation focus. Keeps the mode open for repeats.
+    pub(crate) fn move_diff_scroll(&mut self, down: bool, _: &mut Context<Self>) {
+        let ReviewState::Loaded(loaded) = &self.state else {
+            return;
+        };
+        let total = loaded.rows.len() + 1;
+        if total == 0 {
+            return;
+        }
+        let top = self.list_handle.logical_scroll_top();
+        let current = top.item_ix.min(total.saturating_sub(1));
+        let next = crate::navigation::move_index(current, total, down);
+        // Step by a few rows per press so long diffs move at a readable pace;
+        // clamping (not wrapping) matches pane movement.
+        let stepped = if down {
+            next.saturating_add(2).min(total.saturating_sub(1))
+        } else {
+            next.saturating_sub(2)
+        };
+        self.list_handle.scroll_to(ListOffset {
+            item_ix: stepped,
+            offset_in_item: px(0.),
+        });
+    }
+
     /// Reload when the tab becomes visible, unless a load is in flight.
     /// Freshness beats cached rows here: agents change the worktree under us.
     pub(crate) fn activate(&mut self, cx: &mut Context<Self>) {

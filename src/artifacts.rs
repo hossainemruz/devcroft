@@ -261,6 +261,39 @@ impl ArtifactBrowser {
                 .is_none_or(|kind| snapshot.artifact.kind == kind)
         })
     }
+
+    /// Move the sidebar selection one step for navigation-mode `j`/`k`.
+    /// Clamps at the ends like pane movement, keeps any draft, and leaves
+    /// focus where the pane left it: the detail preview follows the new
+    /// selection while the mode stays open for repeated presses.
+    pub(crate) fn move_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.draft.is_some() || self.saving {
+            return;
+        }
+        let visible: Vec<Snapshot> = self.visible_artifacts().cloned().collect();
+        if visible.is_empty() {
+            return;
+        }
+        let Some(current) = self
+            .selected_id
+            .as_ref()
+            .and_then(|id| visible.iter().position(|s| &s.artifact.id == id))
+        else {
+            let end = if down { 0 } else { visible.len() - 1 };
+            self.select(visible.get(end).cloned(), cx);
+            self.error = None;
+            cx.notify();
+            return;
+        };
+        let next = crate::navigation::move_index(current, visible.len(), down);
+        if next == current {
+            return;
+        }
+        let selection = visible.get(next).cloned();
+        self.select(selection, cx);
+        self.error = None;
+        cx.notify();
+    }
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.saving {
             return;

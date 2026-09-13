@@ -3,6 +3,13 @@ use gpui_kit::WeakEntity;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
 
+/// One stop for navigation-mode `j`/`k` in the Agent sessions sidebar, in
+/// display order (open sessions newest-first, then recent catalog rows).
+pub(super) enum SessionNavTarget {
+    Open(u64),
+    Recent(SessionKey),
+}
+
 /// Keyboard-navigable agent chooser behind `New session…`.
 /// Backed by the kit's `List`, so up/down move the selection, Enter confirms,
 /// Esc closes, and the first agent starts selected. `ListDelegate` callbacks
@@ -611,6 +618,112 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Display order for the sessions sidebar cursor, matching
+    /// `render_agent_sessions`: open sessions for this checkout (newest
+    /// first, excluding rows already shown as recent), then recent catalog
+    /// sessions.
+    pub(super) fn session_nav_order(&self) -> Vec<SessionNavTarget> {
+        let recent = self
+            .session_snapshot
+            .recent(&self.working_directory, self.session_limit);
+        let mut open: Vec<u64> = self
+            .open_sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.checkout == self.working_directory
+                    && !recent.iter().any(|r| s.key.as_ref() == Some(&r.key))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        open.sort_by_key(|id| std::cmp::Reverse(*id));
+        let mut order = Vec::new();
+        for id in open {
+            order.push(SessionNavTarget::Open(id));
+        }
+        for session in &recent {
+            order.push(SessionNavTarget::Recent(session.key.clone()));
+        }
+        order
+    }
+
+    /// Start the sidebar cursor at the active session (or the first row) when
+    /// navigation mode opens on the Sessions pane.
+    pub(super) fn init_session_cursor(
+        &mut self,
+        active: Option<u64>,
+        active_key: Option<SessionKey>,
+    ) {
+        let order = self.session_nav_order();
+        if order.is_empty() {
+            self.session_cursor = None;
+            return;
+        }
+        let position = active
+            .and_then(|id| {
+                order
+                    .iter()
+                    .position(|t| matches!(t, SessionNavTarget::Open(open) if *open == id))
+            })
+            .or_else(|| {
+                active_key.as_ref().and_then(|key| {
+                    order.iter().position(|t| match t {
+                        SessionNavTarget::Open(id) => {
+                            self.open_sessions.get(id).and_then(|s| s.key.as_ref()) == Some(key)
+                        }
+                        SessionNavTarget::Recent(recent) => recent == key,
+                    })
+                })
+            })
+            .unwrap_or(0);
+        self.session_cursor = Some(position.min(order.len() - 1));
+    }
+
+    /// Move the sidebar cursor one step, clamping at the ends like pane
+    /// movement. Keeps navigation mode open for repeats. A first press with
+    /// no cursor lands at the nearest end instead of skipping it.
+    pub(super) fn move_session_cursor(&mut self, down: bool) {
+        let order = self.session_nav_order();
+        if order.is_empty() {
+            self.session_cursor = None;
+            return;
+        }
+        let Some(current) = self.session_cursor else {
+            self.session_cursor = Some(if down { 0 } else { order.len() - 1 });
+            return;
+        };
+        let current = current.min(order.len() - 1);
+        self.session_cursor = Some(crate::navigation::move_index(current, order.len(), down));
+    }
+
+    /// Open the cursor session for navigation-mode `Enter`. Returns true when
+    /// something ran so the caller exits navigation mode.
+    pub(super) fn activate_session_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let order = self.session_nav_order();
+        let Some(cursor) = self.session_cursor else {
+            return false;
+        };
+        match order.get(cursor) {
+            Some(SessionNavTarget::Open(id)) => {
+                let id = *id;
+                if self.open_sessions.contains_key(&id) {
+                    self.activate_open_session(id, window, cx);
+                    return true;
+                }
+                false
+            }
+            Some(SessionNavTarget::Recent(key)) => {
+                let key = key.clone();
+                self.open_agent_session(key, window, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(super) fn render_agent_sessions(&self, cx: &mut Context<Self>) -> AnyElement {
         let agent_index = WorkspaceTab::Agent as usize;
         let active = self.tabs[agent_index]
@@ -653,16 +766,23 @@ impl Workspace {
         if !open.is_empty() {
             list = list.child(div().text_xs().child("Open sessions"));
         }
-        for (&id, session) in open {
+        let open_count = open.len();
+        for (open_pos, (&id, session)) in open.into_iter().enumerate() {
             let status = activity
                 .for_launch(id)
                 .map(|a| a.state.label())
                 .unwrap_or("Status unavailable");
             let is_active = active == Some(id);
+            let is_cursor = self.navigation_open
+                && self.navigation_pane == 0
+                && self.session_cursor == Some(open_pos);
             list = list.child(
                 h_flex()
                     .gap_1()
                     .rounded_md()
+                    .when(is_cursor, |row| {
+                        row.border_1().border_color(cx.theme().ring)
+                    })
                     .when(is_active, |row| row.bg(cx.theme().secondary))
                     .child(
                         Button::new(SharedString::from(format!("open-agent-{id}")))
@@ -703,7 +823,7 @@ impl Workspace {
             );
         }
         list = list.child(div().text_xs().child("Recent sessions"));
-        for session in &recent {
+        for (recent_pos, session) in recent.iter().enumerate() {
             let key = session.key.clone();
             let open = self
                 .open_sessions
@@ -743,6 +863,12 @@ impl Workspace {
                 this.open_agent_session(key.clone(), window, cx)
             }));
             let mut row = h_flex().gap_1().rounded_md().child(row);
+            let is_cursor = self.navigation_open
+                && self.navigation_pane == 0
+                && self.session_cursor == Some(open_count.saturating_add(recent_pos));
+            if is_cursor {
+                row = row.border_1().border_color(cx.theme().ring);
+            }
             if is_selected {
                 row = row.bg(cx.theme().secondary);
             }

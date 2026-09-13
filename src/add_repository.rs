@@ -32,11 +32,25 @@ use crate::command_palette::{
     PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
 };
 use crate::data::{
-    CheckoutInspection, DataRoot, NewRepositoryInput, create_repository, inspect_checkout,
+    CheckoutInspection, DataRoot, NewRepositoryInput, RepositoryMetadata, create_repository,
+    inspect_checkout, link_repository, update_repository_metadata,
 };
+
+/// What the dialog does on submit. Create writes a portable record plus a
+/// device binding; Link binds an existing portable record to a checkout
+/// (recovery for synced-but-unlinked records); Edit overwrites portable
+/// metadata in place. Key renames are out of scope (deferred per
+/// feature-parity), so Link/Edit carry a fixed key shown as static text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RepositoryDialogMode {
+    Create,
+    Link { key: String },
+    Edit { key: String },
+}
 
 pub(crate) struct AddRepositoryView {
     focus_handle: FocusHandle,
+    mode: RepositoryDialogMode,
     data_root: Option<DataRoot>,
     checkout_path: Option<PathBuf>,
     key: Entity<InputState>,
@@ -66,6 +80,7 @@ impl AddRepositoryView {
         };
         Self {
             focus_handle: cx.focus_handle(),
+            mode: RepositoryDialogMode::Create,
             data_root,
             checkout_path: None,
             key: input("e.g. hossainemruz-devcroft", cx),
@@ -80,6 +95,60 @@ impl AddRepositoryView {
             busy: false,
             error: None,
         }
+    }
+
+    /// Link mode: bind an existing portable record to a checkout. Only the
+    /// checkout browser matters; the key is fixed and rendered as static
+    /// text.
+    pub(crate) fn for_link(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        data_root: Option<DataRoot>,
+        key: String,
+    ) -> Self {
+        let mut view = Self::new(window, cx, data_root);
+        view.mode = RepositoryDialogMode::Link { key };
+        view
+    }
+
+    /// Edit mode: overwrite portable metadata in place. Fields prefill from
+    /// the stored record, so a cleared field means "clear it"; the key is
+    /// fixed (renames deferred) and rendered as static text.
+    pub(crate) fn for_edit(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        data_root: Option<DataRoot>,
+        key: String,
+        metadata: &RepositoryMetadata,
+    ) -> Self {
+        let mut view = Self::new(window, cx, data_root);
+        let mut prefill = |state: &Entity<InputState>, value: &str| {
+            if !value.is_empty() {
+                state.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+        };
+        prefill(
+            &view.display_name,
+            metadata.display_name.as_deref().unwrap_or(""),
+        );
+        prefill(&view.owner, metadata.owner.as_deref().unwrap_or(""));
+        prefill(&view.name, metadata.name.as_deref().unwrap_or(""));
+        prefill(
+            &view.description,
+            metadata.description.as_deref().unwrap_or(""),
+        );
+        prefill(&view.group, metadata.group.as_deref().unwrap_or(""));
+        prefill(
+            &view.tags,
+            &metadata.tags.clone().unwrap_or_default().join(", "),
+        );
+        prefill(&view.clone_url, metadata.clone_url.as_deref().unwrap_or(""));
+        prefill(
+            &view.base_branch,
+            metadata.base_branch.as_deref().unwrap_or(""),
+        );
+        view.mode = RepositoryDialogMode::Edit { key };
+        view
     }
 
     /// Pure form snapshot for validation: whitespace-only counts as absent.
@@ -234,7 +303,8 @@ impl AddRepositoryView {
         }
     }
 
-    /// Validate, then create the record plus binding off the main thread.
+    /// Validate, then persist off the main thread. Create writes the record
+    /// plus binding, Link binds an existing record, Edit overwrites metadata.
     /// The dialog stays open with the error on failure; success notifies
     /// and closes.
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -246,30 +316,68 @@ impl AddRepositoryView {
             cx.notify();
             return;
         };
-        let Some(checkout) = self.checkout_path.clone() else {
-            self.error = Some("select a checkout directory first".to_owned());
-            cx.notify();
-            return;
+        let mode = self.mode.clone();
+        // Edit needs no checkout; Create/Link require one.
+        let checkout = if mode == RepositoryDialogMode::Create
+            || matches!(mode, RepositoryDialogMode::Link { .. })
+        {
+            match self.checkout_path.clone() {
+                Some(checkout) => Some(checkout),
+                None => {
+                    self.error = Some("select a checkout directory first".to_owned());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
         };
-        let (key, input) = self.values(cx);
-        if key.is_empty() {
-            self.error = Some("enter a repository key".to_owned());
-            cx.notify();
-            return;
+        let (key_text, input) = self.values(cx);
+        // Resolve the fixed key for Link/Edit; validate the typed key for
+        // Create.
+        let key = match &mode {
+            RepositoryDialogMode::Create => {
+                if key_text.is_empty() {
+                    self.error = Some("enter a repository key".to_owned());
+                    cx.notify();
+                    return;
+                }
+                key_text
+            }
+            RepositoryDialogMode::Link { key } | RepositoryDialogMode::Edit { key } => key.clone(),
+        };
+        let verb = match &mode {
+            RepositoryDialogMode::Create => "added",
+            RepositoryDialogMode::Link { .. } => "linked",
+            RepositoryDialogMode::Edit { .. } => "saved",
         }
+        .to_owned();
         self.busy = true;
         self.error = None;
         cx.notify();
         cx.spawn_in(window, async move |view, cx| {
             let outcome = cx
                 .background_spawn(async move {
-                    create_repository(&root, &key, &checkout, &input).map(|created| created.key)
+                    match mode {
+                        RepositoryDialogMode::Create => {
+                            let checkout = checkout.expect("create requires a checkout");
+                            create_repository(&root, &key, &checkout, &input)
+                                .map(|created| created.key)
+                        }
+                        RepositoryDialogMode::Link { .. } => {
+                            let checkout = checkout.expect("link requires a checkout");
+                            link_repository(&root, &key, &checkout).map(|linked| linked.key)
+                        }
+                        RepositoryDialogMode::Edit { .. } => {
+                            update_repository_metadata(&root, &key, &input).map(|_| key.clone())
+                        }
+                    }
                 })
                 .await;
             let _ = cx.update(|window, cx| match outcome {
                 Ok(key) => {
                     let _ = view.update(cx, |_, cx| cx.emit(RepositoryAdded));
-                    window.push_notification(format!("Repository \"{key}\" added"), cx);
+                    window.push_notification(format!("Repository \"{key}\" {verb}"), cx);
                     window.close_dialog(cx);
                 }
                 Err(error) => {
@@ -368,9 +476,73 @@ impl AddRepositoryView {
             )
     }
 
+    fn render_fixed_key(&self, key: &str) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x858989))
+                    .child("Repository key"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xe7e7e7))
+                    .child(key.to_owned()),
+            )
+    }
+
+    fn render_metadata_fields(&self) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .w_full()
+            .child(self.field("Display name", &self.display_name))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.field("Owner", &self.owner)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.field("Name", &self.name)),
+                    ),
+            )
+            .child(self.field("Description", &self.description))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.field("Group", &self.group)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.field("Tags (comma-separated)", &self.tags)),
+                    ),
+            )
+            .child(self.field("Clone URL", &self.clone_url))
+            .child(self.field("Base branch", &self.base_branch))
+    }
+
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let confirm = view.clone();
+        let (busy_label, idle_label) = match self.mode {
+            RepositoryDialogMode::Create => ("Adding…", "Add repository"),
+            RepositoryDialogMode::Link { .. } => ("Linking…", "Link checkout"),
+            RepositoryDialogMode::Edit { .. } => ("Saving…", "Save changes"),
+        };
         h_flex()
             .gap_2()
             .justify_end()
@@ -385,11 +557,7 @@ impl AddRepositoryView {
             )
             .child(
                 Button::new("add-repository-submit")
-                    .label(if self.busy {
-                        "Adding…"
-                    } else {
-                        "Add repository"
-                    })
+                    .label(if self.busy { busy_label } else { idle_label })
                     .primary()
                     .on_click(move |_, window, cx| {
                         confirm.update(cx, |this, cx| this.submit(window, cx)).ok();
@@ -406,6 +574,39 @@ impl Focusable for AddRepositoryView {
 
 impl Render for AddRepositoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hint = match &self.mode {
+            RepositoryDialogMode::Create => {
+                "Browse fills empty fields from the checkout — your edits are never overwritten."
+            }
+            RepositoryDialogMode::Link { .. } => {
+                "Pick the local checkout to bind. Portable metadata stays untouched."
+            }
+            RepositoryDialogMode::Edit { .. } => {
+                "Clearing a field removes it from the portable record. The key cannot be renamed."
+            }
+        };
+        let mut body = v_flex().gap_3().w_full();
+        match &self.mode {
+            RepositoryDialogMode::Create => {
+                body = body
+                    .child(self.render_checkout(cx))
+                    .child(self.field("Repository key (required, lowercase)", &self.key))
+                    .child(self.render_metadata_fields());
+            }
+            RepositoryDialogMode::Link { key } => {
+                body = body
+                    .child(self.render_fixed_key(key))
+                    .child(self.render_checkout(cx));
+            }
+            RepositoryDialogMode::Edit { key } => {
+                body = body
+                    .child(self.render_fixed_key(key))
+                    .child(self.render_metadata_fields());
+            }
+        }
+        body = body.when_some(self.error.clone(), |this, error| {
+            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+        });
         v_flex()
             .size_full()
             .px_6()
@@ -413,60 +614,14 @@ impl Render for AddRepositoryView {
             .gap_3()
             .bg(rgb(0x090a0a))
             .text_color(rgb(0xe7e7e7))
-            .child(div().text_xs().text_color(rgb(0x737878)).child(
-                "Browse fills empty fields from the checkout — your edits are never overwritten.",
-            ))
+            .child(div().text_xs().text_color(rgb(0x737878)).child(hint))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .w_full()
                     .overflow_y_scrollbar()
-                    .child(
-                        v_flex()
-                            .gap_3()
-                            .w_full()
-                            .child(self.render_checkout(cx))
-                            .child(self.field("Repository key (required, lowercase)", &self.key))
-                            .child(self.field("Display name", &self.display_name))
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(self.field("Owner", &self.owner)),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(self.field("Name", &self.name)),
-                                    ),
-                            )
-                            .child(self.field("Description", &self.description))
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(self.field("Group", &self.group)),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w_0().child(
-                                            self.field("Tags (comma-separated)", &self.tags),
-                                        ),
-                                    ),
-                            )
-                            .child(self.field("Clone URL", &self.clone_url))
-                            .child(self.field("Base branch", &self.base_branch))
-                            .when_some(self.error.clone(), |this, error| {
-                                this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
-                            }),
-                    ),
+                    .child(body),
             )
             .child(self.render_footer(cx))
             .on_key_down(cx.listener(Self::on_key_down))

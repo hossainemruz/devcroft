@@ -4,6 +4,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme as _, ColorName, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _,
@@ -22,7 +23,10 @@ fn item_id(prefix: &str, id: &str) -> SharedString {
 }
 
 use crate::data::dashboard::{Category, Dashboard, Item, Kind, safe_web_url};
-use crate::data::{DataRoot, RecentRepository, SyncStatus, SyncTracker, recent_repositories};
+use crate::data::{
+    DataRoot, RecentRepository, RepositoryEntry, SyncStatus, SyncTracker, all_repositories,
+    recent_repositories,
+};
 use crate::git_status::{GitStatus, load_git_status};
 use crate::relative_time::{current_unix_secs, relative_duration_label};
 
@@ -187,8 +191,43 @@ fn project_opened_label(last_opened_at: Option<&str>, now_secs: i64) -> Option<S
 pub(crate) enum HomeEvent {
     OpenRepository { key: String, label: String },
     AddRepository,
+    LinkRepository { key: String },
+    EditRepository { key: String },
+    UnlinkRepository { key: String },
+    RemoveRepository { key: String },
     OpenAgentSession(crate::agent_sessions::SessionKey),
     RefreshSessions,
+}
+
+/// Session-local group filter for the Projects page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ProjectGroupFilter {
+    #[default]
+    All,
+    Group(String),
+    Ungrouped,
+}
+
+impl ProjectGroupFilter {
+    fn matches(&self, entry: &RepositoryEntry) -> bool {
+        match self {
+            Self::All => true,
+            Self::Group(group) => entry.group.as_deref() == Some(group.as_str()),
+            Self::Ungrouped => entry.group.is_none(),
+        }
+    }
+}
+
+/// Distinct non-empty groups present, sorted. Pure so the filter row stays
+/// unit-testable without a window.
+fn project_groups(entries: &[RepositoryEntry]) -> Vec<String> {
+    let mut groups: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry.group.clone())
+        .collect();
+    groups.sort();
+    groups.dedup();
+    groups
 }
 
 pub(crate) struct HomeView {
@@ -199,6 +238,14 @@ pub(crate) struct HomeView {
     data: Dashboard,
     error: Option<String>,
     projects: Vec<RecentRepository>,
+    /// Every portable record joined with its device binding (linked,
+    /// unlinked, and missing-checkout alike) for the Projects page.
+    /// `projects` above stays linked-only for the Recent cards.
+    all_projects: Vec<RepositoryEntry>,
+    project_errors: Vec<String>,
+    /// Session-local group filter for the Projects page. Survives reloads;
+    /// reset only by picking another filter.
+    project_group_filter: ProjectGroupFilter,
     sessions: Vec<(crate::agent_sessions::SessionSummary, String)>,
     session_errors: Vec<String>,
     sessions_loaded: bool,
@@ -275,6 +322,9 @@ impl HomeView {
             data: Dashboard::default(),
             error: None,
             projects: Vec::new(),
+            all_projects: Vec::new(),
+            project_errors: Vec::new(),
+            project_group_filter: ProjectGroupFilter::All,
             sessions: Vec::new(),
             session_errors: Vec::new(),
             sessions_loaded: false,
@@ -333,6 +383,38 @@ impl HomeView {
 
     pub(crate) fn is_artifacts_page(&self) -> bool {
         self.page == Some("Artifacts")
+    }
+
+    pub(crate) fn is_projects_page(&self) -> bool {
+        self.page == Some("Projects")
+    }
+
+    /// Projects-page rows in render order: every portable record matching
+    /// the group filter, sorted by key.
+    fn visible_projects(&self) -> Vec<RepositoryEntry> {
+        self.all_projects
+            .iter()
+            .filter(|entry| self.project_group_filter.matches(entry))
+            .cloned()
+            .collect()
+    }
+
+    /// Linked checkout paths across Recent cards and the Projects page, for
+    /// git-status cache invalidation and background refresh.
+    fn linked_checkout_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .map(|project| project.checkout_path.clone())
+            .collect();
+        for entry in self.all_projects.iter().filter(|entry| entry.is_linked()) {
+            if let Some(path) = &entry.checkout_path
+                && !paths.contains(path)
+            {
+                paths.push(path.clone());
+            }
+        }
+        paths
     }
 
     pub(crate) fn artifacts_include_archived(&self, cx: &gpui_kit::App) -> bool {
@@ -536,16 +618,16 @@ impl HomeView {
     }
 
     fn refresh_project_git(&mut self, cx: &mut Context<Self>) {
-        if !self.active || self.page.is_some() || self.git_loading || self.projects.is_empty() {
+        let on_projects = self.page == Some("Projects");
+        if !self.active || (!on_projects && self.page.is_some()) || self.git_loading {
+            return;
+        }
+        let paths = self.linked_checkout_paths();
+        if paths.is_empty() {
             return;
         }
         self.git_loading = true;
         let generation = self.project_git.generation;
-        let paths: Vec<_> = self
-            .projects
-            .iter()
-            .map(|project| project.checkout_path.clone())
-            .collect();
         cx.spawn(async move |this, cx| {
             let statuses = cx
                 .background_spawn(async move {
@@ -575,6 +657,16 @@ impl HomeView {
         self.refresh_artifacts(cx);
         if let Some(root) = &self.root {
             self.projects = recent_repositories(root, 4);
+            match all_repositories(root) {
+                Ok((entries, errors)) => {
+                    self.all_projects = entries;
+                    self.project_errors = errors;
+                }
+                Err(error) => {
+                    self.all_projects = Vec::new();
+                    self.project_errors = vec![format!("Could not list repositories: {error:#}")];
+                }
+            }
             match Dashboard::load(root) {
                 Ok(data) => {
                     self.data = data;
@@ -588,20 +680,22 @@ impl HomeView {
         } else {
             self.error = Some("Portable data is unavailable".into());
         }
-        self.project_focus
-            .retain(|key, _| self.projects.iter().any(|project| &project.key == key));
         for project in &self.projects {
             self.project_focus
                 .entry(project.key.clone())
                 .or_insert_with(|| cx.focus_handle());
         }
-        self.project_git.invalidate(
-            &self
-                .projects
-                .iter()
-                .map(|project| project.checkout_path.clone())
-                .collect::<Vec<_>>(),
-        );
+        for entry in &self.all_projects {
+            self.project_focus
+                .entry(entry.key.clone())
+                .or_insert_with(|| cx.focus_handle());
+        }
+        // Drop handles for records that no longer exist anywhere.
+        self.project_focus.retain(|key, _| {
+            self.projects.iter().any(|project| &project.key == key)
+                || self.all_projects.iter().any(|entry| &entry.key == key)
+        });
+        self.project_git.invalidate(&self.linked_checkout_paths());
         self.refresh_project_git(cx);
         cx.notify();
     }
@@ -719,6 +813,426 @@ impl HomeView {
                         cx.notify();
                     })),
             )
+    }
+
+    /// The dedicated Projects page: every portable record, including ones
+    /// with no checkout on this device, as Home-style cards with a `⋯`
+    /// options menu. Back navigation and the title live in the workspace
+    /// titlebar, matching the Artifacts page.
+    fn projects_page(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let linked = self.all_projects.iter().filter(|e| e.is_linked()).count();
+        let missing = self
+            .all_projects
+            .iter()
+            .filter(|e| e.checkout_missing)
+            .count();
+        let unlinked = self.all_projects.len() - linked - missing;
+        let card_width = recent_card_width(f32::from(window.viewport_size().width));
+        let visible = self.visible_projects();
+        let mut page = v_flex().gap_4().child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(self.group_filter_row(cx))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_sm()
+                        .whitespace_nowrap()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} linked · {} not linked · {} missing checkout",
+                            linked, unlinked, missing
+                        )),
+                ),
+        );
+        if visible.is_empty() {
+            page = page.child(div().text_color(cx.theme().muted_foreground).child(
+                if self.all_projects.is_empty() {
+                    "No repositories yet. Add your first project below."
+                } else {
+                    "No repositories in this group."
+                },
+            ));
+        }
+        let mut grid = h_flex().gap_4().flex_wrap();
+        for (index, entry) in visible.iter().enumerate() {
+            grid = grid.child(self.project_card(entry, index, visible.len(), card_width, cx));
+        }
+        page = page.child(grid);
+        for error in &self.project_errors {
+            page = page.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone()),
+            );
+        }
+        page.child(
+            Button::new("add-project-page")
+                .self_start()
+                .ghost()
+                .label("+ Add project")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository))),
+        )
+    }
+
+    /// Group radios: All, each present group, and Ungrouped when relevant.
+    fn group_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let groups = project_groups(&self.all_projects);
+        let has_ungrouped = self.all_projects.iter().any(|entry| entry.group.is_none());
+        let mut row = h_flex()
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Group:"),
+            )
+            .child(self.group_pill(ProjectGroupFilter::All, "All", cx));
+        for group in groups {
+            let label = group.clone();
+            row = row.child(self.group_pill(ProjectGroupFilter::Group(group), &label, cx));
+        }
+        if has_ungrouped {
+            row = row.child(self.group_pill(ProjectGroupFilter::Ungrouped, "Ungrouped", cx));
+        }
+        row
+    }
+
+    fn group_pill(
+        &self,
+        filter: ProjectGroupFilter,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.project_group_filter == filter;
+        Radio::new(item_id("project-group", label))
+            .label(label.to_owned())
+            .checked(active)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Radios never toggle off: selecting the active one is a
+                // no-op, any other pick becomes the filter.
+                if this.project_group_filter != filter {
+                    this.project_group_filter = filter.clone();
+                    cx.notify();
+                }
+            }))
+    }
+
+    /// One Projects card mirroring the Recent-Projects card visuals: title
+    /// plus group pill plus `⋯` menu, git-state row, description, and an
+    /// opened/footer row. Linked titles and footers open the workspace;
+    /// unlinked cards act through their menu and footer link buttons, since
+    /// a nested whole-card button would swallow the menu's clicks.
+    fn project_card(
+        &self,
+        entry: &RepositoryEntry,
+        index: usize,
+        total: usize,
+        card_width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let key = entry.key.clone();
+        let title = entry.display_name.clone().unwrap_or_else(|| key.clone());
+        let group = entry.group.clone().filter(|value| !value.trim().is_empty());
+        let description = entry
+            .description
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        let has_binding = entry.checkout_path.is_some();
+        let linked = entry.is_linked();
+        let now_secs = current_unix_secs();
+        let opened = project_opened_label(entry.last_opened_at.as_deref(), now_secs)
+            .unwrap_or_else(|| "Not opened yet".to_owned());
+        let git_status = entry
+            .checkout_path
+            .as_ref()
+            .and_then(|path| self.project_git.statuses.get(path));
+        let state = project_state_tag(git_status);
+        let branch_pill = project_branch_pill(git_status);
+        let sync = project_sync_label(git_status);
+
+        let home = cx.entity().downgrade();
+        let link_key = key.clone();
+        let edit_key = key.clone();
+        let unlink_key = key.clone();
+        let remove_key = key.clone();
+        let link_label = if has_binding {
+            "Re-link"
+        } else {
+            "Link checkout"
+        };
+        let mut card = v_flex()
+            .flex_none()
+            .w(px(card_width))
+            .min_h(px(160.))
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .track_focus(&self.project_focus[&key])
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                if event.keystroke.key.as_str() == "enter" {
+                    let visible = this.visible_projects();
+                    if visible.get(index).is_some_and(|entry| entry.is_linked()) {
+                        let entry = &visible[index];
+                        let label = entry
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| entry.key.clone());
+                        cx.emit(HomeEvent::OpenRepository {
+                            key: entry.key.clone(),
+                            label,
+                        });
+                    }
+                    return;
+                }
+                let columns = recent_columns(f32::from(window.viewport_size().width));
+                if let Some(next) = project_navigation(&event.keystroke.key, index, total, columns)
+                {
+                    let visible = this.visible_projects();
+                    if let Some(next_key) = visible.get(next).map(|entry| entry.key.clone()) {
+                        this.project_focus[&next_key].focus(window, cx);
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        cx.notify();
+                    }
+                }
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_semibold()
+                            .child(title.clone()),
+                    )
+                    .when_some(group, |this, tag| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px_2()
+                                .rounded_full()
+                                .bg(cx.theme().secondary)
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(tag),
+                        )
+                    })
+                    .child(
+                        Button::new(item_id("repo-options", &key))
+                            .ghost()
+                            .label("⋯")
+                            .accessibility_label(format!("Options for {title}"))
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                                let home_open = home.clone();
+                                let open_key = key.clone();
+                                let open_title = title.clone();
+                                let home_link = home.clone();
+                                let link_key = link_key.clone();
+                                let home_edit = home.clone();
+                                let edit_key = edit_key.clone();
+                                let home_unlink = home.clone();
+                                let unlink_key = unlink_key.clone();
+                                let home_remove = home.clone();
+                                let remove_key = remove_key.clone();
+                                let mut menu = menu;
+                                if linked {
+                                    menu = menu.item(PopupMenuItem::new("Open").on_click(
+                                        move |_, _, cx| {
+                                            let _ = home_open.update(cx, |_, cx| {
+                                                cx.emit(HomeEvent::OpenRepository {
+                                                    key: open_key.clone(),
+                                                    label: open_title.clone(),
+                                                });
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu = menu.item(PopupMenuItem::new(link_label).on_click(
+                                    move |_, _, cx| {
+                                        let _ = home_link.update(cx, |_, cx| {
+                                            cx.emit(HomeEvent::LinkRepository {
+                                                key: link_key.clone(),
+                                            });
+                                        });
+                                    },
+                                ));
+                                menu = menu.item(PopupMenuItem::new("Edit").on_click(
+                                    move |_, _, cx| {
+                                        let _ = home_edit.update(cx, |_, cx| {
+                                            cx.emit(HomeEvent::EditRepository {
+                                                key: edit_key.clone(),
+                                            });
+                                        });
+                                    },
+                                ));
+                                if has_binding {
+                                    menu = menu.item(PopupMenuItem::new("Unlink").on_click(
+                                        move |_, _, cx| {
+                                            let _ = home_unlink.update(cx, |_, cx| {
+                                                cx.emit(HomeEvent::UnlinkRepository {
+                                                    key: unlink_key.clone(),
+                                                });
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu.separator().item(PopupMenuItem::new("Delete").on_click(
+                                    move |_, _, cx| {
+                                        let _ = home_remove.update(cx, |_, cx| {
+                                            cx.emit(HomeEvent::RemoveRepository {
+                                                key: remove_key.clone(),
+                                            });
+                                        });
+                                    },
+                                ))
+                            }),
+                    ),
+            );
+        if linked {
+            card = card.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .flex_wrap()
+                    .when_some(state, |row, (label, hue)| {
+                        row.child(
+                            Tag::color(hue)
+                                .with_size(Size::Small)
+                                .rounded_full()
+                                .flex_none()
+                                .child(label),
+                        )
+                    })
+                    .when(git_status.is_none(), |row| {
+                        row.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Loading Git status…"),
+                        )
+                    })
+                    .when_some(branch_pill, |this, pill| {
+                        this.child(
+                            Tag::secondary()
+                                .with_size(Size::Small)
+                                .rounded_full()
+                                .flex_none()
+                                .child(pill),
+                        )
+                    })
+                    .when_some(sync, |this, counts| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(counts),
+                        )
+                    }),
+            );
+        } else if entry.checkout_missing {
+            card = card.child(div().text_sm().text_color(cx.theme().danger).child(format!(
+                        "Checkout missing: {}",
+                        entry
+                            .checkout_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    )));
+        } else {
+            card = card.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Not linked to this device"),
+            );
+        }
+        card = card.when_some(description, |this, text| {
+            this.child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text),
+            )
+        });
+        for warning in &entry.warnings {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(warning.clone()),
+            );
+        }
+        let footer_key = entry.key.clone();
+        let footer_title = entry
+            .display_name
+            .clone()
+            .unwrap_or_else(|| entry.key.clone());
+        card.child(
+            h_flex()
+                .w_full()
+                .mt_auto()
+                .pt_1()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(opened),
+                )
+                .child(
+                    Button::new(item_id("repo-open", &entry.key))
+                        .ghost()
+                        .label(if linked {
+                            "Open →"
+                        } else if has_binding {
+                            "Re-link"
+                        } else {
+                            "Link"
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            if linked {
+                                cx.emit(HomeEvent::OpenRepository {
+                                    key: footer_key.clone(),
+                                    label: footer_title.clone(),
+                                });
+                            } else {
+                                cx.emit(HomeEvent::LinkRepository {
+                                    key: footer_key.clone(),
+                                });
+                            }
+                        })),
+                ),
+        )
     }
 
     fn todo_card(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1122,19 +1636,25 @@ impl Render for HomeView {
             .pt_4()
             .pb_6();
         if let Some(page) = self.page {
-            body = body
-                .child(
-                    Button::new("back-home")
-                        .self_start()
-                        .ghost()
-                        .label("← Home")
-                        .on_click(cx.listener(|this, _, _, cx| this.activate(cx))),
-                )
-                .child(div().text_2xl().font_semibold().child(page))
-                .child("Coming soon — this dedicated page is a placeholder.")
-                .child(
-                    "Use Home to manage your current items. More views and workflows will follow.",
-                );
+            if page == "Projects" {
+                // Back navigation and the title live in the workspace
+                // titlebar, matching the Artifacts page.
+                body = body.child(self.projects_page(window, cx));
+            } else {
+                body = body
+                    .child(
+                        Button::new("back-home")
+                            .self_start()
+                            .ghost()
+                            .label("← Home")
+                            .on_click(cx.listener(|this, _, _, cx| this.activate(cx))),
+                    )
+                    .child(div().text_2xl().font_semibold().child(page))
+                    .child("Coming soon — this dedicated page is a placeholder.")
+                    .child(
+                        "Use Home to manage your current items. More views and workflows will follow.",
+                    );
+            }
         } else {
             if let Some(error) = &self.error {
                 body = body.child(div().text_color(cx.theme().danger).child(error.clone()));
@@ -1426,7 +1946,29 @@ impl Render for HomeView {
                         .child("No recent projects yet."),
                 );
             }
-            body = body.child(projects).child(
+            body = body.child(projects);
+            let dangling = self
+                .all_projects
+                .iter()
+                .filter(|entry| !entry.is_linked())
+                .count();
+            if dangling > 0 {
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{dangling} {} not linked to this device — open View all to link {}.",
+                            if dangling == 1 {
+                                "repository"
+                            } else {
+                                "repositories"
+                            },
+                            if dangling == 1 { "it" } else { "them" },
+                        )),
+                );
+            }
+            body = body.child(
                 Button::new("add-project-home")
                     .self_start()
                     .ghost()
@@ -1686,5 +2228,48 @@ mod layout_tests {
         assert_eq!(project_opened_label(None, now), None);
         assert_eq!(project_opened_label(Some(""), now), None);
         assert_eq!(project_opened_label(Some("broken"), now), None);
+    }
+
+    fn group_entry(key: &str, group: Option<&str>) -> RepositoryEntry {
+        RepositoryEntry {
+            key: key.to_owned(),
+            display_name: None,
+            description: None,
+            group: group.map(str::to_owned),
+            owner: None,
+            name: None,
+            checkout_path: None,
+            checkout_missing: false,
+            last_opened_at: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn project_groups_lists_distinct_sorted_groups() {
+        let entries = vec![
+            group_entry("b", Some("work")),
+            group_entry("a", Some("personal")),
+            group_entry("c", Some("work")),
+            group_entry("d", None),
+        ];
+        assert_eq!(
+            project_groups(&entries),
+            vec!["personal".to_owned(), "work".to_owned()]
+        );
+        assert!(project_groups(&[]).is_empty());
+    }
+
+    #[test]
+    fn project_group_filter_matches_all_group_and_ungrouped() {
+        let personal = group_entry("a", Some("personal"));
+        let ungrouped = group_entry("b", None);
+        assert!(ProjectGroupFilter::All.matches(&personal));
+        assert!(ProjectGroupFilter::All.matches(&ungrouped));
+        assert!(ProjectGroupFilter::Group("personal".to_owned()).matches(&personal));
+        assert!(!ProjectGroupFilter::Group("personal".to_owned()).matches(&ungrouped));
+        assert!(!ProjectGroupFilter::Group("work".to_owned()).matches(&personal));
+        assert!(!ProjectGroupFilter::Ungrouped.matches(&personal));
+        assert!(ProjectGroupFilter::Ungrouped.matches(&ungrouped));
     }
 }

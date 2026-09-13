@@ -58,6 +58,7 @@ use crate::settings::SettingsView;
 use crate::workspace_settings::WorkspaceSettingsView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::scroll::ScrollableElement as _;
 
 /// How often the header re-reads branch/dirty/ahead-behind state.
@@ -517,6 +518,10 @@ impl Workspace {
                 this.switch_repository(key, label, window, cx)
             }
             HomeEvent::AddRepository => this.open_add_repository(window, cx),
+            HomeEvent::LinkRepository { key } => this.open_link_repository(key, window, cx),
+            HomeEvent::EditRepository { key } => this.open_edit_repository(key, window, cx),
+            HomeEvent::UnlinkRepository { key } => this.unlink_repository(key, window, cx),
+            HomeEvent::RemoveRepository { key } => this.confirm_remove_repository(key, window, cx),
             HomeEvent::OpenAgentSession(key) => this.open_agent_session(key.clone(), window, cx),
             HomeEvent::RefreshSessions => this.refresh_sessions(cx),
         })
@@ -930,6 +935,158 @@ impl Workspace {
                 .h(px(640.))
                 .child(view.clone().into_any_element())
         });
+    }
+
+    /// Open the Link dialog for an existing portable record: checkout picker
+    /// only, key fixed. Used from the Projects page for records synced from
+    /// another device (or left unbound by an interrupted create).
+    fn open_link_repository(&self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let data_root = self.data_root.clone();
+        let key = key.to_owned();
+        let view = cx.new(|cx| AddRepositoryView::for_link(window, cx, data_root, key.clone()));
+        cx.subscribe(
+            &view,
+            |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
+                this.home.update(cx, |view, cx| view.reload(cx));
+                this.reload_recent_repositories();
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(format!("Link checkout for \"{key}\""))
+                .w(px(680.))
+                .h(px(320.))
+                .child(view.clone().into_any_element())
+        });
+    }
+
+    /// Open the Edit dialog for an existing portable record: metadata fields
+    /// prefilled, key fixed (renames deferred). Only the portable JSON is
+    /// rewritten; the device binding is untouched.
+    fn open_edit_repository(&self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.data_root.clone() else {
+            window.push_notification("Portable data is unavailable", cx);
+            return;
+        };
+        let metadata = match crate::data::get_repository_metadata(&root, key) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                window.push_notification(format!("Could not load \"{key}\": {error:#}"), cx);
+                return;
+            }
+        };
+        let data_root = self.data_root.clone();
+        let key = key.to_owned();
+        let view =
+            cx.new(|cx| AddRepositoryView::for_edit(window, cx, data_root, key.clone(), &metadata));
+        cx.subscribe(
+            &view,
+            |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
+                this.home.update(cx, |view, cx| view.reload(cx));
+                this.reload_recent_repositories();
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(format!("Edit \"{key}\""))
+                .w(px(680.))
+                .h(px(640.))
+                .child(view.clone().into_any_element())
+        });
+    }
+
+    /// Drop this device's checkout binding, keeping the portable record.
+    /// Non-destructive by construction: the Projects page offers Re-link
+    /// right where the row stays.
+    fn unlink_repository(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.data_root.clone() else {
+            window.push_notification("Portable data is unavailable", cx);
+            return;
+        };
+        match crate::data::unlink_repository(&root, key) {
+            Ok(true) => {
+                window.push_notification(format!("Unlinked \"{key}\""), cx);
+            }
+            Ok(false) => {
+                window.push_notification(format!("\"{key}\" had no checkout binding"), cx);
+            }
+            Err(error) => {
+                window.push_notification(format!("Could not unlink \"{key}\": {error:#}"), cx);
+                return;
+            }
+        }
+        self.home.update(cx, |view, cx| view.reload(cx));
+        self.reload_recent_repositories();
+        cx.notify();
+    }
+
+    /// Confirm, then delete a portable record and its device binding. The
+    /// local checkout stays on disk; only Devcroft's records go away.
+    fn confirm_remove_repository(&self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
+        let key = key.to_owned();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let workspace = workspace.clone();
+            let key = key.clone();
+            dialog
+                .title(format!("Delete \"{key}\"?"))
+                .child(format!(
+                    "This removes the portable record for \"{key}\" and this device's checkout binding. The local checkout itself stays on disk. This cannot be undone."
+                ))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel-remove-repository")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-remove-repository")
+                                .primary()
+                                .label("Delete")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                }),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    workspace
+                        .update(cx, |this, cx| {
+                            this.remove_repository_confirmed(&key, window, cx)
+                        })
+                        .unwrap_or(false)
+                })
+        });
+    }
+
+    /// Run the confirmed removal: delete records, reload lists, notify.
+    /// Returns true so the confirm dialog closes either way; failures are
+    /// surfaced as notifications.
+    fn remove_repository_confirmed(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(root) = self.data_root.clone() else {
+            window.push_notification("Portable data is unavailable", cx);
+            return true;
+        };
+        match crate::data::remove_repository(&root, key) {
+            Ok(()) => {
+                window.push_notification(format!("Deleted \"{key}\""), cx);
+            }
+            Err(error) => {
+                window.push_notification(format!("Could not delete \"{key}\": {error:#}"), cx);
+                return true;
+            }
+        }
+        self.home.update(cx, |view, cx| view.reload(cx));
+        self.reload_recent_repositories();
+        cx.notify();
+        true
     }
 
     /// Switch visible checkout after recording recency. Hidden checkout entities
@@ -1877,7 +2034,13 @@ impl Workspace {
                 self.select_tab(WorkspaceTab::Resources as usize, window, cx)
             }
             NavigationCommand::Home => self.go_home(window, cx),
-            NavigationCommand::Back => self.go_back_from_artifacts(window, cx),
+            NavigationCommand::Back => {
+                if self.home_visible && self.home.read(cx).is_projects_page() {
+                    self.go_home(window, cx);
+                } else {
+                    self.go_back_from_artifacts(window, cx);
+                }
+            }
             NavigationCommand::NewSession => self.prompt_new_agent_session(window, cx),
             command @ (NavigationCommand::EditMarkdown
             | NavigationCommand::AddComment
@@ -2272,6 +2435,7 @@ impl Render for Workspace {
         // hidden on these pages and the lists stay live through their active
         // polls.
         let is_artifacts = self.home_visible && self.home.read(cx).is_artifacts_page();
+        let is_projects = self.home_visible && self.home.read(cx).is_projects_page();
         let show_archived = if is_artifacts {
             self.home.read(cx).artifacts_include_archived(cx)
         } else {
@@ -2282,7 +2446,7 @@ impl Render for Workspace {
         } else {
             SharedString::from("")
         };
-        let is_home_page = is_artifacts;
+        let is_home_page = is_artifacts || is_projects;
         let attention_count = self.agent_activity.snapshot().attention_count();
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
@@ -2397,6 +2561,28 @@ impl Render for Workspace {
                                         .text_sm()
                                         .font_semibold()
                                         .child(SharedString::from("Artifacts")),
+                                ),
+                        )
+                    })
+                    .when(is_projects, |header| {
+                        header.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Button::new("projects-back")
+                                        .ghost()
+                                        .label("‹ Home")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.go_home(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child(SharedString::from("Projects")),
                                 ),
                         )
                     })

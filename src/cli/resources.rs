@@ -16,6 +16,59 @@ pub(crate) struct RepositoryArgs {
 pub(crate) enum RepositoryCommand {
     /// List readable portable keys, including repositories without checkouts.
     List(LimitArgs),
+    /// Show one portable record plus this device's checkout binding.
+    Get(RepositoryKeyArgs),
+    /// Bind an existing portable record to a local git checkout.
+    Link(RepositoryLinkArgs),
+    /// Remove this device's checkout binding, keeping the portable record.
+    Unlink(RepositoryKeyArgs),
+    /// Patch portable metadata; absent flags keep their stored values,
+    /// an empty string clears the field.
+    Update(RepositoryUpdateArgs),
+    /// Delete the portable record and this device's binding. The local
+    /// checkout itself is left on disk.
+    Remove(RepositoryKeyArgs),
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RepositoryKeyArgs {
+    /// Portable repository key.
+    #[arg(value_name = "KEY")]
+    pub(crate) key: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RepositoryLinkArgs {
+    /// Portable repository key.
+    #[arg(long)]
+    pub(crate) key: String,
+    /// Local git checkout to bind.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) checkout: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RepositoryUpdateArgs {
+    /// Portable repository key.
+    #[arg(value_name = "KEY")]
+    pub(crate) key: String,
+    #[arg(long)]
+    pub(crate) display_name: Option<String>,
+    #[arg(long)]
+    pub(crate) owner: Option<String>,
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    #[arg(long)]
+    pub(crate) description: Option<String>,
+    #[arg(long)]
+    pub(crate) group: Option<String>,
+    /// Comma-separated tags; empty string clears. Absent keeps stored tags.
+    #[arg(long)]
+    pub(crate) tags: Option<String>,
+    #[arg(long)]
+    pub(crate) clone_url: Option<String>,
+    #[arg(long)]
+    pub(crate) base_branch: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]

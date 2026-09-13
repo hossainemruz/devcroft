@@ -141,6 +141,10 @@ pub(crate) fn list_repositories(root: &DataRoot, limit: usize) -> Result<Reposit
 /// the key and checkout path, which travel as separate arguments; a blank
 /// (`None` or whitespace-only) harvested field falls back to the inspected
 /// checkout value, while an explicit value always wins.
+///
+/// [`update_repository_metadata`] reuses the same shape with different
+/// blank semantics (blank means "clear", since the edit form prefills from
+/// the stored record — see that function).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NewRepositoryInput {
     pub(crate) display_name: Option<String>,
@@ -151,6 +155,253 @@ pub(crate) struct NewRepositoryInput {
     pub(crate) tags: Vec<String>,
     pub(crate) clone_url: Option<String>,
     pub(crate) base_branch: Option<String>,
+}
+
+/// One repository for management surfaces (Projects page, CLI): portable
+/// metadata joined with its machine-local checkout binding. Unlike
+/// [`RecentRepository`], unlinked and missing-checkout records are included
+/// so a portable record cloned to a new device can be re-linked — the
+/// recovery shape [`create_repository`] documents for a crash between the
+/// two writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RepositoryEntry {
+    pub(crate) key: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) group: Option<String>,
+    pub(crate) owner: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) checkout_path: Option<PathBuf>,
+    /// True when the binding names a checkout that is no longer on disk.
+    /// Distinct from never-linked: the fix is re-link or unlink, not first
+    /// link.
+    pub(crate) checkout_missing: bool,
+    pub(crate) last_opened_at: Option<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+impl RepositoryEntry {
+    /// Whether this device can open a workspace for the entry right now.
+    pub(crate) fn is_linked(&self) -> bool {
+        self.checkout_path.is_some() && !self.checkout_missing
+    }
+}
+
+/// Portable records joined with device bindings, sorted by key, uncapped:
+/// management surfaces page their own way. Malformed siblings land in
+/// `errors` (like [`list_repositories`]) rather than hiding the rest.
+pub(crate) fn all_repositories(root: &DataRoot) -> Result<(Vec<RepositoryEntry>, Vec<String>)> {
+    let state = DeviceStore::new(root).load().unwrap_or_default();
+    let bindings = state.repositories.unwrap_or_default();
+    let dir = root.portable_dir().join("repositories");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+    };
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(e.to_string());
+                continue;
+            }
+        };
+        let path = entry.path();
+        let key = match require_repository_key(&entry.file_name().to_string_lossy()) {
+            Ok(key) => key,
+            Err(e) => {
+                errors.push(format!("{}: {e:#}", path.display()));
+                continue;
+            }
+        };
+        let metadata: RepositoryMetadata = match std::fs::read(path.join("repository.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        {
+            Some(metadata) => metadata,
+            None => {
+                errors.push(format!(
+                    "{}: malformed repository record",
+                    path.join("repository.json").display()
+                ));
+                continue;
+            }
+        };
+        let mut warnings = Vec::new();
+        if metadata
+            .key
+            .as_ref()
+            .is_some_and(|recorded| recorded != &key)
+        {
+            warnings.push(format!(
+                "repository {key}: metadata key {:?} differs from directory key; use {key}",
+                metadata.key
+            ));
+        }
+        let binding = bindings.get(&key);
+        let raw_checkout = binding
+            .and_then(|binding| binding.checkout_path.as_deref())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let (checkout_path, checkout_missing) = match raw_checkout {
+            Some(path) if path.is_dir() => (Some(path), false),
+            Some(path) => (Some(path), true),
+            None => (None, false),
+        };
+        let non_empty = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+        out.push(RepositoryEntry {
+            key,
+            display_name: non_empty(metadata.display_name),
+            description: non_empty(metadata.description),
+            group: non_empty(metadata.group),
+            owner: non_empty(metadata.owner),
+            name: non_empty(metadata.name),
+            checkout_path,
+            checkout_missing,
+            last_opened_at: binding
+                .and_then(|binding| binding.last_opened_at.clone())
+                .filter(|opened| !opened.is_empty()),
+            warnings,
+        });
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    errors.sort();
+    Ok((out, errors))
+}
+
+/// Read one portable record (for edit prefill and CLI reads). The directory
+/// name is the identity; a `key` mismatch inside the JSON is reported by
+/// [`list_repositories`]/[`all_repositories`] warnings, never a load failure.
+pub(crate) fn get_repository_metadata(root: &DataRoot, key: &str) -> Result<RepositoryMetadata> {
+    let key = require_repository_key(key)?;
+    let path = repository_dir(root, &key).join("repository.json");
+    let metadata: RepositoryMetadata = serde_json::from_slice(&read_bounded(&path)?)
+        .with_context(|| format!("malformed repository at {}", path.display()))?;
+    Ok(metadata)
+}
+
+/// What [`link_repository`] persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinkedRepository {
+    pub(crate) key: String,
+    pub(crate) checkout_path: PathBuf,
+}
+
+/// Bind (or re-bind) an existing portable record to a local checkout.
+///
+/// The portable record must already exist — this is the recovery path for a
+/// record synced from another device, or for a crash between the two writes
+/// in [`create_repository`]. Only `device.json` is touched; portable
+/// metadata is never modified here. The existing `last_opened_at` (if any)
+/// is preserved: opening the repository stamps recency, linking alone does
+/// not reorder the switcher behind the user's back.
+pub(crate) fn link_repository(
+    root: &DataRoot,
+    key: &str,
+    checkout_path: &Path,
+) -> Result<LinkedRepository> {
+    let key = require_repository_key(key)?;
+    if !repository_dir(root, &key).join("repository.json").is_file() {
+        bail!("repository \"{key}\" has no portable record");
+    }
+    let inspection = inspect_checkout(checkout_path)?;
+    let checkout_display = inspection.checkout_path.to_string_lossy().into_owned();
+    let remote_display = inspection.remote_name.clone();
+    DeviceStore::new(root)
+        .update(|state| {
+            let mut bindings = state.repositories.take().unwrap_or_default();
+            let mut binding = bindings.remove(&key).unwrap_or_default();
+            binding.checkout_path = Some(checkout_display.clone());
+            binding.remote_name = Some(remote_display.clone());
+            bindings.insert(key.clone(), binding);
+            state.repositories = Some(bindings);
+        })
+        .context("saving checkout binding to device.json")?;
+    Ok(LinkedRepository {
+        key,
+        checkout_path: inspection.checkout_path,
+    })
+}
+
+/// Remove the machine-local checkout binding for a key, leaving the portable
+/// record untouched. Returns true when a binding existed. Clears
+/// `last_repository` when it pointed at the unlinked key so the switcher
+/// does not remember a destination it can no longer open.
+pub(crate) fn unlink_repository(root: &DataRoot, key: &str) -> Result<bool> {
+    let key = require_repository_key(key)?;
+    DeviceStore::new(root)
+        .update(|state| {
+            let mut bindings = state.repositories.take().unwrap_or_default();
+            let existed = bindings.remove(&key).is_some();
+            state.repositories = Some(bindings);
+            if state.last_repository.as_deref() == Some(&key) {
+                state.last_repository = None;
+            }
+            existed
+        })
+        .context("removing checkout binding from device.json")
+}
+
+/// Overwrite portable metadata from an edit form.
+///
+/// Unlike [`create_repository`] there is no checkout harvest fallback: the
+/// dialog prefills from [`get_repository_metadata`], so a blank field means
+/// "clear it" (stored as absent), not "keep the old value". Unknown JSON
+/// fields (`extra`) round-trip untouched.
+pub(crate) fn update_repository_metadata(
+    root: &DataRoot,
+    key: &str,
+    input: &NewRepositoryInput,
+) -> Result<RepositoryMetadata> {
+    let key = require_repository_key(key)?;
+    let path = repository_dir(root, &key).join("repository.json");
+    let existing: RepositoryMetadata = serde_json::from_slice(&read_bounded(&path)?)
+        .with_context(|| format!("malformed repository at {}", path.display()))?;
+    let metadata = RepositoryMetadata {
+        key: Some(key.clone()),
+        owner: clean_optional(input.owner.as_deref()).map(str::to_owned),
+        name: clean_optional(input.name.as_deref()).map(str::to_owned),
+        display_name: clean_optional(input.display_name.as_deref()).map(str::to_owned),
+        description: clean_optional(input.description.as_deref()).map(str::to_owned),
+        group: clean_optional(input.group.as_deref()).map(str::to_owned),
+        tags: clean_tags(&input.tags),
+        clone_url: clean_optional(input.clone_url.as_deref()).map(str::to_owned),
+        base_branch: clean_optional(input.base_branch.as_deref()).map(str::to_owned),
+        extra: existing.extra,
+    };
+    write_json_atomic(&path, &metadata)
+        .with_context(|| format!("saving repository record to {}", path.display()))?;
+    Ok(metadata)
+}
+
+/// Delete a portable record and its device binding.
+///
+/// Removes `portable/repositories/<key>` wholesale plus the machine-local
+/// binding, clearing `last_repository` when it pointed at the key. The
+/// local checkout itself is never touched — only Devcroft's records. Fails
+/// when no portable record exists, so a typo cannot silently "succeed".
+pub(crate) fn remove_repository(root: &DataRoot, key: &str) -> Result<()> {
+    let key = require_repository_key(key)?;
+    let dir = repository_dir(root, &key);
+    if !dir.join("repository.json").is_file() {
+        bail!("repository \"{key}\" has no portable record");
+    }
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("removing repository record at {}", dir.display()))?;
+    DeviceStore::new(root)
+        .update(|state| {
+            let mut bindings = state.repositories.take().unwrap_or_default();
+            bindings.remove(&key);
+            state.repositories = Some(bindings);
+            if state.last_repository.as_deref() == Some(&key) {
+                state.last_repository = None;
+            }
+        })
+        .context("removing checkout binding from device.json")?;
+    Ok(())
 }
 
 /// What checkout inspection harvested from a local directory.
@@ -1160,5 +1411,199 @@ mod tests {
         );
         assert_eq!(rfc3339_from_unix_secs(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339_from_unix_secs(-1), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn link_rebinds_an_unlinked_portable_record() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        create_repository(
+            &root,
+            "relink-me",
+            checkout.path(),
+            &NewRepositoryInput::default(),
+        )
+        .unwrap();
+        // Simulate a new device: portable record survives, binding does not.
+        DeviceStore::new(&root)
+            .update(|state| {
+                state.repositories = None;
+                state.last_repository = None;
+            })
+            .unwrap();
+        let (entries, _) = all_repositories(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_linked());
+        assert!(entries[0].checkout_path.is_none());
+
+        let other = tempfile::tempdir().unwrap();
+        init_checkout(other.path());
+        let linked = link_repository(&root, "relink-me", other.path()).unwrap();
+        assert_eq!(linked.key, "relink-me");
+        assert!(checkout_for(&root, "relink-me").is_some());
+
+        // Linking preserves recency instead of restamping: the switcher
+        // order only changes on open.
+        let state = DeviceStore::new(&root).load().unwrap();
+        assert!(
+            state.repositories.as_ref().unwrap()["relink-me"]
+                .last_opened_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn link_requires_a_portable_record_and_a_checkout() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        let error = format!(
+            "{:#}",
+            link_repository(&root, "ghost", checkout.path()).expect_err("must fail")
+        );
+        assert!(error.contains("no portable record"), "{error}");
+
+        create_repository(
+            &root,
+            "real",
+            checkout.path(),
+            &NewRepositoryInput::default(),
+        )
+        .unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        let error = format!(
+            "{:#}",
+            link_repository(&root, "real", plain.path()).expect_err("must fail")
+        );
+        assert!(error.contains("not a git checkout"), "{error}");
+        assert!(link_repository(&root, "Not Valid", checkout.path()).is_err());
+    }
+
+    #[test]
+    fn unlink_clears_the_binding_but_keeps_portable() {
+        let (_dir, root) = fresh_root();
+        let checkout = seed_linked(&root, "linked", Some("2024-01-01T00:00:00Z"));
+        assert!(checkout_for(&root, "linked").is_some());
+
+        assert!(unlink_repository(&root, "linked").unwrap());
+        assert!(!unlink_repository(&root, "linked").unwrap());
+        assert_eq!(checkout_for(&root, "linked"), None);
+        // Portable record survives unlinking.
+        assert!(
+            repository_dir(&root, "linked")
+                .join("repository.json")
+                .is_file()
+        );
+        let (entries, _) = all_repositories(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_linked());
+        // Seed helper points at a leaked tempdir; keep it alive for `is_dir`.
+        let _ = checkout;
+    }
+
+    #[test]
+    fn all_repositories_distinguishes_missing_checkouts() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        let checkout = std::fs::canonicalize(checkout.keep()).unwrap();
+        create_repository(&root, "gone", &checkout, &NewRepositoryInput::default()).unwrap();
+        DeviceStore::new(&root)
+            .update(|state| {
+                let mut bindings = state.repositories.take().unwrap_or_default();
+                if let Some(binding) = bindings.get_mut("gone") {
+                    binding.checkout_path = Some("/nonexistent-checkout-dir".to_owned());
+                }
+                state.repositories = Some(bindings);
+            })
+            .unwrap();
+
+        let (entries, errors) = all_repositories(&root).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_linked());
+        assert!(entries[0].checkout_missing);
+        assert_eq!(
+            entries[0].checkout_path.as_deref(),
+            Some(Path::new("/nonexistent-checkout-dir"))
+        );
+    }
+
+    #[test]
+    fn update_overwrites_fields_and_preserves_unknown_json() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        create_repository(
+            &root,
+            "editable",
+            checkout.path(),
+            &NewRepositoryInput {
+                display_name: Some("Old".to_owned()),
+                description: Some("keep me unless cleared".to_owned()),
+                ..NewRepositoryInput::default()
+            },
+        )
+        .unwrap();
+        // Simulate a newer/older build's unknown field.
+        let path = repository_dir(&root, "editable").join("repository.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["futureField"] = serde_json::json!({"v": 1});
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let updated = update_repository_metadata(
+            &root,
+            "editable",
+            &NewRepositoryInput {
+                display_name: Some("  New  ".to_owned()),
+                description: None, // Blank means clear, not keep.
+                tags: vec!["a".to_owned(), " a ".to_owned()],
+                ..NewRepositoryInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.display_name.as_deref(), Some("New"));
+        assert!(updated.description.is_none());
+        assert_eq!(updated.tags, Some(vec!["a".to_owned()]));
+        assert_eq!(
+            updated.extra.get("futureField"),
+            Some(&serde_json::json!({"v": 1}))
+        );
+
+        let stored: RepositoryMetadata = get_repository_metadata(&root, "editable").unwrap();
+        assert_eq!(stored, updated);
+    }
+
+    #[test]
+    fn remove_deletes_portable_and_binding_but_keeps_checkout() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        let checkout_path = std::fs::canonicalize(checkout.path()).unwrap();
+        create_repository(
+            &root,
+            "doomed",
+            &checkout_path,
+            &NewRepositoryInput::default(),
+        )
+        .unwrap();
+        record_repository_open(&root, "doomed").unwrap();
+
+        remove_repository(&root, "doomed").unwrap();
+        assert!(!repository_dir(&root, "doomed").exists());
+        assert_eq!(checkout_for(&root, "doomed"), None);
+        let state = DeviceStore::new(&root).load().unwrap();
+        assert!(state.last_repository.is_none());
+        // The local checkout itself is untouched.
+        assert!(checkout_path.is_dir());
+        // Second remove fails loudly instead of silently succeeding.
+        let error = format!(
+            "{:#}",
+            remove_repository(&root, "doomed").expect_err("must fail")
+        );
+        assert!(error.contains("no portable record"), "{error}");
+        assert!(remove_repository(&root, "Not Valid").is_err());
     }
 }

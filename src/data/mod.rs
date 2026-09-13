@@ -37,10 +37,12 @@ pub(crate) use portable::{
     load_workspace, set_origin,
 };
 pub(crate) use repositories::{
-    CheckoutInspection, CreatedRepository, NewRepositoryInput, RecentRepository,
-    RepositoryMetadata, checkout_for, create_repository, inspect_checkout, list_repositories,
-    normalize_repository_key, recent_repositories, record_repository_open, repository_dir,
-    require_repository_key, resolve_current_key, suggest_repository_key,
+    CheckoutInspection, CreatedRepository, LinkedRepository, NewRepositoryInput, RecentRepository,
+    RepositoryEntry, RepositoryMetadata, all_repositories, checkout_for, create_repository,
+    get_repository_metadata, inspect_checkout, link_repository, list_repositories,
+    normalize_repository_key, recent_repositories, record_repository_open, remove_repository,
+    repository_dir, require_repository_key, resolve_current_key, suggest_repository_key,
+    unlink_repository, update_repository_metadata,
 };
 pub(crate) use sync::{
     SyncOutcome, SyncStatus, SyncTracker, sync_portable, sync_portable_with_tracker,

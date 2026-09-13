@@ -783,14 +783,17 @@ impl HomeView {
         let pr_group = std::rc::Rc::new(std::cell::Cell::new(item.pr_group));
         let original = self.data.clone();
         window.open_dialog(cx, move |dialog, _, _| {
-            let mut form = v_flex().gap_3().child("Title").child(Input::new(&title));
+            let mut form = v_flex().gap_3();
+            if item.kind != Kind::PullRequest {
+                form = form.child("Title").child(Input::new(&title));
+            }
             if item.kind == Kind::Todo {
                 form = form.child("Description").child(Input::new(&description)).child("Label").child(Input::new(&label));
             } else {
                 form = form.child("URL").child(Input::new(&url));
             }
             if item.kind == Kind::PullRequest {
-                form = form.child("Category").child(h_flex().gap_2().flex_wrap().children(Category::ALL.into_iter().enumerate().map(|(index, choice)| {
+                form = form.child("The title is fetched automatically from GitHub.").child("Category").child(h_flex().gap_2().flex_wrap().children(Category::ALL.into_iter().enumerate().map(|(index, choice)| {
                     let category = category.clone();
                     Button::new(("category", index)).label(if category.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
                         .on_click(move |_, _, cx| { category.set(choice); cx.refresh_windows(); })
@@ -811,7 +814,11 @@ impl HomeView {
                     .child(Button::new("save-home-item").primary().label("Save").on_click(|_, window, cx| window.dispatch_action(Box::new(Confirm { secondary: false }), cx))))
                 .on_ok(move |_, window, cx| {
                 let mut item = item.clone();
-                item.title = title.read(cx).value().to_string();
+                item.title = if item.kind == Kind::PullRequest {
+                    String::new()
+                } else {
+                    title.read(cx).value().to_string()
+                };
                 item.description = description.read(cx).value().to_string();
                 item.label = label.read(cx).value().to_string();
                 item.url = url.read(cx).value().to_string();

@@ -3,7 +3,7 @@ use super::*;
 use crate::pull_requests::Ci;
 
 #[derive(Clone)]
-struct DragPr(Item);
+struct DragPr(Item, String);
 
 impl Render for DragPr {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -11,7 +11,7 @@ impl Render for DragPr {
             .p_3()
             .rounded_md()
             .bg(cx.theme().secondary)
-            .child(self.0.title.clone())
+            .child(self.1.clone())
     }
 }
 
@@ -100,13 +100,10 @@ impl HomeView {
     ) -> impl IntoElement {
         let entry = self.pr_status.entries.get(&item.url);
         let status = entry.and_then(|entry| entry.status.as_ref());
-        let title = if item.title == item.url {
-            status
-                .map(|status| status.title.clone())
-                .unwrap_or_else(|| item.title.clone())
-        } else {
-            item.title.clone()
-        };
+        let title = status
+            .map(|status| status.title.clone())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| item.title.clone());
         let mut badges = h_flex().gap_2().flex_wrap().child(
             Tag::secondary()
                 .with_size(Size::Small)
@@ -161,7 +158,7 @@ impl HomeView {
             })
             .bg(cx.theme().background)
             .when(draggable, |card| {
-                card.on_drag(DragPr(item.clone()), |drag, _, _, cx| {
+                card.on_drag(DragPr(item.clone(), title.clone()), |drag, _, _, cx| {
                     cx.new(|_| drag.clone())
                 })
             })

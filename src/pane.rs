@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::ElementExt as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -1136,7 +1137,7 @@ impl Render for TerminalPane {
                 .map_or(0x000000, |session| session.background_color())))
             .font_family(TERMINAL_FONT_FAMILY)
             .track_focus(&self.focus_handle)
-            .focus(|style| style.border_2().border_color(rgb(0x60a5fa)))
+            .focus(|style| style.border_1().border_color(cx.theme().ring))
             .on_prepaint(move |bounds, _, cx| {
                 // Recorded without notifying: the next mouse event reads it.
                 // Notifying here would schedule another paint every frame.

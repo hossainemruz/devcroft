@@ -622,7 +622,7 @@ impl Workspace {
         let activity = self.agent_activity.snapshot();
         let mut sidebar = v_flex()
             .track_focus(&self.agent_sidebar_focus)
-            .focus(|style| style.border_2().border_color(cx.theme().ring))
+            .focus(|style| style.border_1().border_color(cx.theme().ring))
             .h_full()
             .min_h_0()
             .flex_none()

@@ -695,7 +695,7 @@ impl Render for ArtifactBrowser {
         let mut sidebar = v_flex()
             .id("resource-sidebar")
             .track_focus(&self.sidebar_focus)
-            .focus(|style| style.border_2().border_color(cx.theme().ring))
+            .focus(|style| style.border_1().border_color(cx.theme().ring))
             .w(px(260.))
             .flex_none()
             .h_full()
@@ -835,7 +835,7 @@ impl Render for ArtifactBrowser {
         }
         let mut detail = v_flex()
             .track_focus(&self.detail_focus)
-            .focus(|style| style.border_2().border_color(cx.theme().ring))
+            .focus(|style| style.border_1().border_color(cx.theme().ring))
             .flex_1()
             .min_w_0()
             .h_full()
@@ -936,7 +936,7 @@ impl Render for ArtifactBrowser {
                 let mut comments = v_flex()
                     .id("artifact-comments")
                     .track_focus(&self.comments_focus)
-                    .focus(|style| style.border_2().border_color(cx.theme().ring))
+                    .focus(|style| style.border_1().border_color(cx.theme().ring))
                     .max_h(px(240.))
                     .overflow_y_scroll()
                     .gap_2()
@@ -1021,7 +1021,7 @@ impl Render for ArtifactBrowser {
                 main = main.child(comments);
                 let mut rail = v_flex()
                     .track_focus(&self.outline_focus)
-                    .focus(|style| style.border_2().border_color(cx.theme().ring))
+                    .focus(|style| style.border_1().border_color(cx.theme().ring))
                     .flex_none()
                     .h_full()
                     .when(!self.toc.is_empty(), |rail| {

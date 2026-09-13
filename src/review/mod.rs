@@ -31,7 +31,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, ParentElement,
-    Render, ScrollStrategy, SharedString, Styled, Window, div, img, list, px, rgb, svg,
+    Render, ScrollStrategy, SharedString, Styled, Subscription, Window, div, img, list, px, rgb,
+    svg,
 };
 
 use crate::command_palette::{
@@ -80,6 +81,13 @@ pub(crate) struct ReviewView {
     tree_focus: FocusHandle,
     stream_focus: FocusHandle,
     comments_focus: FocusHandle,
+    /// True while the Files sidebar or the tree inside it holds focus. The
+    /// sidebar wrapper tracks `tree_focus`, but keyboard traversal focuses
+    /// the inner `TreeState` handle (see `focus_navigation_pane`), so the
+    /// wrapper's `.focus()` style alone never fires. This mirrors subtree
+    /// focus via `on_focus_in`/`on_focus_out` listeners instead.
+    tree_contains_focus: bool,
+    focus_listeners: Option<[Subscription; 2]>,
     cwd: PathBuf,
     scope_tab: ScopeTab,
     base_branch: String,
@@ -121,6 +129,8 @@ impl ReviewView {
             tree_focus: cx.focus_handle(),
             stream_focus: cx.focus_handle(),
             comments_focus: cx.focus_handle(),
+            tree_contains_focus: false,
+            focus_listeners: None,
             cwd: cwd.to_owned(),
             scope_tab: ScopeTab::FullDiff,
             base_branch,
@@ -819,11 +829,30 @@ impl ReviewView {
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sync scroll before borrowing the diff for the body below.
         self.stream_top
             .set(self.list_handle.logical_scroll_top().item_ix);
         self.sync_tree_and_stream(cx);
+        // Focus listeners need a Window, so they are installed on first
+        // render rather than in `new`. They keep `tree_contains_focus`
+        // fresh across every focus path (keyboard nav, mouse, palettes).
+        if self.focus_listeners.is_none() {
+            let tree = self.tree_focus.clone();
+            let on_in = cx.on_focus_in(&tree, window, |this, _, cx| {
+                if !this.tree_contains_focus {
+                    this.tree_contains_focus = true;
+                    cx.notify();
+                }
+            });
+            let on_out = cx.on_focus_out(&tree, window, |this, _, _, cx| {
+                if this.tree_contains_focus {
+                    this.tree_contains_focus = false;
+                    cx.notify();
+                }
+            });
+            self.focus_listeners = Some([on_in, on_out]);
+        }
         let focus = self.focus_handle.clone();
         let track = self.focus_handle.clone();
         let tree_focus = self.tree_focus.clone();
@@ -885,7 +914,12 @@ impl Render for ReviewView {
                     .child(
                         v_flex()
                             .track_focus(&tree_focus)
-                            .focus(|style| style.border_2().border_color(cx.theme().ring))
+                            .focus(|style| style.border_1().border_color(cx.theme().ring))
+                            .when(self.tree_contains_focus, |this| this.border_1())
+                            .border_color(rgb(0x292b2b))
+                            .when(self.tree_contains_focus, |this| {
+                                this.border_color(cx.theme().ring)
+                            })
                             .w(px(320.))
                             .flex_none()
                             .h_full()
@@ -911,7 +945,7 @@ impl Render for ReviewView {
                     .child(
                         v_flex()
                             .track_focus(&stream_focus)
-                            .focus(|style| style.border_2().border_color(cx.theme().ring))
+                            .focus(|style| style.border_1().border_color(cx.theme().ring))
                             .flex_1()
                             .min_w_0()
                             .h_full()
@@ -953,7 +987,7 @@ impl Render for ReviewView {
                         d.child(
                             div()
                                 .track_focus(&comments_focus)
-                                .focus(|style| style.border_2().border_color(cx.theme().ring))
+                                .focus(|style| style.border_1().border_color(cx.theme().ring))
                                 .child(self.render_comments(cx)),
                         )
                     }),

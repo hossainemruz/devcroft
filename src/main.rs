@@ -34,8 +34,8 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser as _;
 use gpui_kit::component::{ActiveTheme as _, Root, Theme, ThemeMode};
 use gpui_kit::{
-    AppContext as _, Focusable as _, KeyBinding, SharedString, Styled as _, WindowBounds,
-    WindowOptions, px, size,
+    App, AppContext as _, Focusable as _, KeyBinding, SharedString, Styled as _, WindowBounds,
+    WindowOptions, px, rgb, size,
 };
 
 use crate::cli::{Cli, Command};
@@ -100,6 +100,7 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         ]);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
         Theme::change(theme_mode, None, cx);
+        apply_focus_theme(cx);
 
         let options = WindowOptions {
             titlebar: Some(gpui_kit::TitlebarOptions {
@@ -181,6 +182,7 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
         gpui_kit::init(cx);
         load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
         Theme::change(theme_mode, None, cx);
+        apply_focus_theme(cx);
 
         let options = WindowOptions {
             titlebar: Some(gpui_kit::TitlebarOptions {
@@ -206,6 +208,14 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
         .detach();
     });
     Ok(())
+}
+
+/// Single blue used for every keyboard-focus border, applied to the shared
+/// theme so library inputs and our custom panes stay in sync. The default
+/// theme ring is neutral gray; tinting it blue keeps focus subtle (1px,
+/// same width as normal borders) yet distinct from divider gray.
+fn apply_focus_theme(cx: &mut App) {
+    Theme::global_mut(cx).ring = rgb(0x2f81f7).into();
 }
 
 /// Stored theme name to [`ThemeMode`]. Unknown or absent values keep the

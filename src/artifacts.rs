@@ -876,10 +876,23 @@ impl Render for ArtifactBrowser {
         if let Some(snapshot) = self.selected.clone() {
             let artifact = &snapshot.artifact;
             let archived = artifact.archived;
-            let mut main = v_flex().flex_1().min_w_0().h_full().min_h_0().p_4().gap_3();
+            // Right padding stays tight so the document scrollbar docks
+            // beside the outline rail instead of floating mid-pane.
+            let mut main = v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .min_h_0()
+                .p_4()
+                .pt_2()
+                .pr(px(4.))
+                .gap_2();
             if let Some(error) = &self.error {
                 main = main.child(div().text_color(cx.theme().danger).child(error.clone()));
             }
+            // Single compact meta line — kind, recency, repository, and
+            // originating sessions share one wrapping row so the document
+            // starts higher.
             let mut meta = h_flex()
                 .gap_2()
                 .items_center()
@@ -897,12 +910,19 @@ impl Render for ArtifactBrowser {
                         .child(updated_label(artifact.updated_at, current_unix_secs())),
                 );
             if let Some(repository) = artifact.repository.clone() {
-                meta = meta.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(repository),
-                );
+                meta = meta
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("·"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(repository),
+                    );
             }
             if archived {
                 meta = meta.child(
@@ -912,27 +932,46 @@ impl Render for ArtifactBrowser {
                         .child("Archived"),
                 );
             }
-            main = main.child(meta);
             if !artifact.sessions.is_empty() {
-                let mut origins = h_flex().gap_2().flex_wrap().child("Originating sessions:");
+                meta = meta
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("·"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("From"),
+                    );
                 for (index, origin) in artifact.sessions.iter().enumerate() {
                     let origin = origin.clone();
-                    origins =
-                        origins.child(
-                            Button::new(("origin-session", index))
-                                .ghost()
-                                .label(if origin.title.is_empty() {
-                                    origin.key.id.clone()
-                                } else {
-                                    origin.title.clone()
-                                })
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(OpenSession(origin.clone()))
-                                })),
-                        );
+                    meta = meta.child(
+                        Button::new(("origin-session", index))
+                            .ghost()
+                            .small()
+                            .compact()
+                            .label(if origin.title.is_empty() {
+                                origin.key.id.clone()
+                            } else {
+                                origin.title.clone()
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(OpenSession(origin.clone()))
+                            })),
+                    );
                 }
-                main = main.child(origins);
             }
+            main = main.child(
+                h_flex().w_full().justify_center().child(
+                    meta.flex_wrap()
+                        .w_full()
+                        .max_w(px(crate::preview::READING_WIDTH))
+                        .pr(px(16.)),
+                ),
+            );
             if let Some(draft) = &self.draft {
                 main = main
                     .child(

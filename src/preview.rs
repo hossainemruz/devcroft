@@ -14,11 +14,9 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use gpui_kit::base::Scrollbar;
+use gpui_kit::base::{Scrollbar, TextView, TextViewStyle};
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::text::{
-    FrontmatterPlugin, MarkdownExtensions, TextView, TextViewState, TextViewStyle,
-};
+use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextViewState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -28,9 +26,110 @@ use gpui_kit::{
     Styled as _, Window, div, px, rems,
 };
 
-/// Maximum previewed file size: matches the 4 MiB repository file-API limit
-/// referenced in `docs/cli-plan.md`'s open questions.
+/// Shared column width for document content and resource metadata.
+pub(crate) const READING_WIDTH: f32 = 820.;
+
+/// Maximum previewed file size: matches the repository file-API limit.
 pub(crate) const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Preserve label/value metadata lines without preventing ordinary prose from
+/// reflowing. Work on parsed paragraphs so fences and frontmatter stay intact.
+/// This is a display copy; the saved Markdown is never rewritten.
+fn metadata_line_breaks(source: &str) -> String {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.frontmatter = true;
+    let Ok(root) = markdown::to_mdast(source, &options) else {
+        return source.to_owned();
+    };
+    let mut insertions = Vec::new();
+    for node in root.children().into_iter().flatten() {
+        let markdown::mdast::Node::Paragraph(paragraph) = node else {
+            continue;
+        };
+        let Some(position) = &paragraph.position else {
+            continue;
+        };
+        let text = &source[position.start.offset..position.end.offset];
+        let lines: Vec<_> = text.lines().collect();
+        if lines.len() < 2
+            || !lines.iter().all(|line| {
+                line.strip_prefix("**")
+                    .and_then(|line| line.split_once(":**"))
+                    .is_some_and(|(label, _)| !label.is_empty())
+            })
+        {
+            continue;
+        }
+        for (offset, _) in text.match_indices('\n') {
+            let end = position.start.offset + offset;
+            let end = if source.as_bytes()[end - 1] == b'\r' {
+                end - 1
+            } else {
+                end
+            };
+            if !source[..end].ends_with("  ") && !source[..end].ends_with('\\') {
+                insertions.push(end);
+            }
+        }
+    }
+    let mut result = source.to_owned();
+    for offset in insertions.into_iter().rev() {
+        result.insert_str(offset, "  ");
+    }
+    result
+}
+
+type CodeHighlights = std::collections::HashMap<
+    (SharedString, Option<SharedString>, bool),
+    Vec<(std::ops::Range<usize>, HighlightStyle)>,
+>;
+
+fn highlight_code(
+    code: &str,
+    language: Option<&str>,
+    dark: bool,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    use std::sync::LazyLock;
+    use syntect::{
+        easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
+    };
+    static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+    static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+    let Some(syntax) = language.and_then(|lang| SYNTAXES.find_syntax_by_token(lang)) else {
+        return Vec::new();
+    };
+    let theme = &THEMES.themes[if dark {
+        "base16-ocean.dark"
+    } else {
+        "InspiredGitHub"
+    }];
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for line in LinesWithEndings::from(code) {
+        if let Ok(parts) = highlighter.highlight_line(line, &SYNTAXES) {
+            let mut start = offset;
+            for (style, text) in parts {
+                let color = style.foreground;
+                spans.push((
+                    start..start + text.len(),
+                    HighlightStyle {
+                        color: Some(
+                            gpui_kit::rgba(u32::from_be_bytes([
+                                color.r, color.g, color.b, color.a,
+                            ]))
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                ));
+                start += text.len();
+            }
+        }
+        offset += line.len();
+    }
+    spans
+}
 
 /// Read and validate a preview target. Returns `(title, content)` where the
 /// title is the file name (falling back to the full path when it has none).
@@ -177,6 +276,7 @@ pub(crate) struct PreviewView {
     toc_hovered: bool,
     toc_focus: FocusHandle,
     embedded: bool,
+    code_highlights: std::sync::Arc<parking_lot::Mutex<CodeHighlights>>,
 }
 
 /// Scrollspy selection, emitted when the visible section changes.
@@ -185,6 +285,7 @@ impl EventEmitter<TocActive> for PreviewView {}
 
 impl PreviewView {
     pub(crate) fn new(content: SharedString, cx: &mut Context<Self>) -> Self {
+        let content = metadata_line_breaks(&content);
         let (toc, blocks) = extract_toc(&content);
         let state = cx.new(|cx| TextViewState::markdown(&content, cx));
         // Scrollspy: the virtualized list reports its visible item range on
@@ -214,6 +315,7 @@ impl PreviewView {
             toc_hovered: false,
             toc_focus: cx.focus_handle().tab_stop(true),
             embedded: false,
+            code_highlights: Default::default(),
         }
     }
 
@@ -389,56 +491,58 @@ impl Focusable for PreviewView {
 
 impl Render for PreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let reading_width = (window.viewport_size().width - px(80.)).clamp(px(1.), px(960.));
-        // Embedded readers sit below the host view's own header, so they skip
-        // the standalone window's generous top margin. Bottom keeps 32px to
+        let reading_width =
+            (window.viewport_size().width - px(80.)).clamp(px(1.), px(READING_WIDTH));
+        // Embedded readers sit below the host view's own compact header,
+        // so they keep only a small top margin. Bottom keeps 32px to
         // match the scrollbar insets below.
         let reader_top = if self.embedded { px(8.) } else { px(32.) };
         let list_state = self.state.read(cx).list_state().clone();
         let mut table = StyleRefinement::default();
         table.overflow.x = Some(Overflow::Scroll);
-        let code_block = div()
+        let mut code_block = div()
             .px_4()
             .py_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
+            .rounded_md()
             .bg(cx.theme().accent.opacity(0.6))
             .text_size(px(14.))
             .line_height(px(23.))
+            .whitespace_nowrap()
             .style()
             .clone();
+        code_block.overflow.x = Some(Overflow::Scroll);
         let table_head = div()
             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
             .bg(cx.theme().accent.opacity(0.5))
             .style()
             .clone();
         let table_cell = div().px_3().py_2().style().clone();
-        let style = TextViewStyle::default()
-            .paragraph_gap(rems(1.25))
-            .heading_font_size(|level, _| {
+        let body = cx.theme().foreground.opacity(0.85);
+        let style = TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
+            .with_foreground(body)
+            .with_paragraph_gap(rems(1.))
+            .with_heading_font_size(|level, _| {
                 px(match level {
-                    1 => 34.,
-                    2 => 26.,
-                    3 => 21.,
-                    _ => 18.,
+                    1 => 30.,
+                    2 => 23.,
+                    3 => 20.,
+                    4 => 18.,
+                    _ => 16.,
                 })
             })
             // HighlightStyle cannot change a span's font, padding, or corner
             // radius. Keep the source untouched and use a quiet, theme-aware
             // highlight until the renderer exposes real inline-code styling.
-            .inline_code(HighlightStyle {
-                background_color: Some(cx.theme().foreground.opacity(0.075)),
+            .with_inline_code(HighlightStyle {
+                background_color: Some(cx.theme().foreground.opacity(0.10)),
                 ..Default::default()
             })
-            .code_block(code_block)
-            .table(table)
-            .table_head(table_head)
-            .table_cell(table_cell);
-        // Embedded readers (Resources) let the document take the full width:
-        // the host lays out its own outline rail beside this view. The
-        // standalone window keeps its centered column, clipped gutter with
-        // edge scrollbar, and hover outline.
+            .with_code_block(code_block)
+            .with_table(table)
+            .with_table_head(table_head)
+            .with_table_cell(table_cell);
+        // Both hosts use a bounded reading column. Embedded width must follow
+        // the pane rather than the window (Resources can have side rails).
         h_flex()
             .id("preview-reader")
             .track_focus(&self.focus_handle)
@@ -458,38 +562,63 @@ impl Render for PreviewView {
             .size_full()
             .justify_center()
             .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+            .text_color(body)
+            .font_family(crate::fonts::MARKDOWN_FONT_FAMILY)
             .child(
                 div()
                     .w(reading_width)
-                    // flex_1's zero basis overrides the fixed width above,
-                    // so embedded documents fill the host-provided width
-                    // instead of centering a 960px column.
-                    .when(self.embedded, |this| this.flex_1())
+                    .when(self.embedded, |this| this.w_full().max_w(px(READING_WIDTH)))
                     .min_w_0()
                     .h_full()
                     .pt(reader_top)
                     .pb(px(32.))
-                    .text_size(px(17.))
-                    .line_height(px(29.))
+                    .text_size(px(16.))
+                    .line_height(px(26.))
                     .child(
-                        // TextView currently always draws a 16px scrollbar in
-                        // scrollable mode. Clip that gutter (including hitboxes)
-                        // and bind the window-edge scrollbar to the same list.
+                        // TextView always draws a 16px scrollbar in scrollable
+                        // mode. Clip that gutter (including hitboxes) and bind
+                        // an edge-docked scrollbar to the same list, so the
+                        // thumb sits at the pane edge instead of mid-content.
                         // Keeping the virtualized list preserves TOC offsets,
                         // selection, and keyboard scrolling.
-                        div().size_full().overflow_hidden().child(
+                        div().relative().size_full().overflow_hidden().child(
                             TextView::new(&self.state)
                                 .markdown_extensions(MarkdownExtensions::default().frontmatter())
                                 .plugin(FrontmatterPlugin)
                                 .style(style)
+                                .code_block_highlighter({
+                                    let dark = cx.theme().is_dark();
+                                    let cache = self.code_highlights.clone();
+                                    move |block| {
+                                        let code = block.code();
+                                        let language = block.lang();
+                                        cache
+                                            .lock()
+                                            .entry((code.clone(), language.clone(), dark))
+                                            .or_insert_with(|| {
+                                                highlight_code(&code, language.as_deref(), dark)
+                                            })
+                                            .clone()
+                                    }
+                                })
                                 .scrollable(true)
-                                .w(reading_width + px(16.))
+                                .when(!self.embedded, |this| this.w(reading_width + px(16.)))
                                 // Fluid embedded columns cannot precompute the
-                                // +16 clip, so they use the TextView's own
-                                // scrollbar (the pr_16 below keeps text clear
-                                // of it) while standalone keeps edge docking.
-                                .when(self.embedded, |this| this.w_full())
+                                // +16 clip, so they stretch 16px past the clip
+                                // box with a negative inset instead. w_auto is
+                                // required: the scrollable TextView defaults to
+                                // width 100%, which would otherwise win over
+                                // the inset and leave its scrollbar visible.
+                                // The pr_16 below keeps text clear of the
+                                // hidden gutter, matching standalone.
+                                .when(self.embedded, |this| {
+                                    this.absolute()
+                                        .left_0()
+                                        .top_0()
+                                        .bottom_0()
+                                        .right(px(-16.))
+                                        .w_auto()
+                                })
                                 .pr(px(16.)),
                         ),
                     ),
@@ -505,6 +634,25 @@ impl Render for PreviewView {
                         .child(
                             Scrollbar::vertical(&list_state)
                                 .id("preview-window-scrollbar")
+                                .viewport_from_layout(),
+                        ),
+                )
+            })
+            .when(self.embedded, |this| {
+                // Dock the thumb to the reader's pane edge (beside the
+                // outline rail) instead of the centered column. The insets
+                // match the column's own top/bottom padding so the viewport
+                // height — and therefore the thumb — tracks the list.
+                this.child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top(reader_top)
+                        .bottom(px(32.))
+                        .w(px(16.))
+                        .child(
+                            Scrollbar::vertical(&list_state)
+                                .id("preview-embedded-scrollbar")
                                 .viewport_from_layout(),
                         ),
                 )
@@ -528,6 +676,54 @@ impl Render for PreviewView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_breaks_preserve_prose_fences_and_outline() {
+        let source = "# Title\n\n**Status:** proposed\n**Repository:** example\n**Date:** today\n\nHard wrapped\nprose with **bold** text.\n\n```md\n**A:** one\n**B:** two\n```\n\n## Next\n";
+        let rendered = metadata_line_breaks(source);
+        assert!(
+            rendered.contains("**Status:** proposed  \n**Repository:** example  \n**Date:** today")
+        );
+        assert!(rendered.contains("Hard wrapped\nprose with **bold** text."));
+        assert!(rendered.contains("```md\n**A:** one\n**B:** two\n```"));
+        assert_eq!(extract_toc(source), extract_toc(&rendered));
+        assert_eq!(metadata_line_breaks(&rendered), rendered);
+    }
+
+    #[test]
+    fn metadata_breaks_handle_crlf_and_existing_hard_breaks() {
+        let source = "**Status:** proposed\r\n**Date:** today";
+        assert_eq!(
+            metadata_line_breaks(source),
+            "**Status:** proposed  \r\n**Date:** today"
+        );
+        let source = "**Status:** proposed\\\n**Date:** today";
+        assert_eq!(metadata_line_breaks(source), source);
+    }
+
+    #[test]
+    fn fenced_code_has_language_and_theme_aware_colors() {
+        for (language, code) in [
+            ("go", "// café\ntype Example struct { Name string }\n"),
+            ("sql", "SELECT id FROM snapshots WHERE id = 1;\n"),
+        ] {
+            let dark = highlight_code(code, Some(language), true);
+            let light = highlight_code(code, Some(language), false);
+            assert!(!dark.is_empty(), "{language} should have syntax styles");
+            assert!(
+                dark.windows(2)
+                    .any(|spans| spans[0].1.color != spans[1].1.color)
+            );
+            assert_ne!(dark, light);
+            assert_eq!(dark.first().unwrap().0.start, 0);
+            assert_eq!(dark.last().unwrap().0.end, code.len());
+            for (range, _) in dark {
+                assert!(code.get(range).is_some());
+            }
+        }
+        assert!(highlight_code("plain", None, true).is_empty());
+        assert!(highlight_code("plain", Some("unknown-language"), true).is_empty());
+    }
 
     #[test]
     fn reads_file_with_file_name_as_title() {

@@ -42,7 +42,7 @@ use gpui_kit::{
 use crate::cli::{Cli, Command};
 use crate::{
     command_palette::{ToggleActionsPalette, ToggleProjectsPalette},
-    fonts::load_terminal_fonts,
+    fonts::load_bundled_fonts,
     preview::PreviewView,
     workspace::Workspace,
 };
@@ -99,7 +99,7 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
             KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
             KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
         ]);
-        load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
+        load_bundled_fonts(cx).expect("failed to load bundled application fonts");
         Theme::change(theme_mode, None, cx);
         apply_focus_theme(cx);
 
@@ -181,7 +181,7 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
-        load_terminal_fonts(cx).expect("failed to load the bundled JetBrains Mono Nerd Font");
+        load_bundled_fonts(cx).expect("failed to load bundled application fonts");
         Theme::change(theme_mode, None, cx);
         apply_focus_theme(cx);
 

@@ -1,4 +1,4 @@
-//! Bundled terminal font loading and metrics.
+//! Bundled application fonts and terminal metrics.
 
 use std::borrow::Cow;
 
@@ -9,8 +9,28 @@ use crate::metrics::{BASE_FONT_SIZE, init_cell_width};
 
 pub(crate) const TERMINAL_FONT_FAMILY: &str = "JetBrainsMonoNL NFM";
 
-pub(crate) fn load_terminal_fonts(cx: &App) -> Result<()> {
+pub(crate) const MARKDOWN_FONT_FAMILY: &str = "Google Sans Flex";
+
+pub(crate) fn load_bundled_fonts(cx: &App) -> Result<()> {
     cx.text_system().add_fonts(vec![
+        Cow::Borrowed(include_bytes!(
+            "../assets/fonts/google-sans-flex/GoogleSansFlex-Regular.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../assets/fonts/google-sans-flex/GoogleSansFlex-SemiBold.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../assets/fonts/google-sans-flex/GoogleSansFlex-Bold.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../assets/fonts/google-sans-flex/GoogleSansFlex-Italic.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../assets/fonts/google-sans-flex/GoogleSansFlex-SemiBoldItalic.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../assets/fonts/google-sans-flex/GoogleSansFlex-BoldItalic.ttf"
+        )),
         Cow::Borrowed(
             include_bytes!("../assets/JetBrainsMonoNLNerdFontMono-Regular.ttf").as_slice(),
         ),

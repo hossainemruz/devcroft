@@ -21,7 +21,7 @@ impl HomeView {
     }
 
     pub(super) fn visible_pull_requests(&self, category: Category) -> Vec<Item> {
-        self.data.pull_requests(category, self.pr_group_filter)
+        self.data.pull_requests(category, self.group_filter)
     }
 
     pub(super) fn refresh_pull_requests(&mut self, force: bool, cx: &mut Context<Self>) {
@@ -106,7 +106,7 @@ impl HomeView {
         let mut badges = h_flex().gap_2().flex_wrap().child(
             Tag::secondary()
                 .with_size(Size::Small)
-                .child(item.pr_group.label()),
+                .child(item.group.label()),
         );
         if let Some(status) = status {
             let (state, color) = match status.state.as_str() {
@@ -296,9 +296,9 @@ impl HomeView {
 
     pub(super) fn pull_requests_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut filters = h_flex().gap_2().flex_wrap().items_center();
-        for group in [None, Some(PrGroup::Personal), Some(PrGroup::Work)] {
-            let label = group.map_or("All", PrGroup::label);
-            let checked = self.pr_group_filter == group;
+        for group in [None, Some(Group::Personal), Some(Group::Work)] {
+            let label = group.map_or("All", Group::label);
+            let checked = self.group_filter == group;
             filters = filters.child(
                 Radio::new(item_id("filter-pr", label))
                     .label(label.to_owned())
@@ -306,8 +306,8 @@ impl HomeView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         // Radios never toggle off: selecting the active one is
                         // a no-op, any other pick becomes the filter.
-                        if this.pr_group_filter != group {
-                            this.pr_group_filter = group;
+                        if this.group_filter != group {
+                            this.group_filter = group;
                             this.navigation_cursor = None;
                             cx.notify();
                         }
@@ -350,7 +350,7 @@ impl HomeView {
             for item in items {
                 column = column.child(self.pr_card(&item, true, cx));
             }
-            let group = self.pr_group_filter.unwrap_or_default();
+            let group = self.group_filter.unwrap_or_default();
             column = column.child(
                 Button::new(("add-pr-column", index))
                     .ghost()
@@ -359,7 +359,7 @@ impl HomeView {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let mut item = Item::new(Kind::PullRequest);
                         item.category = category;
-                        item.pr_group = group;
+                        item.group = group;
                         this.editor(item, window, cx);
                     })),
             );

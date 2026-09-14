@@ -34,13 +34,13 @@ impl Category {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum PrGroup {
+pub(crate) enum Group {
     #[default]
     Personal,
     Work,
 }
 
-impl PrGroup {
+impl Group {
     pub(crate) const ALL: [Self; 2] = [Self::Personal, Self::Work];
 
     pub(crate) fn label(self) -> &'static str {
@@ -58,14 +58,22 @@ pub(crate) struct Item {
     pub(crate) title: String,
     #[serde(default)]
     pub(crate) description: String,
+    /// Retired free-form tag, superseded by `project`. No UI reads or writes
+    /// it; the value round-trips untouched so older files lose nothing.
     #[serde(default)]
     pub(crate) label: String,
     #[serde(default)]
     pub(crate) url: String,
     #[serde(default)]
     pub(crate) category: Category,
+    /// Personal/Work scope for pull requests and todos. Legacy records
+    /// stored this as `pr_group`; `Dashboard::load` migrates that key.
     #[serde(default)]
-    pub(crate) pr_group: PrGroup,
+    pub(crate) group: Group,
+    /// Repository key this todo belongs to. Empty means unscoped (no
+    /// project). Only meaningful for `Kind::Todo`; other kinds ignore it.
+    #[serde(default)]
+    pub(crate) project: String,
     #[serde(default)]
     pub(crate) completed: bool,
     #[serde(flatten)]
@@ -90,10 +98,22 @@ impl Item {
         }
     }
 
+    /// Repository key this todo is scoped to, or `None` when unscoped.
+    /// Whitespace-only counts as unscoped so hand-edited JSON stays forgiving.
+    pub(crate) fn project_key(&self) -> Option<&str> {
+        let trimmed = self.project.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
     pub(crate) fn validate(&mut self) -> Result<()> {
         self.title = self.title.trim().to_owned();
         self.url = self.url.trim().to_owned();
         self.label = self.label.trim().to_owned();
+        self.project = self.project.trim().to_owned();
         if self.kind != Kind::Todo {
             if self.kind == Kind::PullRequest {
                 self.url = github_pr_url(&self.url)?;
@@ -166,11 +186,28 @@ pub(crate) struct Dashboard {
 
 impl Dashboard {
     pub(crate) fn load(root: &DataRoot) -> Result<Self> {
-        match std::fs::read(root.portable_dir().join("dashboard.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("Reading dashboard.json"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).context("Reading dashboard.json"),
+        let bytes = match std::fs::read(root.portable_dir().join("dashboard.json")) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).context("Reading dashboard.json"),
+        };
+        // Migration: the Personal/Work scope used to serialize as `pr_group`.
+        // Prefer `group` when both keys are present (an older client may have
+        // round-tripped an unknown `group` through `extra` while writing its
+        // own `pr_group`), then drop the legacy key so saves stay clean.
+        let mut value: Value = serde_json::from_slice(&bytes).context("Reading dashboard.json")?;
+        if let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items.iter_mut() {
+                if let Some(record) = item.as_object_mut() {
+                    if record.contains_key("group") {
+                        record.remove("pr_group");
+                    } else if let Some(legacy) = record.remove("pr_group") {
+                        record.insert("group".to_owned(), legacy);
+                    }
+                }
+            }
         }
+        serde_json::from_value(value).context("Reading dashboard.json")
     }
 
     pub(crate) fn save(&self, root: &DataRoot, expected: &Self) -> Result<()> {
@@ -199,13 +236,13 @@ impl Dashboard {
         Ok(())
     }
 
-    pub(crate) fn pull_requests(&self, category: Category, group: Option<PrGroup>) -> Vec<Item> {
+    pub(crate) fn pull_requests(&self, category: Category, group: Option<Group>) -> Vec<Item> {
         self.items
             .iter()
             .filter(|item| {
                 item.kind == Kind::PullRequest
                     && item.category == category
-                    && group.is_none_or(|group| item.pr_group == group)
+                    && group.is_none_or(|group| item.group == group)
             })
             .cloned()
             .collect()
@@ -240,6 +277,45 @@ impl Dashboard {
             self.items.insert(to, item);
         }
     }
+
+    /// Scope a todo to a repository (`None`/empty clears to Unscoped).
+    /// Non-todo items are left untouched so a stale drop cannot corrupt them.
+    pub(crate) fn set_todo_project(&mut self, id: &str, project: Option<&str>) {
+        let normalized = project.unwrap_or_default().trim().to_owned();
+        if let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|i| i.id == id && i.kind == Kind::Todo)
+        {
+            item.project = normalized;
+        }
+    }
+
+    /// Move a todo into a project column, keeping it last among that
+    /// project's incomplete todos. A no-op for unknown ids or completed
+    /// items (completed cards are not draggable).
+    pub(crate) fn move_todo_to_project(&mut self, source: &str, project: Option<&str>) {
+        let normalized = project.unwrap_or_default().trim().to_owned();
+        let Some(source_index) = self
+            .items
+            .iter()
+            .position(|i| i.id == source && i.kind == Kind::Todo && !i.completed)
+        else {
+            return;
+        };
+        let mut item = self.items.remove(source_index);
+        item.project = normalized.clone();
+        // Append after the last remaining incomplete todo of the target
+        // project so the card lands last in its new column; when the column
+        // is empty, push to the end (still last within that column).
+        let insert_at = self
+            .items
+            .iter()
+            .rposition(|i| i.kind == Kind::Todo && !i.completed && i.project == normalized)
+            .map(|index| index + 1)
+            .unwrap_or_else(|| self.items.len());
+        self.items.insert(insert_at, item);
+    }
 }
 
 #[cfg(test)]
@@ -252,24 +328,24 @@ mod tests {
             "category":"WaitingForReview", "futureField":42
         }]})).unwrap();
         let original = doc.items[0].clone();
-        assert_eq!(original.pr_group, PrGroup::Personal);
+        assert_eq!(original.group, Group::Personal);
         assert_eq!(original.category.label(), "Waiting for Approval");
         assert_eq!(
-            doc.pull_requests(Category::WaitingForReview, Some(PrGroup::Personal))
+            doc.pull_requests(Category::WaitingForReview, Some(Group::Personal))
                 .len(),
             1
         );
         assert!(
-            doc.pull_requests(Category::WaitingForReview, Some(PrGroup::Work))
+            doc.pull_requests(Category::WaitingForReview, Some(Group::Work))
                 .is_empty()
         );
         doc.move_pr(&original, Category::Watching).unwrap();
         assert!(doc.move_pr(&original, Category::ToReview).is_err());
         let mut moved = doc.items[0].clone();
-        moved.pr_group = PrGroup::Work;
+        moved.group = Group::Work;
         doc.upsert(moved).unwrap();
         assert_eq!(
-            doc.pull_requests(Category::Watching, Some(PrGroup::Work))
+            doc.pull_requests(Category::Watching, Some(Group::Work))
                 .len(),
             1
         );
@@ -381,5 +457,110 @@ mod tests {
         doc.items[1].completed = true;
         doc.move_todo("b", "a");
         assert_eq!(doc.items[1].id, "b");
+    }
+    #[test]
+    fn legacy_todos_gain_personal_group_and_unscoped_project() {
+        let mut doc: Dashboard = serde_json::from_value(serde_json::json!({"items":[{
+            "id":"legacy", "kind":"Todo", "title":"Old", "futureField": 7
+        }]}))
+        .unwrap();
+        assert_eq!(doc.items[0].group, Group::Personal);
+        assert_eq!(doc.items[0].project_key(), None);
+        let mut scoped = doc.items[0].clone();
+        scoped.group = Group::Work;
+        scoped.project = "  website  ".into();
+        doc.upsert(scoped).unwrap();
+        assert_eq!(doc.items[0].group, Group::Work);
+        assert_eq!(doc.items[0].project_key(), Some("website"));
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["items"][0]["futureField"], 7);
+        assert_eq!(json["items"][0]["group"], "Work");
+        assert_eq!(json["items"][0]["project"], "website");
+        assert_eq!(serde_json::from_value::<Dashboard>(json).unwrap(), doc);
+    }
+    #[test]
+    fn legacy_pr_group_key_migrates_to_group_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(temp.path().to_owned());
+        std::fs::create_dir_all(root.portable_dir()).unwrap();
+        // Pre-rename record: `pr_group` with no `group`.
+        std::fs::write(
+            root.portable_dir().join("dashboard.json"),
+            serde_json::json!({"items":[{
+                "id": "legacy", "kind": "Todo", "title": "Old",
+                "pr_group": "Work", "project": "website",
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let loaded = Dashboard::load(&root).unwrap();
+        assert_eq!(loaded.items[0].group, Group::Work);
+        assert_eq!(loaded.items[0].project_key(), Some("website"));
+        // Saving drops the legacy key so synced files converge on `group`.
+        let snapshot = loaded.clone();
+        loaded.save(&root, &snapshot).unwrap();
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(root.portable_dir().join("dashboard.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["items"][0]["group"], "Work");
+        assert!(raw["items"][0].get("pr_group").is_none());
+        // When both keys are present (an older client round-tripped an
+        // unknown `group` while writing its own `pr_group`), `group` wins.
+        std::fs::write(
+            root.portable_dir().join("dashboard.json"),
+            serde_json::json!({"items":[{
+                "id": "mixed", "kind": "Todo", "title": "Mixed",
+                "group": "Work", "pr_group": "Personal",
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(Dashboard::load(&root).unwrap().items[0].group, Group::Work);
+    }
+    #[test]
+    fn todo_project_moves_keep_column_order() {
+        let mut doc = Dashboard::default();
+        for (id, project) in [("a", ""), ("b", "website"), ("c", "")] {
+            let mut item = Item::new(Kind::Todo);
+            item.id = id.into();
+            item.title = id.into();
+            item.project = project.into();
+            doc.upsert(item).unwrap();
+        }
+        doc.set_todo_project("a", Some("website"));
+        assert_eq!(
+            doc.items.iter().find(|i| i.id == "a").unwrap().project,
+            "website"
+        );
+        doc.move_todo_to_project("c", Some("website"));
+        assert_eq!(
+            doc.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert!(doc.items.iter().all(|i| i.project == "website"));
+        doc.move_todo_to_project("a", None);
+        assert_eq!(
+            doc.items
+                .iter()
+                .find(|i| i.id == "a")
+                .unwrap()
+                .project_key(),
+            None
+        );
+        assert_eq!(
+            doc.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            ["b", "c", "a"]
+        );
+        doc.items
+            .iter_mut()
+            .find(|i| i.id == "b")
+            .unwrap()
+            .completed = true;
+        doc.move_todo_to_project("b", Some("other"));
+        assert_eq!(
+            doc.items.iter().find(|i| i.id == "b").unwrap().project,
+            "website"
+        );
     }
 }

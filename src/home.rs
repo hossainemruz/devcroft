@@ -1,5 +1,6 @@
 //! Home dashboard and dedicated destinations.
 mod pull_requests;
+mod todos;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
@@ -23,7 +24,7 @@ fn item_id(prefix: &str, id: &str) -> SharedString {
     format!("{prefix}-{id}").into()
 }
 
-use crate::data::dashboard::{Category, Dashboard, Item, Kind, PrGroup, safe_web_url};
+use crate::data::dashboard::{Category, Dashboard, Group, Item, Kind, safe_web_url};
 use crate::data::{
     DataRoot, RecentRepository, RepositoryEntry, SyncStatus, SyncTracker, all_repositories,
     recent_repositories,
@@ -231,6 +232,69 @@ fn project_groups(entries: &[RepositoryEntry]) -> Vec<String> {
     groups
 }
 
+/// Session-local project filter for Todos. `All` shows everything, `Unscoped`
+/// shows todos with no project, and `Project(key)` shows one repository.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum TodoProjectFilter {
+    #[default]
+    All,
+    Unscoped,
+    Project(String),
+}
+
+impl TodoProjectFilter {
+    fn matches(&self, project: Option<&str>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Unscoped => project.is_none(),
+            Self::Project(key) => project == Some(key.as_str()),
+        }
+    }
+}
+
+/// One kanban column on the Todos board: a repository or the Unscoped bucket.
+/// Pure so column construction stays unit-testable without a window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TodoColumn {
+    key: Option<String>,
+    title: String,
+}
+
+fn todo_board_columns(projects: &[RepositoryEntry], todos: &[Item]) -> Vec<TodoColumn> {
+    let mut columns = vec![TodoColumn {
+        key: None,
+        title: "Unscoped".to_owned(),
+    }];
+    for entry in projects {
+        let title = entry
+            .display_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| entry.key.clone());
+        columns.push(TodoColumn {
+            key: Some(entry.key.clone()),
+            title,
+        });
+    }
+    let known: std::collections::HashSet<&str> =
+        projects.iter().map(|entry| entry.key.as_str()).collect();
+    let mut orphans: Vec<String> = todos
+        .iter()
+        .filter(|item| item.kind == Kind::Todo)
+        .filter_map(|item| item.project_key().map(str::to_owned))
+        .filter(|key| !known.contains(key.as_str()))
+        .collect();
+    orphans.sort();
+    orphans.dedup();
+    for key in orphans {
+        columns.push(TodoColumn {
+            title: format!("{key} (removed)"),
+            key: Some(key),
+        });
+    }
+    columns
+}
+
 pub(crate) struct HomeView {
     artifacts: gpui_kit::Entity<crate::artifacts::ArtifactBrowser>,
     pub(crate) focus_handle: FocusHandle,
@@ -259,11 +323,18 @@ pub(crate) struct HomeView {
     pr_loading: bool,
     /// Session-local group filter for PRs (`None` shows Personal + Work).
     /// Shared by the inbox list and the dedicated board.
-    pr_group_filter: Option<PrGroup>,
+    group_filter: Option<Group>,
     /// Session-local category filter for the PR inbox (`None` shows all
     /// categories). The dedicated board keeps showing every column; only the
     /// inbox list applies this filter.
     pr_category_filter: Option<Category>,
+    /// Session-local group filter for Todos (`None` shows Personal + Work).
+    /// Shared by the inbox list and the dedicated board.
+    todo_group_filter: Option<Group>,
+    /// Session-local project filter for the Todo inbox (`All` shows every
+    /// project). The dedicated board shows every project as a column and
+    /// only applies the group filter.
+    todo_project_filter: TodoProjectFilter,
     project_focus: HashMap<String, FocusHandle>,
     scroll: ScrollHandle,
     /// Cursor for navigation-mode `j`/`k` through Home cards in visual order
@@ -345,8 +416,10 @@ impl HomeView {
             git_loading: false,
             pr_status: crate::pull_requests::Cache::default(),
             pr_loading: false,
-            pr_group_filter: None,
+            group_filter: None,
             pr_category_filter: None,
+            todo_group_filter: None,
+            todo_project_filter: TodoProjectFilter::All,
             project_focus: HashMap::new(),
             scroll: ScrollHandle::new(),
             navigation_cursor: None,
@@ -494,6 +567,14 @@ impl HomeView {
                 })
                 .collect();
         }
+        if self.is_todos_page() {
+            return self
+                .todo_board_columns()
+                .into_iter()
+                .flat_map(|column| self.column_todos(column.key.as_deref()))
+                .map(|item| HomeNavTarget::Item(item.id))
+                .collect();
+        }
         if self.page.is_some() {
             return Vec::new();
         }
@@ -522,15 +603,17 @@ impl HomeView {
                 i.kind == Kind::PullRequest
                     && (self.show_completed || !i.completed)
                     && i.category == category
-                    && self.pr_group_filter.is_none_or(|group| i.pr_group == group)
+                    && self.group_filter.is_none_or(|group| i.group == group)
             }) {
                 targets.push(HomeNavTarget::Item(item.id.clone()));
             }
         }
-        for item in visible
-            .iter()
-            .filter(|i| i.kind == Kind::Todo && (self.show_completed || !i.completed))
-        {
+        for item in visible.iter().filter(|i| {
+            i.kind == Kind::Todo
+                && (self.show_completed || !i.completed)
+                && self.todo_group_filter.is_none_or(|group| i.group == group)
+                && self.todo_project_filter.matches(i.project_key())
+        }) {
             targets.push(HomeNavTarget::Item(item.id.clone()));
         }
         for item in visible
@@ -790,11 +873,38 @@ impl HomeView {
             };
         let title = input(&item.title, "Title", window, cx);
         let description = input(&item.description, "Description (optional)", window, cx);
-        let label = input(&item.label, "Label (optional)", window, cx);
         let url = input(&item.url, "https://…", window, cx);
         let home = cx.entity().downgrade();
         let category = std::rc::Rc::new(std::cell::Cell::new(item.category));
-        let pr_group = std::rc::Rc::new(std::cell::Cell::new(item.pr_group));
+        let group = std::rc::Rc::new(std::cell::Cell::new(item.group));
+        let todo_project =
+            std::rc::Rc::new(std::cell::RefCell::new(item.project.trim().to_owned()));
+        // Project choices for the Todo editor: Unscoped plus every known
+        // repository, plus the current value when it points at a removed
+        // record so existing scope is never silently dropped.
+        let mut project_options: Vec<(String, String)> = self
+            .all_projects
+            .iter()
+            .map(|entry| {
+                let title = entry
+                    .display_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| entry.key.clone());
+                (entry.key.clone(), title)
+            })
+            .collect();
+        let current_project = item.project.trim().to_owned();
+        if !current_project.is_empty()
+            && !project_options
+                .iter()
+                .any(|(key, _)| key == &current_project)
+        {
+            project_options.push((
+                current_project.clone(),
+                format!("{current_project} (removed)"),
+            ));
+        }
         let original = self.data.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let mut form = v_flex().gap_3();
@@ -802,7 +912,7 @@ impl HomeView {
                 form = form.child("Title").child(Input::new(&title));
             }
             if item.kind == Kind::Todo {
-                form = form.child("Description").child(Input::new(&description)).child("Label").child(Input::new(&label));
+                form = form.child("Description").child(Input::new(&description));
             } else {
                 form = form.child("URL").child(Input::new(&url));
             }
@@ -813,15 +923,61 @@ impl HomeView {
                         .on_click(move |_, _, cx| { category.set(choice); cx.refresh_windows(); })
                 })))
                 .child("Group")
-                .child(h_flex().gap_2().children(PrGroup::ALL.into_iter().enumerate().map(|(index, choice)| {
-                    let pr_group = pr_group.clone();
-                    Button::new(("pr-group", index))
-                        .label(if pr_group.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
-                        .on_click(move |_, _, cx| { pr_group.set(choice); cx.refresh_windows(); })
+                .child(h_flex().gap_2().children(Group::ALL.into_iter().enumerate().map(|(index, choice)| {
+                    let group = group.clone();
+                    Button::new(("group", index))
+                        .label(if group.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
+                        .on_click(move |_, _, cx| { group.set(choice); cx.refresh_windows(); })
                 })));
             }
-            let pr_group = pr_group.clone();
-            let (title, description, label, url, home, category, item, original) = (title.clone(), description.clone(), label.clone(), url.clone(), home.clone(), category.clone(), item.clone(), original.clone());
+            if item.kind == Kind::Todo {
+                form = form.child("Group").child(h_flex().gap_2().children(Group::ALL.into_iter().enumerate().map(|(index, choice)| {
+                    let group = group.clone();
+                    Button::new(("todo-group", index))
+                        .label(if group.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
+                        .on_click(move |_, _, cx| { group.set(choice); cx.refresh_windows(); })
+                })));
+                let selected = todo_project.borrow().clone();
+                let selected_label = if selected.is_empty() {
+                    "Unscoped".to_owned()
+                } else {
+                    project_options
+                        .iter()
+                        .find(|(key, _)| key == &selected)
+                        .map(|(_, title)| title.clone())
+                        .unwrap_or_else(|| selected.clone())
+                };
+                let todo_project = todo_project.clone();
+                let project_options = project_options.clone();
+                form = form.child("Project").child(
+                    Button::new("todo-project")
+                        .label(selected_label)
+                        .dropdown_caret(true)
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for (key, title) in std::iter::once((
+                                String::new(),
+                                "Unscoped".to_owned(),
+                            ))
+                            .chain(project_options.clone())
+                            {
+                                let todo_project = todo_project.clone();
+                                let is_current = *todo_project.borrow() == key;
+                                menu = menu.item(
+                                    PopupMenuItem::new(title)
+                                        .checked(is_current)
+                                        .on_click(move |_, _, cx| {
+                                            *todo_project.borrow_mut() = key.clone();
+                                            cx.refresh_windows();
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
+                );
+            }
+            let group = group.clone();
+            let todo_project = todo_project.clone();
+            let (title, description, url, home, category, item, original) = (title.clone(), description.clone(), url.clone(), home.clone(), category.clone(), item.clone(), original.clone());
             dialog.title("Edit Home item").w(px(560.)).child(form)
                 .footer(DialogFooter::new()
                     .child(Button::new("cancel-home-item").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
@@ -834,10 +990,12 @@ impl HomeView {
                     title.read(cx).value().to_string()
                 };
                 item.description = description.read(cx).value().to_string();
-                item.label = label.read(cx).value().to_string();
                 item.url = url.read(cx).value().to_string();
                 item.category = category.get();
-                item.pr_group = pr_group.get();
+                item.group = group.get();
+                if item.kind == Kind::Todo {
+                    item.project = todo_project.borrow().clone();
+                }
                 home.update(cx, |this, cx| this.change(window, cx, |data| {
                     anyhow::ensure!(*data == original, "Home changed while this form was open. Close it and reopen the item.");
                     data.upsert(item)
@@ -910,24 +1068,174 @@ impl HomeView {
 
     /// Group dropdown for the PR inbox: All, Personal, Work. Matches the
     /// "Group" section of the PR editor.
-    fn pr_group_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.pr_group_filter;
-        let label = current.map_or("All", PrGroup::label);
+    fn group_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.group_filter;
+        let label = current.map_or("All", Group::label);
         let home = cx.entity().downgrade();
-        Button::new("pr-group-filter")
+        Button::new("group-filter")
             .ghost()
             .label(format!("{label} ▾"))
             .dropdown_menu(move |mut menu, _, _| {
-                for option in [None, Some(PrGroup::Personal), Some(PrGroup::Work)] {
-                    let option_label = option.map_or("All", PrGroup::label);
+                for option in [None, Some(Group::Personal), Some(Group::Work)] {
+                    let option_label = option.map_or("All", Group::label);
                     let home = home.clone();
                     menu = menu.item(
                         PopupMenuItem::new(option_label)
                             .checked(current == option)
                             .on_click(move |_, _, cx| {
                                 let _ = home.update(cx, |this, cx| {
-                                    if this.pr_group_filter != option {
-                                        this.pr_group_filter = option;
+                                    if this.group_filter != option {
+                                        this.group_filter = option;
+                                        this.navigation_cursor = None;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
+    pub(crate) fn is_todos_page(&self) -> bool {
+        self.page == Some("Todos")
+    }
+
+    /// Display name for a todo project key: the repository display name when
+    /// known, otherwise the raw key. Empty means Unscoped.
+    fn todo_project_title(&self, key: &str) -> String {
+        if key.trim().is_empty() {
+            return "Unscoped".to_owned();
+        }
+        self.all_projects
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| {
+                entry
+                    .display_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| entry.key.clone())
+            })
+            .unwrap_or_else(|| format!("{key} (removed)"))
+    }
+
+    /// Inbox todos in global order, filtered by completion, group, and
+    /// project. Pure ordering: the inbox stays a flat list; the board groups
+    /// the same items into columns.
+    fn visible_todos(&self) -> Vec<Item> {
+        self.data
+            .items
+            .iter()
+            .filter(|i| {
+                i.kind == Kind::Todo
+                    && (self.show_completed || !i.completed)
+                    && self.todo_group_filter.is_none_or(|group| i.group == group)
+                    && self.todo_project_filter.matches(i.project_key())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Board columns: Unscoped first, then every known repository in key
+    /// order, then orphan keys from removed repositories so scoped todos are
+    /// never hidden.
+    fn todo_board_columns(&self) -> Vec<TodoColumn> {
+        todo_board_columns(&self.all_projects, &self.data.items)
+    }
+
+    /// Todos for one board column in global order, filtered by completion
+    /// and the shared group filter.
+    fn column_todos(&self, project: Option<&str>) -> Vec<Item> {
+        let normalized = project.unwrap_or_default().trim();
+        self.data
+            .items
+            .iter()
+            .filter(|i| {
+                i.kind == Kind::Todo
+                    && (self.show_completed || !i.completed)
+                    && self.todo_group_filter.is_none_or(|group| i.group == group)
+                    && i.project.trim() == normalized
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Group dropdown for the Todo inbox and board: All, Personal, Work.
+    /// Matches the "Group" section of the Todo editor.
+    fn todo_group_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.todo_group_filter;
+        let label = current.map_or("All", Group::label);
+        let home = cx.entity().downgrade();
+        Button::new("todo-group-filter")
+            .ghost()
+            .label(format!("{label} ▾"))
+            .dropdown_menu(move |mut menu, _, _| {
+                for option in [None, Some(Group::Personal), Some(Group::Work)] {
+                    let option_label = option.map_or("All", Group::label);
+                    let home = home.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option_label)
+                            .checked(current == option)
+                            .on_click(move |_, _, cx| {
+                                let _ = home.update(cx, |this, cx| {
+                                    if this.todo_group_filter != option {
+                                        this.todo_group_filter = option;
+                                        this.navigation_cursor = None;
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
+    /// Project dropdown for the Todo inbox: All, Unscoped, plus every known
+    /// repository. An orphaned filter value is kept as an option so active
+    /// filtering never hides its own selection.
+    fn todo_project_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.todo_project_filter.clone();
+        let label = match &current {
+            TodoProjectFilter::All => "All".to_owned(),
+            TodoProjectFilter::Unscoped => "Unscoped".to_owned(),
+            TodoProjectFilter::Project(key) => self.todo_project_title(key),
+        };
+        let home = cx.entity().downgrade();
+        let mut options: Vec<(TodoProjectFilter, String)> = vec![
+            (TodoProjectFilter::All, "All".to_owned()),
+            (TodoProjectFilter::Unscoped, "Unscoped".to_owned()),
+        ];
+        for entry in &self.all_projects {
+            let title = entry
+                .display_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| entry.key.clone());
+            options.push((TodoProjectFilter::Project(entry.key.clone()), title));
+        }
+        if let TodoProjectFilter::Project(key) = &current
+            && !self.all_projects.iter().any(|entry| &entry.key == key)
+        {
+            options.push((current.clone(), format!("{key} (removed)")));
+        }
+        Button::new("todo-project-filter")
+            .ghost()
+            .label(format!("{label} ▾"))
+            .dropdown_menu(move |mut menu, _, _| {
+                for (option, option_label) in options.clone() {
+                    let home = home.clone();
+                    let option_clone = option.clone();
+                    let current_clone = current.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option_label)
+                            .checked(current_clone == option_clone)
+                            .on_click(move |_, _, cx| {
+                                let option = option_clone.clone();
+                                let _ = home.update(cx, |this, cx| {
+                                    if this.todo_project_filter != option {
+                                        this.todo_project_filter = option;
                                         this.navigation_cursor = None;
                                         cx.notify();
                                     }
@@ -1361,6 +1669,7 @@ impl HomeView {
 
     fn todo_card(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
         let cursor = self.is_cursor_item(&item.id);
+        let on_board = self.is_todos_page();
         let mut row = v_flex()
             .id(item_id("home-item", &item.id))
             .gap_1()
@@ -1379,8 +1688,16 @@ impl HomeView {
             };
             row = row.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()));
             let target = item.id.clone();
+            let target_project = item.project.clone();
             row = row.on_drop(cx.listener(move |this, drag: &DragTodo, window, cx| {
+                let on_board = this.is_todos_page();
                 this.change(window, cx, |data| {
+                    // On the board a drop onto another column's card re-scopes
+                    // the dragged todo before reordering; in the flat inbox a
+                    // drop only reorders.
+                    if on_board {
+                        data.set_todo_project(&drag.id, Some(&target_project));
+                    }
                     data.move_todo(&drag.id, &target);
                     Ok(())
                 });
@@ -1393,12 +1710,32 @@ impl HomeView {
         let delete_id = item.id.clone();
         let (move_up, move_down) = if item.completed {
             (None, None)
-        } else {
+        } else if on_board {
+            let project = item.project.trim();
             let pending: Vec<_> = self
                 .data
                 .items
                 .iter()
-                .filter(|i| i.kind == Kind::Todo && !i.completed)
+                .filter(|i| {
+                    i.kind == Kind::Todo
+                        && !i.completed
+                        && i.project.trim() == project
+                        && self.todo_group_filter.is_none_or(|group| i.group == group)
+                })
+                .collect();
+            let index = pending.iter().position(|i| i.id == item.id).unwrap_or(0);
+            (
+                index
+                    .checked_sub(1)
+                    .and_then(|i| pending.get(i))
+                    .map(|i| i.id.clone()),
+                pending.get(index + 1).map(|i| i.id.clone()),
+            )
+        } else {
+            let pending: Vec<_> = self
+                .visible_todos()
+                .into_iter()
+                .filter(|i| !i.completed)
                 .collect();
             let index = pending.iter().position(|i| i.id == item.id).unwrap_or(0);
             (
@@ -1503,20 +1840,29 @@ impl HomeView {
                         }),
                 ),
         );
+        row = row.child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    Tag::secondary()
+                        .with_size(Size::Small)
+                        .child(item.group.label()),
+                )
+                .when(!item.project.trim().is_empty(), |badges| {
+                    badges.child(
+                        Tag::secondary()
+                            .with_size(Size::Small)
+                            .child(self.todo_project_title(item.project.trim())),
+                    )
+                }),
+        );
         if !item.description.is_empty() {
             row = row.child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(item.description.clone()),
-            );
-        }
-        if !item.label.is_empty() {
-            row = row.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("#{}", item.label)),
             );
         }
         row
@@ -1529,21 +1875,25 @@ impl HomeView {
             Kind::Reading => ("To Read", "To Read"),
         };
         let is_pr = kind == Kind::PullRequest;
-        let items: Vec<_> = self
-            .data
-            .items
-            .iter()
-            .filter(|i| {
-                i.kind == kind
-                    && (self.show_completed || !i.completed)
-                    && (!is_pr
-                        || self
-                            .pr_category_filter
-                            .is_none_or(|category| i.category == category))
-                    && (!is_pr || self.pr_group_filter.is_none_or(|group| i.pr_group == group))
-            })
-            .cloned()
-            .collect();
+        let is_todo = kind == Kind::Todo;
+        let items: Vec<_> = if is_todo {
+            self.visible_todos()
+        } else {
+            self.data
+                .items
+                .iter()
+                .filter(|i| {
+                    i.kind == kind
+                        && (self.show_completed || !i.completed)
+                        && (!is_pr
+                            || self
+                                .pr_category_filter
+                                .is_none_or(|category| i.category == category))
+                        && (!is_pr || self.group_filter.is_none_or(|group| i.group == group))
+                })
+                .cloned()
+                .collect()
+        };
         let mut panel = v_flex()
             .flex_1()
             .min_w(px(290.))
@@ -1557,10 +1907,26 @@ impl HomeView {
             .child(self.heading(title, destination, cx));
         if kind == Kind::Todo {
             panel = panel.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Next items to do · drag a card to reorder"),
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_sm().child("Group:"))
+                            .child(self.todo_group_filter_dropdown(cx)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_sm().child("Project:"))
+                            .child(self.todo_project_filter_dropdown(cx)),
+                    ),
             );
         }
         if is_pr {
@@ -1574,15 +1940,15 @@ impl HomeView {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_sm().child("Category:"))
-                            .child(self.pr_category_filter_dropdown(cx)),
+                            .child(div().text_sm().child("Group:"))
+                            .child(self.group_filter_dropdown(cx)),
                     )
                     .child(
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_sm().child("Group:"))
-                            .child(self.pr_group_filter_dropdown(cx)),
+                            .child(div().text_sm().child("Category:"))
+                            .child(self.pr_category_filter_dropdown(cx)),
                     ),
             );
         }
@@ -1665,14 +2031,6 @@ impl HomeView {
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(item.description.clone()),
-                    );
-                }
-                if !item.label.is_empty() {
-                    row = row.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("#{}", item.label)),
                     );
                 }
                 let edit = item.clone();
@@ -1759,18 +2117,36 @@ impl HomeView {
                     .items_center()
                     .gap_2()
                     .child(self.pr_refresh_button(cx))
-                    .child(
-                        Button::new(item_id("add", title)).label("+ Add").on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.editor(Item::new(kind), window, cx)
-                            }),
-                        ),
-                    ),
+                    .child(Button::new(item_id("add", title)).label("+ Add").on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.editor(Item::new(kind), window, cx)
+                        }),
+                    )),
+            )
+        } else if is_todo {
+            let group = self.todo_group_filter.unwrap_or_default();
+            let project = match &self.todo_project_filter {
+                TodoProjectFilter::All | TodoProjectFilter::Unscoped => String::new(),
+                TodoProjectFilter::Project(key) => key.clone(),
+            };
+            panel.child(
+                h_flex().mt_auto().pt_3().justify_end().child(
+                    Button::new(item_id("add", title))
+                        .label("+ Add")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let mut item = Item::new(kind);
+                            item.group = group;
+                            item.project = project.clone();
+                            this.editor(item, window, cx)
+                        })),
+                ),
             )
         } else {
             panel.child(h_flex().mt_auto().pt_3().justify_end().child(
                 Button::new(item_id("add", title)).label("+ Add").on_click(
-                    cx.listener(move |this, _, window, cx| this.editor(Item::new(kind), window, cx)),
+                    cx.listener(move |this, _, window, cx| {
+                        this.editor(Item::new(kind), window, cx)
+                    }),
                 ),
             ))
         }
@@ -1810,6 +2186,8 @@ impl Render for HomeView {
                 body = body.child(self.projects_page(window, cx));
             } else if page == "Pull Requests" {
                 body = body.child(self.pull_requests_page(cx));
+            } else if page == "Todos" {
+                body = body.child(self.todos_page(cx));
             } else {
                 body = body
                     .child(
@@ -2441,5 +2819,50 @@ mod layout_tests {
         assert!(!ProjectGroupFilter::Group("work".to_owned()).matches(&personal));
         assert!(!ProjectGroupFilter::Ungrouped.matches(&personal));
         assert!(ProjectGroupFilter::Ungrouped.matches(&ungrouped));
+    }
+
+    fn todo_item(id: &str, project: &str) -> Item {
+        let mut item = Item::new(Kind::Todo);
+        item.id = id.to_owned();
+        item.title = id.to_owned();
+        item.project = project.to_owned();
+        item
+    }
+
+    #[test]
+    fn todo_project_filter_matches_all_unscoped_and_one_project() {
+        assert!(TodoProjectFilter::All.matches(None));
+        assert!(TodoProjectFilter::All.matches(Some("website")));
+        assert!(TodoProjectFilter::Unscoped.matches(None));
+        assert!(!TodoProjectFilter::Unscoped.matches(Some("website")));
+        assert!(TodoProjectFilter::Project("website".to_owned()).matches(Some("website")));
+        assert!(!TodoProjectFilter::Project("website".to_owned()).matches(None));
+        assert!(!TodoProjectFilter::Project("website".to_owned()).matches(Some("other")));
+    }
+
+    #[test]
+    fn todo_board_columns_start_unscoped_then_projects_then_orphans() {
+        let projects = vec![group_entry("website", None), group_entry("api", None)];
+        let todos = vec![
+            todo_item("a", ""),
+            todo_item("b", "website"),
+            todo_item("c", "gone"),
+        ];
+        let columns = todo_board_columns(&projects, &todos);
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.key.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some("website".to_owned()),
+                Some("api".to_owned()),
+                Some("gone".to_owned()),
+            ]
+        );
+        assert_eq!(columns[0].title, "Unscoped");
+        assert_eq!(columns[3].title, "gone (removed)");
+        assert!(todo_board_columns(&[], &[]).iter().any(|c| c.key.is_none()));
     }
 }

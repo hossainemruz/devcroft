@@ -1579,8 +1579,19 @@ impl HomeView {
                             Tag::secondary()
                                 .with_size(Size::Small)
                                 .rounded_full()
-                                .flex_none()
-                                .child(pill),
+                                .min_w_0()
+                                .max_w_full()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(pill),
+                                ),
                         )
                     })
                     .when_some(sync, |this, counts| {
@@ -2422,8 +2433,19 @@ impl Render for HomeView {
                                         Tag::secondary()
                                             .with_size(Size::Small)
                                             .rounded_full()
-                                            .flex_none()
-                                            .child(pill),
+                                            .min_w_0()
+                                            .max_w_full()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .whitespace_nowrap()
+                                                    .child(pill),
+                                            ),
                                     )
                                 })
                                 .when_some(sync, |this, counts| {

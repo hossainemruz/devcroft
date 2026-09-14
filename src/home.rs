@@ -1,6 +1,8 @@
 //! Home dashboard and dedicated destinations.
+mod links;
 mod pull_requests;
 mod todos;
+use self::links::description_with_links;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
@@ -1858,12 +1860,7 @@ impl HomeView {
                 }),
         );
         if !item.description.is_empty() {
-            row = row.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(item.description.clone()),
-            );
+            row = row.child(description_with_links(item, "todo", cx));
         }
         row
     }
@@ -2026,12 +2023,7 @@ impl HomeView {
                     .child(top)
                     .child(div().font_medium().child(item.title.clone()));
                 if !item.description.is_empty() {
-                    row = row.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(item.description.clone()),
-                    );
+                    row = row.child(description_with_links(item, "reading", cx));
                 }
                 let edit = item.clone();
                 let delete_id = item.id.clone();

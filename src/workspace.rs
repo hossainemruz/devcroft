@@ -2038,7 +2038,8 @@ impl Workspace {
                 if self.home_visible
                     && (self.home.read(cx).is_projects_page()
                         || self.home.read(cx).is_pull_requests_page()
-                        || self.home.read(cx).is_todos_page())
+                        || self.home.read(cx).is_todos_page()
+                        || self.home.read(cx).is_reading_page())
                 {
                     self.go_home(window, cx);
                 } else {
@@ -2452,7 +2453,8 @@ impl Render for Workspace {
         };
         let is_pull_requests = self.home_visible && self.home.read(cx).is_pull_requests_page();
         let is_todos = self.home_visible && self.home.read(cx).is_todos_page();
-        let is_home_page = is_artifacts || is_projects || is_pull_requests || is_todos;
+        let is_reading = self.home_visible && self.home.read(cx).is_reading_page();
+        let is_home_page = is_artifacts || is_projects || is_pull_requests || is_todos || is_reading;
         let attention_count = self.agent_activity.snapshot().attention_count();
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
@@ -2570,7 +2572,7 @@ impl Render for Workspace {
                                 ),
                         )
                     })
-                    .when(is_projects || is_pull_requests || is_todos, |header| {
+                    .when(is_projects || is_pull_requests || is_todos || is_reading, |header| {
                         header.child(
                             h_flex()
                                 .flex_none()
@@ -2589,6 +2591,8 @@ impl Render for Workspace {
                                         "Pull Requests"
                                     } else if is_todos {
                                         "Todos"
+                                    } else if is_reading {
+                                        "To Read"
                                     } else {
                                         "Projects"
                                     },

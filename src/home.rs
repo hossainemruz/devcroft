@@ -1,6 +1,7 @@
 //! Home dashboard and dedicated destinations.
 mod links;
 mod pull_requests;
+mod reading;
 mod todos;
 use self::links::description_with_links;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -574,6 +575,13 @@ impl HomeView {
                 .todo_board_columns()
                 .into_iter()
                 .flat_map(|column| self.column_todos(column.key.as_deref()))
+                .map(|item| HomeNavTarget::Item(item.id))
+                .collect();
+        }
+        if self.is_reading_page() {
+            return self
+                .visible_reading()
+                .into_iter()
                 .map(|item| HomeNavTarget::Item(item.id))
                 .collect();
         }
@@ -1865,6 +1873,113 @@ impl HomeView {
         row
     }
 
+    fn reading_card(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
+        let cursor = self.is_cursor_item(&item.id);
+        let toggle_id = item.id.clone();
+        let title = item.title.clone();
+        let home = cx.entity().downgrade();
+        let edit = item.clone();
+        let delete_id = item.id.clone();
+        let open_url = item.url.clone();
+        let mut card = v_flex()
+            .id(item_id("home-item", &item.id))
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if cursor {
+                cx.theme().ring
+            } else {
+                cx.theme().border
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Checkbox::new(item_id("complete", &item.id))
+                            .checked(item.completed)
+                            .accessibility_label(title.clone())
+                            .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                                this.change(window, cx, |data| {
+                                    if let Some(i) =
+                                        data.items.iter_mut().find(|i| i.id == toggle_id)
+                                    {
+                                        i.completed = *checked;
+                                    }
+                                    Ok(())
+                                });
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_medium()
+                            .child(title.clone()),
+                    )
+                    .child(
+                        Button::new(item_id("reading-menu", &item.id))
+                            .ghost()
+                            .label("⋯")
+                            .accessibility_label(format!("Options for {title}"))
+                            .dropdown_menu_with_anchor(
+                                Anchor::TopRight,
+                                move |menu, _, _| {
+                                    menu.item({
+                                        let home = home.clone();
+                                        let edit = edit.clone();
+                                        PopupMenuItem::new("Edit").on_click(
+                                            move |_, window, cx| {
+                                                let _ = home.update(cx, |this, cx| {
+                                                    this.editor(edit.clone(), window, cx);
+                                                });
+                                            },
+                                        )
+                                    })
+                                    .item({
+                                        let home = home.clone();
+                                        let delete_id = delete_id.clone();
+                                        PopupMenuItem::new("Delete").on_click(
+                                            move |_, window, cx| {
+                                                let _ = home.update(cx, |this, cx| {
+                                                    this.change(window, cx, |data| {
+                                                        data.items.retain(|i| i.id != delete_id);
+                                                        Ok(())
+                                                    });
+                                                });
+                                            },
+                                        )
+                                    })
+                                },
+                            ),
+                    ),
+            );
+        if !item.description.is_empty() {
+            card = card.child(description_with_links(item, "reading", cx));
+        }
+        card.child(
+            h_flex().w_full().justify_end().child(
+                Button::new(item_id("open-reading", &item.id))
+                    .ghost()
+                    .label("Open ↗")
+                    .on_click(move |_, window, cx| {
+                        if safe_web_url(&open_url) {
+                            cx.open_url(&open_url);
+                        } else {
+                            window.push_notification("Invalid web URL", cx);
+                        }
+                    }),
+            ),
+        )
+    }
+
     fn list(&self, kind: Kind, cx: &mut Context<Self>) -> impl IntoElement {
         let (title, destination) = match kind {
             Kind::Todo => ("Todos", "Todos"),
@@ -1875,6 +1990,8 @@ impl HomeView {
         let is_todo = kind == Kind::Todo;
         let items: Vec<_> = if is_todo {
             self.visible_todos()
+        } else if kind == Kind::Reading {
+            self.visible_reading()
         } else {
             self.data
                 .items
@@ -1970,131 +2087,7 @@ impl HomeView {
                     panel = panel.child(self.todo_card(item, cx));
                     continue;
                 }
-                let id = item.id.clone();
-                let cursor = self.is_cursor_item(&id);
-                let mut row = v_flex()
-                    .id(item_id("home-item", &id))
-                    .gap_2()
-                    .p_3()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if cursor {
-                        cx.theme().ring
-                    } else {
-                        cx.theme().border
-                    });
-                let mut top = h_flex().gap_2();
-                if kind != Kind::PullRequest {
-                    top = top.child(
-                        Checkbox::new(item_id("complete", &id))
-                            .checked(item.completed)
-                            .label(if kind == Kind::Todo { "Done" } else { "Read" })
-                            .on_click(cx.listener(move |this, checked: &bool, window, cx| {
-                                this.change(window, cx, |data| {
-                                    if let Some(i) = data.items.iter_mut().find(|i| i.id == id) {
-                                        i.completed = *checked;
-                                    }
-                                    Ok(())
-                                });
-                            })),
-                    );
-                }
-                if kind == Kind::Todo && !item.completed {
-                    let drag = DragTodo {
-                        id: item.id.clone(),
-                        title: item.title.clone(),
-                    };
-                    top = top.child(
-                        div()
-                            .id(item_id("drag", &item.id))
-                            .cursor_pointer()
-                            .child("⋮⋮")
-                            .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())),
-                    );
-                    let target = item.id.clone();
-                    row = row.on_drop(cx.listener(move |this, drag: &DragTodo, window, cx| {
-                        this.change(window, cx, |data| {
-                            data.move_todo(&drag.id, &target);
-                            Ok(())
-                        });
-                    }));
-                }
-                row = row
-                    .child(top)
-                    .child(div().font_medium().child(item.title.clone()));
-                if !item.description.is_empty() {
-                    row = row.child(description_with_links(item, "reading", cx));
-                }
-                let edit = item.clone();
-                let delete_id = item.id.clone();
-                let mut actions = h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(
-                        Button::new(item_id("edit", &item.id))
-                            .ghost()
-                            .label("Edit")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.editor(edit.clone(), window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(item_id("delete", &item.id))
-                            .ghost()
-                            .label("Delete")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.change(window, cx, |data| {
-                                    data.items.retain(|i| i.id != delete_id);
-                                    Ok(())
-                                });
-                            })),
-                    );
-                if kind == Kind::Todo && !item.completed {
-                    let pending: Vec<_> = self
-                        .data
-                        .items
-                        .iter()
-                        .filter(|i| i.kind == Kind::Todo && !i.completed)
-                        .collect();
-                    let index = pending.iter().position(|i| i.id == item.id).unwrap_or(0);
-                    for (name, target) in [
-                        ("Move up", index.checked_sub(1).and_then(|i| pending.get(i))),
-                        ("Move down", pending.get(index + 1)),
-                    ] {
-                        let source = item.id.clone();
-                        let target = target.map(|i| i.id.clone());
-                        actions = actions.child(
-                            Button::new(item_id(name, &source))
-                                .ghost()
-                                .label(name)
-                                .disabled(target.is_none())
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if let Some(target) = &target {
-                                        this.change(window, cx, |data| {
-                                            data.move_todo(&source, target);
-                                            Ok(())
-                                        });
-                                    }
-                                })),
-                        );
-                    }
-                }
-                if kind != Kind::Todo {
-                    let url = item.url.clone();
-                    actions = actions.child(
-                        Button::new(item_id("open", &item.id))
-                            .ghost()
-                            .label("Open ↗")
-                            .on_click(move |_, window, cx| {
-                                if safe_web_url(&url) {
-                                    cx.open_url(&url);
-                                } else {
-                                    window.push_notification("Invalid web URL", cx);
-                                }
-                            }),
-                    );
-                }
-                panel = panel.child(row.child(actions));
+                panel = panel.child(self.reading_card(item, cx));
             }
             if kind != Kind::PullRequest {
                 break;
@@ -2180,6 +2173,8 @@ impl Render for HomeView {
                 body = body.child(self.pull_requests_page(cx));
             } else if page == "Todos" {
                 body = body.child(self.todos_page(cx));
+            } else if page == "To Read" {
+                body = body.child(self.reading_page(window, cx));
             } else {
                 body = body
                     .child(

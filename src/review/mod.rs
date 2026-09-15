@@ -447,7 +447,8 @@ impl ReviewView {
     /// Forward the command-bar toggles to the workspace, mirroring
     /// `TerminalPane::on_key_down`. The tree/stream children don't swallow
     /// keys today, but without this any future child that stops propagation
-    /// would silently break `cmd-k`/`cmd-p` on this tab again. Tab
+    /// would silently break the OS-primary palette toggles (`cmd-k`/`cmd-p`
+    /// on macOS, `ctrl-k`/`ctrl-p` elsewhere) on this tab again. Tab
     /// jumps and session creation are intentionally not forwarded: they live
     /// in navigation mode and the palettes now. All other keys bubble
     /// normally (no `prevent_default`/`stop_propagation`) so tree navigation

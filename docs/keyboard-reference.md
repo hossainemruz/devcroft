@@ -5,15 +5,16 @@ and inputs behave as usual. **Navigation** is keyboard-driven navigation in
 which nothing can edit: every keystroke is either a navigation command or
 consumed before reaching a terminal or input.
 
-Toggle with `Cmd+M` on macOS (`Super+M` on Linux). The top bar shows a
+Toggle with `Cmd+J` on macOS (`Ctrl+J` on Linux/Windows). The top bar shows a
 `NAVIGATION` pill right after the command bar while navigation
-mode owns the keyboard, and a dim `⌘M` hint otherwise. The key list sits
+mode owns the keyboard, and a dim `⌘J` hint on macOS (`Ctrl+J` elsewhere)
+otherwise. The key list sits
 at the bottom-right of the window.
 
 ## Direct shortcuts (normal mode)
 
-- `Cmd+K` / `Ctrl+K`: actions palette
-- `Cmd+P` / `Ctrl+P`: projects palette
+- `Cmd+K` on macOS (`Ctrl+K` on Linux/Windows): actions palette
+- `Cmd+P` on macOS (`Ctrl+P` on Linux/Windows): projects palette
 
 These two also work inside navigation mode: they exit to normal mode and
 open their palette. There are no other direct shortcuts — tab jumps, session

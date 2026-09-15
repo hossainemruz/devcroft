@@ -26,9 +26,10 @@ gpui_kit::actions!(
     ]
 );
 
-/// Which filtered view of the command bar is open. `cmd/ctrl-k` opens the
-/// action commands (navigation, settings, sync); `cmd/ctrl-p` opens project
-/// navigation (recent repositories plus adding one). `Add
+/// Which filtered view of the command bar is open. `cmd-k` on macOS
+/// (`ctrl-k` on Linux/Windows) opens the action commands (navigation,
+/// settings, sync); `cmd-p` on macOS (`ctrl-p` on Linux/Windows) opens
+/// project navigation (recent repositories plus adding one). `Add
 /// repository…` lives only in projects mode, so every command has a single
 /// home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,12 +47,32 @@ impl PaletteMode {
     }
 }
 
-/// Match the command-bar shortcuts from a raw keystroke: `cmd/ctrl-k` opens
-/// actions, `cmd/ctrl-p` opens projects. Pure over the
+/// The OS-primary modifier: `Cmd` on macOS, `Ctrl` on Linux/Windows.
+/// (GPUI's `platform` flag is `Cmd` on macOS but the OS/Windows key
+/// elsewhere, so `platform` alone would bind `Win+K`/`Win+P` on
+/// Linux/Windows — colliding with projector, Cast, and window-manager
+/// chords. The primary-modifier rule keeps one documented shortcut per OS
+/// that matches platform conventions: `Cmd` where the OS reserves `Ctrl`
+/// for readline/terminal control, `Ctrl` where the OS reserves the OS key
+/// for the window manager.)
+pub(crate) fn is_primary_modifier(platform: bool, control: bool) -> bool {
+    if cfg!(target_os = "macos") {
+        platform && !control
+    } else {
+        control && !platform
+    }
+}
+
+/// Match the command-bar shortcuts from a raw keystroke: `cmd-k` on macOS
+/// (`ctrl-k` elsewhere) opens actions, `cmd-p` on macOS (`ctrl-p`
+/// elsewhere) opens projects. Pure over the
 /// keystroke pieces (not `KeyDownEvent`) so every focus site forwards
 /// identically and the mapping stays unit-testable without a window. `alt`
 /// combinations never match, so option-modified typing (e.g. `µ` on macOS)
-/// keeps reaching the terminal. `cmd-s`/`ctrl-s` match nothing: `ctrl-s` is
+/// keeps reaching the terminal. The off-primary modifier never matches
+/// either: `ctrl-k`/`ctrl-p` keep reaching macOS terminals as readline
+/// (kill-line, history-prev), and `cmd`/`super` chords keep reaching the
+/// Linux/Windows window manager. `cmd-s`/`ctrl-s` match nothing: `ctrl-s` is
 /// XOFF flow control, so it must keep reaching terminal applications.
 pub(crate) fn palette_mode_for_shortcut(
     key: &str,
@@ -59,7 +80,7 @@ pub(crate) fn palette_mode_for_shortcut(
     control: bool,
     alt: bool,
 ) -> Option<PaletteMode> {
-    if alt || !(platform || control) {
+    if alt || !is_primary_modifier(platform, control) {
         return None;
     }
     if key.eq_ignore_ascii_case("k") {
@@ -545,22 +566,54 @@ mod tests {
     fn shortcut_matcher_routes_k_and_p_to_their_modes() {
         use PaletteMode::{Actions, Projects};
 
-        assert_eq!(
-            palette_mode_for_shortcut("k", true, false, false),
-            Some(Actions)
-        );
-        assert_eq!(
-            palette_mode_for_shortcut("K", false, true, false),
-            Some(Actions)
-        );
-        assert_eq!(
-            palette_mode_for_shortcut("p", true, false, false),
-            Some(Projects)
-        );
-        assert_eq!(
-            palette_mode_for_shortcut("P", false, true, false),
-            Some(Projects)
-        );
+        // Only the OS-primary modifier matches: `Cmd` on macOS, `Ctrl`
+        // elsewhere. The off-primary chord must keep reaching its owner
+        // (readline on macOS, the window manager on Linux/Windows).
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                palette_mode_for_shortcut("k", true, false, false),
+                Some(Actions)
+            );
+            assert_eq!(
+                palette_mode_for_shortcut("K", true, false, false),
+                Some(Actions)
+            );
+            assert_eq!(
+                palette_mode_for_shortcut("p", true, false, false),
+                Some(Projects)
+            );
+            assert_eq!(
+                palette_mode_for_shortcut("P", true, false, false),
+                Some(Projects)
+            );
+            assert_eq!(palette_mode_for_shortcut("k", false, true, false), None);
+            assert_eq!(palette_mode_for_shortcut("p", false, true, false), None);
+            // Both modifiers held is a distinct chord: leave it alone.
+            assert_eq!(palette_mode_for_shortcut("k", true, true, false), None);
+            assert_eq!(palette_mode_for_shortcut("p", true, true, false), None);
+        } else {
+            assert_eq!(
+                palette_mode_for_shortcut("k", false, true, false),
+                Some(Actions)
+            );
+            assert_eq!(
+                palette_mode_for_shortcut("K", false, true, false),
+                Some(Actions)
+            );
+            assert_eq!(
+                palette_mode_for_shortcut("p", false, true, false),
+                Some(Projects)
+            );
+            assert_eq!(
+                palette_mode_for_shortcut("P", false, true, false),
+                Some(Projects)
+            );
+            assert_eq!(palette_mode_for_shortcut("k", true, false, false), None);
+            assert_eq!(palette_mode_for_shortcut("p", true, false, false), None);
+            // Both modifiers held is a distinct chord: leave it alone.
+            assert_eq!(palette_mode_for_shortcut("k", true, true, false), None);
+            assert_eq!(palette_mode_for_shortcut("p", true, true, false), None);
+        }
         // `s` matches nothing: there is no sessions mode, and `ctrl-s` is
         // XOFF flow control so it must keep reaching terminal applications.
         assert_eq!(palette_mode_for_shortcut("s", true, false, false), None);

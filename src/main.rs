@@ -80,13 +80,17 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
-        // Direct shortcuts are deliberately few: `cmd-k` opens the action
-        // commands and `cmd-p` the project switcher (`cmd` is Super on
-        // Linux, so this covers super+k/super+p there too; the `ctrl`
-        // variants of k/p are fallbacks for environments without a platform
-        // modifier).
-        // Everything else keyboard-driven lives in navigation mode (`cmd-m`,
-        // see `docs/keyboard-reference.md`) and the palettes: tab
+        // Direct shortcuts are deliberately few and OS-primary: `cmd-k`
+        // opens the action commands and `cmd-p` the project switcher on
+        // macOS; `ctrl-k` / `ctrl-p` on Linux/Windows. (`platform` is the
+        // OS key — `Cmd` on macOS, `Win/Super` elsewhere — so binding
+        // `cmd-*` unconditionally would steal `Win+K`/`Win+P` from the
+        // Windows projector, Cast, and Linux window managers; binding
+        // `ctrl-*` on macOS would steal readline kill-line/history-prev
+        // from terminals. One binding per OS avoids both.)
+        // Everything else keyboard-driven lives in navigation mode (`cmd-j`
+        // on macOS, `ctrl-j` elsewhere, see `docs/keyboard-reference.md`)
+        // and the palettes: tab
         // jumps, session creation, and settings have no direct bindings, so
         // `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow control),
         // `ctrl-n` (readline), `ctrl-d` (end-of-file), and `ctrl-/` keep
@@ -94,12 +98,17 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         // the two palette toggles explicitly (see
         // `TerminalPane::on_key_down`), since its raw key handler would
         // otherwise swallow the event while focused.
-        cx.bind_keys([
-            KeyBinding::new("cmd-k", ToggleActionsPalette, None),
-            KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
-            KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
-            KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
-        ]);
+        if cfg!(target_os = "macos") {
+            cx.bind_keys([
+                KeyBinding::new("cmd-k", ToggleActionsPalette, None),
+                KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
+            ]);
+        } else {
+            cx.bind_keys([
+                KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
+                KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
+            ]);
+        }
         load_bundled_fonts(cx).expect("failed to load bundled application fonts");
         Theme::change(theme_mode, None, cx);
         apply_focus_theme(cx);

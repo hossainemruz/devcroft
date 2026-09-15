@@ -1247,13 +1247,22 @@ impl SettingsView {
                     Some("These shortcuts work everywhere, including inside terminals."),
                 )
                 .child(live_row(
-                    "Toggle command palette",
+                    "Toggle actions palette",
                     "Search tabs, settings, and sync.",
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(kbd("⌘K"))
-                        .child(kbd("Ctrl+K")),
+                    if cfg!(target_os = "macos") {
+                        kbd("⌘K")
+                    } else {
+                        kbd("Ctrl+K")
+                    },
+                ))
+                .child(live_row(
+                    "Toggle projects palette",
+                    "Switch between recent repositories.",
+                    if cfg!(target_os = "macos") {
+                        kbd("⌘P")
+                    } else {
+                        kbd("Ctrl+P")
+                    },
                 ))
                 .child(live_row(
                     "Close palette or dialog",

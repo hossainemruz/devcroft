@@ -40,7 +40,8 @@ use crate::agent_sessions::{
 use crate::command_palette::{
     GoToAgent, GoToEditor, GoToResources, GoToReview, GoToTerminal, NewAgentSession,
     PaletteCommand, PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette,
-    ToggleProjectsPalette, item_at, palette_mode_for_shortcut, palette_sections_for_mode,
+    ToggleProjectsPalette, is_primary_modifier, item_at, palette_mode_for_shortcut,
+    palette_sections_for_mode,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
@@ -2117,15 +2118,18 @@ impl Workspace {
         false
     }
 
-    /// The mode toggle: `cmd-m` on macOS, `super-m` on Linux. Plain `m`
-    /// stays free as the Edit Markdown action key (it carries no
-    /// modifiers, so it never matches), and `ctrl-m` must keep reaching
-    /// terminals untouched.
+    /// The mode toggle: `cmd-j` on macOS, `ctrl-j` on Linux/Windows.
+    /// (`cmd-m`/`super-m` previously collided with system Minimize —
+    /// `Cmd+M` on macOS, `Win+M` minimize-all on Windows — so the toggle
+    /// moved to `J`, which has no OS reservation. `J` also echoes the
+    /// in-mode movement keys `j`/`k`, while the required modifier keeps it
+    /// distinct from plain-`j` move-down.) Plain `m` stays free as the Edit
+    /// Markdown action key, `cmd-m` returns to the system (Minimize on
+    /// macOS), and `ctrl-m` returns to terminals as an Enter alias.
     fn is_trigger(keystroke: &gpui_kit::Keystroke) -> bool {
         let modifiers = &keystroke.modifiers;
-        keystroke.key.eq_ignore_ascii_case("m")
-            && modifiers.platform
-            && !modifiers.control
+        keystroke.key.eq_ignore_ascii_case("j")
+            && is_primary_modifier(modifiers.platform, modifiers.control)
             && !modifiers.alt
             && !modifiers.shift
             && !modifiers.function
@@ -2321,13 +2325,20 @@ impl Workspace {
                         } else {
                             "Enter keep focus"
                         };
+                        let toggle = if cfg!(target_os = "macos") {
+                            "⌘J"
+                        } else {
+                            "Ctrl+J"
+                        };
                         let hint = match (panes.len() > 1, item) {
                             (true, true) => {
-                                format!("h/l focus pane · j/k move · {enter} · Esc/⌘M close")
+                                format!("h/l focus pane · j/k move · {enter} · Esc/{toggle} close")
                             }
-                            (true, false) => format!("h/l focus pane · {enter} · Esc/⌘M close"),
-                            (false, true) => format!("j/k move · {enter} · Esc/⌘M close"),
-                            (false, false) => "Esc/⌘M close".to_owned(),
+                            (true, false) => {
+                                format!("h/l focus pane · {enter} · Esc/{toggle} close")
+                            }
+                            (false, true) => format!("j/k move · {enter} · Esc/{toggle} close"),
+                            (false, false) => format!("Esc/{toggle} close"),
                         };
                         div()
                             .pt_2()
@@ -2343,10 +2354,11 @@ impl Workspace {
 
     /// Mode indicator immediately right of the command bar: a highlighted
     /// `NAVIGATION` pill while navigation mode owns the keyboard, a dim
-    /// `⌘M` hint otherwise, so the slot never shifts layout when toggling.
+    /// toggle hint (`⌘J` on macOS, `Ctrl+J` elsewhere) otherwise, so the slot
+    /// never shifts layout when toggling.
     /// Display-only on purpose — pointer presses dismiss the mode through
     /// the root capture handler, so a click-to-toggle here would race that
-    /// dismissal. `⌘M` stays the way in and out.
+    /// dismissal. The hint stays the way in and out.
     fn render_navigation_indicator(&self) -> AnyElement {
         if self.navigation_open {
             h_flex()
@@ -2375,7 +2387,11 @@ impl Workspace {
                 .border_color(rgb(0x292b2b))
                 .text_xs()
                 .text_color(rgb(0x737878))
-                .child("⌘M")
+                .child(if cfg!(target_os = "macos") {
+                    "⌘J"
+                } else {
+                    "Ctrl+J"
+                })
                 .into_any_element()
         }
     }
@@ -2946,42 +2962,56 @@ mod tests {
                 keystroke: Keystroke::parse(key).unwrap(),
             });
         };
+        // OS-primary chords under test: `cmd-j`/`cmd-p` on macOS,
+        // `ctrl-j`/`ctrl-p` on Linux/Windows.
+        const TRIGGER: &str = if cfg!(target_os = "macos") {
+            "cmd-j"
+        } else {
+            "ctrl-j"
+        };
+        const TRIGGER_KEY: &str = "j";
+        const PALETTE: &str = if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        };
+        const PALETTE_KEY: &str = "p";
 
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(is_open(test_cx), "first toggle opens navigation mode");
         assert!(
-            claimed(test_cx).iter().any(|key| key == "m"),
+            claimed(test_cx).iter().any(|key| key == TRIGGER_KEY),
             "trigger key is held until release"
         );
         // Held repeat before release: swallowed, must not toggle back off.
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(
             is_open(test_cx),
             "held trigger repeat must not double-toggle"
         );
-        release(test_cx, "m");
+        release(test_cx, TRIGGER_KEY);
         assert!(
             claimed(test_cx).is_empty(),
             "release clears the held-key set"
         );
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(!is_open(test_cx), "second toggle exits navigation mode");
-        release(test_cx, "m");
-        test_cx.simulate_keystrokes("cmd-m");
+        release(test_cx, TRIGGER_KEY);
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(
             is_open(test_cx),
             "third toggle re-opens navigation mode after release"
         );
-        release(test_cx, "m");
+        release(test_cx, TRIGGER_KEY);
         test_cx.simulate_keystrokes("escape");
         assert!(!is_open(test_cx));
         release(test_cx, "escape");
 
         // Exit via an overlay (add-repository dialog): closing the dialog
         // must not leave stale state that refuses the next toggle.
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(is_open(test_cx));
-        release(test_cx, "m");
+        release(test_cx, TRIGGER_KEY);
         test_cx.simulate_keystrokes("a");
         assert!(!is_open(test_cx), "action exits navigation mode");
         release(test_cx, "a");
@@ -2989,33 +3019,33 @@ mod tests {
         // dialog trap (the interceptor yields to active overlays).
         test_cx.simulate_keystrokes("escape");
         release(test_cx, "escape");
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(
             is_open(test_cx),
             "toggle re-opens after a dialog opened and closed"
         );
-        release(test_cx, "m");
+        release(test_cx, TRIGGER_KEY);
         test_cx.simulate_keystrokes("escape");
         release(test_cx, "escape");
 
         // The palette shortcuts stay live inside navigation mode: they exit
         // to normal mode (in the app the keystroke continues to the
         // palette, which has no binding in this harness).
-        test_cx.simulate_keystrokes("cmd-m");
-        release(test_cx, "m");
-        test_cx.simulate_keystrokes("cmd-p");
+        test_cx.simulate_keystrokes(TRIGGER);
+        release(test_cx, TRIGGER_KEY);
+        test_cx.simulate_keystrokes(PALETTE);
         assert!(!is_open(test_cx), "palette shortcut exits navigation mode");
-        release(test_cx, "p");
-        test_cx.simulate_keystrokes("cmd-m");
+        release(test_cx, PALETTE_KEY);
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(is_open(test_cx), "toggle re-opens after a palette shortcut");
-        release(test_cx, "m");
+        release(test_cx, TRIGGER_KEY);
         test_cx.simulate_keystrokes("escape");
         release(test_cx, "escape");
 
         // Lost key-ups must not wedge the toggle: open and close with no
         // releases at all, then release only the modifiers. The
         // all-released signal re-arms the trigger on its own.
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(is_open(test_cx));
         test_cx.simulate_keystrokes("escape");
         assert!(!is_open(test_cx));
@@ -3023,12 +3053,12 @@ mod tests {
             modifiers: Modifiers::default(),
             capslock: Capslock { on: false },
         });
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(
             is_open(test_cx),
             "toggle re-opens after modifier release without key-ups"
         );
-        release(test_cx, "m");
+        release(test_cx, TRIGGER_KEY);
         test_cx.simulate_keystrokes("escape");
         release(test_cx, "escape");
 
@@ -3036,7 +3066,7 @@ mod tests {
         // marks the claim, so the next trigger press is honored as fresh.
         // Shift, then Ctrl, then Shift release keeps the modifier set
         // non-empty throughout — only the marks can re-arm here.
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(is_open(test_cx));
         test_cx.simulate_keystrokes("escape");
         assert!(!is_open(test_cx));
@@ -3051,7 +3081,7 @@ mod tests {
         test_cx.simulate_event(modifiers(true, false));
         test_cx.simulate_event(modifiers(true, true));
         test_cx.simulate_event(modifiers(false, true));
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(
             is_open(test_cx),
             "toggle re-opens after modifier movement without key-ups"
@@ -3059,7 +3089,7 @@ mod tests {
         // Drain the simulated loss: real releases clear both claims, so the
         // next segment starts clean. (A marked non-trigger key stays
         // swallowed by design — a missed press beats an accidental edit.)
-        release(test_cx, "m");
+        release(test_cx, TRIGGER_KEY);
         release(test_cx, "escape");
         test_cx.simulate_keystrokes("escape");
         assert!(!is_open(test_cx));
@@ -3067,12 +3097,12 @@ mod tests {
 
         // Re-arm must not flicker: a held trigger repeat with no modifier
         // movement in between stays swallowed after a toggle-close.
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(is_open(test_cx));
-        release(test_cx, "m");
-        test_cx.simulate_keystrokes("cmd-m");
+        release(test_cx, TRIGGER_KEY);
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(!is_open(test_cx), "toggle closes");
-        test_cx.simulate_keystrokes("cmd-m");
+        test_cx.simulate_keystrokes(TRIGGER);
         assert!(
             !is_open(test_cx),
             "held trigger repeat without modifier movement stays swallowed"

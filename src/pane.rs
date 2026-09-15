@@ -370,13 +370,15 @@ impl TerminalPane {
         // The command-bar toggles must reach the workspace even while a
         // terminal has focus: everything below would otherwise be sent to the
         // pty. Dispatch them as actions (handled by `Workspace`) instead of
-        // terminal input. The global `cmd-k`/`ctrl-k` and `cmd-p`/`ctrl-p`
-        // bindings cover every other focus site, and dispatching here is
+        // terminal input. The global OS-primary bindings (`cmd-k`/`cmd-p` on
+        // macOS, `ctrl-k`/`ctrl-p` elsewhere) cover every other focus site,
+        // and dispatching here is
         // idempotent with them — whichever path runs first stops the event.
         // These are the only direct shortcuts left: tab jumps and session
         // creation live in navigation mode and the palettes, so `cmd-a`,
         // `cmd-e`, `cmd-/`, `cmd-d`, `cmd-t`, and `cmd-n` keep reaching the
-        // pty here, as do `cmd-s`/`ctrl-s` (`ctrl-s` is XOFF flow control).
+        // pty here, as do `ctrl-s` (XOFF flow control) and, on macOS,
+        // `ctrl-k`/`ctrl-p` (readline kill-line/history-prev).
         if let Some(mode) = palette_mode_for_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,

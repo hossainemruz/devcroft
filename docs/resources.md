@@ -4,7 +4,7 @@ The Resources tab replaces task tracking. Its sidebar lists the current reposito
 
 Use Edit Markdown to change a document and Save or Cancel. The comment panel supports creating, editing, resolving, reopening, and deleting document-level feedback. Originating sessions appear as links and open through the existing session navigator in their associated checkout. Missing sessions report an error without starting a different session.
 
-Keyboard navigation (`Cmd+M` on macOS, `Super+M` on Linux) offers `m` Edit Markdown and `c` Add comment for a selected resource, or `w` Save draft and `q` Cancel draft while drafting, alongside `h`/`l` pane movement. See the [keyboard reference](keyboard-reference.md).
+Keyboard navigation (`Cmd+J` on macOS, `Ctrl+J` on Linux/Windows) offers `m` Edit Markdown and `c` Add comment for a selected resource, or `w` Save draft and `q` Cancel draft while drafting, alongside `h`/`l` pane movement. See the [keyboard reference](keyboard-reference.md).
 
 ## Storage and concurrency
 

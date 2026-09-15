@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{DataRoot, write_json_atomic};
+use crate::agent::AgentKind;
 use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, clamp_sidebar_limit};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
@@ -53,13 +54,11 @@ pub(crate) struct DeviceState {
     /// on read, never rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recent_sessions_limit: Option<u32>,
-    /// Per-workspace default agent harness, keyed by canonical checkout
-    /// path string (see `workspace_agents`). Machine-local like the rest of
-    /// this file: different machines may have different harnesses
-    /// installed. Unknown ids are tolerated on read (callers fall back to
-    /// the default) and preserved across edits via plain-string storage.
+    /// Default agent harness id (Settings > Agent). Absent or unknown means
+    /// [`AgentKind::DEFAULT`]; stored as a plain string so a harness added
+    /// later can never break older builds' startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) workspace_agents: Option<HashMap<String, String>>,
+    pub(crate) default_agent: Option<String>,
     /// Machine-local checkout bindings by repository key: the linked local
     /// checkout plus remote alias. Portable metadata lives in
     /// `portable/repositories/<key>/repository.json`; only the binding that
@@ -104,11 +103,25 @@ impl DeviceState {
             })
     }
 
+    /// Effective default agent harness: the stored id, or
+    /// [`AgentKind::DEFAULT`] when unset or unknown. Never fails — a
+    /// hand-edited or future id must not break startup.
+    pub(crate) fn default_agent_or_default(&self) -> AgentKind {
+        self.default_agent
+            .as_deref()
+            .and_then(AgentKind::parse)
+            .unwrap_or(AgentKind::DEFAULT)
+    }
+
     /// Drop legacy selection fields: derived paths are never honored, and
-    /// must not linger back into the file on the next save.
+    /// must not linger back into the file on the next save. The removed
+    /// per-workspace default agent map (`workspace_agents`) is dropped the
+    /// same way: fresh checkouts start with the first harness and returning
+    /// checkouts resume their last session.
     fn scrub_legacy(&mut self) {
         self.extra.remove("dataDirectory");
         self.extra.remove("data_directory");
+        self.extra.remove("workspace_agents");
     }
 }
 
@@ -204,6 +217,7 @@ mod tests {
             sync_interval_minutes: Some(15),
             app_font_size: Some(17.0),
             recent_sessions_limit: Some(40),
+            default_agent: Some("claude".to_owned()),
             ..DeviceState::default()
         };
         state
@@ -218,6 +232,11 @@ mod tests {
         assert_eq!(loaded.app_font_size_or_default(), 17.0);
         assert_eq!(loaded.recent_sessions_limit, Some(40));
         assert_eq!(loaded.recent_sessions_limit_or_default(), 40);
+        assert_eq!(loaded.default_agent.as_deref(), Some("claude"));
+        assert_eq!(
+            loaded.default_agent_or_default(),
+            crate::agent::AgentKind::Claude
+        );
         assert_eq!(loaded.extra.get("futureField"), Some(&json!({"v": [1, 2]})));
 
         // The file itself is two-space JSON with a trailing newline.
@@ -271,6 +290,38 @@ mod tests {
             ..DeviceState::default()
         };
         assert_eq!(exact.recent_sessions_limit_or_default(), 40);
+    }
+
+    #[test]
+    fn default_agent_defaults_and_tolerates_unknown_ids() {
+        use crate::agent::AgentKind;
+        assert_eq!(
+            DeviceState::default().default_agent_or_default(),
+            AgentKind::DEFAULT
+        );
+        let exact = DeviceState {
+            default_agent: Some("claude".to_owned()),
+            ..DeviceState::default()
+        };
+        assert_eq!(exact.default_agent_or_default(), AgentKind::Claude);
+        // Case-insensitive like the rest of device.json reads.
+        let mixed = DeviceState {
+            default_agent: Some("Claude".to_owned()),
+            ..DeviceState::default()
+        };
+        assert_eq!(mixed.default_agent_or_default(), AgentKind::Claude);
+        // Unknown or empty ids fall back instead of failing the load.
+        for id in ["gemini", "", "  "] {
+            let unknown = DeviceState {
+                default_agent: Some(id.to_owned()),
+                ..DeviceState::default()
+            };
+            assert_eq!(
+                unknown.default_agent_or_default(),
+                AgentKind::DEFAULT,
+                "id {id:?} should fall back"
+            );
+        }
     }
 
     #[test]

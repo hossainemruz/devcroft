@@ -12,8 +12,9 @@ pub(super) enum SessionNavTarget {
 
 /// Keyboard-navigable agent chooser behind `New session…`.
 /// Backed by the kit's `List`, so up/down move the selection, Enter confirms,
-/// Esc closes, and the first agent starts selected. `ListDelegate` callbacks
-/// cannot borrow the workspace, so the delegate holds a weak handle instead.
+/// Esc closes, and the global default (Settings > Agent) starts selected
+/// with a `Default` badge. `ListDelegate` callbacks cannot borrow the
+/// workspace, so the delegate holds a weak handle instead.
 struct AgentPicker {
     default: AgentKind,
     selected: usize,
@@ -52,17 +53,6 @@ impl ListDelegate for AgentPicker {
                             .items_center()
                             .child(icon)
                             .child(div().text_sm().font_semibold().child(agent.label()))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(0x292b2b))
-                                    .bg(rgb(0x080909))
-                                    .text_xs()
-                                    .text_color(rgb(0x858989))
-                                    .child(format!("`{}`", agent.command())),
-                            )
                             .when(agent == self.default, |row| {
                                 row.child(
                                     div().text_xs().text_color(rgb(0x737878)).child("Default"),
@@ -450,25 +440,28 @@ impl Workspace {
     }
 
     /// Ask which harness a new session should use before spawning anything.
-    /// The default is offered as a hint but never auto-selected: starting a
-    /// session launches a process, so an explicit pick beats a mislaunch.
-    /// The persisted default stays untouched; this choice applies to this
-    /// session only, exactly like selecting a historical session. The picker
-    /// is a real `List`, so arrow keys move the highlight, Enter confirms, and
-    /// the first agent is selected as soon as the dialog opens.
+    /// Starting a session launches a process, so an explicit pick beats a
+    /// mislaunch. The global default (Settings > Agent) starts selected;
+    /// this choice applies to this session only, exactly like selecting a
+    /// historical session. The picker is a real `List`, so arrow keys move
+    /// the highlight and Enter confirms.
     pub(super) fn prompt_new_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Opening a dialog clears stale navigation state; the dialog trap
         // owns the keyboard from here.
         self.close_navigation(cx);
         let workspace = cx.entity().downgrade();
         let project = self.project_name.clone();
-        let default = self.default_agent;
         let icons = self.agent_icon_tiles.clone();
+        let selected = AgentKind::ALL
+            .iter()
+            .position(|agent| *agent == self.default_agent)
+            .unwrap_or(0);
+        let default = self.default_agent;
         let list_state = cx.new(|cx| {
             ListState::new(
                 AgentPicker {
                     default,
-                    selected: 0,
+                    selected,
                     workspace,
                     icons,
                 },
@@ -477,7 +470,7 @@ impl Workspace {
             )
         });
         list_state.update(cx, |state, cx| {
-            state.set_selected_index(Some(IndexPath::default()), window, cx);
+            state.set_selected_index(Some(IndexPath::new(selected)), window, cx);
         });
         let dialog_list = list_state.clone();
         window.open_dialog(cx, move |dialog, _, cx| {

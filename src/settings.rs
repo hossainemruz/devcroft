@@ -24,6 +24,10 @@ use gpui_kit::{
     div, px, rgb,
 };
 
+use std::rc::Rc;
+
+use crate::agent::AgentKind;
+use crate::agent_icons::{self, AgentIconTiles};
 use crate::agent_sessions::{
     DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, clamp_sidebar_limit,
 };
@@ -111,6 +115,12 @@ pub(crate) struct SettingsView {
     skill_environment: String,
     session_limit: usize,
     session_limit_error: Option<String>,
+    default_agent: AgentKind,
+    default_agent_error: Option<String>,
+    /// Full-color harness logos for the default-agent options. The harness
+    /// set is fixed, so tiles are rasterized once at creation and shared by
+    /// every render.
+    agent_icon_tiles: Rc<AgentIconTiles>,
 }
 
 impl SettingsView {
@@ -148,6 +158,13 @@ impl SettingsView {
             .and_then(|root| DeviceStore::new(root).load().ok())
             .map(|state| state.recent_sessions_limit_or_default())
             .unwrap_or(DEFAULT_SIDEBAR_LIMIT);
+        let default_agent = data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok())
+            .map(|state| state.default_agent_or_default())
+            .unwrap_or(AgentKind::DEFAULT);
+        let mut agent_icon_tiles = AgentIconTiles::new();
+        agent_icons::ensure_tiles(AgentKind::ALL, &mut agent_icon_tiles, cx);
         Self {
             focus_handle: cx.focus_handle(),
             active_section: SettingsSection::General,
@@ -175,6 +192,9 @@ impl SettingsView {
             skill_environment: crate::agent_skill::environment(),
             session_limit,
             session_limit_error: None,
+            default_agent,
+            default_agent_error: None,
+            agent_icon_tiles: Rc::new(agent_icon_tiles),
         }
     }
 
@@ -199,10 +219,16 @@ impl SettingsView {
                 .ok()
                 .map(|state| state.recent_sessions_limit_or_default())
                 .unwrap_or(DEFAULT_SIDEBAR_LIMIT);
+            self.default_agent = DeviceStore::new(&root)
+                .load()
+                .ok()
+                .map(|state| state.default_agent_or_default())
+                .unwrap_or(AgentKind::DEFAULT);
         } else {
             self.sync_interval = None;
             self.saved_origin = None;
             self.session_limit = DEFAULT_SIDEBAR_LIMIT;
+            self.default_agent = AgentKind::DEFAULT;
         }
         let saved = self.saved_origin.clone().unwrap_or_default();
         self.origin_input.update(cx, |state, cx| {
@@ -222,6 +248,7 @@ impl SettingsView {
             self.skill_environment = crate::agent_skill::environment();
         }
         self.session_limit_error = None;
+        self.default_agent_error = None;
         self.origin_busy = false;
         self.origin_error = None;
         self.origin_notice = None;
@@ -494,6 +521,32 @@ impl SettingsView {
         if let Some(workspace) = self.workspace.clone() {
             workspace
                 .update(cx, |this, cx| this.set_session_limit(limit, cx))
+                .ok();
+        }
+        cx.notify();
+    }
+
+    /// Persist the default agent harness and push it to the owning workspace
+    /// so fresh Agent panes and the New-session picker pick it up
+    /// immediately. Open sessions keep running with the harness they started
+    /// with; the live value applies even when the write fails (same spirit
+    /// as the font size), and the error line says persistence is what broke.
+    fn set_default_agent(&mut self, agent: AgentKind, cx: &mut Context<Self>) {
+        if self.default_agent == agent {
+            return;
+        }
+        self.default_agent = agent;
+        self.default_agent_error = None;
+        if let Some(root) = self.data_root.clone()
+            && let Err(error) = DeviceStore::new(&root).update(|state| {
+                state.default_agent = Some(agent.id().to_owned());
+            })
+        {
+            self.default_agent_error = Some(format!("Could not save the default agent: {error:#}"));
+        }
+        if let Some(workspace) = self.workspace.clone() {
+            workspace
+                .update(cx, |this, cx| this.set_default_agent(agent, cx))
                 .ok();
         }
         cx.notify();
@@ -1073,6 +1126,64 @@ impl SettingsView {
     fn render_agent(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::agent_skill::{Action, Target};
         let busy = self.skill_busy;
+        let current = self.default_agent;
+        let tiles = self.agent_icon_tiles.clone();
+        let default = group(
+            "Default agent",
+            Some("Launched when the Agent tab opens without history, and pre-selected in New session…. Open sessions keep running."),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .children(AgentKind::ALL.into_iter().map(|agent| {
+                    let selected = agent == current;
+                    let icon =
+                        agent_icons::agent_icon(agent, &tiles, agent_icons::ICON_PX);
+                    div()
+                        .flex_1()
+                        .min_w(px(220.))
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .cursor_pointer()
+                        .when(selected, |this| {
+                            this.border_color(rgb(0x2f81f7)).bg(rgb(0x0e1a2b))
+                        })
+                        .when(!selected, |this| {
+                            this.border_color(rgb(0x292b2b)).bg(rgb(0x0e0f0f))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_default_agent(agent, cx)
+                            }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(icon)
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .text_color(rgb(0xe7e7e7))
+                                        .child(agent.label().to_owned()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x737878))
+                                .child(agent.description().to_owned()),
+                        )
+                })),
+        )
+        .when_some(self.default_agent_error.clone(), |this, error| {
+            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+        });
         let limit = self.session_limit;
         let is_default = limit == DEFAULT_SIDEBAR_LIMIT;
         let sessions = group(
@@ -1190,25 +1301,25 @@ impl SettingsView {
                     .text_color(rgb(0x858989))
                     .child("Updates and removal preserve modified or unmanaged skill folders."),
             );
-        v_flex().gap_4().child(sessions).child(skill).child(
-            dummy_group("Agent", "Coming soon — these controls are placeholders.")
-                .child(dummy_row(
-                    "Default command",
-                    "Launched when the Agent tab opens.",
-                    dummy_value(agent_command_label()),
-                ))
-                .child(font_size_note_row(self.font_size, "Agent panes"))
-                .child(dummy_row(
-                    "Provider",
-                    "Used for activity detection.",
-                    dummy_dropdown("Auto"),
-                ))
-                .child(dummy_row(
-                    "Approval mode",
-                    "When the agent may edit without asking.",
-                    dummy_dropdown("Ask before edits"),
-                )),
-        )
+        v_flex()
+            .gap_4()
+            .child(default)
+            .child(sessions)
+            .child(skill)
+            .child(
+                dummy_group("Agent", "Coming soon — these controls are placeholders.")
+                    .child(font_size_note_row(self.font_size, "Agent panes"))
+                    .child(dummy_row(
+                        "Provider",
+                        "Used for activity detection.",
+                        dummy_dropdown("Auto"),
+                    ))
+                    .child(dummy_row(
+                        "Approval mode",
+                        "When the agent may edit without asking.",
+                        dummy_dropdown("Ask before edits"),
+                    )),
+            )
     }
 
     fn render_terminal(&self) -> impl IntoElement {
@@ -1286,14 +1397,6 @@ fn editor_command_label() -> String {
     WorkspaceTab::Editor
         .command()
         .unwrap_or("nvim .")
-        .to_owned()
-}
-
-/// `opencode` today; read from the workspace contract so the label cannot drift.
-fn agent_command_label() -> String {
-    WorkspaceTab::Agent
-        .command()
-        .unwrap_or("opencode")
         .to_owned()
 }
 

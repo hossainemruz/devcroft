@@ -45,8 +45,7 @@ use crate::command_palette::{
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
-    recent_repositories, record_repository_open, resolve_current_key, resolve_workspace_agent,
-    set_workspace_agent as persist_workspace_agent, sync_portable_with_tracker,
+    recent_repositories, record_repository_open, resolve_current_key, sync_portable_with_tracker,
 };
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
@@ -58,7 +57,6 @@ use crate::navigation::{
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
 use crate::settings::SettingsView;
-use crate::workspace_settings::WorkspaceSettingsView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
@@ -187,11 +185,12 @@ pub(crate) struct Workspace {
     review: Entity<ReviewView>,
     /// Harness the visible Agent pane was spawned with. Preserved across
     /// repository switches with its tabs; selecting a historical session
-    /// changes this without touching the persisted default.
+    /// or starting a new one updates it.
     session_agent: AgentKind,
-    /// Persisted default harness for the current checkout: what *new*
-    /// sessions launch. Updated by the workspace settings sheet; open
-    /// sessions keep running with the harness they started with.
+    /// Global default harness (Settings > Agent): what fresh Agent panes
+    /// launch and what the New-session picker pre-selects. Loaded from
+    /// `device.json` at startup and pushed live by Settings; open sessions
+    /// keep running with the harness they started with.
     default_agent: AgentKind,
     /// Strong entity handles keep hidden PTYs and their output tasks alive.
     inactive_repositories: HashMap<PathBuf, RepositoryTabs>,
@@ -295,8 +294,7 @@ struct RepositoryTabs {
     tabs: Vec<Option<Entity<TerminalPane>>>,
     review: Entity<ReviewView>,
     /// Harness its Agent pane was spawned with, kept so a switch back
-    /// restores the running session instead of respawning with a newer
-    /// default.
+    /// restores the running session instead of respawning.
     agent: AgentKind,
 }
 
@@ -343,18 +341,21 @@ impl Workspace {
             .to_owned();
 
         let working_directory = &checkout_identity(working_directory);
-        // Resolved before the first panes spawn so the Agent tab launches
-        // the stored harness. Failures stay non-fatal (default harness) and
-        // surface as a palette notification instead; this also keeps sync
-        // working even if the startup path never persisted device state.
         let data_root = crate::data::ensure_ready(None).ok();
-        let initial_agent = resolve_workspace_agent(data_root.as_ref(), working_directory);
+        // Global default harness (Settings > Agent). Fresh Agent panes
+        // start with it; returning to a checkout resumes its most recent
+        // session instead. Later edits come through `set_default_agent`.
+        let default_agent = data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok())
+            .map(|state| state.default_agent_or_default())
+            .unwrap_or(AgentKind::DEFAULT);
         // Home must not launch an agent or editor in the startup directory.
         // Panes are created only when the user enters a repository workspace.
         let active_tab = WorkspaceTab::Agent;
         let tabs = vec![None; WorkspaceTab::ALL.len()];
         let review = cx.new(|cx| ReviewView::new(working_directory, cx));
-        let session_agent = initial_agent;
+        let session_agent = default_agent;
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         // Interceptors run before GPUI resolves key bindings (unlike element
         // capture handlers). This is essential while the HUD is open: Escape,
@@ -629,7 +630,7 @@ impl Workspace {
             tabs,
             review,
             session_agent,
-            default_agent: initial_agent,
+            default_agent,
             inactive_repositories: HashMap::new(),
             settings,
             project_name: project_name.into(),
@@ -1220,17 +1221,14 @@ impl Workspace {
         if self.working_directory == checkout {
             return;
         }
-        // The persisted default may have changed while this checkout was
-        // hidden (e.g. another window saved it), so re-resolve: fresh tabs
-        // spawn with it, restored tabs keep their running session.
-        let default_agent = resolve_workspace_agent(self.data_root.as_ref(), checkout);
+        // Restored tabs keep their running session; unseen checkouts start
+        // fresh and resolve to the global default on entry.
         let next = self
             .inactive_repositories
             .remove(checkout)
             .unwrap_or_else(|| {
-                RepositoryTabs::new(checkout, default_agent, &self.agent_activity, cx)
+                RepositoryTabs::new(checkout, self.default_agent, &self.agent_activity, cx)
             });
-        self.default_agent = default_agent;
         let previous = RepositoryTabs {
             active_tab: std::mem::replace(&mut self.active_tab, next.active_tab),
             tabs: std::mem::replace(&mut self.tabs, next.tabs),
@@ -1351,36 +1349,6 @@ impl Workspace {
         }
     }
 
-    /// Persist the workspace default harness from the settings sheet and
-    /// restart the Agent tab with it: the old PTY session is dropped with
-    /// its pane entity, and a fresh login shell launches the new harness.
-    /// Other tabs and hidden repositories are untouched.
-    pub(crate) fn set_default_agent(
-        &mut self,
-        agent: AgentKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.default_agent == agent {
-            return;
-        }
-        if let Err(error) = persist_workspace_agent(
-            self.data_root.as_ref(),
-            &self.working_directory.clone(),
-            agent,
-        ) {
-            window.push_notification(format!("Could not save the default agent: {error:#}"), cx);
-            return;
-        }
-        self.default_agent = agent;
-        window.push_notification(format!("New sessions will use {}", agent.label()), cx);
-        cx.notify();
-    }
-
-    pub(crate) fn default_agent(&self) -> AgentKind {
-        self.default_agent
-    }
-
     /// Apply a Settings > Agent sidebar limit live: re-project the
     /// in-memory snapshot so the sidebar updates immediately. The caller
     /// owns persistence; values are clamped for defense in depth.
@@ -1394,27 +1362,16 @@ impl Workspace {
         self.publish_sessions(cx);
     }
 
-    /// Open the per-workspace settings sheet with a fresh view: the sheet
-    /// always reflects the current checkout and its live selection, so
-    /// re-reading on every opening beats reasoning about staleness across
-    /// repository switches. The sheet layer is owned by [`Root`]; like the
-    /// Add Repository dialog, the view is dropped with it.
-    fn open_workspace_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = cx.entity().downgrade();
-        let view = cx.new(|cx| {
-            WorkspaceSettingsView::new(
-                self.working_directory.clone(),
-                self.project_name.to_string(),
-                self.default_agent,
-                workspace,
-                cx,
-            )
-        });
-        window.open_sheet(cx, move |sheet, _, _| {
-            sheet
-                .title("Workspace settings")
-                .child(view.clone().into_any_element())
-        });
+    /// Apply a Settings > Agent default harness live: fresh Agent panes and
+    /// the New-session picker pick it up immediately. The caller owns
+    /// persistence; open sessions keep running with the harness they
+    /// started with.
+    pub(crate) fn set_default_agent(&mut self, agent: AgentKind, cx: &mut Context<Self>) {
+        if self.default_agent == agent {
+            return;
+        }
+        self.default_agent = agent;
+        cx.notify();
     }
 
     /// Re-check git status right now instead of waiting for the next poll
@@ -2841,43 +2798,16 @@ impl Render for Workspace {
                     })
                     .when(!self.home_visible, |header| {
                         header.child(
-                            h_flex()
-                                .flex_none()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    TabBar::new("workspace-tabs")
-                                        .segmented()
-                                        .selected_index(active_index)
-                                        .on_click(cx.listener(|this, index: &usize, window, cx| {
-                                            this.select_tab(*index, window, cx);
-                                        }))
-                                        .children(
-                                            WorkspaceTab::ALL
-                                                .into_iter()
-                                                .map(|tab| Tab::new().label(tab.label())),
-                                        ),
-                                )
-                                // Per-workspace settings: default agent harness for
-                                // this checkout. Opens a sheet (see
-                                // `open_workspace_settings`); the sheet layer below
-                                // paints it.
-                                .child(
-                                    div()
-                                        .p_2()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .text_color(rgb(0x737878))
-                                        .hover(|this| {
-                                            this.bg(rgb(0x1d1f1f)).text_color(rgb(0xe7e7e7))
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, window, cx| {
-                                                this.open_workspace_settings(window, cx);
-                                            }),
-                                        )
-                                        .child(Icon::new(IconName::Settings).size(px(16.))),
+                            TabBar::new("workspace-tabs")
+                                .segmented()
+                                .selected_index(active_index)
+                                .on_click(cx.listener(|this, index: &usize, window, cx| {
+                                    this.select_tab(*index, window, cx);
+                                }))
+                                .children(
+                                    WorkspaceTab::ALL
+                                        .into_iter()
+                                        .map(|tab| Tab::new().label(tab.label())),
                                 ),
                         )
                     }),
@@ -2906,14 +2836,8 @@ impl Render for Workspace {
             // Notification layer (`push_notification`, e.g. the terminal copy
             // feedback): like dialogs, `Root` stores these without painting
             // them. Without this layer every notification is silently
-            // swallowed. Above content and the palette dim, below sheets and
-            // dialogs.
+            // swallowed. Above content and the palette dim, below dialogs.
             .children(Root::render_notification_layer(window, cx))
-            // Sheet layer (workspace settings): `Root` stores the opened
-            // sheet but never paints it itself — without this layer the gear
-            // button opens a sheet that stays invisible. Below dialogs so a
-            // dialog opened over a sheet floats on top.
-            .children(Root::render_sheet_layer(window, cx))
             // Dialog layer (settings, …): `Root` stores opened dialogs but
             // never paints them itself — the app must render this layer on
             // top of its content, otherwise an opened dialog stays invisible.

@@ -4,7 +4,7 @@
 
 The top-level SVGs `claude.svg`, `codex.svg`, `opencode.svg`, and `omp.svg`
 are the respective agent CLIs' brand marks, used as full-color logos in the
-Agent surfaces (workspace settings, new-session picker, sessions sidebar,
+Agent surfaces (new-session picker, sessions sidebar,
 Home cards — see `src/agent_icons.rs`). The first three belong to their
 respective owners (Anthropic, OpenAI, SST) and are redistributed here for
 product identification only; `omp.svg` is oh-my-pi's pi-and-connector mark.

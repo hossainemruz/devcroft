@@ -1,15 +1,14 @@
 //! The agent harness launched in the Agent tab.
 //!
-//! Each workspace remembers one default harness ([`AgentKind`]) in
-//! machine-local `device.json`, keyed by its canonical checkout path (see
-//! [`crate::data`]). Picking a harness in the workspace settings sheet
-//! persists it for future sessions; open sessions keep running with the
-//! harness they started with ([`AgentKind::command`]).
+//! Entering a checkout resumes its most recent session when history exists;
+//! otherwise the Agent tab starts the default harness (Settings > Agent,
+//! [`AgentKind::DEFAULT`] until changed). Use **New session…** to pick a
+//! harness explicitly for a new session; open sessions keep running with
+//! the harness they started with ([`AgentKind::command`]).
 //!
 //! Only `opencode`, `claude`, `codex`, and `omp` exist today. Adding a
 //! harness later is a matter of extending this enum plus its id/command
-//! tables below — the persistence layer already round-trips unknown ids as
-//! plain strings.
+//! tables below.
 
 /// Agent harness launched in the Agent tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,14 +20,16 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    /// The default for workspaces without a stored preference.
+    /// The fallback harness: fresh installs and unset or unknown stored
+    /// preferences resolve here. It is also the first entry in the
+    /// new-session picker.
     pub(crate) const DEFAULT: Self = Self::Opencode;
 
-    /// Every harness the workspace settings sheet offers, in display order.
+    /// Every harness the new-session picker offers, in display order.
     pub(crate) const ALL: [Self; 4] = [Self::Opencode, Self::Claude, Self::Codex, Self::Omp];
 
-    /// Stable id used in `device.json` and matched case-insensitively on
-    /// read, so hand-edited values like `"Claude"` still resolve.
+    /// Stable id matched case-insensitively when resolving historical
+    /// sessions, so values like `"Claude"` still resolve.
     pub(crate) fn id(self) -> &'static str {
         match self {
             Self::Opencode => "opencode",
@@ -38,7 +39,7 @@ impl AgentKind {
         }
     }
 
-    /// Human label for the settings sheet.
+    /// Human label for the new-session picker and session rows.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Opencode => "opencode",
@@ -48,10 +49,10 @@ impl AgentKind {
         }
     }
 
-    /// Short description for the settings sheet.
+    /// Short description for the new-session picker and session rows.
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Self::Opencode => "The default AI agent.",
+            Self::Opencode => "Anomaly's opencode CLI.",
             Self::Claude => "Anthropic's Claude Code CLI.",
             Self::Codex => "OpenAI's Codex CLI.",
             Self::Omp => "The oh-my-pi agent harness.",
@@ -69,7 +70,7 @@ impl AgentKind {
     }
 
     /// Parse a stored id. Unknown or empty values return `None` so callers
-    /// fall back to [`AgentKind::DEFAULT`] instead of rejecting the file.
+    /// fall back to [`AgentKind::DEFAULT`] instead of rejecting the session.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "opencode" => Some(Self::Opencode),

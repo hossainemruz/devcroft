@@ -30,7 +30,6 @@ mod review;
 mod session;
 mod settings;
 mod workspace;
-mod workspace_settings;
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser as _;

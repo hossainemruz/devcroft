@@ -2,7 +2,7 @@
 
 Devcroft is a small GPUI desktop workspace with three persistent, Ghostty-powered terminal tabs:
 
-- **Agent** launches the workspace's default agent (`opencode` unless changed to `claude`, `codex`, or `omp` in the workspace settings sheet) in your default shell. Use **New session…** in the Agent sidebar to pick a harness for a new session without changing the saved default.
+- **Agent** resumes the checkout's most recent session when history exists, otherwise it launches your default agent (`opencode` unless changed in Settings → Agent) in your default shell. Use **New session…** in the Agent sidebar to pick a harness (`opencode`, `claude`, `codex`, or `omp`) explicitly for a new session.
 - **Editor** launches `nvim .` in your default shell.
 - **Terminal** launches your default login shell.
 

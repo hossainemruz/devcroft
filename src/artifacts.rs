@@ -11,14 +11,14 @@ use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _, h_flex,
-    tag::Tag, v_flex,
+    ActiveTheme as _, ColorName, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _,
+    h_flex, tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
+    Anchor, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    Focusable as _, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
 };
 use std::time::Duration;
 const PAGE_SIZE: usize = 100;
@@ -585,6 +585,13 @@ impl ArtifactBrowser {
             .disabled(self.draft.is_some() || self.saving)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
                 menu.item({
+                    let content = menu_snapshot.artifact.content.clone();
+                    PopupMenuItem::new("Copy Markdown").on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
+                        window.push_notification("Copied Markdown", cx);
+                    })
+                })
+                .item({
                     let view = view.clone();
                     PopupMenuItem::new("Edit Markdown")
                         .on_click(move |_, window, cx| {
@@ -714,6 +721,26 @@ enum Mutation {
     Archive,
 }
 
+/// Distinct sidebar/detail pill per artifact type so kinds are scannable
+/// without reading. Hues are type-neutral on purpose: green/red are reserved
+/// elsewhere for status (open/pass/clean vs closed/fail), so `Plan` uses sky
+/// instead of green and `RFC` uses violet for proposal-like content.
+fn kind_tag_color(kind: Kind) -> ColorName {
+    match kind {
+        Kind::Rfc => ColorName::Violet,
+        Kind::Plan => ColorName::Sky,
+        Kind::Note => ColorName::Amber,
+    }
+}
+
+fn kind_tag(kind: Kind) -> Tag {
+    Tag::color(kind_tag_color(kind))
+        .with_size(Size::Small)
+        .rounded_full()
+        .flex_none()
+        .child(kind.label())
+}
+
 /// `Updated 2h ago` for sidebar cards. `updated_at_ms` is unix millis (see
 /// `data::record::timestamp`); future values read as `just now` rather than
 /// a negative duration. Pure over `now_secs` for tests.
@@ -829,13 +856,7 @@ impl Render for ArtifactBrowser {
                                     .w_full()
                                     .items_center()
                                     .gap_1()
-                                    .child(
-                                        Tag::secondary()
-                                            .with_size(Size::Small)
-                                            .rounded_full()
-                                            .flex_none()
-                                            .child(artifact.kind.label()),
-                                    )
+                                    .child(kind_tag(artifact.kind))
                                     .child(div().text_xs().child(recency)),
                             ),
                     )
@@ -896,13 +917,7 @@ impl Render for ArtifactBrowser {
             let mut meta = h_flex()
                 .gap_2()
                 .items_center()
-                .child(
-                    Tag::secondary()
-                        .with_size(Size::Small)
-                        .rounded_full()
-                        .flex_none()
-                        .child(artifact.kind.label()),
-                )
+                .child(kind_tag(artifact.kind))
                 .child(
                     div()
                         .text_xs()

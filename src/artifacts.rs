@@ -948,20 +948,21 @@ impl Render for ArtifactBrowser {
                     );
                 for (index, origin) in artifact.sessions.iter().enumerate() {
                     let origin = origin.clone();
-                    meta = meta.child(
-                        Button::new(("origin-session", index))
-                            .ghost()
-                            .small()
-                            .compact()
-                            .label(if origin.title.is_empty() {
-                                origin.key.id.clone()
-                            } else {
-                                origin.title.clone()
-                            })
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(OpenSession(origin.clone()))
-                            })),
-                    );
+                    meta =
+                        meta.child(
+                            Button::new(("origin-session", index))
+                                .ghost()
+                                .small()
+                                .compact()
+                                .label(if origin.title.is_empty() {
+                                    origin.key.id.clone()
+                                } else {
+                                    origin.title.clone()
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(OpenSession(origin.clone()))
+                                })),
+                        );
                 }
             }
             main = main.child(

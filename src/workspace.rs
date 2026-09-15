@@ -2454,7 +2454,8 @@ impl Render for Workspace {
         let is_pull_requests = self.home_visible && self.home.read(cx).is_pull_requests_page();
         let is_todos = self.home_visible && self.home.read(cx).is_todos_page();
         let is_reading = self.home_visible && self.home.read(cx).is_reading_page();
-        let is_home_page = is_artifacts || is_projects || is_pull_requests || is_todos || is_reading;
+        let is_home_page =
+            is_artifacts || is_projects || is_pull_requests || is_todos || is_reading;
         let attention_count = self.agent_activity.snapshot().attention_count();
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
@@ -2572,33 +2573,36 @@ impl Render for Workspace {
                                 ),
                         )
                     })
-                    .when(is_projects || is_pull_requests || is_todos || is_reading, |header| {
-                        header.child(
-                            h_flex()
-                                .flex_none()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Button::new("projects-back")
-                                        .ghost()
-                                        .label("‹ Home")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.go_home(window, cx)
-                                        })),
-                                )
-                                .child(div().text_sm().font_semibold().child(SharedString::from(
-                                    if is_pull_requests {
-                                        "Pull Requests"
-                                    } else if is_todos {
-                                        "Todos"
-                                    } else if is_reading {
-                                        "To Read"
-                                    } else {
-                                        "Projects"
-                                    },
-                                ))),
-                        )
-                    })
+                    .when(
+                        is_projects || is_pull_requests || is_todos || is_reading,
+                        |header| {
+                            header.child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Button::new("projects-back")
+                                            .ghost()
+                                            .label("‹ Home")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.go_home(window, cx)
+                                            })),
+                                    )
+                                    .child(div().text_sm().font_semibold().child(
+                                        SharedString::from(if is_pull_requests {
+                                            "Pull Requests"
+                                        } else if is_todos {
+                                            "Todos"
+                                        } else if is_reading {
+                                            "To Read"
+                                        } else {
+                                            "Projects"
+                                        }),
+                                    )),
+                            )
+                        },
+                    )
                     .when(!self.home_visible, |header| {
                         header.child(
                             h_flex()

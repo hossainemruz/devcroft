@@ -4,13 +4,17 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
+    env,
+    ffi::OsStr,
     io::Read,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const SHELL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,7 +170,7 @@ impl Cache {
 
 pub(crate) fn fetch(url: &str) -> Result<Status> {
     let url = crate::data::dashboard::github_pr_url(url)?;
-    let mut command = Command::new("gh");
+    let mut command = Command::new(resolve_gh()?);
     command
         .args([
             "pr",
@@ -184,13 +188,162 @@ pub(crate) fn fetch(url: &str) -> Result<Status> {
     serde_json::from_slice(&bytes).context("GitHub returned an unreadable PR status")
 }
 
+/// Locate `gh` the way an interactive terminal would, not just via the
+/// app's inherited `PATH`. A Finder/Dock-launched macOS app gets a minimal
+/// system `PATH` without mise shims, `~/.local/bin`, or Homebrew, while the
+/// terminal tabs launch a login shell that sources all of that. Without
+/// this, macOS users with a working terminal `gh` still see "Could not
+/// start GitHub CLI".
+fn resolve_gh() -> Result<PathBuf> {
+    resolve_gh_from(
+        env::var_os("PATH").as_deref(),
+        env::var_os("HOME").as_deref(),
+        || login_shell_lookup(SHELL_LOOKUP_TIMEOUT),
+    )
+}
+
+fn resolve_gh_from(
+    path_var: Option<&OsStr>,
+    home: Option<&OsStr>,
+    shell_lookup: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf> {
+    let home_path;
+    let home = match home {
+        Some(home) if !home.is_empty() => {
+            home_path = PathBuf::from(home);
+            Some(home_path.as_path())
+        }
+        _ => None,
+    };
+    if let Some(found) =
+        find_on_path(path_var).or_else(|| first_executable(well_known_candidates(home)))
+    {
+        return Ok(found);
+    }
+    if let Some(found) = shell_lookup() {
+        return Ok(found);
+    }
+    bail!(
+        "Could not start GitHub CLI (gh not found on PATH, in ~/.local/share/mise/shims, \
+         ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, or via your login shell). \
+         Install gh and run gh auth login, then refresh"
+    )
+}
+
+fn find_on_path(path_var: Option<&OsStr>) -> Option<PathBuf> {
+    let path_var = path_var?;
+    for dir in env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join("gh");
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn well_known_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/gh"),
+        PathBuf::from("/usr/local/bin/gh"),
+        PathBuf::from("/opt/local/bin/gh"),
+    ];
+    if let Some(home) = home {
+        candidates.insert(0, home.join(".local/bin/gh"));
+        candidates.insert(0, home.join(".local/share/mise/shims/gh"));
+    }
+    candidates
+}
+
+fn first_executable(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| is_executable(path))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.is_file()
+        && path
+            .metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Ask the user's login shell where `gh` is, matching the environment the
+/// terminal tabs already run with. Returns the first absolute executable
+/// path printed by `command -v gh`, if any.
+fn login_shell_lookup(timeout: Duration) -> Option<PathBuf> {
+    let shell = env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_owned());
+    let mut child = Command::new(shell)
+        .args(["-lc", "command -v gh 2>/dev/null"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(8192 + 1).read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(exit)) => break Some(exit),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    if !exit?.success() {
+        return None;
+    }
+    let bytes = reader.join().ok()?.ok()?;
+    parse_command_v_output(&bytes)
+}
+
+fn parse_command_v_output(bytes: &[u8]) -> Option<PathBuf> {
+    let line = String::from_utf8_lossy(bytes)
+        .lines()
+        .next()?
+        .trim()
+        .to_owned();
+    if line.is_empty() {
+        return None;
+    }
+    // `command -v` can print a shell function body or alias instead of a
+    // path; only accept absolute paths that actually execute.
+    let path = PathBuf::from(line);
+    if path.is_absolute() && is_executable(&path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn run(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Could not start GitHub CLI. Install gh and run gh auth login")?;
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Could not start GitHub CLI ({error}). Install gh and run gh auth login"
+            )
+        })?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     // Drain both pipes concurrently so large responses cannot deadlock `gh`.
@@ -359,5 +512,82 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("gh auth login"));
         assert!(!error.to_string().contains("secret"));
+    }
+
+    #[cfg(unix)]
+    fn fake_gh(dir: &std::path::Path, executable: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("gh");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+        )
+        .unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_lookup_prefers_path_then_known_locations_then_shell() {
+        let path_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let path_gh = fake_gh(path_dir.path(), true);
+        let _other_gh = fake_gh(other_dir.path(), true);
+        let shim_dir = home_dir.path().join(".local/share/mise/shims");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim_gh = fake_gh(&shim_dir, true);
+
+        // Inherited PATH wins.
+        let path_var = std::env::join_paths([path_dir.path(), other_dir.path()]).unwrap();
+        let found = resolve_gh_from(
+            Some(path_var.as_os_str()),
+            Some(home_dir.path().as_os_str()),
+            || panic!("shell lookup must not run when PATH already resolves gh"),
+        )
+        .unwrap();
+        assert_eq!(found, path_gh);
+
+        // Mise shim covers GUI launches whose PATH lacks user tooling.
+        let found = resolve_gh_from(
+            Some(OsStr::new("/nonexistent")),
+            Some(home_dir.path().as_os_str()),
+            || panic!("shell lookup must not run when a known location resolves gh"),
+        )
+        .unwrap();
+        assert_eq!(found, shim_gh);
+
+        // Login-shell fallback for install locations we do not know about.
+        let shell_gh = path_gh.clone();
+        let found = resolve_gh_from(Some(OsStr::new("/nonexistent")), None, || {
+            Some(shell_gh.clone())
+        })
+        .unwrap();
+        assert_eq!(found, path_gh);
+
+        // Total miss stays actionable and keeps the auth hint.
+        let error = resolve_gh_from(Some(OsStr::new("/nonexistent")), None, || None).unwrap_err();
+        assert!(error.to_string().contains("gh not found"));
+        assert!(error.to_string().contains("gh auth login"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_lookup_ignores_non_executable_and_shell_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let _plain_file = fake_gh(dir.path(), false);
+        let path_var = std::env::join_paths([dir.path()]).unwrap();
+        assert!(find_on_path(Some(path_var.as_os_str())).is_none());
+
+        // `command -v` may print an alias or function instead of a path.
+        assert!(parse_command_v_output(b"alias gh='gh --paginate'\n").is_none());
+        assert!(parse_command_v_output(b"gh () {\n  command gh \"$@\"\n}\n").is_none());
+        assert!(parse_command_v_output(b"relative/gh\n").is_none());
+        assert!(parse_command_v_output(b"\n").is_none());
+
+        let executable = fake_gh(dir.path(), true);
+        let output = format!("{}\n", executable.display());
+        assert_eq!(parse_command_v_output(output.as_bytes()), Some(executable));
     }
 }

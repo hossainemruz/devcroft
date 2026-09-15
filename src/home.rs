@@ -1940,36 +1940,29 @@ impl HomeView {
                             .ghost()
                             .label("⋯")
                             .accessibility_label(format!("Options for {title}"))
-                            .dropdown_menu_with_anchor(
-                                Anchor::TopRight,
-                                move |menu, _, _| {
-                                    menu.item({
-                                        let home = home.clone();
-                                        let edit = edit.clone();
-                                        PopupMenuItem::new("Edit").on_click(
-                                            move |_, window, cx| {
-                                                let _ = home.update(cx, |this, cx| {
-                                                    this.editor(edit.clone(), window, cx);
-                                                });
-                                            },
-                                        )
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                                menu.item({
+                                    let home = home.clone();
+                                    let edit = edit.clone();
+                                    PopupMenuItem::new("Edit").on_click(move |_, window, cx| {
+                                        let _ = home.update(cx, |this, cx| {
+                                            this.editor(edit.clone(), window, cx);
+                                        });
                                     })
-                                    .item({
-                                        let home = home.clone();
-                                        let delete_id = delete_id.clone();
-                                        PopupMenuItem::new("Delete").on_click(
-                                            move |_, window, cx| {
-                                                let _ = home.update(cx, |this, cx| {
-                                                    this.change(window, cx, |data| {
-                                                        data.items.retain(|i| i.id != delete_id);
-                                                        Ok(())
-                                                    });
-                                                });
-                                            },
-                                        )
+                                })
+                                .item({
+                                    let home = home.clone();
+                                    let delete_id = delete_id.clone();
+                                    PopupMenuItem::new("Delete").on_click(move |_, window, cx| {
+                                        let _ = home.update(cx, |this, cx| {
+                                            this.change(window, cx, |data| {
+                                                data.items.retain(|i| i.id != delete_id);
+                                                Ok(())
+                                            });
+                                        });
                                     })
-                                },
-                            ),
+                                })
+                            }),
                     ),
             );
         if !item.description.is_empty() {

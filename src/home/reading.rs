@@ -57,11 +57,18 @@ impl HomeView {
                     .child(self.reading_card(&item, cx)),
             );
         }
-        v_flex().gap_4()
+        v_flex()
+            .gap_4()
             .child(filters)
-            .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Save links to read later. Mark them read when done."))
-            .when_some(self.error.clone(), |view, error| view.child(div().text_color(cx.theme().danger).child(error)))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Save links to read later. Mark them read when done."),
+            )
+            .when_some(self.error.clone(), |view, error| {
+                view.child(div().text_color(cx.theme().danger).child(error))
+            })
             .child(rows)
             .child(
                 h_flex().w_full().child(

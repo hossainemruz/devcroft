@@ -137,6 +137,16 @@ impl HomeView {
                 badges = badges.child(Tag::color(color).with_size(Size::Small).child(label));
             }
         }
+        if entry.is_some_and(|entry| entry.error.is_some()) {
+            // Scannable error indicator: red when there is no data at all,
+            // amber caution when showing retained stale data.
+            let (label, color) = if status.is_some() {
+                ("Stale", ColorName::Amber)
+            } else {
+                ("Fetch failed", ColorName::Red)
+            };
+            badges = badges.child(Tag::color(color).with_size(Size::Small).child(label));
+        }
         let delete_id = item.id.clone();
         let open_url = item.url.clone();
         let menu_item = item.clone();
@@ -168,13 +178,7 @@ impl HomeView {
                     .items_start()
                     .justify_between()
                     .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .font_medium()
-                            .child(title.clone()),
-                    )
+                    .child(div().flex_1().min_w_0().font_medium().child(title.clone()))
                     .child(
                         Button::new(item_id("pr-menu", &item.id))
                             .ghost()
@@ -197,15 +201,12 @@ impl HomeView {
                                     let item = menu_item.clone();
                                     let home = entity.clone();
                                     menu = menu.item(
-                                        PopupMenuItem::new(format!(
-                                            "Move to {}",
-                                            category.label()
-                                        ))
-                                        .on_click(move |_, window, cx| {
-                                            home.update(cx, |this, cx| {
-                                                this.move_pr(&item, category, window, cx)
-                                            })
-                                        }),
+                                        PopupMenuItem::new(format!("Move to {}", category.label()))
+                                            .on_click(move |_, window, cx| {
+                                                home.update(cx, |this, cx| {
+                                                    this.move_pr(&item, category, window, cx)
+                                                })
+                                            }),
                                     );
                                 }
                                 let home = entity.clone();
@@ -240,19 +241,14 @@ impl HomeView {
             )
             .child(badges);
         if let Some(error) = entry.and_then(|entry| entry.error.as_ref()) {
-            card = card.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{}: {error}",
-                        if status.is_some() {
-                            "Status stale"
-                        } else {
-                            "Status unavailable"
-                        }
-                    )),
-            );
+            card = card.child(div().text_xs().text_color(cx.theme().danger).child(format!(
+                "{}: {error}",
+                if status.is_some() {
+                    "Status stale"
+                } else {
+                    "Status unavailable"
+                }
+            )));
         }
         if let Some(at) = entry.and_then(|entry| entry.updated_at) {
             card = card.child(
@@ -278,19 +274,16 @@ impl HomeView {
             );
         }
         card.child(
-            h_flex()
-                .w_full()
-                .justify_end()
-                .child(
-                    Button::new(item_id("open-pr", &item.id))
-                        .ghost()
-                        .label("Open ↗")
-                        .on_click(move |_, _, cx| {
-                            if safe_web_url(&open_url) {
-                                cx.open_url(&open_url);
-                            }
-                        }),
-                ),
+            h_flex().w_full().justify_end().child(
+                Button::new(item_id("open-pr", &item.id))
+                    .ghost()
+                    .label("Open ↗")
+                    .on_click(move |_, _, cx| {
+                        if safe_web_url(&open_url) {
+                            cx.open_url(&open_url);
+                        }
+                    }),
+            ),
         )
     }
 

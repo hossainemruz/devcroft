@@ -344,6 +344,9 @@ pub(crate) struct HomeView {
     /// (sessions, projects, then inbox items). `None` outside navigation mode;
     /// `Enter` activates the cursor item once and exits the mode.
     navigation_cursor: Option<usize>,
+    /// Full-color harness logos for the Recent Activity session cards,
+    /// rasterized once at creation (the harness set is fixed).
+    agent_icon_tiles: std::rc::Rc<crate::agent_icons::AgentIconTiles>,
 }
 
 /// One stop for navigation-mode `j`/`k` on Home, in visual order.
@@ -398,6 +401,12 @@ impl HomeView {
             },
         )
         .detach();
+        let mut agent_icon_tiles = crate::agent_icons::AgentIconTiles::new();
+        crate::agent_icons::ensure_tiles(
+            crate::agent::AgentKind::ALL,
+            &mut agent_icon_tiles,
+            cx,
+        );
         let mut view = Self {
             artifacts,
             focus_handle: cx.focus_handle(),
@@ -426,6 +435,7 @@ impl HomeView {
             project_focus: HashMap::new(),
             scroll: ScrollHandle::new(),
             navigation_cursor: None,
+            agent_icon_tiles: std::rc::Rc::new(agent_icon_tiles),
         };
         view.reload(cx);
         cx.spawn(async move |this, cx| {
@@ -2222,6 +2232,11 @@ impl Render for HomeView {
                 )
                 .into();
                 let cursor = self.navigation_cursor == Some(session_index);
+                let icon = crate::agent_icons::session_icon(
+                    session.agent(),
+                    &self.agent_icon_tiles,
+                    crate::agent_icons::ICON_INLINE_PX,
+                );
                 sessions = sessions.child(
                     Button::new(id)
                         .ghost()
@@ -2256,14 +2271,20 @@ impl Render for HomeView {
                                         .child(repository.clone()),
                                 )
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!(
-                                            "{} · {}",
-                                            session.provider_label(),
-                                            session.age()
-                                        )),
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(icon)
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!(
+                                                    "{} · {}",
+                                                    session.provider_label(),
+                                                    session.age()
+                                                )),
+                                        ),
                                 ),
                         )
                         .on_click(cx.listener(move |_, _, _, cx| {

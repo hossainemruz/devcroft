@@ -16,8 +16,10 @@ use gpui_kit::{
     MouseButton, ParentElement, Render, Styled, WeakEntity, Window, div, rgb,
 };
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::agent::AgentKind;
+use crate::agent_icons::{self, AgentIconTiles};
 use crate::command_palette::{
     PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
 };
@@ -29,6 +31,9 @@ pub(crate) struct WorkspaceSettingsView {
     project_name: String,
     selected: AgentKind,
     workspace: WeakEntity<Workspace>,
+    /// Full-color harness logos, rasterized once at sheet creation (the
+    /// harness set is fixed, so no refresh path is needed).
+    icon_tiles: Rc<AgentIconTiles>,
 }
 
 impl WorkspaceSettingsView {
@@ -39,12 +44,15 @@ impl WorkspaceSettingsView {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut tiles = AgentIconTiles::new();
+        agent_icons::ensure_tiles(AgentKind::ALL, &mut tiles, cx);
         Self {
             focus_handle: cx.focus_handle(),
             checkout,
             project_name,
             selected: default_agent,
             workspace,
+            icon_tiles: Rc::new(tiles),
         }
     }
 
@@ -102,19 +110,31 @@ impl WorkspaceSettingsView {
     fn render_agent_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
         let view = cx.entity().downgrade();
+        let tiles = self.icon_tiles.clone();
+        let trigger_icon = agent_icons::agent_icon(selected, &tiles, agent_icons::ICON_PX);
+        let menu_tiles = tiles.clone();
         Button::new("workspace-settings-agent")
-            .label(selected.label())
             .accessibility_label(format!("Agent, {}", selected.label()))
             .dropdown_caret(true)
             .outline()
             .w_full()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(trigger_icon)
+                    .child(selected.label().to_owned()),
+            )
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let mut menu = menu;
                 for agent in AgentKind::ALL {
                     let view = view.clone();
+                    let tiles = menu_tiles.clone();
                     let checked = agent == selected;
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
+                            let icon =
+                                agent_icons::agent_icon(agent, &tiles, agent_icons::ICON_PX);
                             v_flex()
                                 .w_full()
                                 .gap_1()
@@ -122,6 +142,7 @@ impl WorkspaceSettingsView {
                                     h_flex()
                                         .gap_2()
                                         .items_center()
+                                        .child(icon)
                                         .child(
                                             div()
                                                 .text_sm()

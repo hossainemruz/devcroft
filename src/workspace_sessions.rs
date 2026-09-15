@@ -18,6 +18,7 @@ struct AgentPicker {
     default: AgentKind,
     selected: usize,
     workspace: WeakEntity<Workspace>,
+    icons: Rc<crate::agent_icons::AgentIconTiles>,
 }
 
 impl ListDelegate for AgentPicker {
@@ -34,6 +35,11 @@ impl ListDelegate for AgentPicker {
         _cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
         let agent = AgentKind::ALL[ix.row];
+        let icon = crate::agent_icons::agent_icon(
+            agent,
+            &self.icons,
+            crate::agent_icons::ICON_PX,
+        );
         Some(
             ListItem::new(("new-session-agent", ix.row)).child(
                 v_flex()
@@ -44,6 +50,7 @@ impl ListDelegate for AgentPicker {
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .child(icon)
                             .child(div().text_sm().font_semibold().child(agent.label()))
                             .child(
                                 div()
@@ -456,12 +463,14 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let project = self.project_name.clone();
         let default = self.default_agent;
+        let icons = self.agent_icon_tiles.clone();
         let list_state = cx.new(|cx| {
             ListState::new(
                 AgentPicker {
                     default,
                     selected: 0,
                     workspace,
+                    icons,
                 },
                 window,
                 cx,
@@ -776,6 +785,11 @@ impl Workspace {
             let is_cursor = self.navigation_open
                 && self.navigation_pane == 0
                 && self.session_cursor == Some(open_pos);
+            let icon = crate::agent_icons::agent_icon(
+                session.agent,
+                &self.agent_icon_tiles,
+                crate::agent_icons::ICON_INLINE_PX,
+            );
             list = list.child(
                 h_flex()
                     .gap_1()
@@ -801,11 +815,18 @@ impl Workspace {
                                     .w_full()
                                     .items_start()
                                     .gap_1()
-                                    .child(div().w_full().truncate().child(session.title.clone()))
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .child(format!("{} · {status}", session.agent.label())),
+                                        div().w_full().truncate().child(session.title.clone()),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(icon)
+                                            .child(div().text_xs().child(format!(
+                                                "{} · {status}",
+                                                session.agent.label()
+                                            ))),
                                     ),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -835,6 +856,11 @@ impl Workspace {
                 .map(|a| format!(" · {}", a.state.label()))
                 .unwrap_or_default();
             let is_selected = selected == Some(&key);
+            let icon = crate::agent_icons::session_icon(
+                session.agent(),
+                &self.agent_icon_tiles,
+                crate::agent_icons::ICON_INLINE_PX,
+            );
             let row = Button::new(SharedString::from(format!(
                 "recent-agent-{}-{}-{}",
                 key.provider,
@@ -853,11 +879,17 @@ impl Workspace {
                     .w_full()
                     .gap_1()
                     .child(div().w_full().truncate().child(session.title.clone()))
-                    .child(div().text_xs().child(format!(
-                        "{} · {}{status}",
-                        session.provider_label(),
-                        session.age()
-                    ))),
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(icon)
+                            .child(div().text_xs().child(format!(
+                                "{} · {}{status}",
+                                session.provider_label(),
+                                session.age()
+                            ))),
+                    ),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_agent_session(key.clone(), window, cx)

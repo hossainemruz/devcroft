@@ -1,4 +1,17 @@
-# File icon assets — attribution
+# Icon assets — attribution
+
+## Agent harness logos
+
+The top-level SVGs `claude.svg`, `codex.svg`, `opencode.svg`, and `omp.svg`
+are the respective agent CLIs' brand marks, used as full-color logos in the
+Agent surfaces (workspace settings, new-session picker, sessions sidebar,
+Home cards — see `src/agent_icons.rs`). The first three belong to their
+respective owners (Anthropic, OpenAI, SST) and are redistributed here for
+product identification only; `omp.svg` is oh-my-pi's pi-and-connector mark.
+Sessions from unknown providers fall back to the neutral `Bot` glyph. To add
+a harness logo, drop `<key>.svg` next to these and extend `icon_svg`.
+
+## File icons
 
 The SVGs in `files/` are a vendored subset of the
 [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme)

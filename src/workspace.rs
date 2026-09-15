@@ -7,6 +7,7 @@ mod sessions;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -30,6 +31,7 @@ use gpui_kit::{
 
 use crate::add_repository::AddRepositoryView;
 use crate::agent::AgentKind;
+use crate::agent_icons::{self, AgentIconTiles};
 use crate::agent_activity::{ActivityState, AgentActivityStore};
 use crate::agent_sessions::{
     Catalog, DEFAULT_SIDEBAR_LIMIT, HOME_LIMIT, SessionKey, SessionSummary,
@@ -266,6 +268,10 @@ pub(crate) struct Workspace {
     /// which is what keeps a held toggle from flickering.
     navigation_claimed_keys: HashMap<String, bool>,
     agent_sidebar_focus: FocusHandle,
+    /// Full-color harness logos for the Agent sidebar, the new-session
+    /// picker, and session rows. The harness set is fixed, so tiles are
+    /// rasterized once at startup and shared by every render.
+    agent_icon_tiles: Rc<AgentIconTiles>,
     /// Kept for the workspace lifetime so the app-level pre-keymap hook is
     /// released with this window rather than leaking into later workspaces.
     _navigation_interceptor: Subscription,
@@ -611,6 +617,8 @@ impl Workspace {
             },
         )
         .detach();
+        let mut agent_icon_tiles = AgentIconTiles::new();
+        agent_icons::ensure_tiles(AgentKind::ALL, &mut agent_icon_tiles, cx);
         Self {
             home,
             resources,
@@ -651,6 +659,7 @@ impl Workspace {
             session_cursor: None,
             navigation_claimed_keys: HashMap::new(),
             agent_sidebar_focus: cx.focus_handle().tab_stop(true),
+            agent_icon_tiles: Rc::new(agent_icon_tiles),
             _navigation_interceptor: navigation_interceptor,
         }
     }

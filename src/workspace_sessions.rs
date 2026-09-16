@@ -10,6 +10,39 @@ pub(super) enum SessionNavTarget {
     Recent(SessionKey),
 }
 
+/// Shared presentation for live sessions and rows from the recent catalog.
+struct SessionSidebarRow {
+    target: SessionNavTarget,
+    title: String,
+    provider: String,
+    age: Option<String>,
+    tooltip: String,
+    icon: AnyElement,
+    status: Option<ActivityState>,
+    open_id: Option<u64>,
+    selected: bool,
+    cursor: bool,
+}
+
+fn session_section(title: &'static str, count: usize, cx: &App) -> impl IntoElement {
+    h_flex()
+        .items_center()
+        .justify_between()
+        .px_2()
+        .pt_2()
+        .pb_1()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(div().font_semibold().child(title))
+        .child(
+            div()
+                .px_2()
+                .rounded_full()
+                .bg(cx.theme().secondary)
+                .child(count.to_string()),
+        )
+}
+
 /// Keyboard-navigable agent chooser behind `New session…`.
 /// Backed by the kit's `List`, so up/down move the selection, Enter confirms,
 /// Esc closes, and the global default (Settings > Agent) starts selected
@@ -722,6 +755,156 @@ impl Workspace {
         }
     }
 
+    fn render_session_row(&self, row: SessionSidebarRow, cx: &mut Context<Self>) -> AnyElement {
+        let accent = cx.theme().info;
+        let muted = cx.theme().muted_foreground;
+        let id = match &row.target {
+            SessionNavTarget::Open(id) => format!("open-agent-{id}"),
+            SessionNavTarget::Recent(key) => format!(
+                "recent-agent-{}-{}-{}",
+                key.provider,
+                key.store.display(),
+                key.id
+            ),
+        };
+        let close_id = match &row.target {
+            SessionNavTarget::Open(id) => format!("close-agent-{id}"),
+            SessionNavTarget::Recent(_) => {
+                format!("close-recent-{}", row.open_id.unwrap_or_default())
+            }
+        };
+        let mut metadata = h_flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .text_xs()
+            .text_color(muted)
+            .child(div().min_w_0().truncate().child(row.provider));
+        if let Some(status) = row.status {
+            let color = match status {
+                ActivityState::Starting | ActivityState::Working => accent,
+                ActivityState::NeedsAttention => cx.theme().warning,
+                ActivityState::Finished => cx.theme().success,
+                _ => muted,
+            };
+            metadata = metadata.child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .items_center()
+                    .text_color(color)
+                    .child(div().flex_none().size(px(5.)).rounded_full().bg(color))
+                    .child(div().truncate().child(status.label())),
+            );
+        }
+        metadata = metadata.child(div().flex_1());
+        if let Some(age) = row.age {
+            metadata = metadata.child(div().flex_none().max_w(px(72.)).truncate().child(age));
+        }
+        let title = row.title;
+        let mut card = h_flex()
+            .relative()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(if row.cursor {
+                cx.theme().ring
+            } else {
+                gpui_kit::transparent_black()
+            })
+            .when(row.selected, |card| card.bg(accent.opacity(0.10)))
+            .hover(|card| {
+                card.bg(if row.selected {
+                    accent.opacity(0.15)
+                } else {
+                    cx.theme().secondary.opacity(0.6)
+                })
+            })
+            .child(
+                Button::new(SharedString::from(id))
+                    .ghost()
+                    .small()
+                    .flex_1()
+                    .min_w_0()
+                    .h_auto()
+                    .px_2()
+                    .py_2()
+                    .tooltip(row.tooltip)
+                    .accessibility_label(title.clone())
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(26.))
+                                    .mt(px(2.))
+                                    .rounded_md()
+                                    .bg(cx.theme().secondary)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(row.icon),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .items_start()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .text_sm()
+                                            .truncate()
+                                            .when(row.selected, |title| title.font_semibold())
+                                            .child(title.clone()),
+                                    )
+                                    .child(metadata),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| match &row.target {
+                        SessionNavTarget::Open(id) => this.activate_open_session(*id, window, cx),
+                        SessionNavTarget::Recent(key) => {
+                            this.open_agent_session(key.clone(), window, cx)
+                        }
+                    })),
+            );
+        if row.selected {
+            card = card.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(10.))
+                    .bottom(px(10.))
+                    .w(px(2.))
+                    .rounded_full()
+                    .bg(accent),
+            );
+        }
+        if let Some(id) = row.open_id {
+            card = card.child(
+                Button::new(SharedString::from(close_id))
+                    .ghost()
+                    .xsmall()
+                    .flex_none()
+                    .mr_1()
+                    .icon(IconName::Close)
+                    .text_color(muted)
+                    .tooltip("Close session")
+                    .accessibility_label(format!("Close session: {title}"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_agent_session(id, window, cx)
+                    })),
+            );
+        }
+        card.into_any_element()
+    }
+
     pub(super) fn render_agent_sessions(&self, cx: &mut Context<Self>) -> AnyElement {
         let agent_index = WorkspaceTab::Agent as usize;
         let active = self.tabs[agent_index]
@@ -762,73 +945,42 @@ impl Workspace {
             .collect();
         open.sort_by_key(|(id, _)| std::cmp::Reverse(**id));
         if !open.is_empty() {
-            list = list.child(div().text_xs().child("Open sessions"));
+            list = list.child(session_section("Open sessions", open.len(), cx));
         }
         let open_count = open.len();
         for (open_pos, (&id, session)) in open.into_iter().enumerate() {
             let status = activity
                 .for_launch(id)
-                .map(|a| a.state.label())
-                .unwrap_or("Status unavailable");
-            let is_active = active == Some(id);
-            let is_cursor = self.navigation_open
-                && self.navigation_pane == 0
-                && self.session_cursor == Some(open_pos);
-            let icon = crate::agent_icons::agent_icon(
-                session.agent,
-                &self.agent_icon_tiles,
-                crate::agent_icons::ICON_INLINE_PX,
-            );
-            list = list.child(
-                h_flex()
-                    .gap_1()
-                    .rounded_md()
-                    .when(is_cursor, |row| {
-                        row.border_1().border_color(cx.theme().ring)
-                    })
-                    .when(is_active, |row| row.bg(cx.theme().secondary))
-                    .child(
-                        Button::new(SharedString::from(format!("open-agent-{id}")))
-                            .ghost()
-                            .flex_1()
-                            .min_w_0()
-                            .h_auto()
-                            .p_2()
-                            .tooltip(format!(
-                                "{}\n{} · {status}",
-                                session.title,
-                                session.agent.label()
-                            ))
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .items_start()
-                                    .gap_1()
-                                    .child(div().w_full().truncate().child(session.title.clone()))
-                                    .child(
-                                        h_flex().gap_2().items_center().child(icon).child(
-                                            div().text_xs().child(format!(
-                                                "{} · {status}",
-                                                session.agent.label()
-                                            )),
-                                        ),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.activate_open_session(id, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("close-agent-{id}")))
-                            .ghost()
-                            .label("×")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_agent_session(id, window, cx)
-                            })),
+                .map(|a| a.state)
+                .unwrap_or(ActivityState::Unavailable);
+            list = list.child(self.render_session_row(
+                SessionSidebarRow {
+                    target: SessionNavTarget::Open(id),
+                    title: session.title.clone(),
+                    provider: session.agent.label().into(),
+                    age: None,
+                    tooltip: format!(
+                        "{}\n{} · {}",
+                        session.title,
+                        session.agent.label(),
+                        status.label()
                     ),
-            );
+                    icon: crate::agent_icons::agent_icon(
+                        session.agent,
+                        &self.agent_icon_tiles,
+                        crate::agent_icons::ICON_PX,
+                    ),
+                    status: Some(status),
+                    open_id: Some(id),
+                    selected: active == Some(id),
+                    cursor: self.navigation_open
+                        && self.navigation_pane == 0
+                        && self.session_cursor == Some(open_pos),
+                },
+                cx,
+            ));
         }
-        list = list.child(div().text_xs().child("Recent sessions"));
+        list = list.child(session_section("Recent sessions", recent.len(), cx));
         for (recent_pos, session) in recent.iter().enumerate() {
             let key = session.key.clone();
             let open = self
@@ -836,73 +988,57 @@ impl Workspace {
                 .iter()
                 .find(|(_, s)| s.key.as_ref() == Some(&key))
                 .map(|(&id, _)| id);
-            let status = open
-                .and_then(|id| activity.for_launch(id))
-                .map(|a| format!(" · {}", a.state.label()))
-                .unwrap_or_default();
-            let is_selected = selected == Some(&key);
-            let icon = crate::agent_icons::session_icon(
-                session.agent(),
-                &self.agent_icon_tiles,
-                crate::agent_icons::ICON_INLINE_PX,
-            );
-            let row = Button::new(SharedString::from(format!(
-                "recent-agent-{}-{}-{}",
-                key.provider,
-                key.store.display(),
-                key.id
-            )))
-            .ghost()
-            .flex_1()
-            .min_w_0()
-            .h_auto()
-            .p_2()
-            .tooltip(session.tooltip())
-            .child(
-                v_flex()
-                    .items_start()
-                    .w_full()
-                    .gap_1()
-                    .child(div().w_full().truncate().child(session.title.clone()))
-                    .child(h_flex().gap_2().items_center().child(icon).child(
-                        div().text_xs().child(format!(
-                            "{} · {}{status}",
-                            session.provider_label(),
-                            session.age()
-                        )),
-                    )),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_agent_session(key.clone(), window, cx)
-            }));
-            let mut row = h_flex().gap_1().rounded_md().child(row);
-            let is_cursor = self.navigation_open
-                && self.navigation_pane == 0
-                && self.session_cursor == Some(open_count.saturating_add(recent_pos));
-            if is_cursor {
-                row = row.border_1().border_color(cx.theme().ring);
+            let status = open.and_then(|id| activity.for_launch(id)).map(|a| a.state);
+            let mut tooltip = session.tooltip();
+            if let Some(status) = status {
+                tooltip.push_str(&format!("\n{}", status.label()));
             }
-            if is_selected {
-                row = row.bg(cx.theme().secondary);
-            }
-            if let Some(id) = open {
-                row = row.child(
-                    Button::new(SharedString::from(format!("close-recent-{id}")))
-                        .ghost()
-                        .label("×")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_agent_session(id, window, cx)
-                        })),
-                );
-            }
-            list = list.child(row);
+            list = list.child(self.render_session_row(
+                SessionSidebarRow {
+                    target: SessionNavTarget::Recent(key.clone()),
+                    title: session.title.clone(),
+                    provider: session.provider_label().into(),
+                    age: Some(session.age()),
+                    tooltip,
+                    icon: crate::agent_icons::session_icon(
+                        session.agent(),
+                        &self.agent_icon_tiles,
+                        crate::agent_icons::ICON_PX,
+                    ),
+                    status,
+                    open_id: open,
+                    selected: selected == Some(&key),
+                    cursor: self.navigation_open
+                        && self.navigation_pane == 0
+                        && self.session_cursor == Some(open_count.saturating_add(recent_pos)),
+                },
+                cx,
+            ));
         }
         if recent.is_empty() {
-            list = list.child(div().text_sm().child(if self.session_snapshot.loaded {
-                "No recent sessions."
-            } else {
-                "Loading sessions…"
-            }));
+            list = list.child(
+                v_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_6()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(Icon::new(IconName::SquareTerminal).size(px(24.)))
+                    .child(if self.session_snapshot.loaded {
+                        "No recent sessions yet"
+                    } else {
+                        "Loading sessions…"
+                    })
+                    .when(self.session_snapshot.loaded, |empty| {
+                        empty.child(
+                            div()
+                                .text_xs()
+                                .text_center()
+                                .child("Start a session to work with an agent."),
+                        )
+                    }),
+            );
         }
         for error in &self.session_snapshot.errors {
             list = list.child(
@@ -923,19 +1059,22 @@ impl Workspace {
                         .gap_1()
                         .child(
                             Button::new("new-agent-session")
-                                .ghost()
+                                .small()
                                 .flex_1()
                                 .icon(IconName::Plus)
-                                .label("New session…")
+                                .label("New session")
+                                .tooltip("Choose an agent and start a session")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.prompt_new_agent_session(window, cx)
                                 })),
                         )
                         .child(
                             Button::new("refresh-agent-sessions")
+                                .small()
                                 .ghost()
                                 .icon(IconName::RotateCw)
                                 .tooltip("Refresh sessions")
+                                .accessibility_label("Refresh sessions")
                                 .loading(self.session_refreshing)
                                 .on_click(cx.listener(|this, _, _, cx| this.refresh_sessions(cx))),
                         ),

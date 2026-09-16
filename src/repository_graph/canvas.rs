@@ -1,5 +1,5 @@
 //! Screen-space geometry, painting, and gestures; no persistence or domain rules.
-use gpui_kit::component::{ActiveTheme as _, StyledExt as _, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Context, DispatchPhase, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -218,8 +218,9 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
     }
     let bounds_cell = page.bounds.clone();
     let weak = cx.entity().downgrade();
-    let accent = cx.theme().primary;
+    let accent = cx.theme().info;
     let line = cx.theme().muted_foreground;
+    let grid = cx.theme().muted_foreground.opacity(0.14);
     let mut content = div()
         .id("repository-graph-canvas")
         .relative()
@@ -271,6 +272,22 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
             canvas(
                 move |bounds, _, _| bounds_cell.set(bounds),
                 move |bounds, _, window, _| {
+                    let spacing = (24. * view.zoom).max(12.);
+                    let mut x = view.offset.x.rem_euclid(spacing);
+                    while x < f32::from(bounds.size.width) {
+                        let mut y = view.offset.y.rem_euclid(spacing);
+                        while y < f32::from(bounds.size.height) {
+                            window.paint_quad(gpui_kit::fill(
+                                gpui_kit::Bounds::new(
+                                    bounds.origin + point(px(x), px(y)),
+                                    gpui_kit::size(px(1.5), px(1.5)),
+                                ),
+                                grid,
+                            ));
+                            y += spacing;
+                        }
+                        x += spacing;
+                    }
                     for (curve, selected, preview) in curves {
                         paint_curve(
                             curve,
@@ -357,7 +374,7 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
             .description
             .as_deref()
             .unwrap_or("Add a repository description");
-        let preview: String = preview.chars().take(95).collect();
+        let preview: String = preview.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut body = v_flex()
             .id(format!("graph-node-{key}"))
             .absolute()
@@ -365,16 +382,18 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
             .top(px(pos.y))
             .w(px(NODE_WIDTH * view.zoom))
             .h(px(NODE_HEIGHT * view.zoom))
-            .p(px(12. * view.zoom))
-            .gap(px(5. * view.zoom))
-            .rounded_md()
-            .border_2()
+            .p(px(14. * view.zoom))
+            .gap(px(8. * view.zoom))
+            .rounded_lg()
+            .border_1()
             .border_color(if selected || target {
                 accent
             } else {
                 cx.theme().border
             })
             .bg(cx.theme().secondary)
+            .shadow_sm()
+            .hover(|style| style.border_color(accent.opacity(0.65)))
             .cursor_pointer()
             .tab_index(0)
             .focus(|style| style.border_color(accent))
@@ -403,17 +422,29 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
                 }),
             )
             .child(
-                div()
-                    .font_semibold()
-                    .text_size(px((14. * view.zoom).max(10.)))
-                    .truncate()
-                    .child(node.label().to_owned()),
+                h_flex()
+                    .gap(px(8. * view.zoom))
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(px(14. * view.zoom))
+                            .text_color(accent),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_semibold()
+                            .text_size(px((14. * view.zoom).max(10.)))
+                            .truncate()
+                            .child(node.label().to_owned()),
+                    ),
             )
             .child(
                 div()
                     .text_color(cx.theme().muted_foreground)
                     .text_size(px((11. * view.zoom).max(9.)))
-                    .overflow_hidden()
+                    .truncate()
                     .flex_1()
                     .child(preview),
             )
@@ -425,13 +456,13 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
                     .child(if node.unresolved {
                         "Missing repository · cleanup available".into()
                     } else if hidden > 0 {
-                        format!("{hidden} hidden connections · Show in All")
+                        format!("{hidden} connections outside this view")
                     } else if node.repository.checkout_missing {
                         "Checkout missing".into()
                     } else if !node.repository.is_linked() {
                         "Not linked on this device".into()
                     } else {
-                        node.repository.group.clone().unwrap_or_default()
+                        "Linked on this device".into()
                     }),
             );
         for output in [false, true] {
@@ -447,16 +478,23 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
                     .left(px(NODE_WIDTH * view.zoom / 2. - 8.))
                     .w(px(16.))
                     .h(px(16.))
-                    .rounded_full()
-                    .bg(if target {
-                        accent
-                    } else {
-                        cx.theme().background
-                    })
-                    .border_2()
-                    .border_color(accent)
                     .when(output, |el| el.bottom(px(-8.)))
                     .when(!output, |el| el.top(px(-8.)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(9.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if selected || target { accent } else { line })
+                            .bg(if target {
+                                accent
+                            } else {
+                                cx.theme().background
+                            }),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |page, event: &MouseDownEvent, window, cx| {

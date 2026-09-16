@@ -6,7 +6,11 @@ mod layout;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::radio::{Radio, RadioGroup};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
+};
 use gpui_kit::{
     AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
     IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
@@ -110,7 +114,9 @@ impl GraphPage {
         })
         .detach();
         let mut layouts = Layouts::default();
-        layouts.groups.insert("All".into(), GroupLayout::default());
+        layouts
+            .groups
+            .insert(layouts.last_group.clone(), GroupLayout::default());
         Self {
             focus_handle,
             root,
@@ -210,6 +216,25 @@ impl GraphPage {
             .or_default()
     }
     fn ensure_positions(&mut self) {
+        // Restore a specific group when upgrading an old All view, or when a
+        // custom group disappears after a metadata edit or portable sync.
+        let groups = self.groups();
+        if !groups.contains(&self.layouts.last_group) {
+            self.layouts.last_group = groups
+                .iter()
+                .find(|group| {
+                    self.graph.as_ref().is_some_and(|graph| {
+                        graph.nodes.iter().any(|node| {
+                            relationships::group_matches(
+                                node.repository.group.as_deref(),
+                                Some(group),
+                            )
+                        })
+                    })
+                })
+                .unwrap_or(&groups[0])
+                .clone();
+        }
         let keys: Vec<_> = self
             .graph
             .as_ref()
@@ -262,6 +287,9 @@ impl GraphPage {
             .unwrap_or_default()
     }
     fn set_group(&mut self, group: String, cx: &mut Context<Self>) {
+        if self.layouts.last_group == group {
+            return;
+        }
         self.cancel_gesture(cx);
         self.layouts.last_group = group;
         self.ensure_positions();
@@ -272,21 +300,28 @@ impl GraphPage {
         let mut groups = BTreeSet::new();
         if let Some(graph) = &self.graph {
             for node in &graph.nodes {
-                if let Some(group) = &node.repository.group
+                if let Some(group) = node.repository.group.as_deref().map(str::trim)
+                    && !group.is_empty()
                     && !group.eq_ignore_ascii_case("Personal")
                     && !group.eq_ignore_ascii_case("Work")
                 {
-                    groups.insert(group.clone());
+                    groups.insert(group.to_owned());
                 }
             }
         }
-        let mut choices = vec!["All".into(), "Personal".into(), "Work".into()];
+        let mut choices = vec!["Personal".into(), "Work".into()];
         choices.extend(
             groups
                 .into_iter()
                 .filter(|g| g != "All" && g != "Ungrouped"),
         );
-        choices.push("Ungrouped".into());
+        if self.graph.as_ref().is_some_and(|graph| {
+            graph.nodes.iter().any(|node| {
+                relationships::group_matches(node.repository.group.as_deref(), Some("Ungrouped"))
+            })
+        }) {
+            choices.push("Ungrouped".into());
+        }
         choices
     }
     fn hidden_count(&self, key: &str, visible: &BTreeSet<String>) -> usize {
@@ -943,17 +978,8 @@ impl GraphPage {
                         );
                     }
                 }
-                panel = panel.child(
-                    Button::new("show-endpoints-all")
-                        .ghost()
-                        .label("Show connections in All")
-                        .on_click(cx.listener(|page, _, window, cx| {
-                            page.search
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                            page.set_group("All".into(), cx);
-                            page.fit(cx);
-                        })),
-                );
+                panel = panel.child(div().text_xs().text_color(cx.theme().muted_foreground)
+                    .child("Connections to other groups are included here. Select a connection to inspect or edit it."));
             }
             Draft::Edge { id, .. } => {
                 panel = panel
@@ -1085,73 +1111,120 @@ impl GraphPage {
 
 impl Render for GraphPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let weak = cx.entity().downgrade();
         let groups = self.groups();
+        let count = self.visible_nodes(cx).len();
+        let selected_group = groups
+            .iter()
+            .position(|group| group == &self.layouts.last_group);
+        let radios = RadioGroup::horizontal("relationship-groups")
+            .flex_none()
+            .selected_index(selected_group)
+            .children(groups.iter().enumerate().map(|(index, group)| {
+                Radio::new(("relationship-group", index))
+                    .small()
+                    .label(group.clone())
+                    .py_1()
+            }))
+            .on_change(cx.listener(move |page, index: &usize, _, cx| {
+                if let Some(group) = groups.get(*index) {
+                    page.set_group(group.clone(), cx);
+                }
+            }));
         let toolbar = h_flex()
             .flex_none()
             .items_center()
-            .flex_wrap()
-            .gap_2()
-            .p_2()
+            .gap_4()
+            .px_4()
+            .py_2()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                Button::new("relationship-groups")
-                    .ghost()
-                    .label(format!("Group: {} ⌄", self.layouts.last_group))
-                    .dropdown_menu(move |menu, _, _| {
-                        let mut menu = menu;
-                        for group in &groups {
-                            let (group, weak) = (group.clone(), weak.clone());
-                            menu = menu.item(PopupMenuItem::new(group.clone()).on_click(
-                                move |_, _, cx| {
-                                    let _ = weak
-                                        .update(cx, |page, cx| page.set_group(group.clone(), cx));
-                                },
-                            ));
-                        }
-                        menu
-                    }),
-            )
-            .child(Input::new(&self.search).w(px(210.)))
-            .child(
-                Button::new("add-relationship")
-                    .primary()
-                    .label("Add relationship")
-                    .disabled(self.graph.is_none() || self.saving)
-                    .on_click(cx.listener(|page, _, window, cx| {
-                        page.new_edge(String::new(), String::new(), None, window, cx)
-                    })),
+                h_flex()
+                    .flex_1()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Group"),
+                    )
+                    .child(radios),
             )
             .child(
-                Button::new("add-graph-repository")
-                    .ghost()
-                    .label("Add repository")
-                    .on_click(cx.listener(|page, _, _, cx| {
-                        page.set_group("All".into(), cx);
-                        cx.emit(GraphEvent::AddRepository);
-                    })),
+                Input::new(&self.search)
+                    .small()
+                    .w(px(280.))
+                    .min_w(px(160.))
+                    .prefix(Icon::new(IconName::Search).small())
+                    .cleanable(true),
             )
             .child(
-                Button::new("graph-fit")
-                    .ghost()
-                    .label("Fit view")
-                    .on_click(cx.listener(|page, _, _, cx| page.fit(cx))),
-            )
-            .child(
-                Button::new("graph-arrange")
-                    .ghost()
-                    .label("Auto arrange")
-                    .on_click(cx.listener(|page, _, _, cx| page.arrange(cx))),
-            )
-            .child(
-                Button::new("graph-refresh")
-                    .ghost()
-                    .label("Refresh")
-                    .disabled(self.loading)
-                    .on_click(cx.listener(|page, _, _, cx| page.refresh(cx))),
+                h_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("add-graph-repository")
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("Repository")
+                            .tooltip("Add repository")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(GraphEvent::AddRepository);
+                            })),
+                    )
+                    .child(
+                        Button::new("add-relationship")
+                            .small()
+                            .primary()
+                            .icon(IconName::Network)
+                            .label("Relationship")
+                            .tooltip("Add relationship")
+                            .disabled(self.graph.is_none() || self.saving)
+                            .on_click(cx.listener(|page, _, window, cx| {
+                                page.new_edge(String::new(), String::new(), None, window, cx)
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .pl_2()
+                            .border_l_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                Button::new("graph-fit")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Maximize)
+                                    .tooltip("Fit view")
+                                    .accessibility_label("Fit view")
+                                    .disabled(count == 0)
+                                    .on_click(cx.listener(|page, _, _, cx| page.fit(cx))),
+                            )
+                            .child(
+                                Button::new("graph-arrange")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::LayoutDashboard)
+                                    .tooltip("Auto arrange")
+                                    .accessibility_label("Auto arrange")
+                                    .disabled(count == 0)
+                                    .on_click(cx.listener(|page, _, _, cx| page.arrange(cx))),
+                            )
+                            .child(
+                                Button::new("graph-refresh")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::RotateCw)
+                                    .tooltip("Refresh repositories")
+                                    .accessibility_label("Refresh repositories")
+                                    .disabled(self.loading)
+                                    .on_click(cx.listener(|page, _, _, cx| page.refresh(cx))),
+                            ),
+                    ),
             );
-        let count = self.visible_nodes(cx).len();
         let mut body = div()
             .relative()
             .flex_1()
@@ -1222,8 +1295,24 @@ impl Render for GraphPage {
                 );
             }
         }
-        page.child(body).child(div().flex_none().px_3().py_1().text_xs().text_color(cx.theme().muted_foreground)
-            .child(format!("{count} repositories · Provider → consumer · Drag background to pan · Scroll to zoom · Tab then Enter to inspect · Escape to cancel · {:.0}%", self.layout().viewport.zoom*100.)))
+        page.child(body).child(
+            h_flex()
+                .flex_none()
+                .flex_wrap()
+                .justify_between()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("{count} repositories · Provider → consumer"))
+                .child(format!(
+                    "Drag to pan · Scroll to zoom · {:.0}%",
+                    self.layout().viewport.zoom * 100.
+                )),
+        )
     }
 }
 
@@ -1231,6 +1320,57 @@ impl Render for GraphPage {
 mod tests {
     use super::*;
     use gpui_kit::{Focusable as _, point};
+
+    #[gpui_kit::test]
+    fn group_migration_and_switching_preserve_saved_positions(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().to_owned());
+        for (key, group) in [
+            ("api", "work"),
+            ("ui", "Work"),
+            ("tool", "Custom"),
+            ("other", ""),
+        ] {
+            crate::data::write_json_atomic(
+                &root
+                    .portable_dir()
+                    .join(format!("repositories/{key}/repository.json")),
+                &serde_json::json!({ "key": key, "group": group }),
+            )
+            .unwrap();
+        }
+        let graph = relationships::load(&root, Query::default()).unwrap();
+        cx.update(gpui_kit::component::init);
+        let (page, cx) = cx.add_window_view(|window, cx| GraphPage::new(None, window, cx));
+        page.update(cx, |page, cx| {
+            page.graph = Some(graph);
+            page.layouts.last_group = "All".into();
+            page.layouts
+                .groups
+                .entry("Work".into())
+                .or_default()
+                .positions
+                .insert("api".into(), Point::new(321., 123.));
+            page.ensure_positions();
+            assert_eq!(page.groups(), ["Personal", "Work", "Custom", "Ungrouped"]);
+            assert_eq!(page.layouts.last_group, "Work");
+            assert_eq!(page.visible_nodes(cx).len(), 2);
+            page.set_group("Custom".into(), cx);
+            assert_eq!(page.visible_nodes(cx)[0].key(), "tool");
+            page.set_group("Ungrouped".into(), cx);
+            assert_eq!(page.visible_nodes(cx)[0].key(), "other");
+            page.set_group("Work".into(), cx);
+            assert_eq!(page.layout().positions["api"], Point::new(321., 123.));
+            page.graph
+                .as_mut()
+                .unwrap()
+                .nodes
+                .retain(|node| node.key() != "tool");
+            page.layouts.last_group = "Custom".into();
+            page.ensure_positions();
+            assert_eq!(page.layouts.last_group, "Work");
+        });
+    }
 
     #[gpui_kit::test]
     fn floating_editor_occludes_canvas_and_escape_works_in_textarea(

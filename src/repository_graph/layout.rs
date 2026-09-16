@@ -104,7 +104,7 @@ impl Default for Layouts {
         Self {
             schema_version: 1,
             groups: BTreeMap::new(),
-            last_group: "All".into(),
+            last_group: "Personal".into(),
         }
     }
 }
@@ -161,6 +161,11 @@ pub(crate) fn arrange(keys: &[String], edges: &[Relationship]) -> BTreeMap<Strin
             reverse.get_mut(&edge.to).unwrap().insert(edge.from.clone());
         }
     }
+    let isolated: BTreeSet<_> = keys
+        .iter()
+        .filter(|key| forward[*key].is_empty() && reverse[*key].is_empty())
+        .cloned()
+        .collect();
     let mut seen = BTreeSet::new();
     let mut order = Vec::new();
     for key in &keys {
@@ -237,7 +242,7 @@ pub(crate) fn arrange(keys: &[String], edges: &[Relationship]) -> BTreeMap<Strin
         for (i, members) in components
             .iter()
             .enumerate()
-            .filter(|(i, _)| ranks[*i] == rank)
+            .filter(|(i, members)| ranks[*i] == rank && !isolated.contains(&members[0]))
         {
             let _ = i;
             for (index, key) in members.iter().enumerate() {
@@ -249,7 +254,21 @@ pub(crate) fn arrange(keys: &[String], edges: &[Relationship]) -> BTreeMap<Strin
             x += if members.len() > 1 { 640. } else { 300. };
             height = height.max(members.len().div_ceil(2) as f32 * 180.);
         }
-        y += height + 60.;
+        if height > 0. {
+            y += height + 60.;
+        }
+    }
+    // Unconnected repositories have no hierarchy. Keep them in a compact grid
+    // below the connected graph instead of stretching the canvas horizontally.
+    let columns = (isolated.len() as f32).sqrt().ceil().clamp(1., 4.) as usize;
+    for (index, key) in isolated.into_iter().enumerate() {
+        result.insert(
+            key,
+            Point::new(
+                (index % columns) as f32 * 300.,
+                y + (index / columns) as f32 * 180.,
+            ),
+        );
     }
     result
 }
@@ -273,6 +292,35 @@ impl GroupLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn isolated_repositories_wrap_without_overlapping_the_hierarchy() {
+        let keys: Vec<_> = (0..17).map(|index| format!("repo-{index:02}")).collect();
+        let edge = Relationship {
+            id: "connection".into(),
+            from: keys[0].clone(),
+            to: keys[1].clone(),
+            description: "Uses the provider".into(),
+            extra: BTreeMap::new(),
+        };
+        let positions = arrange(&keys, &[edge]);
+        assert_eq!(positions.len(), keys.len());
+        assert!(positions[&keys[0]].y < positions[&keys[1]].y);
+        for key in &keys[2..] {
+            assert!(positions[key].y > positions[&keys[1]].y + NODE_HEIGHT);
+            assert!(positions[key].x <= 900.);
+        }
+        for (index, key) in keys.iter().enumerate() {
+            for other in &keys[index + 1..] {
+                let (a, b) = (positions[key], positions[other]);
+                assert!((a.x - b.x).abs() >= NODE_WIDTH || (a.y - b.y).abs() >= NODE_HEIGHT);
+            }
+        }
+        let mut reversed = keys.clone();
+        reversed.reverse();
+        assert_eq!(arrange(&keys, &[]), arrange(&reversed, &[]));
+        assert!(arrange(&[], &[]).is_empty());
+    }
+
     #[test]
     fn coordinates_zoom_anchor_and_fit() {
         let mut viewport = Viewport::default();

@@ -68,3 +68,6 @@ Mouse: drag a node body to move it, background to pan, or an output handle to
 an input handle to create a connection. Select an edge, then drag its provider
 or consumer handle to rewire. Scroll zooms around the pointer. Finish editing
 with Save or Cancel; Auto arrange and Fit view are explicit toolbar actions.
+Group radio buttons switch between Personal, Work, custom groups, and Ungrouped
+when present. Connections outside the current group remain listed in the node
+inspector. The icon buttons provide tooltips and accessible names.

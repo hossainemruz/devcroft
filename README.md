@@ -54,7 +54,9 @@ Drag the background to pan, scroll to zoom about the pointer, and use **Fit view
 or **Auto arrange**. **Tab / Shift+Tab**, then **Enter**, selects nodes or edge
 labels; **Add relationship** provides a keyboard form. **Escape** cancels the
 active gesture or dismisses the draft. Groups change the view only; a node's
-inspector can show hidden connections in All. Click **Open repository** to enter
+inspector lists connections across groups. Choose a group using the radio buttons;
+the last selected group and its layout are remembered. **Auto arrange** puts
+unconnected repositories in a compact grid. Click **Open repository** to enter
 a linked checkout explicitly.
 
 ```sh

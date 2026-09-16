@@ -1,7 +1,8 @@
 # Repository Relationships: implementation plan
 
-Status: planned, application implementation not started. This is the active
-feature; Review Assistant is deferred until Repository Relationships is complete.
+Status: implemented and validated on 2026-09-16. See
+[implementation validation](repository-relationships-validation.md) for automated
+and native desktop results. Review Assistant remains deferred.
 
 ## Agreed scope
 

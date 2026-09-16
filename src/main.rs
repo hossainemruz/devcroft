@@ -26,6 +26,7 @@ mod pane;
 mod preview;
 mod pull_requests;
 mod relative_time;
+mod repository_graph;
 mod review;
 mod session;
 mod settings;

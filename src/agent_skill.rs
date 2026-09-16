@@ -22,6 +22,10 @@ const FILES: &[(&str, &str)] = &[
         "references/review.md",
         include_str!("../assets/skills/devcroft/references/review.md"),
     ),
+    (
+        "references/relationships.md",
+        include_str!("../assets/skills/devcroft/references/relationships.md"),
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]

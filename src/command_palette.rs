@@ -104,6 +104,7 @@ pub(crate) enum PaletteCommand {
     GoResources,
     GoHome,
     BrowseArtifacts,
+    RepositoryRelationships,
     AddRepository,
     OpenSettings,
     SyncPortable,
@@ -120,7 +121,7 @@ impl PaletteCommand {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::GoAgent,
         Self::GoEditor,
         Self::GoTerminal,
@@ -128,6 +129,7 @@ impl PaletteCommand {
         Self::GoResources,
         Self::GoHome,
         Self::BrowseArtifacts,
+        Self::RepositoryRelationships,
         Self::AddRepository,
         Self::OpenSettings,
         Self::SyncPortable,
@@ -142,6 +144,7 @@ impl PaletteCommand {
             Self::GoResources => "Go to Resources",
             Self::GoHome => "Go to Home",
             Self::BrowseArtifacts => "Browse artifacts",
+            Self::RepositoryRelationships => "Repository relationships",
             Self::AddRepository => "Add repository…",
             Self::OpenSettings => "Open settings…",
             Self::SyncPortable => "Sync portable data now",
@@ -159,6 +162,9 @@ impl PaletteCommand {
             Self::GoReview => &["tab", "review", "diff"],
             Self::GoResources => &["tab", "resources", "artifacts"],
             Self::GoHome => &["tab", "home", "dashboard"],
+            Self::RepositoryRelationships => {
+                &["graph", "canvas", "dependencies", "dependents", "map"]
+            }
             Self::BrowseArtifacts => &[
                 "artifact",
                 "artifacts",
@@ -359,7 +365,7 @@ pub(crate) fn item_at(
     sections.get(section)?.items.get(row).cloned()
 }
 
-const GO_TO_COMMANDS: [PaletteCommand; 7] = [
+const GO_TO_COMMANDS: [PaletteCommand; 8] = [
     PaletteCommand::GoAgent,
     PaletteCommand::GoEditor,
     PaletteCommand::GoTerminal,
@@ -367,6 +373,7 @@ const GO_TO_COMMANDS: [PaletteCommand; 7] = [
     PaletteCommand::GoResources,
     PaletteCommand::GoHome,
     PaletteCommand::BrowseArtifacts,
+    PaletteCommand::RepositoryRelationships,
 ];
 
 const REPOSITORY_COMMANDS: [PaletteCommand; 1] = [PaletteCommand::AddRepository];
@@ -531,7 +538,11 @@ mod tests {
         // Home destinations and global commands stay reachable everywhere.
         assert_eq!(
             commands,
-            vec![PaletteCommand::GoHome, PaletteCommand::BrowseArtifacts,]
+            vec![
+                PaletteCommand::GoHome,
+                PaletteCommand::BrowseArtifacts,
+                PaletteCommand::RepositoryRelationships
+            ]
         );
         // Projects mode is page-agnostic: switching checkouts is how you
         // leave Home, so recents stay put there too.
@@ -652,7 +663,12 @@ mod tests {
             item_at(&sections, 0, 6),
             Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
         );
-        assert_eq!(item_at(&sections, 0, 7), None);
+        assert_eq!(
+            item_at(&sections, 0, 7),
+            Some(PaletteItem::Command(
+                PaletteCommand::RepositoryRelationships
+            ))
+        );
         assert_eq!(
             item_at(&sections, 1, 0),
             Some(PaletteItem::SwitchRepository {
@@ -680,9 +696,9 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 7 go-to + 2 switch + 1 add + 1 settings + 1 sync.
-        assert_eq!(all.len(), 12);
-        assert_eq!(filter_items(&sections, "   ").len(), 12);
+        // 8 go-to + 2 switch + 1 add + 1 settings + 1 sync.
+        assert_eq!(all.len(), 13);
+        assert_eq!(filter_items(&sections, "   ").len(), 13);
     }
 
     #[test]

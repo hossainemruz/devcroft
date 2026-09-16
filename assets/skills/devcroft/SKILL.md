@@ -1,6 +1,6 @@
 ---
 name: devcroft
-description: Use Devcroft's CLI to manage Devcroft repository Markdown artifacts and artifact/review comments. Use when the user mentions Devcroft work, a Devcroft artifact ID, or asks to address comments in Devcroft's Review pane.
+description: Use Devcroft's CLI to manage Devcroft repository relationships, Markdown artifacts, and artifact/review comments. Use when the user mentions Devcroft work, a Devcroft artifact ID, or asks to address comments in Devcroft's Review pane.
 ---
 
 # Devcroft
@@ -18,6 +18,7 @@ Use the `devcroft` CLI for Devcroft records. Artifact and review operations work
 
 | Need | Commands / guidance |
 | --- | --- |
+| Query or edit repository relationships | `devcroft repository relationships` / `relationship` — read [relationships](references/relationships.md) |
 | Discover repositories | `devcroft repository list --json` |
 | Store RFCs, plans, notes as Markdown artifacts | `devcroft artifact` — read [resources](references/resources.md) |
 | Read and manage artifact comments | `devcroft artifact comment` — read [resources](references/resources.md) |

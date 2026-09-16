@@ -14,6 +14,10 @@ pub(crate) struct RepositoryArgs {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub(crate) enum RepositoryCommand {
+    /// Query provider → consumer relationships, including unlinked repositories.
+    Relationships(RelationshipQueryArgs),
+    /// Create, edit, or delete a relationship with a fresh graph revision.
+    Relationship(RelationshipArgs),
     /// List readable portable keys, including repositories without checkouts.
     List(LimitArgs),
     /// Show one portable record plus this device's checkout binding.
@@ -52,6 +56,9 @@ pub(crate) struct RepositoryUpdateArgs {
     /// Portable repository key.
     #[arg(value_name = "KEY")]
     pub(crate) key: String,
+    /// Repository metadata revision from get or relationships.
+    #[arg(long)]
+    pub(crate) revision: String,
     #[arg(long)]
     pub(crate) display_name: Option<String>,
     #[arg(long)]
@@ -69,6 +76,63 @@ pub(crate) struct RepositoryUpdateArgs {
     pub(crate) clone_url: Option<String>,
     #[arg(long)]
     pub(crate) base_branch: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RelationshipQueryArgs {
+    pub(crate) repository: Option<String>,
+    #[arg(long, requires = "repository", value_parser = clap::value_parser!(u8).range(1..=8))]
+    pub(crate) depth: Option<u8>,
+    #[arg(long)]
+    pub(crate) group: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RelationshipArgs {
+    #[command(subcommand)]
+    pub(crate) command: RelationshipCommand,
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum RelationshipCommand {
+    Create(RelationshipCreateArgs),
+    Update(RelationshipUpdateArgs),
+    Delete(RevisionArgs),
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RelationshipDescriptionArgs {
+    #[arg(long, conflicts_with = "description_file")]
+    pub(crate) description: Option<String>,
+    /// UTF-8 multiline description, or - for stdin (maximum 16384 bytes).
+    #[arg(long)]
+    pub(crate) description_file: Option<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RelationshipCreateArgs {
+    /// Provider repository key.
+    #[arg(long)]
+    pub(crate) from: String,
+    /// Consumer repository key.
+    #[arg(long)]
+    pub(crate) to: String,
+    #[arg(long)]
+    pub(crate) revision: String,
+    #[command(flatten)]
+    pub(crate) text: RelationshipDescriptionArgs,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct RelationshipUpdateArgs {
+    #[command(flatten)]
+    pub(crate) record: RevisionArgs,
+    #[arg(long)]
+    pub(crate) from: Option<String>,
+    #[arg(long)]
+    pub(crate) to: Option<String>,
+    #[command(flatten)]
+    pub(crate) text: RelationshipDescriptionArgs,
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]

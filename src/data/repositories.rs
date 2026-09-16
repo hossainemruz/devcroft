@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::device::DeviceRepositoryBinding;
-use super::record::read_bounded;
-use super::store_lock::{portable_gate, reject_symlink};
+use super::record::{MAX_BYTES, atomic_replace, read_bounded, revision};
+use super::store_lock::{portable_gate, reject_symlink, repository_graph_lock};
 use super::{DataRoot, DeviceStore, run_git_in, write_json_atomic};
 
 /// Portable repository metadata. `camelCase` matches the Electron
@@ -33,6 +33,8 @@ use super::{DataRoot, DeviceStore, run_git_in, write_json_atomic};
 /// warning elsewhere, never a load failure here.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RepositoryMetadata {
+    #[serde(skip)]
+    pub(crate) revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,6 +85,7 @@ pub(crate) struct RepositoryList {
 /// The portable gate prevents built-in sync/checkout from changing the scan.
 pub(crate) fn list_repositories(root: &DataRoot, limit: usize) -> Result<RepositoryList> {
     let _gate = portable_gate(root, false)?;
+    let _lock = repository_graph_lock(root, false)?;
     reject_symlink(&root.portable_dir())?;
     let dir = root.portable_dir().join("repositories");
     reject_symlink(&dir)?;
@@ -163,8 +166,10 @@ pub(crate) struct NewRepositoryInput {
 /// so a portable record cloned to a new device can be re-linked — the
 /// recovery shape [`create_repository`] documents for a crash between the
 /// two writes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RepositoryEntry {
+    pub(crate) revision: String,
     pub(crate) key: String,
     pub(crate) display_name: Option<String>,
     pub(crate) description: Option<String>,
@@ -191,6 +196,16 @@ impl RepositoryEntry {
 /// management surfaces page their own way. Malformed siblings land in
 /// `errors` (like [`list_repositories`]) rather than hiding the rest.
 pub(crate) fn all_repositories(root: &DataRoot) -> Result<(Vec<RepositoryEntry>, Vec<String>)> {
+    let _gate = portable_gate(root, false)?;
+    let _lock = repository_graph_lock(root, false)?;
+    all_repositories_unlocked(root)
+}
+
+pub(super) fn all_repositories_unlocked(
+    root: &DataRoot,
+) -> Result<(Vec<RepositoryEntry>, Vec<String>)> {
+    reject_symlink(&root.portable_dir())?;
+    reject_symlink(&root.portable_dir().join("repositories"))?;
     let state = DeviceStore::new(root).load().unwrap_or_default();
     let bindings = state.repositories.unwrap_or_default();
     let dir = root.portable_dir().join("repositories");
@@ -217,16 +232,10 @@ pub(crate) fn all_repositories(root: &DataRoot) -> Result<(Vec<RepositoryEntry>,
                 continue;
             }
         };
-        let metadata: RepositoryMetadata = match std::fs::read(path.join("repository.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        {
-            Some(metadata) => metadata,
-            None => {
-                errors.push(format!(
-                    "{}: malformed repository record",
-                    path.join("repository.json").display()
-                ));
+        let metadata = match get_repository_metadata_unlocked(root, &key) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", path.display()));
                 continue;
             }
         };
@@ -253,6 +262,7 @@ pub(crate) fn all_repositories(root: &DataRoot) -> Result<(Vec<RepositoryEntry>,
         };
         let non_empty = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
         out.push(RepositoryEntry {
+            revision: metadata.revision,
             key,
             display_name: non_empty(metadata.display_name),
             description: non_empty(metadata.description),
@@ -276,10 +286,24 @@ pub(crate) fn all_repositories(root: &DataRoot) -> Result<(Vec<RepositoryEntry>,
 /// name is the identity; a `key` mismatch inside the JSON is reported by
 /// [`list_repositories`]/[`all_repositories`] warnings, never a load failure.
 pub(crate) fn get_repository_metadata(root: &DataRoot, key: &str) -> Result<RepositoryMetadata> {
+    let _gate = portable_gate(root, false)?;
+    let _lock = repository_graph_lock(root, false)?;
+    get_repository_metadata_unlocked(root, key)
+}
+
+pub(super) fn get_repository_metadata_unlocked(
+    root: &DataRoot,
+    key: &str,
+) -> Result<RepositoryMetadata> {
     let key = require_repository_key(key)?;
     let path = repository_dir(root, &key).join("repository.json");
-    let metadata: RepositoryMetadata = serde_json::from_slice(&read_bounded(&path)?)
+    reject_symlink(&root.portable_dir())?;
+    reject_symlink(&root.portable_dir().join("repositories"))?;
+    reject_symlink(&repository_dir(root, &key))?;
+    let bytes = read_bounded(&path)?;
+    let mut metadata: RepositoryMetadata = serde_json::from_slice(&bytes)
         .with_context(|| format!("malformed repository at {}", path.display()))?;
+    metadata.revision = revision(&bytes)?;
     Ok(metadata)
 }
 
@@ -355,12 +379,19 @@ pub(crate) fn update_repository_metadata(
     root: &DataRoot,
     key: &str,
     input: &NewRepositoryInput,
+    expected_revision: &str,
 ) -> Result<RepositoryMetadata> {
+    let _gate = portable_gate(root, false)?;
+    let _lock = repository_graph_lock(root, true)?;
     let key = require_repository_key(key)?;
     let path = repository_dir(root, &key).join("repository.json");
-    let existing: RepositoryMetadata = serde_json::from_slice(&read_bounded(&path)?)
-        .with_context(|| format!("malformed repository at {}", path.display()))?;
+    let existing = get_repository_metadata_unlocked(root, &key)?;
+    anyhow::ensure!(
+        existing.revision == expected_revision,
+        "stale repository revision; reload before saving (draft was not saved)"
+    );
     let metadata = RepositoryMetadata {
+        revision: String::new(),
         key: Some(key.clone()),
         owner: clean_optional(input.owner.as_deref()).map(str::to_owned),
         name: clean_optional(input.name.as_deref()).map(str::to_owned),
@@ -372,8 +403,69 @@ pub(crate) fn update_repository_metadata(
         base_branch: clean_optional(input.base_branch.as_deref()).map(str::to_owned),
         extra: existing.extra,
     };
-    write_json_atomic(&path, &metadata)
-        .with_context(|| format!("saving repository record to {}", path.display()))?;
+    save_metadata_unlocked(&path, metadata, expected_revision)
+}
+
+/// Patch only purpose and group, preserving every unrelated metadata field.
+pub(crate) fn patch_repository_purpose(
+    root: &DataRoot,
+    key: &str,
+    description: String,
+    group: String,
+    expected_revision: &str,
+) -> Result<RepositoryMetadata> {
+    let _gate = portable_gate(root, false)?;
+    let _lock = repository_graph_lock(root, true)?;
+    let mut metadata = get_repository_metadata_unlocked(root, key)?;
+    anyhow::ensure!(
+        metadata.revision == expected_revision,
+        "stale repository revision; reload before saving (draft was not saved)"
+    );
+    metadata.description = clean_optional(Some(&description)).map(str::to_owned);
+    metadata.group = clean_optional(Some(&group)).map(str::to_owned);
+    save_metadata_unlocked(
+        &repository_dir(root, key).join("repository.json"),
+        metadata,
+        expected_revision,
+    )
+}
+
+fn save_metadata_unlocked(
+    path: &Path,
+    mut metadata: RepositoryMetadata,
+    expected_revision: &str,
+) -> Result<RepositoryMetadata> {
+    for value in [
+        &metadata.description,
+        &metadata.group,
+        &metadata.display_name,
+        &metadata.owner,
+        &metadata.name,
+        &metadata.clone_url,
+        &metadata.base_branch,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        anyhow::ensure!(
+            value.len() <= 16_384,
+            "repository field exceeds 16384 bytes"
+        );
+    }
+    let mut bytes = serde_json::to_vec_pretty(&metadata)?;
+    bytes.push(b'\n');
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "repository record exceeds size limit"
+    );
+    atomic_replace(path, &bytes, || {
+        anyhow::ensure!(
+            revision(&read_bounded(path)?)? == expected_revision,
+            "stale repository revision; reload before saving"
+        );
+        Ok(())
+    })?;
+    metadata.revision = revision(&bytes)?;
     Ok(metadata)
 }
 
@@ -384,8 +476,14 @@ pub(crate) fn update_repository_metadata(
 /// local checkout itself is never touched — only Devcroft's records. Fails
 /// when no portable record exists, so a typo cannot silently "succeed".
 pub(crate) fn remove_repository(root: &DataRoot, key: &str) -> Result<()> {
+    let _gate = portable_gate(root, false)?;
+    let _lock = repository_graph_lock(root, true)?;
+    super::relationships::ensure_repository_removable_unlocked(root, key)?;
     let key = require_repository_key(key)?;
     let dir = repository_dir(root, &key);
+    reject_symlink(&root.portable_dir())?;
+    reject_symlink(&root.portable_dir().join("repositories"))?;
+    reject_symlink(&dir)?;
     if !dir.join("repository.json").is_file() {
         bail!("repository \"{key}\" has no portable record");
     }
@@ -735,13 +833,18 @@ pub(crate) fn create_repository(
     checkout_path: &Path,
     input: &NewRepositoryInput,
 ) -> Result<CreatedRepository> {
+    let inspection = inspect_checkout(checkout_path)?;
+    let _gate = portable_gate(root, false)?;
+    let _lock = repository_graph_lock(root, true)?;
+    reject_symlink(&root.portable_dir())?;
+    reject_symlink(&root.portable_dir().join("repositories"))?;
     let key = require_repository_key(key)?;
     let dir = repository_dir(root, &key);
     if dir.exists() {
         bail!("repository key \"{key}\" already exists");
     }
-    let inspection = inspect_checkout(checkout_path)?;
     let metadata = RepositoryMetadata {
+        revision: String::new(),
         key: Some(key.clone()),
         owner: clean_optional(input.owner.as_deref())
             .map(str::to_owned)
@@ -1562,6 +1665,7 @@ mod tests {
                 tags: vec!["a".to_owned(), " a ".to_owned()],
                 ..NewRepositoryInput::default()
             },
+            &get_repository_metadata(&root, "editable").unwrap().revision,
         )
         .unwrap();
         assert_eq!(updated.display_name.as_deref(), Some("New"));

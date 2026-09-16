@@ -62,6 +62,7 @@ pub(crate) struct AddRepositoryView {
     tags: Entity<InputState>,
     clone_url: Entity<InputState>,
     base_branch: Entity<InputState>,
+    revision: String,
     busy: bool,
     error: Option<String>,
 }
@@ -92,6 +93,7 @@ impl AddRepositoryView {
             tags: input("Comma-separated, e.g. rust, desktop", cx),
             clone_url: input("e.g. git@github.com:hossainemruz/devcroft.git", cx),
             base_branch: input("e.g. main", cx),
+            revision: String::new(),
             busy: false,
             error: None,
         }
@@ -122,6 +124,7 @@ impl AddRepositoryView {
         metadata: &RepositoryMetadata,
     ) -> Self {
         let mut view = Self::new(window, cx, data_root);
+        view.revision = metadata.revision.clone();
         let mut prefill = |state: &Entity<InputState>, value: &str| {
             if !value.is_empty() {
                 state.update(cx, |state, cx| state.set_value(value, window, cx));
@@ -352,6 +355,7 @@ impl AddRepositoryView {
             RepositoryDialogMode::Edit { .. } => "saved",
         }
         .to_owned();
+        let revision = self.revision.clone();
         self.busy = true;
         self.error = None;
         cx.notify();
@@ -369,7 +373,8 @@ impl AddRepositoryView {
                             link_repository(&root, &key, &checkout).map(|linked| linked.key)
                         }
                         RepositoryDialogMode::Edit { .. } => {
-                            update_repository_metadata(&root, &key, &input).map(|_| key.clone())
+                            update_repository_metadata(&root, &key, &input, &revision)
+                                .map(|_| key.clone())
                         }
                     }
                 })

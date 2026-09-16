@@ -15,6 +15,7 @@ The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, 
 Devcroft opens on Home without starting terminal processes. Open a recent project or use the shared command bar (`Cmd+K` for actions, `Cmd+P` for projects on macOS; `Ctrl+K` / `Ctrl+P` on Linux/Windows) to enter a repository workspace. The **Home** button and **Go Home** command return to the dashboard without stopping existing sessions.
 
 - **Recent Projects:** up to four linked repositories, ordered by last opened time. Each card shows its checkout's branch (or detached commit), clean/modified state, and available ahead/behind counts. Status refreshes in the background every five seconds while Home is active; this reads local Git state and does not fetch remotes. Click anywhere on a card to open its workspace; **Add project** registers another checkout.
+- **Repository Relationships:** open from Home, Projects, or the action palette. Connect providers to consumers on a native canvas, edit repository purposes/groups, and query dependencies and dependents from the CLI. Isolated and unlinked repositories are included. Definitions sync through portable Git; per-group positions and viewports stay on this device.
 - **Resources:** repository Markdown artifacts with originating sessions, editing, and agent-accessible comments.
 - **Pull Requests:** track a GitHub PR by URL and choose a **Personal** or **Work** group. Titles are fetched automatically from GitHub; no title input is needed. The URL is shown until the first successful fetch. Cards show approval status, CI passed/failed (or pending/no checks), and open/draft/merged/closed state using your existing `gh auth login`. Status refreshes in the background every minute while Home or the PR board is active; **Refresh status** retries immediately. Failed fetches retain the last result with a stale indicator. **View all** opens a kanban board with **Waiting for Approval**, **To Review**, and **Watching** columns and All/Personal/Work filtering. Drag cards between columns or use their menu to move them. Edit and remove tracked entries locally; **Open** launches GitHub in your browser. Existing entries default to Personal and retain their column.
 - **Todos:** add/edit a title, optional description, **Personal** or **Work** group, and an optional project. `http(s)` links in the description render clickable and open in a browser. The checkbox sits in front of the title; the **⋯** menu in the top-right corner holds **Edit**, **Delete**, and keyboard-accessible **Move up / Move down**. Cards show their group and project badges. Drag a card onto another incomplete todo to reorder it. The inbox filters by group and project. Enable **Show completed** to restore completed items. **View all** opens a kanban board with one column per project plus **Unscoped** for todos with no project (removed projects keep their own column so scoped todos are never hidden); drag cards between columns to re-scope them. The board shares the group filter and respects **Show completed**.
@@ -40,6 +41,33 @@ devcroft artifact comment list ART_ID --json
 ```
 
 The CLI works without a running desktop. Records use the selected `DEVCROFT_DATA_DIR` or the normal per-OS root. See [Resources](docs/resources.md) and the [agent instructions](assets/skills/devcroft/references/resources.md).
+
+### Repository relationship graph
+
+`api → backend` means **backend depends on api**. Drag from a provider's bottom
+handle to a consumer's top handle, describe the connection, then Save. Select a
+node to edit its purpose/group, or an edge/label to edit endpoints, description,
+or delete it. Selected edge endpoints can also be rewired by dragging their
+handles; changes remain drafts until Save. Cycles are supported.
+
+Drag the background to pan, scroll to zoom about the pointer, and use **Fit view**
+or **Auto arrange**. **Tab / Shift+Tab**, then **Enter**, selects nodes or edge
+labels; **Add relationship** provides a keyboard form. **Escape** cancels the
+active gesture or dismisses the draft. Groups change the view only; a node's
+inspector can show hidden connections in All. Click **Open repository** to enter
+a linked checkout explicitly.
+
+```sh
+devcroft repository relationships backend --json
+devcroft repository relationships backend --depth 2 --json
+devcroft repository relationship create --from api --to backend --description 'backend implements api contracts' --revision GRAPH_REV --json
+devcroft repository get backend --json
+devcroft repository update backend --description 'Service implementation' --revision METADATA_REV --json
+```
+
+Read before editing and use the returned revision. Stale saves preserve UI drafts;
+review the latest values before retrying. See the [agent relationship reference](assets/skills/devcroft/references/relationships.md)
+for limits, group exclusions, unresolved repositories, and the full command set.
 
 ## Code review
 

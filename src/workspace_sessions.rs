@@ -36,11 +36,7 @@ impl ListDelegate for AgentPicker {
         _cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
         let agent = AgentKind::ALL[ix.row];
-        let icon = crate::agent_icons::agent_icon(
-            agent,
-            &self.icons,
-            crate::agent_icons::ICON_PX,
-        );
+        let icon = crate::agent_icons::agent_icon(agent, &self.icons, crate::agent_icons::ICON_PX);
         Some(
             ListItem::new(("new-session-agent", ix.row)).child(
                 v_flex()
@@ -808,18 +804,14 @@ impl Workspace {
                                     .w_full()
                                     .items_start()
                                     .gap_1()
+                                    .child(div().w_full().truncate().child(session.title.clone()))
                                     .child(
-                                        div().w_full().truncate().child(session.title.clone()),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(icon)
-                                            .child(div().text_xs().child(format!(
+                                        h_flex().gap_2().items_center().child(icon).child(
+                                            div().text_xs().child(format!(
                                                 "{} · {status}",
                                                 session.agent.label()
-                                            ))),
+                                            )),
+                                        ),
                                     ),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -872,17 +864,13 @@ impl Workspace {
                     .w_full()
                     .gap_1()
                     .child(div().w_full().truncate().child(session.title.clone()))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(icon)
-                            .child(div().text_xs().child(format!(
-                                "{} · {}{status}",
-                                session.provider_label(),
-                                session.age()
-                            ))),
-                    ),
+                    .child(h_flex().gap_2().items_center().child(icon).child(
+                        div().text_xs().child(format!(
+                            "{} · {}{status}",
+                            session.provider_label(),
+                            session.age()
+                        )),
+                    )),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_agent_session(key.clone(), window, cx)

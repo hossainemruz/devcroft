@@ -31,8 +31,8 @@ use gpui_kit::{
 
 use crate::add_repository::AddRepositoryView;
 use crate::agent::AgentKind;
-use crate::agent_icons::{self, AgentIconTiles};
 use crate::agent_activity::{ActivityState, AgentActivityStore};
+use crate::agent_icons::{self, AgentIconTiles};
 use crate::agent_sessions::{
     Catalog, DEFAULT_SIDEBAR_LIMIT, HOME_LIMIT, SessionKey, SessionSummary,
     Snapshot as SessionSnapshot,
@@ -178,6 +178,9 @@ impl GitPoll {
 pub(crate) struct Workspace {
     resources: Entity<crate::artifacts::ArtifactBrowser>,
     home: Entity<HomeView>,
+    relationships: Entity<crate::repository_graph::GraphPage>,
+    relationships_visible: bool,
+    relationships_origin: Option<PageOrigin>,
     home_visible: bool,
     portable_git_poll: GitPoll,
     active_tab: WorkspaceTab,
@@ -525,6 +528,7 @@ impl Workspace {
             HomeEvent::OpenRepository { key, label } => {
                 this.switch_repository(key, label, window, cx)
             }
+            HomeEvent::Relationships => this.open_relationships(window, cx),
             HomeEvent::AddRepository => this.open_add_repository(window, cx),
             HomeEvent::LinkRepository { key } => this.open_link_repository(key, window, cx),
             HomeEvent::EditRepository { key } => this.open_edit_repository(key, window, cx),
@@ -619,9 +623,31 @@ impl Workspace {
             },
         )
         .detach();
+        let relationships =
+            cx.new(|cx| crate::repository_graph::GraphPage::new(data_root.clone(), window, cx));
+        cx.subscribe_in(
+            &relationships,
+            window,
+            |this, _, event, window, cx| match event {
+                crate::repository_graph::GraphEvent::AddRepository => {
+                    this.open_add_repository(window, cx)
+                }
+                crate::repository_graph::GraphEvent::OpenRepository { key, label } => {
+                    this.switch_repository(key, label, window, cx)
+                }
+                crate::repository_graph::GraphEvent::MetadataChanged => {
+                    this.home.update(cx, |view, cx| view.reload(cx));
+                    this.reload_recent_repositories();
+                }
+            },
+        )
+        .detach();
         let mut agent_icon_tiles = AgentIconTiles::new();
         agent_icons::ensure_tiles(AgentKind::ALL, &mut agent_icon_tiles, cx);
         Self {
+            relationships,
+            relationships_visible: false,
+            relationships_origin: None,
             home,
             resources,
             home_visible: true,
@@ -683,6 +709,14 @@ impl Workspace {
     fn focus_active_pane(&mut self, window: &mut Window, cx: &mut App) {
         self.remember_agent_pane(cx);
         self.sync_activity_visibility(window, cx);
+        if self.relationships_visible {
+            self.relationships
+                .read(cx)
+                .focus_handle
+                .clone()
+                .focus(window, cx);
+            return;
+        }
         if self.home_visible {
             self.home.read(cx).focus_handle.clone().focus(window, cx);
             return;
@@ -915,6 +949,7 @@ impl Workspace {
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
                 PaletteCommand::GoHome => self.go_home(window, cx),
+                PaletteCommand::RepositoryRelationships => self.open_relationships(window, cx),
                 PaletteCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
                 PaletteCommand::SyncPortable => {
                     self.request_sync(window, cx);
@@ -935,6 +970,7 @@ impl Workspace {
             &view,
             |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
                 this.home.update(cx, |view, cx| view.reload(cx));
+                this.relationships.update(cx, |view, cx| view.refresh(cx));
                 this.reload_recent_repositories();
             },
         )
@@ -959,6 +995,7 @@ impl Workspace {
             &view,
             |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
                 this.home.update(cx, |view, cx| view.reload(cx));
+                this.relationships.update(cx, |view, cx| view.refresh(cx));
                 this.reload_recent_repositories();
             },
         )
@@ -980,32 +1017,46 @@ impl Workspace {
             window.push_notification("Portable data is unavailable", cx);
             return;
         };
-        let metadata = match crate::data::get_repository_metadata(&root, key) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                window.push_notification(format!("Could not load \"{key}\": {error:#}"), cx);
-                return;
-            }
-        };
-        let data_root = self.data_root.clone();
         let key = key.to_owned();
-        let view =
-            cx.new(|cx| AddRepositoryView::for_edit(window, cx, data_root, key.clone(), &metadata));
-        cx.subscribe(
-            &view,
-            |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
-                this.home.update(cx, |view, cx| view.reload(cx));
-                this.reload_recent_repositories();
-            },
-        )
+        cx.spawn_in(window, async move |this, cx| {
+            let read_key = key.clone();
+            let result = cx
+                .background_spawn(
+                    async move { crate::data::get_repository_metadata(&root, &read_key) },
+                )
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let metadata = match result {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        window
+                            .push_notification(format!("Could not load \"{key}\": {error:#}"), cx);
+                        return;
+                    }
+                };
+                let data_root = this.data_root.clone();
+                let view = cx.new(|cx| {
+                    AddRepositoryView::for_edit(window, cx, data_root, key.clone(), &metadata)
+                });
+                cx.subscribe(
+                    &view,
+                    |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
+                        this.home.update(cx, |view, cx| view.reload(cx));
+                        this.relationships.update(cx, |view, cx| view.refresh(cx));
+                        this.reload_recent_repositories();
+                    },
+                )
+                .detach();
+                window.open_dialog(cx, move |dialog, _, _| {
+                    dialog
+                        .title(format!("Edit \"{key}\""))
+                        .w(px(680.))
+                        .h(px(640.))
+                        .child(view.clone().into_any_element())
+                });
+            });
+        })
         .detach();
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title(format!("Edit \"{key}\""))
-                .w(px(680.))
-                .h(px(640.))
-                .child(view.clone().into_any_element())
-        });
     }
 
     /// Drop this device's checkout binding, keeping the portable record.
@@ -1085,18 +1136,27 @@ impl Workspace {
             window.push_notification("Portable data is unavailable", cx);
             return true;
         };
-        match crate::data::remove_repository(&root, key) {
-            Ok(()) => {
-                window.push_notification(format!("Deleted \"{key}\""), cx);
-            }
-            Err(error) => {
-                window.push_notification(format!("Could not delete \"{key}\": {error:#}"), cx);
-                return true;
-            }
-        }
-        self.home.update(cx, |view, cx| view.reload(cx));
-        self.reload_recent_repositories();
-        cx.notify();
+        let key = key.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let delete_key = key.clone();
+            let result = cx
+                .background_spawn(async move { crate::data::remove_repository(&root, &delete_key) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(()) => {
+                        window.push_notification(format!("Deleted \"{key}\""), cx);
+                        this.home.update(cx, |view, cx| view.reload(cx));
+                        this.relationships.update(cx, |view, cx| view.refresh(cx));
+                        this.reload_recent_repositories();
+                    }
+                    Err(error) => window
+                        .push_notification(format!("Could not delete \"{key}\": {error:#}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         true
     }
 
@@ -1245,6 +1305,9 @@ impl Workspace {
     }
 
     fn enter_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.relationships_visible = false;
+        self.relationships
+            .update(cx, |view, cx| view.set_active(false, cx));
         // Catch-all for tab/location changes (select, switch, session open):
         // a stale HUD must not survive the move.
         self.close_navigation(cx);
@@ -1288,7 +1351,45 @@ impl Workspace {
         }
     }
 
+    fn open_relationships(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.relationships_visible {
+            self.relationships_origin = Some(if self.home_visible {
+                PageOrigin::Home
+            } else {
+                PageOrigin::Repository
+            });
+        }
+        self.close_navigation(cx);
+        self.home.update(cx, |view, cx| view.deactivate(cx));
+        self.resources
+            .update(cx, |view, cx| view.set_active(false, cx));
+        self.relationships_visible = true;
+        self.home_visible = true;
+        self.command_open = false;
+        self.relationships
+            .update(cx, |view, cx| view.set_active(true, cx));
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    fn back_from_relationships(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.relationships_visible = false;
+        self.relationships
+            .update(cx, |view, cx| view.set_active(false, cx));
+        match self.relationships_origin.take() {
+            Some(PageOrigin::Repository) => self.enter_repository(window, cx),
+            _ => {
+                self.home.update(cx, |view, cx| view.resume_page(cx));
+            }
+        }
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.relationships_visible = false;
+        self.relationships
+            .update(cx, |view, cx| view.set_active(false, cx));
         self.close_navigation(cx);
         self.artifacts_origin = None;
         self.resources
@@ -1307,6 +1408,9 @@ impl Workspace {
     /// while Home is visible. Captures the origin so the titlebar back
     /// button returns where the user came from.
     fn browse_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.relationships_visible = false;
+        self.relationships
+            .update(cx, |view, cx| view.set_active(false, cx));
         self.close_navigation(cx);
         let already_there = self.home_visible && self.home.read(cx).is_artifacts_page();
         if !already_there {
@@ -1425,6 +1529,7 @@ impl Workspace {
     /// underneath them may have moved — a sync rebase or a Settings branch
     /// switch. Shared so both paths reload exactly the same set.
     pub(crate) fn reload_portable_projections(&mut self, cx: &mut Context<Self>) {
+        self.relationships.update(cx, |view, cx| view.refresh(cx));
         if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
             self.resources.update(cx, |view, cx| view.refresh(cx));
         }
@@ -1760,6 +1865,9 @@ impl Workspace {
     }
 
     fn render_active_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.relationships_visible {
+            return self.relationships.clone().into_any_element();
+        }
         if self.home_visible {
             return self.home.clone().into_any_element();
         }
@@ -1783,6 +1891,9 @@ impl Workspace {
     }
 
     fn navigation_context(&self, cx: &App) -> NavigationContext {
+        if self.relationships_visible {
+            return NavigationContext::Relationships;
+        }
         if self.home_visible {
             if self.home.read(cx).is_artifacts_page() {
                 NavigationContext::Artifacts
@@ -1795,6 +1906,9 @@ impl Workspace {
     }
 
     fn navigation_resource_state(&self, cx: &App) -> navigation::ResourceState {
+        if self.relationships_visible {
+            return navigation::ResourceState::default();
+        }
         if self.home_visible && self.home.read(cx).is_artifacts_page() {
             self.home.read(cx).artifacts_navigation_state(cx)
         } else if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
@@ -1805,6 +1919,12 @@ impl Workspace {
     }
 
     fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
+        if self.relationships_visible {
+            return vec![(
+                "Relationships",
+                self.relationships.read(cx).focus_handle.clone(),
+            )];
+        }
         if self.home_visible {
             return if self.home.read(cx).is_artifacts_page() {
                 self.home.read(cx).artifacts_navigation_panes(cx)
@@ -1851,7 +1971,10 @@ impl Workspace {
         // Start item cursors where `j`/`k` should repeat from: the active
         // session in the sidebar, the first Home card on the dashboard.
         // Artifact and review lists reuse their existing selection.
-        if self.home_visible && !self.home.read(cx).is_artifacts_page() {
+        if self.home_visible
+            && !self.relationships_visible
+            && !self.home.read(cx).is_artifacts_page()
+        {
             self.home
                 .update(cx, |view, cx| view.set_navigation_active(true, cx));
             self.session_cursor = None;
@@ -1918,6 +2041,9 @@ impl Workspace {
     /// `j`/`k`. Keeps the mode open for repeats; locations without a list
     /// consume the key and stay open. Clamps at the ends like pane movement.
     fn move_navigation_item(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.relationships_visible {
+            return;
+        }
         if self.home_visible {
             if self.home.read(cx).is_artifacts_page() {
                 self.home
@@ -1966,7 +2092,10 @@ impl Workspace {
         {
             return;
         }
-        if self.home_visible && !self.home.read(cx).is_artifacts_page() {
+        if self.home_visible
+            && !self.relationships_visible
+            && !self.home.read(cx).is_artifacts_page()
+        {
             let activated = self
                 .home
                 .update(cx, |view, cx| view.activate_navigation_cursor(window, cx));
@@ -2002,6 +2131,10 @@ impl Workspace {
             }
             NavigationCommand::Home => self.go_home(window, cx),
             NavigationCommand::Back => {
+                if self.relationships_visible {
+                    self.back_from_relationships(window, cx);
+                    return;
+                }
                 if self.home_visible
                     && (self.home.read(cx).is_projects_page()
                         || self.home.read(cx).is_pull_requests_page()
@@ -2041,6 +2174,9 @@ impl Workspace {
     /// Resources sidebar, or Review files/diff. Other panes consume the keys
     /// and stay open.
     fn navigation_item_available(&self, cx: &App) -> bool {
+        if self.relationships_visible {
+            return false;
+        }
         if self.home_visible {
             if self.home.read(cx).is_artifacts_page() {
                 return true;
@@ -2062,6 +2198,9 @@ impl Workspace {
     /// Artifact and review lists apply their selection live, so `Enter` there
     /// only keeps focus.
     fn navigation_enter_opens(&self, cx: &App) -> bool {
+        if self.relationships_visible {
+            return false;
+        }
         if !self.home_visible
             && self.active_tab == WorkspaceTab::Agent
             && self.navigation_pane == 0
@@ -2069,7 +2208,10 @@ impl Workspace {
         {
             return true;
         }
-        if self.home_visible && !self.home.read(cx).is_artifacts_page() {
+        if self.home_visible
+            && !self.relationships_visible
+            && !self.home.read(cx).is_artifacts_page()
+        {
             return self.home.read(cx).navigation_cursor_active();
         }
         false
@@ -2209,6 +2351,7 @@ impl Workspace {
         let context_title = match self.navigation_context(cx) {
             NavigationContext::Home => "Home",
             NavigationContext::Artifacts => "Artifacts",
+            NavigationContext::Relationships => "Relationships",
             NavigationContext::Workspace => self.active_tab.label(),
         };
         let viewport = window.viewport_size();
@@ -2396,6 +2539,7 @@ fn palette_icon(command: PaletteCommand) -> IconName {
         PaletteCommand::GoResources => IconName::CircleCheck,
         PaletteCommand::GoHome => IconName::LayoutDashboard,
         PaletteCommand::BrowseArtifacts => IconName::BookOpen,
+        PaletteCommand::RepositoryRelationships => IconName::LayoutDashboard,
         PaletteCommand::AddRepository => IconName::Plus,
         PaletteCommand::OpenSettings => IconName::Settings,
         PaletteCommand::SyncPortable => IconName::RotateCw,
@@ -2421,8 +2565,12 @@ impl Render for Workspace {
         // The archived filter also lives here; the portable git status is
         // hidden on these pages and the lists stay live through their active
         // polls.
-        let is_artifacts = self.home_visible && self.home.read(cx).is_artifacts_page();
-        let is_projects = self.home_visible && self.home.read(cx).is_projects_page();
+        let is_artifacts = self.home_visible
+            && !self.relationships_visible
+            && self.home.read(cx).is_artifacts_page();
+        let is_projects = self.home_visible
+            && !self.relationships_visible
+            && self.home.read(cx).is_projects_page();
         let show_archived = if is_artifacts {
             self.home.read(cx).artifacts_include_archived(cx)
         } else {
@@ -2433,11 +2581,20 @@ impl Render for Workspace {
         } else {
             SharedString::from("")
         };
-        let is_pull_requests = self.home_visible && self.home.read(cx).is_pull_requests_page();
-        let is_todos = self.home_visible && self.home.read(cx).is_todos_page();
-        let is_reading = self.home_visible && self.home.read(cx).is_reading_page();
-        let is_home_page =
-            is_artifacts || is_projects || is_pull_requests || is_todos || is_reading;
+        let is_pull_requests = self.home_visible
+            && !self.relationships_visible
+            && self.home.read(cx).is_pull_requests_page();
+        let is_todos =
+            self.home_visible && !self.relationships_visible && self.home.read(cx).is_todos_page();
+        let is_reading = self.home_visible
+            && !self.relationships_visible
+            && self.home.read(cx).is_reading_page();
+        let is_home_page = self.relationships_visible
+            || is_artifacts
+            || is_projects
+            || is_pull_requests
+            || is_todos
+            || is_reading;
         let attention_count = self.agent_activity.snapshot().attention_count();
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
@@ -2532,6 +2689,27 @@ impl Render for Workspace {
                     .border_color(rgb(0x292b2b))
                     .when(self.home_visible && !is_home_page, |header| {
                         header.child(div().text_lg().font_semibold().child("Devcroft"))
+                    })
+                    .when(self.relationships_visible, |header| {
+                        header.child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Button::new("relationships-back")
+                                        .ghost()
+                                        .label("‹ Back")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.back_from_relationships(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child("Repository Relationships"),
+                                ),
+                        )
                     })
                     .when(is_artifacts, |header| {
                         header.child(

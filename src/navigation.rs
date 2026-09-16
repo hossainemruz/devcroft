@@ -9,6 +9,7 @@ pub(crate) enum Context {
     Home,
     Workspace,
     Artifacts,
+    Relationships,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -153,7 +154,7 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
     let mut result = match context {
         Context::Home => HOME.to_vec(),
         Context::Workspace => WORKSPACE.to_vec(),
-        Context::Artifacts => ARTIFACTS.to_vec(),
+        Context::Artifacts | Context::Relationships => ARTIFACTS.to_vec(),
     };
     if resource.selected && !resource.saving {
         result.extend(if resource.drafting {
@@ -274,7 +275,12 @@ mod tests {
     fn movement_keys_are_reserved_everywhere() {
         // h/l move between panes and j/k move within the focused list:
         // none of them may become single-key actions in any context.
-        for context in [Context::Home, Context::Workspace, Context::Artifacts] {
+        for context in [
+            Context::Home,
+            Context::Workspace,
+            Context::Artifacts,
+            Context::Relationships,
+        ] {
             for key in ['h', 'l', 'j', 'k'] {
                 assert_eq!(resolve(context, ResourceState::default(), key), None);
             }
@@ -285,7 +291,12 @@ mod tests {
     fn shared_palette_keys_are_gone_everywhere() {
         // The Common section was removed: palettes stay reachable through
         // their direct shortcuts, so p/s/o must offer nothing in any context.
-        for context in [Context::Home, Context::Workspace, Context::Artifacts] {
+        for context in [
+            Context::Home,
+            Context::Workspace,
+            Context::Artifacts,
+            Context::Relationships,
+        ] {
             for key in ['p', 's', 'o'] {
                 assert_eq!(resolve(context, ResourceState::default(), key), None);
             }
@@ -299,7 +310,12 @@ mod tests {
 
     #[test]
     fn every_available_context_has_unique_keys() {
-        for context in [Context::Home, Context::Workspace, Context::Artifacts] {
+        for context in [
+            Context::Home,
+            Context::Workspace,
+            Context::Artifacts,
+            Context::Relationships,
+        ] {
             for resource in [
                 ResourceState::default(),
                 ResourceState {

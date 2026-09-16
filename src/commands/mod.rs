@@ -2,6 +2,7 @@
 mod artifacts;
 mod input;
 mod output;
+mod relationships;
 
 use anyhow::Result;
 use serde_json::json;
@@ -13,6 +14,10 @@ pub(crate) use artifacts::artifact;
 pub(crate) fn repository(args: RepositoryArgs) -> Result<()> {
     let root = crate::data::resolve_data_root()?;
     match args.command {
+        RepositoryCommand::Relationships(query) => relationships::query(&root, query, args.json),
+        RepositoryCommand::Relationship(mutation) => {
+            relationships::mutate(&root, mutation.command, args.json)
+        }
         RepositoryCommand::List(bounds) => {
             let list = crate::data::list_repositories(&root, bounds.limit.into())?;
             let mut human = String::new();
@@ -49,7 +54,7 @@ pub(crate) fn repository(args: RepositoryArgs) -> Result<()> {
             );
             output::emit(
                 args.json,
-                json!({"formatVersion": 1, "key": key.key, "metadata": metadata, "binding": binding}),
+                json!({"formatVersion": 1, "key": key.key, "revision": metadata.revision, "metadata": metadata, "binding": binding}),
                 &human,
                 &[],
                 &[],
@@ -99,7 +104,12 @@ pub(crate) fn repository(args: RepositoryArgs) -> Result<()> {
                 clone_url: update.clone_url.or(stored.clone_url),
                 base_branch: update.base_branch.or(stored.base_branch),
             };
-            let metadata = crate::data::update_repository_metadata(&root, &update.key, &input)?;
+            let metadata = crate::data::update_repository_metadata(
+                &root,
+                &update.key,
+                &input,
+                &update.revision,
+            )?;
             let human = format!(
                 "{}\t{}\n",
                 update.key,
@@ -107,7 +117,7 @@ pub(crate) fn repository(args: RepositoryArgs) -> Result<()> {
             );
             output::emit(
                 args.json,
-                json!({"formatVersion": 1, "key": update.key, "metadata": metadata}),
+                json!({"formatVersion": 1, "key": update.key, "revision": metadata.revision, "metadata": metadata}),
                 &human,
                 &[],
                 &[],

@@ -9,6 +9,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 pub(super) const MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+pub(super) fn revision(bytes: &[u8]) -> Result<String> {
+    Ok(format!(
+        "v1-{}",
+        gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, bytes)?
+    ))
+}
 const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
 pub(super) fn nonblank(value: &str, name: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{name} must not be blank");

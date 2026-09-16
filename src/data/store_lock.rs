@@ -24,6 +24,12 @@ pub(super) fn artifact_lock(root: &DataRoot, id: &str, exclusive: bool) -> Resul
     lock_file(&dir.join(format!("{id}.lock")), exclusive)
 }
 
+/// Serializes the graph and repository catalog together, including endpoint
+/// creation/removal. Acquire after the portable gate; do not reacquire in helpers.
+pub(super) fn repository_graph_lock(root: &DataRoot, exclusive: bool) -> Result<File> {
+    lock_file(&root.root().join("cache/repository-graph.lock"), exclusive)
+}
+
 fn lock_file(path: &Path, exclusive: bool) -> Result<File> {
     reject_symlink(path)?;
     let file = OpenOptions::new()

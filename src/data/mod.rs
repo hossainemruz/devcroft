@@ -15,6 +15,7 @@ pub(crate) mod dashboard;
 mod device;
 mod portable;
 mod record;
+pub(crate) mod relationships;
 mod repositories;
 mod store_lock;
 mod sync;
@@ -39,9 +40,9 @@ pub(crate) use repositories::{
     CheckoutInspection, CreatedRepository, LinkedRepository, NewRepositoryInput, RecentRepository,
     RepositoryEntry, RepositoryMetadata, all_repositories, checkout_for, create_repository,
     get_repository_metadata, inspect_checkout, link_repository, list_repositories,
-    normalize_repository_key, recent_repositories, record_repository_open, remove_repository,
-    repository_dir, require_repository_key, resolve_current_key, suggest_repository_key,
-    unlink_repository, update_repository_metadata,
+    normalize_repository_key, patch_repository_purpose, recent_repositories,
+    record_repository_open, remove_repository, repository_dir, require_repository_key,
+    resolve_current_key, suggest_repository_key, unlink_repository, update_repository_metadata,
 };
 pub(crate) use sync::{
     SyncOutcome, SyncStatus, SyncTracker, sync_portable, sync_portable_with_tracker,

@@ -53,3 +53,18 @@ Resource actions appear on the Resources tab and on the global Artifacts page. D
 ## Panes
 
 Pane movement follows the rendered left-to-right layout and only includes regions on screen. Agent covers the sessions sidebar and the terminal; Review covers files, diff, and comments when shown; Resources and Artifacts cover the list, the document or draft, and the comments and outline rails when shown. Editor and Terminal each have one pane. Home has one pane: `j`/`k` there walk every dashboard card (recent sessions, recent projects, then pull requests, todos, and reading items) instead of switching panes. On the Pull Requests board, `j`/`k` walk cards column by column within the selected All/Personal/Work filter and `Enter` edits the selected PR. On the Todos board, `j`/`k` walk cards column by column (Unscoped first, then projects) within the selected group filter and `Enter` toggles the selected todo. On the To Read page, `j`/`k` walk the list in order and `Enter` toggles the selected item read. Card menus also support moving PRs without dragging. The focused pane is named in the list and native panes show a focus ring; the `j`/`k` cursor shows as a ring around the highlighted sidebar row or card.
+
+## Repository Relationships
+
+Open **Repository relationships** from the action palette, Home, or Projects.
+Use **Tab / Shift+Tab** to focus toolbar controls, repository nodes, edge labels,
+and inspector controls. **Enter** on a node or edge selects it. The **Add
+relationship** form supports provider/consumer choices without dragging.
+**Escape** cancels an active gesture or dismisses the editor without saving.
+Normal typing remains in the focused input; no single-key graph shortcuts are
+installed. Navigation mode offers Home and Back.
+
+Mouse: drag a node body to move it, background to pan, or an output handle to
+an input handle to create a connection. Select an edge, then drag its provider
+or consumer handle to rewire. Scroll zooms around the pointer. Finish editing
+with Save or Cancel; Auto arrange and Fit view are explicit toolbar actions.

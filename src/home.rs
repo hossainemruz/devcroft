@@ -196,6 +196,7 @@ fn project_opened_label(last_opened_at: Option<&str>, now_secs: i64) -> Option<S
 pub(crate) enum HomeEvent {
     OpenRepository { key: String, label: String },
     AddRepository,
+    Relationships,
     LinkRepository { key: String },
     EditRepository { key: String },
     UnlinkRepository { key: String },
@@ -311,6 +312,7 @@ pub(crate) struct HomeView {
     /// `projects` above stays linked-only for the Recent cards.
     all_projects: Vec<RepositoryEntry>,
     project_errors: Vec<String>,
+    project_refresh: crate::artifacts::Refresh,
     /// Session-local group filter for the Projects page. Survives reloads;
     /// reset only by picking another filter.
     project_group_filter: ProjectGroupFilter,
@@ -402,11 +404,7 @@ impl HomeView {
         )
         .detach();
         let mut agent_icon_tiles = crate::agent_icons::AgentIconTiles::new();
-        crate::agent_icons::ensure_tiles(
-            crate::agent::AgentKind::ALL,
-            &mut agent_icon_tiles,
-            cx,
-        );
+        crate::agent_icons::ensure_tiles(crate::agent::AgentKind::ALL, &mut agent_icon_tiles, cx);
         let mut view = Self {
             artifacts,
             focus_handle: cx.focus_handle(),
@@ -417,6 +415,7 @@ impl HomeView {
             projects: Vec::new(),
             all_projects: Vec::new(),
             project_errors: Vec::new(),
+            project_refresh: crate::artifacts::Refresh::default(),
             project_group_filter: ProjectGroupFilter::All,
             sessions: Vec::new(),
             session_errors: Vec::new(),
@@ -462,6 +461,14 @@ impl HomeView {
         self.active = true;
         self.page = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
+        self.reload(cx);
+    }
+
+    pub(crate) fn resume_page(&mut self, cx: &mut Context<Self>) {
+        self.active = true;
+        self.artifacts.update(cx, |view, cx| {
+            view.set_active(self.page == Some("Artifacts"), cx)
+        });
         self.reload(cx);
     }
 
@@ -792,18 +799,8 @@ impl HomeView {
 
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         self.refresh_artifacts(cx);
+        self.reload_projects(cx);
         if let Some(root) = &self.root {
-            self.projects = recent_repositories(root, 4);
-            match all_repositories(root) {
-                Ok((entries, errors)) => {
-                    self.all_projects = entries;
-                    self.project_errors = errors;
-                }
-                Err(error) => {
-                    self.all_projects = Vec::new();
-                    self.project_errors = vec![format!("Could not list repositories: {error:#}")];
-                }
-            }
             match Dashboard::load(root) {
                 Ok(data) => {
                     self.data = data;
@@ -817,6 +814,49 @@ impl HomeView {
         } else {
             self.error = Some("Portable data is unavailable".into());
         }
+        self.refresh_pull_requests(false, cx);
+        cx.notify();
+    }
+
+    /// Catalog locks can wait behind sync or graph edits; never take them on the
+    /// UI thread. Coalesce reloads and reject an older in-flight projection.
+    fn reload_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let Some(generation) = self.project_refresh.request() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let (projects, result) = cx
+                .background_spawn(async move {
+                    (recent_repositories(&root, 4), all_repositories(&root))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.project_refresh.finish(generation) {
+                    this.projects = projects;
+                    match result {
+                        Ok((entries, errors)) => {
+                            this.all_projects = entries;
+                            this.project_errors = errors;
+                        }
+                        Err(error) => {
+                            this.project_errors =
+                                vec![format!("Could not list repositories: {error:#}")]
+                        }
+                    }
+                    this.refresh_project_views(cx);
+                    cx.notify();
+                } else {
+                    this.reload_projects(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_project_views(&mut self, cx: &mut Context<Self>) {
         for project in &self.projects {
             self.project_focus
                 .entry(project.key.clone())
@@ -834,8 +874,6 @@ impl HomeView {
         });
         self.project_git.invalidate(&self.linked_checkout_paths());
         self.refresh_project_git(cx);
-        self.refresh_pull_requests(false, cx);
-        cx.notify();
     }
 
     pub(crate) fn refresh_artifacts(&mut self, cx: &mut Context<Self>) {
@@ -1323,6 +1361,13 @@ impl HomeView {
             );
         }
         page.child(
+            Button::new("project-relationships")
+                .self_start()
+                .ghost()
+                .label("Relationships")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::Relationships))),
+        )
+        .child(
             Button::new("add-project-page")
                 .self_start()
                 .ghost()
@@ -2271,20 +2316,16 @@ impl Render for HomeView {
                                         .child(repository.clone()),
                                 )
                                 .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .child(icon)
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!(
-                                                    "{} · {}",
-                                                    session.provider_label(),
-                                                    session.age()
-                                                )),
-                                        ),
+                                    h_flex().gap_2().items_center().child(icon).child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{} · {}",
+                                                session.provider_label(),
+                                                session.age()
+                                            )),
+                                    ),
                                 ),
                         )
                         .on_click(cx.listener(move |_, _, _, cx| {
@@ -2539,6 +2580,13 @@ impl Render for HomeView {
                         )),
                 );
             }
+            body = body.child(
+                Button::new("home-relationships")
+                    .self_start()
+                    .ghost()
+                    .label("Repository relationships")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::Relationships))),
+            );
             body = body.child(
                 Button::new("add-project-home")
                     .self_start()
@@ -2803,6 +2851,7 @@ mod layout_tests {
 
     fn group_entry(key: &str, group: Option<&str>) -> RepositoryEntry {
         RepositoryEntry {
+            revision: String::new(),
             key: key.to_owned(),
             display_name: None,
             description: None,

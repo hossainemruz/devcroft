@@ -21,9 +21,6 @@ use crate::agent::AgentKind;
 
 /// Display size of agent logos; tiles rasterize at 3x for retina.
 pub(crate) const ICON_PX: f32 = 16.0;
-/// Smaller logo for inline use in muted `text_xs` subtitle lines (session
-/// sidebar rows, Home cards), where 16px dwarfs the surrounding text.
-pub(crate) const ICON_INLINE_PX: f32 = 10.0;
 const RASTER_SCALE: f32 = 3.0;
 
 /// Raw bytes for a harness logo, or `None` when the harness has no vendored

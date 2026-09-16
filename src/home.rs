@@ -1,4 +1,5 @@
 //! Home dashboard and dedicated destinations.
+mod dashboard;
 mod links;
 mod pull_requests;
 mod reading;
@@ -1062,29 +1063,20 @@ impl HomeView {
         });
     }
 
-    fn heading(
-        &self,
-        title: &'static str,
-        destination: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        h_flex()
-            .justify_between()
-            .gap_2()
-            .child(div().text_lg().font_semibold().child(title))
-            .child(
-                Button::new(item_id("view-all", title))
-                    .ghost()
-                    .label("View all →")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.focus_handle.focus(window, cx);
-                        this.page = Some(destination);
-                        this.navigation_cursor = None;
-                        this.refresh_pull_requests(false, cx);
-                        this.scroll.set_offset(point(px(0.), px(0.)));
-                        cx.notify();
-                    })),
-            )
+    fn view_all(&self, destination: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new(item_id("view-all", destination))
+            .ghost()
+            .small()
+            .label("View all")
+            .icon(gpui_kit::component::IconName::ArrowRight)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.focus_handle.focus(window, cx);
+                this.page = Some(destination);
+                this.navigation_cursor = None;
+                this.refresh_pull_requests(false, cx);
+                this.scroll.set_offset(point(px(0.), px(0.)));
+                cx.notify();
+            }))
     }
 
     /// Category dropdown for the PR inbox: All plus every category
@@ -1750,7 +1742,8 @@ impl HomeView {
             .id(item_id("home-item", &item.id))
             .gap_1()
             .p_2()
-            .rounded_md()
+            .rounded_lg()
+            .bg(cx.theme().background)
             .border_1()
             .border_color(if cursor {
                 cx.theme().ring
@@ -1953,7 +1946,8 @@ impl HomeView {
             .min_w_0()
             .gap_1()
             .p_2()
-            .rounded_md()
+            .rounded_lg()
+            .bg(cx.theme().background)
             .border_1()
             .border_color(if cursor {
                 cx.theme().ring
@@ -2067,17 +2061,48 @@ impl HomeView {
                 .cloned()
                 .collect()
         };
+        let (icon, color, empty_title, empty_description, add_label) = match kind {
+            Kind::PullRequest => (
+                gpui_kit::component::IconName::Github,
+                cx.theme().info,
+                "A clear review queue",
+                "Track a pull request to follow reviews and checks.",
+                "Add pull request",
+            ),
+            Kind::Todo => (
+                gpui_kit::component::IconName::CircleCheck,
+                cx.theme().success,
+                "Room for your next step",
+                "Capture a task, big or small, and take it from here.",
+                "Add todo",
+            ),
+            Kind::Reading => (
+                gpui_kit::component::IconName::BookOpen,
+                cx.theme().warning,
+                "Keep something worth reading",
+                "Save articles and references for a quieter moment.",
+                "Add reading",
+            ),
+        };
         let mut panel = v_flex()
             .flex_1()
             .min_w(px(290.))
-            .min_h(px(380.))
+            .min_h(px(320.))
             .gap_3()
             .p_4()
-            .rounded_lg()
+            .rounded_xl()
             .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
-            .child(self.heading(title, destination, cx));
+            .border_color(cx.theme().border.opacity(0.7))
+            .bg(cx.theme().secondary.opacity(0.22))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(dashboard::panel_title(title, items.len(), icon, color, cx))
+                    .child(self.view_all(destination, cx)),
+            );
         if kind == Kind::Todo {
             panel = panel.child(
                 h_flex()
@@ -2090,14 +2115,24 @@ impl HomeView {
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_sm().child("Group:"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Group"),
+                            )
                             .child(self.todo_group_filter_dropdown(cx)),
                     )
                     .child(
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_sm().child("Project:"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Project"),
+                            )
                             .child(self.todo_project_filter_dropdown(cx)),
                     ),
             );
@@ -2109,28 +2144,47 @@ impl HomeView {
                     .justify_between()
                     .items_center()
                     .gap_2()
+                    .flex_wrap()
                     .child(
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_sm().child("Group:"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Group"),
+                            )
                             .child(self.group_filter_dropdown(cx)),
                     )
                     .child(
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_sm().child("Category:"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Category"),
+                            )
                             .child(self.pr_category_filter_dropdown(cx)),
                     ),
             );
         }
         if items.is_empty() {
             panel = panel.child(
-                div()
-                    .py_4()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Nothing here yet. Add your first item below."),
+                v_flex()
+                    .flex_1()
+                    .justify_center()
+                    .gap_2()
+                    .py_6()
+                    .child(div().text_sm().font_medium().child(empty_title))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(empty_description),
+                    ),
             );
         }
         for category in Category::ALL {
@@ -2157,15 +2211,23 @@ impl HomeView {
                 h_flex()
                     .mt_auto()
                     .pt_3()
-                    .justify_end()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .justify_between()
                     .items_center()
                     .gap_2()
+                    .flex_wrap()
                     .child(self.pr_refresh_button(cx))
-                    .child(Button::new(item_id("add", title)).label("+ Add").on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.editor(Item::new(kind), window, cx)
-                        }),
-                    )),
+                    .child(
+                        Button::new(item_id("add", title))
+                            .ghost()
+                            .small()
+                            .icon(gpui_kit::component::IconName::Plus)
+                            .label(add_label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.editor(Item::new(kind), window, cx)
+                            })),
+                    ),
             )
         } else if is_todo {
             let group = self.todo_group_filter.unwrap_or_default();
@@ -2174,25 +2236,43 @@ impl HomeView {
                 TodoProjectFilter::Project(key) => key.clone(),
             };
             panel.child(
-                h_flex().mt_auto().pt_3().justify_end().child(
-                    Button::new(item_id("add", title))
-                        .label("+ Add")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let mut item = Item::new(kind);
-                            item.group = group;
-                            item.project = project.clone();
-                            this.editor(item, window, cx)
-                        })),
-                ),
+                h_flex()
+                    .mt_auto()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .child(
+                        Button::new(item_id("add", title))
+                            .ghost()
+                            .small()
+                            .icon(gpui_kit::component::IconName::Plus)
+                            .label(add_label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let mut item = Item::new(kind);
+                                item.group = group;
+                                item.project = project.clone();
+                                this.editor(item, window, cx)
+                            })),
+                    ),
             )
         } else {
-            panel.child(h_flex().mt_auto().pt_3().justify_end().child(
-                Button::new(item_id("add", title)).label("+ Add").on_click(
-                    cx.listener(move |this, _, window, cx| {
-                        this.editor(Item::new(kind), window, cx)
-                    }),
-                ),
-            ))
+            panel.child(
+                h_flex()
+                    .mt_auto()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .child(
+                        Button::new(item_id("add", title))
+                            .ghost()
+                            .small()
+                            .icon(gpui_kit::component::IconName::Plus)
+                            .label(add_label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.editor(Item::new(kind), window, cx)
+                            })),
+                    ),
+            )
         }
     }
 }
@@ -2250,370 +2330,7 @@ impl Render for HomeView {
                     );
             }
         } else {
-            if let Some(error) = &self.error {
-                body = body.child(div().text_color(cx.theme().danger).child(error.clone()));
-            }
-            body = body.child(
-                h_flex()
-                    .justify_between()
-                    .child(div().text_lg().font_semibold().child("Recent Activity"))
-                    .child(
-                        Button::new("refresh-home-sessions")
-                            .ghost()
-                            .label("Refresh")
-                            .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(HomeEvent::RefreshSessions)),
-                            ),
-                    ),
-            );
-            let mut sessions = h_flex().gap_4().flex_wrap();
-            for (session_index, (session, repository)) in self.sessions.iter().enumerate() {
-                let key = session.key.clone();
-                let id: SharedString = format!(
-                    "home-session-{}-{}-{}",
-                    key.provider,
-                    key.store.display(),
-                    key.id
-                )
-                .into();
-                let cursor = self.navigation_cursor == Some(session_index);
-                let icon = crate::agent_icons::session_icon(
-                    session.agent(),
-                    &self.agent_icon_tiles,
-                    crate::agent_icons::ICON_INLINE_PX,
-                );
-                sessions = sessions.child(
-                    Button::new(id)
-                        .ghost()
-                        .w(px(card_width))
-                        .h_auto()
-                        .p_4()
-                        .border_1()
-                        .border_color(if cursor {
-                            cx.theme().ring
-                        } else {
-                            cx.theme().border
-                        })
-                        .rounded_lg()
-                        .tooltip(session.tooltip())
-                        .child(
-                            v_flex()
-                                .items_start()
-                                .w_full()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .truncate()
-                                        .font_semibold()
-                                        .child(session.title.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .truncate()
-                                        .text_sm()
-                                        .child(repository.clone()),
-                                )
-                                .child(
-                                    h_flex().gap_2().items_center().child(icon).child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!(
-                                                "{} · {}",
-                                                session.provider_label(),
-                                                session.age()
-                                            )),
-                                    ),
-                                ),
-                        )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(HomeEvent::OpenAgentSession(key.clone()))
-                        })),
-                );
-            }
-            if self.sessions.is_empty() {
-                sessions = sessions.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if self.sessions_loaded {
-                            "No recent agent sessions."
-                        } else {
-                            "Loading agent sessions…"
-                        }),
-                );
-            }
-            body = body.child(sessions);
-            for error in &self.session_errors {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(error.clone()),
-                );
-            }
-            body = body.child(self.heading("Recent Projects", "Projects", cx));
-            let mut projects = h_flex().gap_4().flex_wrap();
-            let now_secs = current_unix_secs();
-            for (index, project) in self.projects.iter().enumerate() {
-                let key = project.key.clone();
-                let label = project.display_name.clone().unwrap_or_else(|| key.clone());
-                let open_label = label.clone();
-                let git_status = self.project_git.statuses.get(&project.checkout_path);
-                let status = project_git_label(git_status);
-                let group = project
-                    .group
-                    .clone()
-                    .filter(|value| !value.trim().is_empty());
-                let description = project
-                    .description
-                    .clone()
-                    .filter(|value| !value.trim().is_empty());
-                let state = project_state_tag(git_status);
-                let pending = match git_status {
-                    None => Some("Loading Git status…"),
-                    Some(status) if status.branch.is_none() => Some("Git status unavailable"),
-                    _ => None,
-                };
-                let branch_pill = project_branch_pill(git_status);
-                let sync = project_sync_label(git_status);
-                let opened = project_opened_label(project.last_opened_at.as_deref(), now_secs)
-                    .unwrap_or_else(|| "Not opened yet".to_owned());
-                let accessible = format!("Open {label}. {status}. {opened}");
-                let cursor =
-                    self.navigation_cursor == Some(self.sessions.len().saturating_add(index));
-                projects = projects.child(
-                    // gpui-kit Base Button supplies pointer, Enter/Space, tab
-                    // traversal and accessibility semantics for the whole card.
-                    gpui_kit::base::Button::new(item_id("project", &key))
-                        .track_focus(&self.project_focus[&key])
-                        .accessibility_label(accessible)
-                        .cursor_pointer()
-                        .flex_col()
-                        .items_start()
-                        .justify_start()
-                        .flex_none()
-                        .w(px(card_width))
-                        .min_h(px(160.))
-                        .gap_2()
-                        .p_4()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(if cursor {
-                            cx.theme().ring
-                        } else {
-                            cx.theme().border
-                        })
-                        .hover(|style| style.bg(cx.theme().secondary))
-                        .focus(|style| style.border_color(cx.theme().ring).bg(cx.theme().secondary))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(HomeEvent::OpenRepository {
-                                key: key.clone(),
-                                label: open_label.clone(),
-                            });
-                        }))
-                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                            if event.keystroke.modifiers.modified() {
-                                return;
-                            }
-                            let columns = recent_columns(f32::from(window.viewport_size().width));
-                            if let Some(next) = project_navigation(
-                                &event.keystroke.key,
-                                index,
-                                this.projects.len(),
-                                columns,
-                            ) {
-                                this.project_focus[&this.projects[next].key].focus(window, cx);
-                                cx.stop_propagation();
-                                window.prevent_default();
-                                cx.notify();
-                            }
-                        }))
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .font_semibold()
-                                        .child(label),
-                                )
-                                .when_some(group, |this, tag| {
-                                    this.child(
-                                        div()
-                                            .flex_none()
-                                            .px_2()
-                                            .rounded_full()
-                                            .bg(cx.theme().secondary)
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(tag),
-                                    )
-                                }),
-                        )
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .gap_2()
-                                .flex_wrap()
-                                .when_some(state, |row, (label, hue)| {
-                                    row.child(
-                                        Tag::color(hue)
-                                            .with_size(Size::Small)
-                                            .rounded_full()
-                                            .flex_none()
-                                            .child(label),
-                                    )
-                                })
-                                .when_some(pending, |row, text| {
-                                    row.child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(text),
-                                    )
-                                })
-                                .when_some(branch_pill, |this, pill| {
-                                    this.child(
-                                        Tag::secondary()
-                                            .with_size(Size::Small)
-                                            .rounded_full()
-                                            .min_w_0()
-                                            .max_w_full()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .text_ellipsis()
-                                                    .whitespace_nowrap()
-                                                    .child(pill),
-                                            ),
-                                    )
-                                })
-                                .when_some(sync, |this, counts| {
-                                    this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(counts),
-                                    )
-                                }),
-                        )
-                        .when_some(description, |this, text| {
-                            this.child(
-                                div()
-                                    .w_full()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(text),
-                            )
-                        })
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .mt_auto()
-                                .pt_1()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(opened),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("Open →"),
-                                ),
-                        ),
-                );
-            }
-            if self.projects.is_empty() {
-                projects = projects.child(
-                    div()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("No recent projects yet."),
-                );
-            }
-            body = body.child(projects);
-            let dangling = self
-                .all_projects
-                .iter()
-                .filter(|entry| !entry.is_linked())
-                .count();
-            if dangling > 0 {
-                body = body.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "{dangling} {} not linked to this device — open View all to link {}.",
-                            if dangling == 1 {
-                                "repository"
-                            } else {
-                                "repositories"
-                            },
-                            if dangling == 1 { "it" } else { "them" },
-                        )),
-                );
-            }
-            body = body.child(
-                Button::new("add-project-home")
-                    .self_start()
-                    .ghost()
-                    .label("+ Add project")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository))),
-            );
-            body = body.child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_lg().font_semibold().child("Inbox"))
-                    .child(
-                        Checkbox::new("show-completed")
-                            .label("Show completed")
-                            .checked(self.show_completed)
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.show_completed = *checked;
-                                cx.notify();
-                            })),
-                    ),
-            );
-            body = body.child(
-                h_flex()
-                    .flex_grow(1.)
-                    .flex_shrink_0()
-                    .items_stretch()
-                    .gap_4()
-                    .flex_wrap()
-                    .child(self.list(Kind::PullRequest, cx))
-                    .child(self.list(Kind::Todo, cx))
-                    .child(self.list(Kind::Reading, cx)),
-            );
+            body = body.child(self.dashboard(card_width, cx));
         }
         div()
             .id("home")

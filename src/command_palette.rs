@@ -22,7 +22,8 @@ gpui_kit::actions!(
         GoToTerminal,
         GoToReview,
         GoToResources,
-        NewAgentSession
+        NewAgentSession,
+        Quit
     ]
 );
 
@@ -90,6 +91,28 @@ pub(crate) fn palette_mode_for_shortcut(
     } else {
         None
     }
+}
+
+/// Match the quit shortcut from a raw keystroke: `cmd-q` on macOS
+/// (`ctrl-q` elsewhere). Pure over the keystroke pieces (not `KeyDownEvent`)
+/// so every focus site forwards identically and the mapping stays
+/// unit-testable without a window, matching
+/// [`palette_mode_for_shortcut`]. `alt`/`shift` combinations never match, so
+/// option-modified typing and `cmd-shift-q` (macOS log-out) keep their own
+/// behavior. The off-primary modifier never matches either, mirroring the
+/// palette rule: `ctrl-q` keeps reaching macOS terminals as-is, and `cmd` /
+/// `super` chords keep reaching the Linux/Windows window manager.
+pub(crate) fn is_quit_shortcut(
+    key: &str,
+    platform: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+) -> bool {
+    if alt || shift || !is_primary_modifier(platform, control) {
+        return false;
+    }
+    key.eq_ignore_ascii_case("q")
 }
 
 /// Every static command the bar can run, in canonical order. Repository
@@ -640,6 +663,31 @@ mod tests {
         assert_eq!(palette_mode_for_shortcut("s", true, false, true), None);
         assert_eq!(palette_mode_for_shortcut("o", true, false, false), None);
         assert_eq!(palette_mode_for_shortcut("Enter", true, false, false), None);
+    }
+
+    #[test]
+    fn quit_shortcut_matches_only_the_os_primary_q() {
+        // Only the OS-primary modifier matches: `Cmd+Q` on macOS, `Ctrl+Q`
+        // elsewhere. Shift/alt chords and the off-primary modifier must keep
+        // reaching their owner (macOS log-out, readline, window manager).
+        if cfg!(target_os = "macos") {
+            assert!(is_quit_shortcut("q", true, false, false, false));
+            assert!(is_quit_shortcut("Q", true, false, false, false));
+            assert!(!is_quit_shortcut("q", false, true, false, false));
+            assert!(!is_quit_shortcut("q", true, true, false, false));
+        } else {
+            assert!(is_quit_shortcut("q", false, true, false, false));
+            assert!(is_quit_shortcut("Q", false, true, false, false));
+            assert!(!is_quit_shortcut("q", true, false, false, false));
+            assert!(!is_quit_shortcut("q", true, true, false, false));
+        }
+        assert!(!is_quit_shortcut("q", true, false, true, false));
+        assert!(!is_quit_shortcut("q", false, true, true, false));
+        assert!(!is_quit_shortcut("q", true, false, false, true));
+        assert!(!is_quit_shortcut("q", false, true, false, true));
+        assert!(!is_quit_shortcut("q", false, false, false, false));
+        assert!(!is_quit_shortcut("k", true, false, false, false));
+        assert!(!is_quit_shortcut("k", false, true, false, false));
     }
 
     #[test]

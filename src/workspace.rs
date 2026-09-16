@@ -40,8 +40,8 @@ use crate::agent_sessions::{
 use crate::command_palette::{
     GoToAgent, GoToEditor, GoToResources, GoToReview, GoToTerminal, NewAgentSession,
     PaletteCommand, PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette,
-    ToggleProjectsPalette, is_primary_modifier, item_at, palette_mode_for_shortcut,
-    palette_sections_for_mode,
+    ToggleProjectsPalette, is_primary_modifier, is_quit_shortcut, item_at,
+    palette_mode_for_shortcut, palette_sections_for_mode,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
@@ -2267,6 +2267,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Quit stays live everywhere, including navigation mode and held-key
+        // repeats: close the HUD (if open) and let the keystroke continue to
+        // normal dispatch, which quits via the global OS-primary binding.
+        // Must run before the claimed-key rearm below, or repeats would stay
+        // swallowed.
+        if is_quit_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            event.keystroke.modifiers.shift,
+            event.keystroke.modifiers.alt,
+        ) {
+            if self.navigation_open {
+                self.close_navigation(cx);
+            }
+            return;
+        }
         let key = event.keystroke.key.to_ascii_lowercase();
         // `KeystrokeEvent` intentionally omits raw `is_held`; retain each
         // claimed key until its real KeyUp event so physical repeats cannot
@@ -2293,7 +2310,8 @@ impl Workspace {
             self.close_navigation(cx);
             return;
         }
-        // The two palette shortcuts stay live inside navigation mode:
+        // The two palette shortcuts stay live inside navigation mode (quit is
+        // handled above and also stays live):
         // opening another overlay clears the mode (same rule as dialogs
         // above) and the keystroke continues to normal dispatch, which
         // opens the palette. Every other modified keystroke is still

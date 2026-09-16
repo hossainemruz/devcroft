@@ -26,7 +26,8 @@ use crate::{
     agent::AgentKind,
     agent_activity::{AgentActivityStore, PreparedAgentLaunch, TerminalObservation},
     command_palette::{
-        PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
+        PaletteMode, Quit, ToggleActionsPalette, ToggleProjectsPalette, is_quit_shortcut,
+        palette_mode_for_shortcut,
     },
     fonts::TERMINAL_FONT_FAMILY,
     metrics::{
@@ -360,6 +361,23 @@ impl TerminalPane {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Quit must never reach the pty: dispatch it as an action (handled
+        // app-wide) instead of terminal input, mirroring the palette toggles
+        // below. The global OS-primary binding (`cmd-q` on macOS, `ctrl-q`
+        // elsewhere) covers every other focus site, and dispatching here is
+        // idempotent with it — whichever path runs first stops the event.
+        if is_quit_shortcut(
+            &event.keystroke.key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            event.keystroke.modifiers.shift,
+            event.keystroke.modifiers.alt,
+        ) {
+            window.dispatch_action(Box::new(Quit), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         // Typing dismisses a completed selection highlight; the text is
         // already on the clipboard from the drag release.
         if self.selection_anchor.is_some() || self.selection_focus.is_some() {
@@ -374,7 +392,7 @@ impl TerminalPane {
         // macOS, `ctrl-k`/`ctrl-p` elsewhere) cover every other focus site,
         // and dispatching here is
         // idempotent with them — whichever path runs first stops the event.
-        // These are the only direct shortcuts left: tab jumps and session
+        // These are the only direct shortcuts left besides quit: tab jumps and session
         // creation live in navigation mode and the palettes, so `cmd-a`,
         // `cmd-e`, `cmd-/`, `cmd-d`, `cmd-t`, and `cmd-n` keep reaching the
         // pty here, as do `ctrl-s` (XOFF flow control) and, on macOS,

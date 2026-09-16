@@ -15,9 +15,10 @@ at the bottom-right of the window.
 
 - `Cmd+K` on macOS (`Ctrl+K` on Linux/Windows): actions palette
 - `Cmd+P` on macOS (`Ctrl+P` on Linux/Windows): projects palette
+- `Cmd+Q` on macOS (`Ctrl+Q` on Linux/Windows): quit (works even with a terminal focused or navigation mode open; never sent to the pty)
 
-These two also work inside navigation mode: they exit to normal mode and
-open their palette. There are no other direct shortcuts — tab jumps, session
+These three also work inside navigation mode: the palettes exit to normal mode and
+open, while quit closes navigation and quits. There are no other direct shortcuts — tab jumps, session
 creation, and settings live in navigation mode and the palettes.
 
 ## While navigation mode is open

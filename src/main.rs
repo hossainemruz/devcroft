@@ -42,7 +42,7 @@ use gpui_kit::{
 
 use crate::cli::{Cli, Command};
 use crate::{
-    command_palette::{ToggleActionsPalette, ToggleProjectsPalette},
+    command_palette::{Quit, ToggleActionsPalette, ToggleProjectsPalette},
     fonts::load_bundled_fonts,
     preview::PreviewView,
     workspace::Workspace,
@@ -81,10 +81,11 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
     app.run(move |cx| {
         gpui_kit::init(cx);
         // Direct shortcuts are deliberately few and OS-primary: `cmd-k`
-        // opens the action commands and `cmd-p` the project switcher on
-        // macOS; `ctrl-k` / `ctrl-p` on Linux/Windows. (`platform` is the
+        // opens the action commands, `cmd-p` the project switcher, and
+        // `cmd-q` quits on macOS; `ctrl-k` / `ctrl-p` / `ctrl-q` on
+        // Linux/Windows. (`platform` is the
         // OS key — `Cmd` on macOS, `Win/Super` elsewhere — so binding
-        // `cmd-*` unconditionally would steal `Win+K`/`Win+P` from the
+        // `cmd-*` unconditionally would steal `Win+K`/`Win+P`/`Win+Q` from the
         // Windows projector, Cast, and Linux window managers; binding
         // `ctrl-*` on macOS would steal readline kill-line/history-prev
         // from terminals. One binding per OS avoids both.)
@@ -95,20 +96,23 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         // `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow control),
         // `ctrl-n` (readline), `ctrl-d` (end-of-file), and `ctrl-/` keep
         // reaching terminal applications. The terminal pane still forwards
-        // the two palette toggles explicitly (see
+        // the two palette toggles and quit explicitly (see
         // `TerminalPane::on_key_down`), since its raw key handler would
         // otherwise swallow the event while focused.
         if cfg!(target_os = "macos") {
             cx.bind_keys([
                 KeyBinding::new("cmd-k", ToggleActionsPalette, None),
                 KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
+                KeyBinding::new("cmd-q", Quit, None),
             ]);
         } else {
             cx.bind_keys([
                 KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
                 KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
+                KeyBinding::new("ctrl-q", Quit, None),
             ]);
         }
+        cx.on_action(|_: &Quit, cx| cx.quit());
         load_bundled_fonts(cx).expect("failed to load bundled application fonts");
         Theme::change(theme_mode, None, cx);
         apply_focus_theme(cx);
@@ -191,6 +195,15 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // Same OS-primary quit as the workspace window (see `run_app`): the
+        // preview has no terminal to swallow keys, so the global binding is
+        // enough — no per-view forwarding needed here.
+        if cfg!(target_os = "macos") {
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        } else {
+            cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
+        }
+        cx.on_action(|_: &Quit, cx| cx.quit());
         load_bundled_fonts(cx).expect("failed to load bundled application fonts");
         Theme::change(theme_mode, None, cx);
         apply_focus_theme(cx);

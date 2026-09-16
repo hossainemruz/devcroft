@@ -56,7 +56,7 @@ Pane movement follows the rendered left-to-right layout and only includes region
 
 ## Repository Relationships
 
-Open **Repository relationships** from the action palette, Home, or Projects.
+Open **Repository relationships** from the action palette or Projects.
 Use **Tab / Shift+Tab** to focus toolbar controls, repository nodes, edge labels,
 and inspector controls. **Enter** on a node or edge selects it. The **Add
 relationship** form supports provider/consumer choices without dragging.

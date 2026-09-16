@@ -2581,13 +2581,6 @@ impl Render for HomeView {
                 );
             }
             body = body.child(
-                Button::new("home-relationships")
-                    .self_start()
-                    .ghost()
-                    .label("Repository relationships")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::Relationships))),
-            );
-            body = body.child(
                 Button::new("add-project-home")
                     .self_start()
                     .ghost()

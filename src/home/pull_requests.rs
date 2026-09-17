@@ -148,7 +148,21 @@ impl HomeView {
             badges = badges.child(Tag::color(color).with_size(Size::Small).child(label));
         }
         let delete_id = item.id.clone();
-        let open_url = item.url.clone();
+        let updated = if let Some(at) = entry.and_then(|entry| entry.updated_at) {
+            Some(format!(
+                "Updated {}{}",
+                relative_duration_label(current_unix_secs().saturating_sub(at)),
+                if entry.is_some_and(|entry| entry.fetching) {
+                    " · refreshing…"
+                } else {
+                    ""
+                }
+            ))
+        } else if entry.is_none_or(|entry| entry.fetching) {
+            Some("Fetching status…".to_owned())
+        } else {
+            None
+        };
         let menu_item = item.clone();
         let menu_title = title.clone();
         let entity = cx.entity();
@@ -178,7 +192,15 @@ impl HomeView {
                     .items_start()
                     .justify_between()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().font_medium().child(title.clone()))
+                    .child(
+                        title_link(item, "pr-title", &title, cx).child(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .whitespace_normal()
+                                .child(title.clone()),
+                        ),
+                    )
                     .child(
                         Button::new(item_id("pr-menu", &item.id))
                             .ghost()
@@ -227,17 +249,22 @@ impl HomeView {
                     ),
             )
             .child(
-                div()
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
                     .child(
-                        item.url
-                            .trim_start_matches("https://github.com/")
-                            .replace("/pull/", " #"),
-                    ),
+                        div().flex_1().min_w_0().truncate().child(
+                            item.url
+                                .trim_start_matches("https://github.com/")
+                                .replace("/pull/", " #"),
+                        ),
+                    )
+                    .when_some(updated, |row, updated| {
+                        row.child(div().flex_none().max_w(px(170.)).truncate().child(updated))
+                    }),
             )
             .child(badges);
         if let Some(error) = entry.and_then(|entry| entry.error.as_ref()) {
@@ -250,41 +277,7 @@ impl HomeView {
                 }
             )));
         }
-        if let Some(at) = entry.and_then(|entry| entry.updated_at) {
-            card = card.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "Updated {}{}",
-                        relative_duration_label(current_unix_secs().saturating_sub(at)),
-                        if entry.is_some_and(|entry| entry.fetching) {
-                            " · refreshing…"
-                        } else {
-                            ""
-                        }
-                    )),
-            );
-        } else if entry.is_none_or(|entry| entry.fetching) {
-            card = card.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Fetching status…"),
-            );
-        }
-        card.child(
-            h_flex().w_full().justify_end().child(
-                Button::new(item_id("open-pr", &item.id))
-                    .ghost()
-                    .label("Open ↗")
-                    .on_click(move |_, _, cx| {
-                        if safe_web_url(&open_url) {
-                            cx.open_url(&open_url);
-                        }
-                    }),
-            ),
-        )
+        card
     }
 
     pub(super) fn pull_requests_page(&self, cx: &mut Context<Self>) -> impl IntoElement {

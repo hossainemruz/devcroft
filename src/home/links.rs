@@ -7,6 +7,43 @@
 use super::*;
 use gpui_kit::component::link::Link;
 
+/// Card titles keep their text styling while providing keyboard activation
+/// and link semantics. Check the destination at activation like the old Open buttons.
+pub(super) fn title_link(
+    item: &Item,
+    id_prefix: &str,
+    title: &str,
+    cx: &Context<HomeView>,
+) -> gpui_kit::base::Link {
+    gpui_kit::base::Link::new(item_id(id_prefix, &item.id))
+        .href(item.url.clone())
+        .accessibility_label(title.to_owned())
+        .flex_1()
+        .min_w_0()
+        .max_w_full()
+        .rounded_sm()
+        .font_medium()
+        .text_color(cx.theme().foreground)
+        .cursor_pointer()
+        .hover(|style| style.text_color(cx.theme().link).text_decoration_1())
+        .focus(|style| {
+            style
+                .bg(cx.theme().secondary)
+                .text_color(cx.theme().link)
+                .text_decoration_1()
+        })
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .open_with(|url, _, window, cx| {
+            if safe_web_url(url) {
+                cx.open_url(url);
+            } else {
+                window.push_notification("Invalid web URL", cx);
+            }
+        })
+}
+
 /// One run of plain text or a single URL. Pure so splitting stays
 /// unit-testable without a window.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,13 +122,24 @@ pub(super) fn description_with_links(
 ) -> impl IntoElement {
     let mut row = h_flex()
         .w_full()
+        .min_w_0()
+        .max_w_full()
+        .overflow_hidden()
         .flex_wrap()
+        .whitespace_normal()
         .text_sm()
         .text_color(cx.theme().muted_foreground);
     for (index, segment) in split_links(&item.description).into_iter().enumerate() {
         match segment {
             DescriptionSegment::Text(text) => {
-                row = row.child(div().child(text));
+                row = row.child(
+                    div()
+                        .min_w_0()
+                        .max_w_full()
+                        .overflow_hidden()
+                        .whitespace_normal()
+                        .child(text),
+                );
             }
             DescriptionSegment::Link(url) if safe_web_url(&url) => {
                 row = row.child(
@@ -110,7 +158,14 @@ pub(super) fn description_with_links(
                 );
             }
             DescriptionSegment::Link(url) => {
-                row = row.child(div().child(url));
+                row = row.child(
+                    div()
+                        .min_w_0()
+                        .max_w_full()
+                        .overflow_hidden()
+                        .whitespace_normal()
+                        .child(url),
+                );
             }
         }
     }

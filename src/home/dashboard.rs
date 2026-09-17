@@ -84,36 +84,6 @@ impl HomeView {
             .w_full()
             .flex_1()
             .gap_6()
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_4()
-                    .pt_2()
-                    .pb_2()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_2xl().font_semibold().child("Your workspace"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "Recent conversations, active projects, and what’s next.",
-                                    ),
-                            ),
-                    )
-                    .child(
-                        Button::new("add-project-home")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label("Add project")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository))),
-                    ),
-            )
             .when_some(self.error.clone(), |view, error| {
                 view.child(
                     div()
@@ -317,7 +287,7 @@ impl HomeView {
     }
 
     fn project_section(&self, card_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut projects = h_flex().gap_4().flex_wrap();
+        let mut projects = h_flex().items_stretch().gap_4().flex_wrap();
         let now_secs = current_unix_secs();
         for (index, project) in self.projects.iter().enumerate() {
             let key = project.key.clone();
@@ -381,21 +351,7 @@ impl HomeView {
                         });
                     }))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                        if event.keystroke.modifiers.modified() {
-                            return;
-                        }
-                        let columns = recent_columns(f32::from(window.viewport_size().width));
-                        if let Some(next) = project_navigation(
-                            &event.keystroke.key,
-                            index,
-                            this.projects.len(),
-                            columns,
-                        ) {
-                            this.project_focus[&this.projects[next].key].focus(window, cx);
-                            cx.stop_propagation();
-                            window.prevent_default();
-                            cx.notify();
-                        }
+                        this.navigate_recent_project(index, event, window, cx);
                     }))
                     .child(
                         h_flex()
@@ -522,14 +478,43 @@ impl HomeView {
                     ),
             );
         }
-        if self.projects.is_empty() {
-            projects = projects.child(empty_state(
-                IconName::FolderOpen,
-                "Your next project starts here",
-                "Add a repository to keep its code, agents, and reviews together.",
-                cx,
-            ));
-        }
+        let add_cursor = self.navigation_cursor == Some(self.sessions.len() + self.projects.len());
+        projects = projects.child(
+            gpui_kit::base::Button::new("add-project-home")
+                .track_focus(&self.add_project_focus)
+                .accessibility_label("Add project")
+                .cursor_pointer()
+                .flex_none()
+                .w(px(card_width))
+                .min_h(px(164.))
+                .p_4()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .rounded_xl()
+                .border_1()
+                .border_dashed()
+                .border_color(if add_cursor {
+                    cx.theme().ring
+                } else {
+                    cx.theme().border
+                })
+                .bg(cx.theme().secondary.opacity(0.12))
+                .text_color(cx.theme().muted_foreground)
+                .hover(|style| {
+                    style
+                        .bg(cx.theme().secondary.opacity(0.65))
+                        .border_color(cx.theme().info.opacity(0.45))
+                        .text_color(cx.theme().foreground)
+                })
+                .focus(|style| style.border_color(cx.theme().ring).bg(cx.theme().secondary))
+                .child(Icon::new(IconName::Plus).size(px(20.)))
+                .child(div().font_medium().child("Add project"))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository)))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.navigate_recent_project(this.projects.len(), event, window, cx);
+                })),
+        );
         let dangling = self
             .all_projects
             .iter()
@@ -561,5 +546,35 @@ impl HomeView {
                         )),
                 )
             })
+    }
+
+    /// Include the trailing Add project card in the recent-project grid's
+    /// arrow-key navigation. The dedicated Projects page has its own grid.
+    fn navigate_recent_project(
+        &self,
+        index: usize,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let columns = recent_columns(f32::from(window.viewport_size().width));
+        if let Some(next) = project_navigation(
+            &event.keystroke.key,
+            index,
+            self.projects.len() + 1,
+            columns,
+        ) {
+            if next == self.projects.len() {
+                self.add_project_focus.focus(window, cx);
+            } else {
+                self.project_focus[&self.projects[next].key].focus(window, cx);
+            }
+            cx.stop_propagation();
+            window.prevent_default();
+            cx.notify();
+        }
     }
 }

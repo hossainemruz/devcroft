@@ -4,7 +4,7 @@ mod links;
 mod pull_requests;
 mod reading;
 mod todos;
-use self::links::description_with_links;
+use self::links::{description_with_links, title_link};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
@@ -342,9 +342,10 @@ pub(crate) struct HomeView {
     /// only applies the group filter.
     todo_project_filter: TodoProjectFilter,
     project_focus: HashMap<String, FocusHandle>,
+    add_project_focus: FocusHandle,
     scroll: ScrollHandle,
     /// Cursor for navigation-mode `j`/`k` through Home cards in visual order
-    /// (sessions, projects, then inbox items). `None` outside navigation mode;
+    /// (sessions, projects, Add project, then inbox items). `None` outside navigation mode;
     /// `Enter` activates the cursor item once and exits the mode.
     navigation_cursor: Option<usize>,
     /// Full-color harness logos for the Recent Activity session cards,
@@ -357,6 +358,7 @@ pub(crate) struct HomeView {
 enum HomeNavTarget {
     Session(usize),
     Project(usize),
+    AddProject,
     Item(String),
 }
 
@@ -433,6 +435,7 @@ impl HomeView {
             todo_group_filter: None,
             todo_project_filter: TodoProjectFilter::All,
             project_focus: HashMap::new(),
+            add_project_focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             navigation_cursor: None,
             agent_icon_tiles: std::rc::Rc::new(agent_icon_tiles),
@@ -574,8 +577,8 @@ impl HomeView {
     }
 
     /// Ordered stops for navigation-mode `j`/`k` in visual order: recent
-    /// sessions, recent projects, then inbox items (PRs grouped by category,
-    /// then todos, then reading) matching the dashboard render order. Only
+    /// sessions, recent projects, Add project, then inbox items (PRs grouped
+    /// by category, then todos, then reading) matching the dashboard render order. Only
     /// the dashboard and PR board participate; the board follows its filter.
     fn navigation_targets(&self) -> Vec<HomeNavTarget> {
         if self.is_pull_requests_page() {
@@ -613,6 +616,7 @@ impl HomeView {
         for index in 0..self.projects.len() {
             targets.push(HomeNavTarget::Project(index));
         }
+        targets.push(HomeNavTarget::AddProject);
         let visible: Vec<Item> = self
             .data
             .items
@@ -741,6 +745,10 @@ impl HomeView {
                     return true;
                 }
                 false
+            }
+            HomeNavTarget::AddProject => {
+                cx.emit(HomeEvent::AddRepository);
+                true
             }
             HomeNavTarget::Item(id) => {
                 let Some(item) = self.data.items.iter().find(|i| &i.id == id).cloned() else {
@@ -1740,6 +1748,8 @@ impl HomeView {
         let on_board = self.is_todos_page();
         let mut row = v_flex()
             .id(item_id("home-item", &item.id))
+            .w_full()
+            .min_w_0()
             .gap_1()
             .p_2()
             .rounded_lg()
@@ -1939,7 +1949,6 @@ impl HomeView {
         let home = cx.entity().downgrade();
         let edit = item.clone();
         let delete_id = item.id.clone();
-        let open_url = item.url.clone();
         let mut card = v_flex()
             .id(item_id("home-item", &item.id))
             .w_full()
@@ -1975,14 +1984,8 @@ impl HomeView {
                             })),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .font_medium()
-                            .child(title.clone()),
+                        title_link(item, "reading-title", &title, cx)
+                            .child(div().w_full().truncate().child(title.clone())),
                     )
                     .child(
                         Button::new(item_id("reading-menu", &item.id))
@@ -2017,20 +2020,7 @@ impl HomeView {
         if !item.description.is_empty() {
             card = card.child(description_with_links(item, "reading", cx));
         }
-        card.child(
-            h_flex().w_full().justify_end().child(
-                Button::new(item_id("open-reading", &item.id))
-                    .ghost()
-                    .label("Open ↗")
-                    .on_click(move |_, window, cx| {
-                        if safe_web_url(&open_url) {
-                            cx.open_url(&open_url);
-                        } else {
-                            window.push_notification("Invalid web URL", cx);
-                        }
-                    }),
-            ),
-        )
+        card
     }
 
     fn list(&self, kind: Kind, cx: &mut Context<Self>) -> impl IntoElement {

@@ -2470,72 +2470,74 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Mode indicator immediately right of the command bar: a highlighted
-    /// `NAVIGATION` pill while navigation mode owns the keyboard, a dim
-    /// toggle hint (`⌘J` on macOS, `Ctrl+J` elsewhere) otherwise, so the slot
-    /// never shifts layout when toggling.
+    /// Reserve room for the active label so switching modes never shifts search.
     /// Display-only on purpose — pointer presses dismiss the mode through
     /// the root capture handler, so a click-to-toggle here would race that
     /// dismissal. The hint stays the way in and out.
     fn render_navigation_indicator(&self) -> AnyElement {
-        if self.navigation_open {
-            h_flex()
-                .items_center()
-                .h(px(32.))
-                .px_3()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(0x713f12))
-                .bg(rgb(0x211609))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(rgb(0xf59e0b))
-                        .child("NAVIGATION"),
-                )
-                .into_any_element()
-        } else {
-            h_flex()
-                .items_center()
-                .h(px(32.))
-                .px_2()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(0x292b2b))
-                .text_xs()
-                .text_color(rgb(0x737878))
-                .child(if cfg!(target_os = "macos") {
-                    "⌘J"
-                } else {
-                    "Ctrl+J"
-                })
-                .into_any_element()
-        }
+        h_flex()
+            .flex_none()
+            .w(px(104.))
+            .items_center()
+            // The wider palette covers part of this slot. Keep its layout
+            // space while hiding the whole badge, including its border.
+            .when(self.command_open, |indicator| indicator.invisible())
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1p5()
+                    .h(px(28.))
+                    .px_2()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(0x252828))
+                    .text_xs()
+                    .text_color(rgb(0x858989))
+                    .when(self.navigation_open, |this| {
+                        this.bg(rgb(0x211609))
+                            .border_color(rgb(0x713f12))
+                            .text_color(rgb(0xf59e0b))
+                    })
+                    .child(Icon::new(gpui_kit::assets::IconName::Keyboard).size(px(14.)))
+                    .child(if self.navigation_open {
+                        "Navigation"
+                    } else if cfg!(target_os = "macos") {
+                        "⌘J"
+                    } else {
+                        "Ctrl+J"
+                    }),
+            )
+            .into_any_element()
     }
 
-    /// Branch pill for the header: `⎇ <branch>` on a branch, `➦ <short-sha>`
-    /// on a detached HEAD. Long branch names truncate instead of pushing the
-    /// command bar aside.
+    /// Branch pill with a commit icon for detached HEADs. Long names truncate
+    /// instead of pushing the command bar aside.
     fn render_branch_pill(&self, branch: SharedString) -> impl IntoElement {
-        let glyph = if self.git_poll.status().detached {
-            "➦"
+        let icon = if self.git_poll.status().detached {
+            gpui_kit::assets::IconName::GitCommitHorizontal
         } else {
-            "⎇"
+            gpui_kit::assets::IconName::GitBranch
         };
         h_flex()
+            .min_w_0()
             .gap_1()
             .items_center()
+            .h(px(22.))
             .px_2()
             .rounded_md()
-            .border_1()
-            .border_color(rgb(0x292b2b))
-            .bg(rgb(0x0e0f0f))
+            .bg(rgb(0x171919))
             .text_xs()
-            .child(div().text_color(rgb(0x737878)).child(glyph))
+            .child(
+                Icon::new(icon)
+                    .size(px(12.))
+                    .flex_none()
+                    .text_color(rgb(0x858989)),
+            )
             .child(
                 div()
-                    .max_w(px(160.))
+                    .min_w_0()
+                    .max_w(px(120.))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
@@ -2619,6 +2621,20 @@ impl Render for Workspace {
         } else {
             format!("⚠ {attention_count} agents need attention")
         };
+        // Center the field itself, independently of unequal header controls.
+        // Retain the flexible layout in narrow windows so the adjacent badges
+        // cannot overlap the workspace tabs.
+        let command_width = 280.;
+        let palette_width = 380.;
+        let centered_min_width = if self.home_visible {
+            960.
+        } else if attention_count > 0 {
+            1400.
+        } else {
+            1280.
+        };
+        let center_command = window.viewport_size().width >= px(centered_min_width);
+        let command_left = (window.viewport_size().width - px(command_width)) / 2.;
 
         v_flex()
             .relative()
@@ -2699,14 +2715,17 @@ impl Render for Workspace {
             }))
             .child(
                 h_flex()
-                    .h(px(58.))
-                    .px_4()
+                    .relative()
+                    .h(px(WORKSPACE_HEADER_HEIGHT))
+                    .flex_none()
+                    .px_3()
                     .gap_3()
                     .items_center()
+                    .bg(rgb(0x0c0d0d))
                     .border_b_1()
-                    .border_color(rgb(0x292b2b))
+                    .border_color(rgb(0x222525))
                     .when(self.home_visible && !is_home_page, |header| {
-                        header.child(div().text_lg().font_semibold().child("Devcroft"))
+                        header.child(div().text_sm().font_semibold().child("Devcroft"))
                     })
                     .when(self.relationships_visible, |header| {
                         header.child(
@@ -2716,6 +2735,7 @@ impl Render for Workspace {
                                 .child(
                                     Button::new("relationships-back")
                                         .ghost()
+                                        .small()
                                         .label("‹ Back")
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.back_from_relationships(window, cx)
@@ -2738,6 +2758,7 @@ impl Render for Workspace {
                                 .child(
                                     Button::new("artifacts-back")
                                         .ghost()
+                                        .small()
                                         .label(artifacts_back)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.go_back_from_artifacts(window, cx)
@@ -2762,6 +2783,7 @@ impl Render for Workspace {
                                     .child(
                                         Button::new("projects-back")
                                             .ghost()
+                                            .small()
                                             .label("‹ Home")
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.go_home(window, cx)
@@ -2784,20 +2806,29 @@ impl Render for Workspace {
                     .when(!self.home_visible, |header| {
                         header.child(
                             h_flex()
-                                .flex_none()
+                                .min_w_0()
+                                .max_w(px(360.))
                                 .gap_2()
                                 .items_center()
                                 .child(
                                     Button::new("go-home")
                                         .ghost()
+                                        .small()
+                                        .size(px(28.))
+                                        .icon(IconName::ChevronLeft)
                                         .accessibility_label("Home")
-                                        .child(div().text_sm().child("‹ Home"))
+                                        .tooltip("Back to Home")
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.go_home(window, cx);
                                         })),
                                 )
                                 .child(
                                     div()
+                                        .min_w_0()
+                                        .max_w(px(160.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .text_sm()
                                         .font_semibold()
                                         .child(self.project_name.clone()),
@@ -2826,29 +2857,40 @@ impl Render for Workspace {
                                 ),
                         )
                     })
+                    .when(center_command, |header| header.child(div().flex_1()))
                     .child(
                         h_flex()
-                            .flex_1()
-                            .justify_center()
-                            .gap_2()
+                            .min_w_0()
+                            .items_center()
+                            .when(center_command, |bar| {
+                                bar.absolute().top_0().h_full().left(command_left)
+                            })
+                            .when(!center_command, |bar| bar.flex_1().justify_center())
+                            .gap_1()
                             .child(
                                 div()
                                     .relative()
-                                    .w(px(380.))
-                                    .flex_shrink_0()
+                                    .w(px(command_width))
+                                    .min_w(px(140.))
+                                    .when(center_command, |field| field.flex_none())
                                     .child(
                                         Button::new("workspace-command-trigger")
                                             .ghost()
+                                            .small()
                                             .accessibility_label("Open command palette")
-                                            .w(px(380.))
-                                            .h(px(32.))
-                                            .px_3()
-                                            .gap_2()
+                                            .tooltip(if cfg!(target_os = "macos") {
+                                                "Commands ⌘K · Projects ⌘P"
+                                            } else {
+                                                "Commands Ctrl+K · Projects Ctrl+P"
+                                            })
+                                            .w_full()
+                                            .h(px(28.))
+                                            .px_2()
                                             .items_center()
                                             .rounded_md()
                                             .border_1()
-                                            .border_color(rgb(0x292b2b))
-                                            .bg(rgb(0x0e0f0f))
+                                            .border_color(rgb(0x252828))
+                                            .bg(rgb(0x121414))
                                             .text_xs()
                                             .text_color(rgb(0x737878))
                                             .cursor_pointer()
@@ -2864,35 +2906,57 @@ impl Render for Workspace {
                                                     .size(px(14.))
                                                     .text_color(rgb(0x737878)),
                                             )
-                                            .child(div().flex_1().child("Type a command…"))
                                             .child(
                                                 div()
-                                                    .px_1()
-                                                    .rounded_md()
-                                                    .border_1()
-                                                    .border_color(rgb(0x292b2b))
-                                                    .text_color(rgb(0x858989))
-                                                    .child("⌘K"),
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_xs()
+                                                    .text_ellipsis()
+                                                    .child("Search commands…"),
                                             )
                                             .child(
                                                 div()
                                                     .px_1()
-                                                    .rounded_md()
-                                                    .border_1()
-                                                    .border_color(rgb(0x292b2b))
+                                                    .flex_none()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x1d2020))
+                                                    .text_xs()
                                                     .text_color(rgb(0x858989))
-                                                    .child("⌘P"),
+                                                    .child(if cfg!(target_os = "macos") {
+                                                        "⌘K"
+                                                    } else {
+                                                        "Ctrl+K"
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1()
+                                                    .flex_none()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x1d2020))
+                                                    .text_xs()
+                                                    .text_color(rgb(0x858989))
+                                                    .child(if cfg!(target_os = "macos") {
+                                                        "⌘P"
+                                                    } else {
+                                                        "Ctrl+P"
+                                                    }),
                                             ),
                                     )
-                                    // Keep the open search field on the trigger's exact
-                                    // bounds, even when neighboring header controls change.
+                                    // Keep the wider palette on the same center as
+                                    // the trigger, leaving room for labels and hints.
                                     .when(self.command_open, |anchor| {
                                         anchor.child(deferred(
                                             div()
                                                 .absolute()
                                                 .top_0()
                                                 .left_0()
-                                                .w_full()
+                                                .when(center_command, |palette| {
+                                                    palette.left(px((command_width
+                                                        - palette_width)
+                                                        / 2.))
+                                                })
+                                                .w(px(palette_width))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(|_, _, _, cx| {
@@ -2908,8 +2972,10 @@ impl Render for Workspace {
                                 bar.child(
                                     Button::new("agent-attention-trigger")
                                         .ghost()
+                                        .small()
                                         .accessibility_label(attention_label.clone())
-                                        .h(px(32.))
+                                        .tooltip(attention_label.clone())
+                                        .h(px(28.))
                                         .px_2()
                                         .rounded_md()
                                         .border_1()
@@ -2917,7 +2983,8 @@ impl Render for Workspace {
                                         .bg(rgb(0x211609))
                                         .text_xs()
                                         .text_color(rgb(0xf59e0b))
-                                        .label(attention_label.clone())
+                                        .icon(IconName::TriangleAlert)
+                                        .label(attention_count.to_string())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_command_palette(
                                                 PaletteMode::Projects,
@@ -2980,6 +3047,7 @@ impl Render for Workspace {
                         header.child(
                             Button::new("portable-status")
                                 .ghost()
+                                .small()
                                 .tooltip(detail)
                                 .child(
                                     Tag::color(hue)
@@ -2995,16 +3063,26 @@ impl Render for Workspace {
                     .when(!self.home_visible, |header| {
                         header.child(
                             TabBar::new("workspace-tabs")
-                                .segmented()
+                                .pill()
+                                .small()
+                                .flex_none()
+                                .h(px(28.))
+                                .p(px(2.))
+                                .rounded_md()
+                                .bg(rgb(0x171919))
+                                .border_1()
+                                .border_color(rgb(0x222525))
                                 .selected_index(active_index)
                                 .on_click(cx.listener(|this, index: &usize, window, cx| {
                                     this.select_tab(*index, window, cx);
                                 }))
-                                .children(
-                                    WorkspaceTab::ALL
-                                        .into_iter()
-                                        .map(|tab| Tab::new().label(tab.label())),
-                                ),
+                                .children(WorkspaceTab::ALL.into_iter().map(|tab| {
+                                    Tab::new()
+                                        .label(tab.label())
+                                        .when(tab as usize == active_index, |tab| {
+                                            tab.font_semibold()
+                                        })
+                                })),
                         )
                     }),
             )

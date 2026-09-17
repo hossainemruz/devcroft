@@ -4,6 +4,7 @@ mod agent_activity;
 mod agent_icons;
 mod agent_sessions;
 mod agent_skill;
+mod app_assets;
 mod artifacts;
 mod cli;
 mod command_palette;
@@ -77,7 +78,7 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
     // later through the same path.
     crate::metrics::set_app_font_size(app_font_size);
 
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(app_assets::AppAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);
         // Direct shortcuts are deliberately few and OS-primary: `cmd-k`
@@ -192,7 +193,7 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
     let content: SharedString = content.into();
     let window_title = format!("Preview — {title}");
 
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(app_assets::AppAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);
         // Same OS-primary quit as the workspace window (see `run_app`): the

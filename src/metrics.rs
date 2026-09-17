@@ -41,7 +41,7 @@ pub(crate) fn review_font_size() -> f32 {
     app_font_size() * (13.0 / BASE_FONT_SIZE)
 }
 pub(crate) const TERMINAL_PADDING: f32 = 12.0;
-pub(crate) const WORKSPACE_HEADER_HEIGHT: f32 = 58.0;
+pub(crate) const WORKSPACE_HEADER_HEIGHT: f32 = 48.0;
 /// Maximum scroll lines forwarded to the terminal per wheel event.
 ///
 /// Trackpads emit high-frequency fractional deltas; without a bound a single

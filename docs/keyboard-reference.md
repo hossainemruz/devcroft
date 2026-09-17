@@ -6,9 +6,9 @@ which nothing can edit: every keystroke is either a navigation command or
 consumed before reaching a terminal or input.
 
 Toggle with `Cmd+J` on macOS (`Ctrl+J` on Linux/Windows). The top bar shows a
-`NAVIGATION` pill right after the command bar while navigation
-mode owns the keyboard, and a dim `⌘J` hint on macOS (`Ctrl+J` elsewhere)
-otherwise. The key list sits
+a keyboard badge with `⌘J` on macOS (`Ctrl+J` elsewhere) right after the command
+bar. It becomes an amber `Navigation` badge while the mode owns the keyboard,
+without shifting the search field. The key list sits
 at the bottom-right of the window.
 
 ## Direct shortcuts (normal mode)

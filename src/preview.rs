@@ -6,6 +6,8 @@
 //! standalone window — no workspace, no terminal panes, no socket — as a
 //! stateful scrollable [`TextView`](gpui_kit::component::text::TextView)
 //! with a hover-expandable table of contents and scrollspy.
+//! Resources embeds this same reader; only the outer spacing and outline
+//! controls differ. Both window entry points host it inside the component Root.
 //!
 //! Markdown is the first renderer; future kinds (images, …) add sibling
 //! readers and either extend [`PreviewView`] or add a parallel view,
@@ -23,7 +25,7 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
     InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton, Overflow,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, Window, div, px, rems,
+    Styled as _, Window, div, px, relative, rems,
 };
 
 /// Shared column width for document content and resource metadata.
@@ -491,8 +493,6 @@ impl Focusable for PreviewView {
 
 impl Render for PreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let reading_width =
-            (window.viewport_size().width - px(80.)).clamp(px(1.), px(READING_WIDTH));
         // Embedded readers sit below the host view's own compact header,
         // so they keep only a small top margin. Bottom keeps 32px to
         // match the scrollbar insets below.
@@ -561,19 +561,22 @@ impl Render for PreviewView {
             .relative()
             .size_full()
             .justify_center()
+            .when(!self.embedded, |this| this.px(px(40.)))
             .bg(cx.theme().background)
             .text_color(body)
             .font_family(crate::fonts::MARKDOWN_FONT_FAMILY)
             .child(
                 div()
-                    .w(reading_width)
-                    .when(self.embedded, |this| this.w_full().max_w(px(READING_WIDTH)))
+                    .w_full()
+                    .max_w(px(READING_WIDTH))
                     .min_w_0()
                     .h_full()
                     .pt(reader_top)
                     .pb(px(32.))
                     .text_size(px(16.))
-                    .line_height(px(26.))
+                    // Keep 26px body lines, while allowing larger headings to
+                    // inherit proportionate spacing when they wrap.
+                    .line_height(relative(26. / 16.))
                     .child(
                         // TextView always draws a 16px scrollbar in scrollable
                         // mode. Clip that gutter (including hitboxes) and bind
@@ -602,61 +605,36 @@ impl Render for PreviewView {
                                     }
                                 })
                                 .scrollable(true)
-                                .when(!self.embedded, |this| this.w(reading_width + px(16.)))
-                                // Fluid embedded columns cannot precompute the
-                                // +16 clip, so they stretch 16px past the clip
-                                // box with a negative inset instead. w_auto is
+                                // Both hosts stretch 16px past the clip box to
+                                // hide the built-in scrollbar. w_auto is
                                 // required: the scrollable TextView defaults to
                                 // width 100%, which would otherwise win over
                                 // the inset and leave its scrollbar visible.
-                                // The pr_16 below keeps text clear of the
-                                // hidden gutter, matching standalone.
-                                .when(self.embedded, |this| {
-                                    this.absolute()
-                                        .left_0()
-                                        .top_0()
-                                        .bottom_0()
-                                        .right(px(-16.))
-                                        .w_auto()
-                                })
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .right(px(-16.))
+                                .w_auto()
                                 .pr(px(16.)),
                         ),
                     ),
             )
-            .when(!self.embedded, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top(px(32.))
-                        .bottom(px(32.))
-                        .w(px(16.))
-                        .child(
-                            Scrollbar::vertical(&list_state)
-                                .id("preview-window-scrollbar")
-                                .viewport_from_layout(),
-                        ),
-                )
-            })
-            .when(self.embedded, |this| {
-                // Dock the thumb to the reader's pane edge (beside the
-                // outline rail) instead of the centered column. The insets
-                // match the column's own top/bottom padding so the viewport
-                // height — and therefore the thumb — tracks the list.
-                this.child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top(reader_top)
-                        .bottom(px(32.))
-                        .w(px(16.))
-                        .child(
-                            Scrollbar::vertical(&list_state)
-                                .id("preview-embedded-scrollbar")
-                                .viewport_from_layout(),
-                        ),
-                )
-            })
+            // Both hosts dock the thumb to the pane edge. Match the column's
+            // insets so its viewport height and the scrollbar stay in sync.
+            .child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top(reader_top)
+                    .bottom(px(32.))
+                    .w(px(16.))
+                    .child(
+                        Scrollbar::vertical(&list_state)
+                            .id("preview-scrollbar")
+                            .viewport_from_layout(),
+                    ),
+            )
             .when(!self.toc.is_empty() && !self.embedded, |this| {
                 this.child(
                     v_flex()
@@ -676,6 +654,67 @@ impl Render for PreviewView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_hosts_reserve_space_for_wrapped_headings() {
+        use gpui_kit::component::Root;
+        use gpui_kit::{Bounds, Pixels, TestApp, WindowBounds, WindowOptions, point, size};
+
+        const CONTENT: &str = "# Review Assistant: guided change review and impact investigation\n\nStatus: revised design proposal.\n";
+
+        let mut app = TestApp::new();
+        app.update(gpui_kit::init);
+        for column_width in [320., 820.] {
+            let mut layouts = Vec::new();
+            for embedded in [false, true] {
+                let mut reader = None;
+                // Give both hosts the same content width; standalone adds
+                // 40px side margins while Resources supplies its own spacing.
+                let width = column_width + if embedded { 0. } else { 80. };
+                let mut window = app.open_window_with_options(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(0.), px(0.)),
+                            size(px(width), px(700.)),
+                        ))),
+                        ..Default::default()
+                    },
+                    |window, cx| {
+                        let view = cx.new(|cx| {
+                            if embedded {
+                                PreviewView::embedded(CONTENT.into(), cx)
+                            } else {
+                                PreviewView::new(CONTENT.into(), cx)
+                            }
+                        });
+                        reader = Some(view.clone());
+                        Root::new(view, window, cx)
+                    },
+                );
+                window.draw();
+                app.run_until_parked();
+                window.draw();
+                let (heading, paragraph) = window.read(|_, cx| {
+                    let view = reader.as_ref().unwrap().read(cx);
+                    let list = view.state.read(cx).list_state();
+                    (
+                        list.bounds_for_item(0).expect("heading must render"),
+                        list.bounds_for_item(1).expect("paragraph must render"),
+                    )
+                });
+                assert!(
+                    heading.size.height > px(60.),
+                    "wrapped 30px heading needs more than two 26px body lines: {heading:?}"
+                );
+                assert!(paragraph.top() >= heading.bottom());
+                layouts.push((heading.size, paragraph.size));
+            }
+            let close = |a: Pixels, b: Pixels| (a - b).abs() < px(0.1);
+            assert!(close(layouts[0].0.width, layouts[1].0.width));
+            assert!(close(layouts[0].0.height, layouts[1].0.height));
+            assert!(close(layouts[0].1.height, layouts[1].1.height));
+        }
+    }
 
     #[test]
     fn metadata_breaks_preserve_prose_fences_and_outline() {

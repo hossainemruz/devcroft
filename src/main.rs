@@ -225,7 +225,9 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
             cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| PreviewView::new(content.clone(), cx));
                 view.read(cx).focus_handle(cx).focus(window, cx);
-                view
+                // Match the workspace host: Root supplies rem sizing, text
+                // selection/copy, focus traversal, and component overlays.
+                cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .map_err(|error| anyhow!("failed to open preview window: {error}"))
             .expect("failed to open preview window");

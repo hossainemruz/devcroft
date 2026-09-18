@@ -1,377 +1,674 @@
-# Review Assistant: design and implementation proposal
+# Review Assistant: guided change review and impact investigation
 
-Status: deferred until Repository Relationships is implemented. Application
-implementation has not started. The active [Repository Relationships plan](repository-relationships-design.md)
-defines the canvas, storage, and provider-to-consumer direction for that feature.
+Status: revised design proposal, 2026-09-18. Repository Relationships is
+[implemented](repository-relationships-validation.md). Review Assistant
+application implementation has not started.
+
+Confirmed product direction: an interactive review session built around a rich,
+evolving review guide. The first version helps the reviewer understand a change,
+check it against intent, and investigate its effects, within one repository or
+across related repositories. Teaching the concepts needed for that review is
+part of the first version. Standalone exploration can follow later. Other choices
+below are recommendations to validate during implementation.
 
 ## Product objective
 
-Help a human understand code, assess a change, and investigate customer behavior
-that a change might break. The reviewer owns the conclusion. The assistant
-provides explanations, evidence, experiments, and explicit unanswered questions.
+Help the reviewer answer: **What do I need to understand, does the change match
+the design, and what evidence do we have about its consequences?**
 
-The motivating example is an RPC migration from a Python monolith to a Go
+Start with the change being reviewed and any supplied design doc. Explain the
+language and architectural concepts needed to follow the implementation, connect
+requirements to code and tests, and trace affected contracts and assumptions.
+The human owns the review conclusion. The assistant supplies a navigable guide,
+contextual explanations, evidence, verification, and open questions.
+
+A core scenario is reviewing agent-written code in an unfamiliar language, with
+a design doc and no repository relationships. The reviewer should be able to
+learn the relevant concepts, follow execution, inspect how the implementation
+meets the design, and ask informed questions. Relationships are optional context;
+their absence does not reduce this to an incomplete or blocked review.
+
+The motivating example remains an RPC migration from a Python monolith to a Go
 service. The migrated implementation omitted information required by restore.
-Normal operation worked, and the restore consumer lived in another repository.
-The assistant should make the behavior difference visible, trace the consumer
-when its source is available, and expose the missing context otherwise.
+Normal operation worked; the restore consumer lived in another repository.
+Given high-level relationships and available source, a useful review should
+connect the old producer, changed output, consuming code, and restore behavior.
 
-## One session model, several starting points
+Repository Relationships supplies a reusable starting map. The assistant turns
+a particular change and that map into evidence about its effects. Graph
+reachability establishes a candidate for investigation. Source inspection and
+execution establish the consequence of the change.
 
-Use an investigation session as the shared model. A diff is optional. Repository
-count and investigation purpose are independent: a small question can involve
-two repositories, and a broad regression review can involve just one.
+## First-version experience
 
-| Starting point | Initial context | Initial questions | Useful result |
-| --- | --- | --- | --- |
-| Understand code while building | Selected code and current working tree | What does this do? What calls it? Why this design? | Explanation and execution walkthrough |
-| Review a local change | Before/after snapshots and an optional requirement | What changed? Which assumptions changed? | Behavioral brief, walkthrough, concerns |
-| Verify a bug fix | Reproduction, expected behavior, before/after snapshots | Is the bug fixed? Which adjacent behavior could regress? | Reproduction evidence and focused regression scenarios |
-| Explore a codebase | Repository snapshot and a question or entry point | Where does this behavior start? What are the invariants? | Navigable subsystem explanation |
-| Review a migration | Old/new implementation locations and related repositories | What contract changed? Which consumer versions depend on it? | Behavior comparison and compatibility investigations |
+Open Review and choose **Review changes** for the current comparison. Attach a
+design doc or requirement when available, and optionally select code or ask a
+question. The reviewer can say "I understand the design but am unfamiliar with
+this language" or name concepts they already know. No expertise questionnaire
+is required. Preserve Review's full-diff and uncommitted scopes and display which
+comparison is being captured.
 
-These are editable starting presets, not separate engines or mandatory forms.
-Default to the current checkout and selection. Let a question expand an existing
-session with another focus, comparison, or repository without losing its notes.
-An answer to a small question need not generate a full review report.
+Build the review guide progressively: establish intent, inspect the change,
+identify necessary concepts, and walk through behavior. Let the reviewer read
+freely or follow the walkthrough step by step. Introduce concepts at the code
+locations where they help the reviewer make a decision.
 
-## Session data
+Discover related repositories automatically, explain why each is relevant, and
+read available source within the configured context scope. Let the reviewer
+adjust versions, exclude context, attach missing source, or include a previous
+implementation. Ask focused questions when information is missing while
+independent investigation continues.
 
-Keep a small stable record with optional typed results:
+Show a concise overview with the guide's intent, concepts, walkthrough, review
+checkpoints, and open questions. Surface supported concerns as they are found.
+Selecting an explanation, code excerpt, or checkpoint provides context for a
+follow-up: "Explain this expression," "Show this as pseudocode," "What happens
+if this fails?", or "Does the CLI also use this?" Keep the conversation and
+durable guide together in the same session.
 
-```text
-Investigation
-  id, title, objective, revision
-  context_generation
-  repositories[]       # one or more repositories with selected snapshots
-  comparisons[]        # zero or more before/after or implementation comparisons
-  focuses[]            # selections, symbols, workflows, questions
-  context_sources[]    # requirements, plans, incidents, author decision records
-  turns[]              # questions, run state, answers, provider session identity
-  evidence[]           # source excerpts, search records, recorded command results
-  results[]            # explanations, walkthroughs, behavior differences, concerns
-  reviewer_notes[]     # human conclusions and unresolved questions
+The first version includes:
+
+- One changed checkout and its exact before/after comparison.
+- Guided review against an optional design doc, including the concepts needed
+  for unfamiliar language features and architecture in this particular change.
+- A rich, evolving guide with annotated code, useful diagrams, contextual chat,
+  free reading or sequential walkthrough, and explicit Markdown export.
+- Automatic relationship context and targeted inspection of related repositories,
+  including unchanged files and both dependencies and dependents.
+- Optional old/new implementation locations for migration reviews, including
+  implementations without shared Git history.
+- Evidence-linked concerns, explicit context gaps, follow-up questions, and full
+  snapshot source navigation.
+- Local durable sessions, one validated installed-agent runner, cancellation,
+  freshness tracking, and a shared desktop/CLI interface.
+- Isolated verification and deliberate handoff into human review feedback.
+
+A standalone Assistant destination, general codebase exploration, automatic PR
+import, and coordinated changes across several repositories are later extensions.
+The session model can hold multiple comparisons without requiring all these
+product flows in the first slice.
+
+## The review guide and contextual conversation
+
+The guide is the main reading surface and the durable result of the session.
+Chat lets the reviewer direct the investigation and request explanation at the
+point of confusion. Source navigation lets them inspect the implementation behind
+each claim. All three share the same captured context and review history.
+
+| Guide section | What it helps the reviewer do |
+| --- | --- |
+| Intent | Understand the design's expected behavior, constraints, and ambiguities. |
+| Concepts | Learn the language, domain, and architectural ideas needed for this change, with links to their use in code. |
+| Walkthrough | Follow the entry point, normal execution, failure paths, and recovery through annotated source and useful diagrams. |
+| Review checkpoints | Connect each important requirement or invariant to implementation evidence, tests, and a review decision or question. |
+| Open questions | See concerns, missing evidence, and explanations or verification still needed. |
+| Reviewer notes | Preserve the human's understanding, decisions, and reasons. |
+
+Keep explanations proportional to the change and the reviewer's stated needs.
+For a background-retry change, the guide might explain error handling, task
+lifetime, and duplicate effects. Give each concept a plain-language explanation,
+a small example when useful, where it appears in the actual code, and why it
+matters to review. Let the reviewer expand explanations or skip familiar material.
+Avoid a general language course or mandatory quizzes.
+
+Walk through behavior in execution order rather than file order. For example,
+explain an early error return at the point where it prevents scheduling, then
+connect that outcome to the design's recovery requirement. Distinguish exact
+source excerpts from simplified examples and pseudocode. Diagrams should link
+back to the relevant source and make simplifications clear.
+
+### Conversation and guide updates
+
+Questions can target a guide section, a checkpoint, or a source range. Preserve
+that target with the turn so "Why does this happen?" stays meaningful after
+navigating elsewhere. The reviewer can also ask a session-wide question at any
+time, interrupt the walkthrough, and return to the same place afterward.
+
+Answer follow-ups in context. For a question about retries, explain partial
+success, show the relevant code, and identify any unresolved duplicate-effect
+concern. Offer **Add to guide** for a useful explanation, or update the relevant
+section when the reviewer explicitly asks for that. Initial guide generation
+and requested updates can proceed incrementally without repeated confirmation.
+Keep conversational detours in their threads; retain unresolved review questions
+as visible checkpoints.
+
+Apply guide updates to identified sections and keep their revision history.
+Preserve human notes, understanding markers, and concern dispositions. A clearer
+explanation does not resolve the associated correctness question or establish
+that the reviewer understood it. Allow optional human markers such as
+"Understood" and "Needs explanation," independent of review approval.
+
+The guide is saved locally with its session and cited source versions. A
+deliberate **Export guide** action creates a Markdown artifact containing the
+selected guide content. It should remain readable without replaying the chat.
+
+### Single-repository example
+
+Given a design doc, an agent-written change, and a reviewer unfamiliar with its
+language, the assistant should:
+
+1. Extract the intended behavior and expose ambiguous requirements.
+2. Inspect the implementation to select the concepts that matter for this review.
+3. Explain those concepts beside the relevant source, using examples on request.
+4. Walk through normal execution, failures, and recovery within the repository.
+5. Map requirements to code and tests, exposing missing or contradictory evidence.
+6. Answer follow-ups and preserve useful explanations and open questions in the
+   guide so the reviewer can resume later.
+
+Trace internal callers, shared state, and module contracts as needed. No saved
+relationships is a valid starting condition. A known relevant repository with
+unavailable source is a separate, explicit context gap.
+
+## How relationships guide a review
+
+Reuse the existing [relationship model](repository-relationships-design.md) and
+`src/data/relationships.rs`. Definitions remain high-level, portable knowledge.
+Agents discover RPCs, fields, invariants, and workflows during a review; these
+are investigation results, not additional mandatory relationship metadata.
+
+Direction is **provider → consumer**. For a change in backend:
+
+| Existing connection | Review question |
+| --- | --- |
+| api → backend | Does backend still honor the contracts supplied by api? |
+| backend → ui | Does changed backend behavior break assumptions in ui? |
+| backend → cli | Does the CLI depend on the changed behavior? |
+| api → ui | Does ui interpret the shared contract differently from backend? |
+
+Incoming dependencies establish requirements and provider behavior. Outgoing
+dependents help investigate consequences. A consumer change can introduce a new
+expectation of its provider, so both directions matter.
+
+The installed discovery interface already exists:
+
+```sh
+devcroft repository relationships backend --json
+devcroft repository relationships backend --depth 2 --json
 ```
 
-A repository's role can be changed implementation, previous implementation,
-consumer, or supporting context. One repository can have multiple roles and
-snapshots. An unregistered local checkout can use a session-local identity;
-registration is useful for reuse, not required for a quick explanation.
+Respect the actual query contract:
 
-A comparison between implementations in different repositories is a semantic
-comparison. It does not require shared Git history or pretend to be a normal
-branch diff. A PR adds an exact base/head comparison plus available discussion
-and requirements. It is another context source, not a separate analysis engine.
+- `dependencies` and `dependents` contain direct neighbors at every depth.
+- Expanded nodes carry a shortest **undirected** neighborhood `path` and
+  `distance`. These are discovery routes, not causal impact paths. Explain
+  propagation using original directed edges and source evidence.
+- Default queries include all groups, independently of the graph page's current
+  filter. An explicit review scope can restrict source access; record excluded
+  connections instead of silently inheriting a UI filter.
+- Check `diagnostics`, `truncated`, `excludedRelationships`, unresolved endpoints,
+  and checkout availability. Registration does not imply usable source.
+- Depth is bounded to 1–8 and responses to 1000 nodes. A limit is a context gap,
+  not evidence that no additional consumers exist.
 
-### Source identity and freshness
+`truncated: false` does not mean the whole graph was explored: a neighborhood
+query still has its selected depth. Record that discovery scope explicitly.
 
-Resolve branch names to commit IDs. For uncommitted work, capture an immutable
-overlay containing changed files, included untracked files, deletions, and their
-content hashes over a commit. Record exclusions and unavailable content. Check
-for concurrent edits during capture and retry or expose inconsistency rather
-than silently mixing versions. Stage-only and whole-working-tree comparisons
-must be distinct if both are offered.
+Record the graph responses used, query parameters, edge definitions and revision,
+and included node metadata and revisions. The graph revision covers the
+relationship document; repository purposes and groups have separate revisions.
+Retain descriptions actually used so later edits cannot rewrite earlier context.
 
-Every source citation contains repository identity, snapshot, path, range, and
-content identity. Open the cited snapshot even if the live checkout has moved.
-Run source inspection against these snapshots so an actively coding agent cannot
-change the evidence halfway through an answer.
+### Select context progressively
 
-Associate each turn with a context generation. Adding a repository or refreshing
-sources creates a new generation; late output from an earlier generation cannot
-overwrite newer results. Preserve earlier answers with their original context.
-Initially mark results as needing refresh when any scoped source snapshot changes.
-Later, narrow invalidation only where dependency tracking supports it, including
-the scope of searches that found no matches. Unchanged cited lines alone do not
-establish that a conclusion remains valid.
+Start with the changed repository and its direct neighborhood. Inspect changed
+behavior before selecting deeper source reads. A backend formatting change
+should not trigger a full inspection of every UI and CLI.
 
-## How an investigation proceeds
+For each potentially affected behavior, formulate a concrete question, such as
+"Who reads the omitted restore metadata?" Inspect manifests, schemas, routes,
+serialization code, callers, tests, and relevant configuration. Descriptions
+guide the search; find the detailed dependency in source. Matching names alone
+is insufficient for cross-language calls.
 
-1. Interpret the question and choose a starting focus. Briefly show the current
-   scope and produce an initial useful explanation as soon as evidence permits.
-2. Gather relevant source: the selected code, complete functions/files, callers,
-   contracts, tests, requirements, and recorded decisions. Use bounded searches
-   and targeted reads; do not put every repository into the prompt.
-3. Form explicit questions. For a migration, compare observable behavior. For a
-   bug fix, establish the reproduction and intended behavior, then inspect
-   adjacent assumptions. For exploration, trace the requested execution path.
-4. Query saved repository relationships to select relevant available context
-   automatically, then follow evidence into other files or repositories. Show
-   why repositories were included. Work within the user's configured context
-   scope and carry unavailable context as a gap.
-5. Answer with source links, or investigate a concrete concern. Run an applicable
-   experiment when execution is within the session's selected capabilities.
-6. Save useful results and remaining questions. Continue on follow-up without
-   repeating completed searches against the same snapshot.
+Expand when a contract question or observed behavior suggests another repository.
+Follow a downstream effect further when it changes that consumer's own externally
+visible behavior. Stop a path when evidence supports a stable contract, the
+question is answered, context is unavailable, or the selected budget is reached.
+State the reason and scope of that stop.
 
-Keep a bounded question queue and visible progress. A quick explanation stops
-after answering its question. A broader review can spend more time investigating
-dependencies. Cancellation, budget exhaustion, unavailable context, and a finished
-answer are distinct outcomes. A finished run does not mean exhaustive coverage.
+Cycles are valid. Deduplicate work by repository snapshot and investigation
+question. One repository can participate in several workflows and roles; one
+visit does not establish that all its relevant behavior was assessed.
 
-Start with source searches, file/manifest discovery, Git history, and saved
-repository relationships, with manual context overrides. The saved map provides
-high-level descriptions; the agent discovers detailed dependencies by inspecting
-code. Add symbol indexes or language-specific analysis only when measured
-investigations show the need. Cross-language RPC investigations also require
-schemas, routes, serialization code, and configuration; matching function names
-is insufficient.
+Code can reveal dependencies absent from the map. Include their source when it
+is available within the review's scope and record how they were discovered.
+An empty or stale graph still permits local review. Suggested graph corrections
+can be a later explicit save action; findings do not silently change shared
+relationship definitions.
 
-## Evidence and results
-
-Return readable explanations with a small typed envelope for navigation and
-state. A walkthrough references source locations. A behavior difference links
-the implementations being compared. A concern links a trigger, dependency,
-possible customer consequence, supporting evidence, and remaining uncertainty.
-
-Distinguish these kinds of support:
-
-- Observed source behavior: linked implementation at a recorded snapshot.
-- Recorded rationale: a cited plan, decision, or discussion. This is an author's
-  statement, not automatic proof that the implementation matches it.
-- Inference: a reasoned interpretation that still needs checking.
-- Execution evidence: a command, environment, snapshots, exit status, and bounded
-  output captured by the runner. A proposed test is not a test result.
-
-Validate result structure, citation paths, ranges, and snapshot membership before
-making links actionable. Structural validation cannot prove an explanation true;
-the sources and experiments remain inspectable. Unsupported conclusions become
-questions or hypotheses rather than confirmed defects.
-
-Keep run status, concern assessment, evidence freshness, and human review state
-separate. An agent finishing a task or fixing code does not mark the human's
-understanding complete. Avoid a numerical safety score or a claim that all
-customer behavior has been covered.
-
-## Repositories and customer workflows
-
-Use Devcroft's proposed shared [repository relationships](repository-relationships-design.md)
-feature for planning, review, implementation, and learning. A relationship contains
-two repositories and a short high-level description, such as "B consumes A's
-gRPC services" or "A uses the protobuf contracts defined in D." Query incoming
-and outgoing connections automatically so the agent can find related source
-without repeated manual attachment. The agent inspects that source to discover
-specific contracts, fields, workflows, expectations, and tests. These details are
-investigation results, not required relationship metadata. Provide simple forms
-and lists for editing, with a graph view for exploration. Saved relationships
-are context-discovery hints and are not treated as a complete or permanently
-accurate dependency graph. Each session records which relationships and graph
-revision informed its context, plus any user overrides.
-
-For each consumer, record the version being examined and why it matters. The
-latest branch is not assumed to be deployed. For staged migrations, investigate
-the provider/consumer combinations that will actually coexist. Include older
-stored data and restore behavior where the contract reaches persisted data.
-
-When restore source is missing, the RPC omission can still be surfaced from the
-old/new comparison. Its restore consequence remains unknown. When the repository
-is attached, continue the same investigation and connect producer, omitted
-information, consumer, and verification. Searches must record their scope,
-truncation, and exclusions; no matches is not proof of no consumers.
-
-## Verification
-
-Source analysis is the default operation. Tests and reproductions are explicit
-investigation actions with concrete commands, environments, and limits. Inspect
-and run them in disposable copies/worktrees with synthetic data as appropriate;
-the review does not modify the checkout being explained.
-
-For a bug fix, useful evidence includes a reproduction failing before and passing
-after, plus targeted neighboring cases. For a migration, replay shared inputs
-against old and new implementations when feasible, compare observable outputs
-and side effects, and exercise actual consumers. Equal outputs for sampled inputs
-do not prove general compatibility. Some workflows need external services or
-manual observation; record that limitation and the verification still needed.
-
-Generated test candidates remain distinct from accepted tests and actual runs.
-Record environment mismatch and inconclusive runs explicitly. Inspection,
-verification, and implementation use distinct capabilities; existing user
-authorization/configuration should prevent repetitive permission prompts.
-
-## Implementation seams in Devcroft
-
-Expose one deep investigation module shared by desktop and CLI. Its interface
-supports starting a session, applying a user action/question, reading state or
-events, and cancelling a run. It owns snapshot selection, evidence validation,
-run lifecycle, freshness, and persistence. Callers do not manage provider event
-formats or assemble prompts themselves.
+## Review workflow
 
 ```mermaid
 flowchart TD
-    Review[Review selection] --> Core[Investigation module]
-    Explore[Assistant workspace] --> Core
-    CLI[Headless CLI] --> Core
-    Core --> Context[Snapshots and targeted source retrieval]
-    Core --> Runner[Installed agent runner]
-    Core --> Store[Local sessions and evidence]
-    Runner --> Context
-    Runner --> Verify[Isolated verification]
+    Change[Captured before and after source] --> Source[Inspect behavior and required concepts]
+    Intent[Design doc and reviewer context] --> Source
+    Map[Optional repository relationships] --> Source
+    Source --> Guide[Review guide: intent, concepts, walkthrough, checkpoints]
+    Source --> Effects[Trace effects within and across repositories]
+    Effects --> Verification[Run focused verification when available]
+    Effects --> Guide
+    Verification --> Guide
+    Guide --> Followup[Contextual conversation]
+    Followup --> Source
+    Followup --> Update[Requested guide updates]
+    Update --> Guide
 ```
 
-Proposed initial ownership:
+1. **Capture the review.** Resolve the comparison, attached design/requirements,
+   and any stated familiarity or learning needs. Save exact source and document
+   versions, plus relationship context where available.
+2. **Establish intent and assess the change.** Extract requirements and ambiguities,
+   check local correctness, and identify changed behavior and assumptions. Read
+   complete relevant source. Treat the author's explanation as intent to check.
+3. **Build the guide and choose questions.** Explain necessary concepts and walk
+   through execution. Map requirements to code and tests. Select local correctness
+   and impact questions, including related repositories when relevant. Let the
+   reviewer follow the guide or interrupt with a contextual question.
+4. **Trace plausible effects.** Connect the producer or caller, changed contract,
+   consuming code, and workflow. Inspect counterevidence: fallbacks, unused fields,
+   version gates, feature flags, and changed requirements can explain compatibility.
+5. **Verify where useful.** Propose or run a focused reproduction or consumer test
+   using the session's configured capabilities. Record what actually ran.
+6. **Update and continue.** Incorporate evidence and open questions into guide
+   checkpoints. Answer follow-ups and apply requested explanatory updates. Reuse
+   evidence from unchanged snapshots; preserve prior guide revisions and answers
+   when refreshing context.
+
+Keep a bounded question queue and visible progress such as "Inspecting restore's
+reader for the changed RPC output." Finish a targeted question when answered.
+Distinguish completed, cancelled, interrupted, budget-limited, and failed runs.
+A completed run does not imply exhaustive review.
+
+## What the reviewer receives
+
+Organize the guide around intent, concepts, behavior, and workflows. Keep concerns
+accessible throughout the walkthrough. An explanation can help someone understand
+the code while leaving its correctness unresolved. A checkpoint should distinguish
+implementation evidence, test evidence, missing verification, and human judgment.
+Repository lists and the existing graph support context and navigation.
+
+Each concern contains the changed behavior and before/after evidence; the
+triggering input or workflow; the contract or assumption and relevant versions/
+configuration; a trace through source to the consumer and customer effect;
+counterevidence and remaining uncertainty; and a next check or possible remedy
+where justified. Keep verification state and human disposition separate from
+the assessment.
+
+An illustrative migration concern could read:
+
+> Restore may lose information after the RPC migration. The old implementation
+> writes metadata M; the new implementation omits it. At the inspected consumer
+> revision, restore reads M to reconstruct state. The normal request path does
+> not exercise that reader. Verify by creating data through the new implementation
+> and restoring it through the supported consumer version.
+
+In a real result, each source claim links to its snapshot. Before reading the
+consumer, the omission is an observed difference and the restore consequence is
+an open question. After inspecting it, source can support a concern even when
+execution is unavailable. A reproduction supplies separate evidence. An
+intentional compatible omission should receive a scoped explanation of why the
+consumer tolerates it.
+
+### Evidence and coverage
+
+Distinguish observed source behavior, recorded intent, inference, and execution
+evidence. A proposed test is not a result; a graph description is not a verified
+runtime dependency. Validate citation paths, ranges, content identities, and
+snapshot membership before making links actionable. Structural validation makes
+results inspectable but cannot prove the model's reasoning true.
+
+Track coverage per behavior/question and repository snapshot:
+
+| State | Meaning |
+| --- | --- |
+| Discovered | Relationship or source suggests context; it has not been inspected. |
+| Investigating | A specific question is being checked. |
+| Assessed | A scoped conclusion has evidence, whether concerning or compatible. |
+| Unresolved | Source, version information, execution, or further reasoning is missing. |
+| Excluded | Outside the selected scope or budget, with the reason retained. |
+
+Report scope concretely: "Inspected backend and CLI at these revisions; UI source
+is unavailable; the deployed CLI revision is unknown." Searches retain query,
+snapshot, scope, limits, truncation, and exclusions. No matches is a scoped search
+result, not proof that consumers do not exist.
+
+Keep run status, concern assessment, coverage, freshness, human understanding,
+and human disposition independent. A human can accept or dismiss a concern with
+a note, mark an explanation understood, keep a question open, or ask for another
+check. Resolving a comment, reading a section, or finishing an agent run does not
+establish understanding or approval of the change. Do not produce a numerical
+safety score or an "all consumers safe" verdict.
+
+## Source identity and version assumptions
+
+Default to the active Review comparison. Full diff means merge-base to captured
+working tree; uncommitted means HEAD to captured working tree. Current Review
+combines staged and unstaged work. Any later stage-only choice needs a distinct
+capture and label.
+
+Capture attached design docs and requirement excerpts with their source identity
+and version/content hash. Guide checkpoints cite the intent that was actually
+reviewed. If the design changes, preserve the old comparison and refresh against
+the newly selected intent rather than silently rewriting the review criteria.
+
+For uncommitted work, capture an immutable overlay over a commit containing
+changed files, included untracked files, deletions, and content hashes. Record
+unavailable files and exclusions. Detect concurrent edits during capture and
+retry or expose inconsistency instead of mixing versions.
+
+For automatically included related repositories, propose the checked-out HEAD
+commit as the initial snapshot. Show that choice and any excluded dirty changes.
+Allow another locally available revision or an explicitly captured working tree.
+Checkout binding supplies location, not deployment information. Missing source
+or an unavailable ref is a gap; graph queries do not imply fetching or cloning.
+
+Local HEAD and the latest branch are not assumed to be deployed. Record the
+version examined and why it matters. A missing deployed version limits release
+compatibility conclusions while source review can continue. For migrations,
+consider provider/consumer versions that actually coexist, stored data, restore,
+and rollback. Avoid an exhaustive version matrix unless the rollout requires it.
+
+For later coordinated repository changes, retain each before/after comparison
+and assess relevant mixed-version combinations. Compatibility between all new
+revisions alone does not establish rollout compatibility.
+
+A citation contains repository identity, snapshot, path, line range, and content
+identity. Resolve named refs to commit IDs and run source inspection against
+captured versions, including native agent reads. Open the cited snapshot even
+if the live checkout moves. A migration can attach old/new implementations from
+different repositories as semantic comparison sources without shared Git history.
+Unregistered local source can use a session-local identity, without automatic
+graph discovery for that key.
+
+Capture a repository when it enters scope and record the time. This is a set
+of explicit source versions, not an atomic snapshot of a deployed system.
+Reading more files from an existing snapshot preserves its identity. Adding a
+repository/comparison, changing intent or versions, or adopting refreshed graph
+context creates a new context generation. Reuse prior evidence only where its
+inputs still apply. Late output from an older generation cannot replace the
+current review.
+
+Guide sections and contextual turns retain stable IDs, the guide revision they
+refer to, and their evidence/context generation. Elaborating an explanation over
+unchanged inputs creates a guide revision without recapturing source. Refreshing
+source or intent makes affected walkthroughs and checkpoints need review again;
+retain prior human notes and markers with their original context.
+
+The run owner applies context expansion before accepting results that use it;
+subsequent submissions identify the new generation. Expansion queries that find
+a changed graph must adopt that context explicitly rather than mixing revisions
+silently into an existing assessment.
+
+Initially use conservative freshness: when selected sources or relationship/node
+metadata used for context change, mark assessments as needing refresh. Preserve
+older answers with their context. Track query/discovery scope as well as citations;
+a new consumer or changed search result can matter even when cited lines remain
+unchanged. Narrow invalidation only when dependency tracking supports it.
+
+## Verification
+
+Source inspection is the default. Tests and reproductions have concrete commands,
+snapshots, environments, expected observations, and limits. Run in disposable
+copies/worktrees with synthetic data where appropriate, keeping the reviewed
+checkout available for ongoing work.
+
+For a fix, seek a reproduction failing before and passing after plus targeted
+neighboring cases. For a migration, replay shared inputs against old/new
+implementations and exercise actual consumers. Include relevant side effects
+and persisted data. Equal outputs for sampled inputs do not prove compatibility.
+
+Store commands, working directories, source versions, environment details,
+exit status, and bounded output as runner-recorded evidence. Generated test
+candidates, accepted tests, and completed runs remain distinct. Record unavailable
+services, environment mismatch, and inconclusive results explicitly.
+
+Inspection, isolated verification, and implementation use distinct capabilities.
+Existing authorization/configuration should avoid repetitive permission prompts.
+Acting on a finding can use the coding-agent/comment workflow as a separate
+action. Re-review resulting changes before claiming a concern was addressed.
+
+## Session model and implementation seam
+
+Use one deep investigation module shared by desktop and CLI, centered on a
+change-review session and its guide. Its interface starts a session, applies a
+question, guide action, or context action, reads state/events, and cancels a run.
+It owns context capture, guide revisions, evidence validation, freshness,
+lifecycle, and persistence. Callers do not assemble prompts or interpret
+provider-specific events.
+
+```text
+ReviewSession
+  id, title, objective, revision, context_generation
+  reviewer_context       # optional stated familiarity and explanation preferences
+  comparisons[]          # primary change initially; migration source pairs
+  repository_snapshots[] # identities, versions, roles, capture details
+  relationship_context[] # saved queries, edges, node metadata and revisions
+  context_sources[]      # captured requirement/design, incident, author decision
+  guide                  # stable section IDs, content, revision history, evidence links
+  questions[]            # behavior, scope, reason, coverage state, conclusion
+  turns[]                # section/source target, guide revision, questions/answers
+                         # run/generation, progress, provider session identity
+  evidence[]             # source, search, recorded execution, cited intent
+  results[]              # behavior changes, impact traces, concerns, explanations
+  reviewer_notes[]       # section/checkpoint target, understanding, human disposition
+```
+
+Keep the typed envelope small: identity, navigation, provenance, and state.
+Guide sections hold readable prose, annotated snippets, diagrams where useful,
+and links to evidence or results. Use the same concern/checkpoint identities in
+the guide and conversation so an update cannot leave contradictory copies.
+An impact trace is a session result rather than a permanent contract schema in
+the relationship store. Keep guide and conversation actions accessible through
+the shared CLI as well as the desktop.
 
 | Location | Responsibility |
 | --- | --- |
-| `src/investigation/` | Shared session model, source snapshots, validated results, persistence, run lifecycle |
-| `src/investigation/runner.rs` initially | One concrete installed-agent integration; extract provider adapters when adding the next supported provider |
-| `src/assistant/` | GPUI session view, context selection, questions, walkthrough and concern navigation |
-| `src/data/relationships.rs` initially | Shared relationship records and queries for planning, review, and exploration |
-| `src/assistant/source.rs` initially | Read-only snapshot source viewer for unchanged files and other repositories |
-| `src/cli/investigation.rs` | Headless input/output translating into the same investigation interface |
-| `src/workspace.rs`, `src/command_palette.rs` | Navigation, selection handoff, and keeping a session alive across repository switches |
-| `assets/skills/devcroft/` | Agent-facing investigation workflow and CLI discovery |
+| `src/investigation/` (new) | Sessions, guide revisions, snapshots, evidence, lifecycle, persistence, private context-selection helpers |
+| `src/investigation/runner.rs` (new) | First installed-agent integration; extract adapters when adding supported providers |
+| `src/review/` | Review changes entry, guide, contextual conversation, result navigation, existing comments |
+| Snapshot source view (new, initially under `src/review/`) | Read-only full source and cross-repository evidence navigation |
+| `src/cli/` and `src/commands/` | New investigation commands calling the shared module; command grammar still to be designed |
+| `src/data/relationships.rs` | Existing graph store and query interface, reused directly |
+| `src/data/repositories.rs` | Existing repository catalog and device checkout bindings |
+| `src/workspace.rs` | Review handoff and session lifetime across repository switches |
+| `assets/skills/devcroft/` | Agent workflow and shared CLI discovery |
 
-These are ownership suggestions, not a requirement to create all files upfront.
-Keep internal helpers private and split them as real responsibilities emerge.
+`src/review/git.rs` reads one checkout against HEAD or a merge base. Extract
+reusable snapshot operations as needed; immutable comparisons and dirty overlays
+require new work. Diff hunks and Git reads have limits, so obtain analysis source
+separately and report unavailable content. Displayed hunks are incomplete input.
 
-### Reuse and current limitations
-
-- `src/review/git.rs` currently compares a single checkout's working tree against
-  HEAD or a merge base. Reuse relevant Git logic, extracting snapshot operations
-  into a shared module as needed. Arbitrary immutable comparisons need new work.
-- `src/review/model.rs` and its renderer intentionally cap diff output. Analysis
-  must obtain complete source separately and report unavailable content; the
-  displayed hunks are not a complete analysis input.
-- `src/review/feedback.rs` already supports human line/range feedback. Hand a
-  finding into that workflow when its location belongs to the active diff.
-  Keep investigation notes separate, because they also cover unchanged files
-  and multiple repositories. The current review CLI cannot create comments;
-  any CLI handoff that creates them requires an explicit extension.
-- `src/data/repositories.rs` and device checkout bindings supply the existing
-  repository catalog. Use it for context selection without requiring all
-  included repositories to have changes.
-- `src/agent_sessions/` discovers and resumes conversations. Its metadata process
-  helper explicitly does not submit prompts. A structured investigation runner
-  is new work; it must not be assumed to exist in that catalog.
-- `src/artifacts.rs` and `src/data/artifacts.rs` provide Markdown artifacts and
-  originating-session links. Use them for selected plans and saved summaries,
-  not as the storage format for every live run and source snapshot.
+`src/agent_sessions/` discovers/resumes conversations; its metadata process helper
+does not submit prompts. A structured runner is new work. Artifacts can supply
+selected plans and receive exported guides or summaries; live sessions, guide
+history, and source blobs need their own store.
 
 ### Agent execution
 
-Build on installed coding agents and Devcroft's headless CLI/skill approach.
-Initial intended provider scope is OpenCode, Codex, and Claude, with one validated
-provider first. Existing support for launching a harness in a terminal does not
-imply support for structured assistant execution.
+Use installed agents and the existing CLI/skill approach. Intended providers
+remain OpenCode, Codex, and Claude, beginning with one validated provider.
+Devcroft supplies reproducible context, result handling, and review navigation;
+the agent performs source investigation. Add language-specific indexes only
+when observed retrieval problems justify them.
 
-The first implementation task is a capability experiment: select an installed
-provider and verify prompt submission, source access across scoped snapshots,
-incremental results, cancellation including child processes, output limits,
-and enforceable source-write restrictions. Verify structured result delivery and
-test-result capture. Determine the concrete invocation from the installed
-version's documentation; this proposal does not assume shared flags or protocols.
+Run a dedicated review conversation. Attach relevant author decisions as sources,
+keeping intent distinguishable from interpretation. Do not submit hidden review
+turns into the active implementation terminal.
 
-Run a dedicated investigation conversation. Attach relevant author decision
-records/session excerpts as sources when available. Preserve the distinction
-between recorded intent and the investigating agent's interpretation. Do not
-submit hidden review prompts into the user's active implementation terminal.
+The first capability experiment validates prompt submission, scoped access across
+repository snapshots, incremental progress, structured results, output limits,
+cancellation including child processes, and source-write restrictions. Determine
+invocation from the installed version's documentation; terminal launch support
+does not establish these capabilities.
 
-Use validated JSON results through a supported provider output mechanism or a
-Devcroft-owned CLI result-ingestion path (command naming remains to be designed).
-Normalize provider progress into a small set of run events. Do not scrape the
-terminal display to reconstruct claims. CLI mutations need versioned input,
-fresh revisions, and idempotency for retried submissions. A run owner handles
-cancellation and persistence; headless runs must also work without the desktop.
+Use supported structured output or a Devcroft-owned CLI ingestion path with
+versioned input, fresh revisions, and idempotent submissions. Normalize progress
+to a small set of events. Capture execution evidence from the runner rather than
+reconstructing claims from terminal text. A run owner handles process lifetime
+and restart recovery, including without the desktop.
 
-Only advertise capabilities validated for that provider. Native filesystem tools
-must obey the same scoped snapshot and write restrictions as CLI retrieval; a
-prompt saying "read only" is insufficient enforcement. Reuse installed-agent
-runtime capabilities where they meet the contract. If they cannot, narrow the
-first provider or capability rather than silently weakening the contract.
+Only advertise validated capabilities. Native filesystem tools and verification
+commands must obey the selected scope and write restrictions; a prompt saying
+"read only" is insufficient enforcement. Reuse provider runtime facilities where
+they meet the contract. Otherwise narrow the supported capability or provider.
 
 ### Persistence
 
-Propose durable machine-local records under the selected Devcroft data root at
-`investigations/`, outside `portable/`. Keep regenerable retrieval indexes under
-`cache/`. Retain source blobs referenced by saved results until their owning
-records are deleted; they are not disposable cache entries.
+Store durable local sessions at `investigations/` under the selected Devcroft data
+root, outside `portable/`, including guides, contextual conversations, reviewer
+notes, and revision history. Retain cited source and design-doc blobs until owning
+records are deleted. Regenerable retrieval indexes can live under `cache/`.
 
 Use schema versions, cross-process locking, atomic writes, revision checks, and
-idempotent run updates. Mark interrupted runs accurately after restart. Keep
-local checkout paths and run state local. Intentional relationship definitions
-belong with portable repository metadata as described in the relationship
-proposal; join local paths when querying. Saving a selected
-summary as a Resources artifact is a deliberate export into the existing
-portable store; raw run logs and snapshots are not exported automatically.
+idempotent run updates. Preserve interrupted runs accurately after restart.
+Checkout paths, captured sources, and raw execution state remain local.
+Relationships and repository descriptions retain their portable storage.
+Exporting a selected guide or summary as a Markdown artifact is deliberate; it
+does not automatically export raw conversations, source snapshots, or run logs.
+Include the reviewed versions, selected excerpts, source paths, and evidence
+limitations. Exported prose and diagrams need readable Markdown representations;
+mark evidence links requiring the original local session so a recipient can
+distinguish included evidence from material unavailable on their device. Retain
+the originating session and guide revision on the export. Later guide edits do
+not silently change the exported artifact.
 
-## User experience
+## Review UI
 
-Provide an Assistant destination that works even with no changes. The Review tab
-can open the same session in a panel with the current selection attached. Start
-from commands such as Explain selection, Check this change, Verify a fix, Explore
-repository, and Compare implementations. They prefill intent and context.
+Enter from the existing Review destination and give the guide the main reading
+area while the assisted review is open. Show a compact overview and section
+navigation, with the option to read freely or follow walkthrough steps. Keep
+concerns and open checkpoints easy to reach without completing the walkthrough.
 
-Show the question and available repositories compactly. Expand context details
-when needed. Present explanations first for learning, behavioral differences and
-concerns first for regression work. Let the user switch between those views in
-the same session. A guided walkthrough navigates actual snapshot code.
+Open actual snapshot source alongside the guide when following evidence. Provide
+a contextual conversation panel for a selected section, excerpt, or checkpoint,
+plus a session-wide question entry. Show the current conversation target clearly
+and preserve it when navigating. Offer Explain further, Show an example, Show as
+pseudocode, and Add to guide as contextual actions rather than mandatory steps.
 
-Follow a citation into another repository without replacing the session or
-changing the coding terminal's working directory. A source pane is required:
-the current diff stream alone cannot display arbitrary unchanged source. Full
-source navigation is part of the first useful slice, not a cosmetic follow-up.
+Adapt the layout to available space; a narrow window can switch between guide,
+source, and conversation while preserving position and focus. Dismissing the
+assisted review returns to the normal diff. Reserve no empty space for closed
+panels. Keep run progress and cancellation accessible while reading the guide.
 
-Allow the reviewer to pin conclusions, keep questions open, and revisit earlier
-answers. Human understanding is separate from files viewed and comments resolved.
+Expose inclusion reasons, inspected revisions, coverage, and gaps in a context
+view. Use familiar repository names in explanations and keep hashes/revision
+tokens in evidence details. Link to the existing Relationships page for edits.
+A separate review graph visualization can follow later.
+
+Open citations in full snapshot source, including unchanged files and other
+repositories, while retaining the session and originating comparison. Show
+before/after or producer/consumer locations together when needed. Source
+navigation does not change a coding terminal's directory. Keep session lifetime
+independent of the active repository view.
+
+Allow human notes and concern disposition. Offer deliberate handoff into inline
+feedback when a finding belongs to the active diff. Preserve provenance and
+revalidate the anchor; otherwise keep a session concern. The current review CLI
+lists/resolves/reopens/deletes comments but cannot create them or edit bodies.
+CLI comment creation requires an explicit extension.
+
+Keep optional understanding markers beside the relevant explanation. Display
+guide updates and freshness in context, retaining notes and the reading position.
+Provide Export guide with a choice of the whole guide or selected sections and
+make its source/version context visible before saving the Markdown artifact.
 
 ## Delivery sequence and acceptance evidence
 
-1. **Runner capability experiment and fixtures.** Validate one installed provider
-   against the execution requirements above. Create small controlled repositories
-   for a local change, unchanged-code exploration, a bug fix, and the omitted RPC
-   information with a restore consumer in a second repository. Include an
-   intentional, compatible omission as a counterexample.
-2. **One complete session journey.** Implement local session storage, immutable
-   context, the CLI interface, one runner, validated citations, an Assistant view,
-   and source navigation. Demonstrate both no-diff exploration and explanation of
-   an uncommitted change. Cancellation/restart/freshness must work in this slice.
-3. **Regression and migration investigations.** Add typed behavior differences,
-   concerns, requirement/reproduction attachments, shared relationship queries,
-   and old/new implementation comparisons. The relationship records, CLI, and
-   forms can ship independently ahead of this step. Demonstrate automatic context
-   selection for the cross-repository restore fixture using only high-level
-   relationship descriptions. The agent must discover the detailed restore
-   dependency from code. Show an honest gap when its consumer is unavailable.
-4. **Verification and Review integration.** Add isolated experiments and recorded
-   results, contextual entry from diff selections, human notes, review-comment
-   handoff, and selected summary export. Show a failing-before/passing-after bug
-   reproduction and a neighboring regression case.
-5. **Broaden from observed use.** Add remaining intended providers with adapter
-   contract tests, a relationship graph view, PR context import, incremental
-   retrieval, and relationship suggestions. Introduce language indexes only when
-   they solve demonstrated retrieval gaps.
+1. **Prove guided and cross-repository review through one installed runner.**
+   Create a single-repository change with a design doc and a stated unfamiliar
+   language. Demonstrate a grounded concept explanation, behavioral walkthrough,
+   requirement checkpoints, and a contextual question that updates the guide.
+   Also create a changed provider, shared contract, and unchanged restore consumer
+   with only high-level relationships. Find the detailed restore dependency and
+   include an intentional compatible omission as a counterexample. Validate the
+   execution and evidence contract across both scenarios.
+2. **Deliver the interactive guide journey.** Implement local sessions and guide
+   history, immutable context, shared CLI, one runner, relationship context where
+   applicable, validated citations, the guide as the main Review surface,
+   contextual chat, and full source navigation together. Exercise both the
+   single-repository learning journey and an uncommitted provider change affecting
+   an unchanged consumer. Demonstrate cancellation, restart, missing source, and
+   refresh while preserving guide revisions, answers, and human notes.
+3. **Complete verification and reviewer handoff.** Add isolated experiments,
+   captured results, human disposition, comment handoff, and Markdown guide export.
+   Demonstrate a failing-before/passing-after reproduction and a neighboring case.
+   Exercise old/new implementations across repositories and distinguish normal
+   operation from restore behavior.
+4. **Broaden from observed use.** Add remaining intended providers with adapter
+   contract tests, coordinated changes, richer deployed-version inputs, explicit
+   PR import, graph navigation, and relationship suggestions. Consider standalone
+   explanation/exploration once the change-review journey is useful.
 
-The data model supports multiple repositories from the first slice. Saved
-relationships select context automatically; automatic discovery of new
-relationships comes later. Normal PR Open actions can retain
-their current browser behavior; an explicit Investigate action imports context.
+Steps 1–3 define the first release. Step 1 is an experiment, not completed product
+support. Normal PR Open actions retain their browser behavior; a later explicit
+review action can import context.
 
-Test the investigation module through its desktop/CLI interface: no-diff input,
-dirty snapshots, excluded/unavailable files, cross-repository citations, stale
-generations, interrupted runs, malformed results, concurrent writes, and tool
-failures. Use real fixture execution for verification capture. Assess model
-quality separately with repeated scenario runs and reviewer inspection: finding
-the true restore dependency, avoiding the compatible-omission false positive,
-grounding explanations, and stating missing context. Passing Rust tests does
-not establish the quality of model investigations.
+Acceptance scenarios must include:
 
-For UI changes, run the repository's Rust checks and a desktop smoke test covering
-selection handoff, snapshot citation navigation, repository switching, follow-up
-questions, cancellation, and stale-answer display. Evaluate human usefulness by
-whether the reviewer can explain the behavior, a design tradeoff, and a failure
-path using the available evidence.
+- Review a repository with no relationships using a supplied design doc. Explain
+  the necessary language/architectural concepts, follow normal and failure paths,
+  and map important requirements to actual implementation and test evidence.
+- Adapt explanation depth to stated familiarity and follow-up questions. Keep
+  simplified examples distinguishable from actual source and preserve ambiguous
+  requirements or unsupported claims as open questions.
+- Ask from a selected guide section or source range, navigate elsewhere, and
+  retain the original question context. Add a useful answer to the guide and
+  resume the walkthrough without losing notes or reading position.
+- Preserve human understanding markers independently of concern disposition and
+  test results. Source/design refresh marks affected sections for renewed review
+  while keeping the prior guide and human decisions inspectable.
+- Reopen a saved guide and contextual conversation. Export selected sections as
+  readable Markdown with version context and explicit limits on local evidence
+  links; later session changes leave the saved export unchanged.
+- Connect the omitted RPC information to restore through real consumer source,
+  starting with only high-level relationships.
+- Explain the compatible-omission counterexample with evidence instead of
+  reporting an unsupported defect.
+- With consumer source absent, report the producer difference and missing
+  evidence, then continue the same review after attachment.
+- Inspect incoming dependencies for new provider expectations; follow transitive
+  consequences using directed relationships and verified source paths.
+- Terminate cycles and bound inspection of irrelevant neighbors. Never present
+  an undirected graph path alone as causal evidence.
+- Expose missing/stale edges, filtered connections, graph limits, unavailable
+  versions, and dirty related checkouts as context choices or limitations.
+- Prevent source/metadata changes and late output from rewriting earlier context
+  or replacing the current assessment.
+- Keep evidence stable while a coding agent works; cancelling review stops owned
+  processes without interrupting that coding agent.
 
-## Decisions to settle through the first experiment
+Test the shared module through its desktop/CLI interface: capture consistency,
+immutable citations, bounded queries, guide/section revisions, anchored turns,
+human-note preservation, generations, malformed results, concurrent writes,
+interruption recovery, export, and tool failures. Use real fixture execution to
+validate test capture. Assess model quality separately through repeated scenarios
+and human inspection, including whether concepts are relevant, explanations are
+accurate, and checkpoints are grounded; Rust tests do not establish their quality.
 
-- Which installed provider meets the minimum execution contract with the least
-  integration work? Keep detailed provider protocol decisions behind that result.
-- How much source capture is practical for large dirty worktrees? Preserve exact
-  evidence and visible exclusions before optimizing retention or retrieval.
-- Which test environments can be reproduced locally, and which require a recorded
-  external/manual verification step?
-- Does a compact Assistant panel suffice for everyday explanation, and when does
-  a full session view become necessary? Validate with the same session model.
+For UI implementation, run the repository's Rust checks and a desktop smoke test
+covering selection/comparison handoff, cross-repository source navigation,
+guide reading and updates, contextual follow-up, understanding markers, repository
+switching, cancellation, stale sections, comment handoff, and Markdown export.
+The usefulness check is whether a reviewer unfamiliar with the language can
+explain the implementation's key concepts, assess how it meets the design, and
+identify behavior and verification gaps. For a cross-repository change, also
+check whether they can explain the affected consumer workflow using the evidence.
 
-The initial defaults are current-checkout context, concise answers with expandable
-sources, automatic context from saved relationships with manual overrides, source
-inspection first, local durable sessions, and reviewer-owned conclusions.
+## Questions for the first experiment
+
+- Which installed provider meets the execution contract with least new work?
+- What capture strategy gives consistent, practical access to large dirty
+  worktrees while preserving exact citations and visible exclusions?
+- What investigation budget discovers the restore dependency and counterevidence
+  without examining every connected repository?
+- What explanation depth helps a reviewer unfamiliar with the language follow
+  the actual implementation and make informed review decisions?
+- Which consumer verification environments run locally, and which require a
+  recorded external or manual check?
+- What layout keeps the guide, source evidence, and contextual conversation
+  comfortable to navigate at different window sizes?
+
+Initial defaults: the active Review comparison, an evolving guide as the main
+surface, contextual conversation, explanation matched to the reviewer's needs,
+source inspection first, optional relationship context with evidence-driven
+expansion, local durable sessions, and reviewer-owned conclusions.

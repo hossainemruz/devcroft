@@ -11,8 +11,8 @@ use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, ColorName, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _,
-    h_flex, tag::Tag, v_flex,
+    ActiveTheme as _, ColorName, Disableable as _, IconName, Sizable, Size, StyledExt as _,
+    WindowExt as _, h_flex, tag::Tag, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -680,6 +680,13 @@ impl ArtifactBrowser {
                     })
                 })
                 .item({
+                    let id = menu_snapshot.artifact.id.clone();
+                    PopupMenuItem::new("Copy ID").on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                        window.push_notification("Copied artifact ID", cx);
+                    })
+                })
+                .item({
                     let view = view.clone();
                     PopupMenuItem::new("Edit Markdown")
                         .on_click(move |_, window, cx| {
@@ -992,9 +999,9 @@ impl Render for ArtifactBrowser {
             if let Some(error) = &self.error {
                 main = main.child(div().text_color(cx.theme().danger).child(error.clone()));
             }
-            // Single compact meta line — kind, recency, repository, and
+            // Single compact meta line — kind, recency, ID, repository, and
             // originating sessions share one wrapping row so the document
-            // starts higher.
+            // starts higher. The ID copies on click for CLI and agent use.
             let mut meta = h_flex()
                 .gap_2()
                 .items_center()
@@ -1005,6 +1012,34 @@ impl Render for ArtifactBrowser {
                         .text_color(cx.theme().muted_foreground)
                         .child(updated_label(artifact.updated_at, current_unix_secs())),
                 );
+            {
+                let artifact_id = artifact.id.clone();
+                let tooltip_id = artifact_id.clone();
+                let label_id = artifact_id.clone();
+                meta = meta
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("·"),
+                    )
+                    .child(
+                        Button::new("copy-artifact-id")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(IconName::Copy)
+                            .label(artifact_id.clone())
+                            .tooltip(format!("Copy artifact ID: {tooltip_id}"))
+                            .accessibility_label(format!("Copy artifact ID {label_id}"))
+                            .on_click(move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    artifact_id.clone(),
+                                ));
+                                window.push_notification("Copied artifact ID", cx);
+                            }),
+                    );
+            }
             if let Some(repository) = artifact.repository.clone() {
                 meta = meta
                     .child(

@@ -54,6 +54,7 @@ pub(crate) enum Scope {
 }
 pub(crate) struct OpenSession(pub(crate) crate::data::artifacts::OriginSession);
 impl EventEmitter<OpenSession> for ArtifactBrowser {}
+impl EventEmitter<crate::preview::OpenReference> for ArtifactBrowser {}
 
 struct Draft {
     input: Entity<TextareaState>,
@@ -80,6 +81,8 @@ pub(crate) struct ArtifactBrowser {
     draft: Option<Draft>,
     saved_drafts: std::collections::HashMap<Scope, Draft>,
     saving: bool,
+    opening: bool,
+    open_generation: u64,
     pub(crate) focus_handle: FocusHandle,
     sidebar_focus: FocusHandle,
     detail_focus: FocusHandle,
@@ -126,6 +129,8 @@ impl ArtifactBrowser {
             draft: None,
             saved_drafts: Default::default(),
             saving: false,
+            opening: false,
+            open_generation: 0,
             focus_handle: cx.focus_handle(),
             sidebar_focus: cx.focus_handle().tab_stop(true),
             detail_focus: cx.focus_handle().tab_stop(true),
@@ -207,6 +212,8 @@ impl ArtifactBrowser {
     }
     pub(crate) fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
         if self.scope != scope {
+            self.open_generation = self.open_generation.wrapping_add(1);
+            self.opening = false;
             if let Some(draft) = self.draft.take() {
                 self.saved_drafts.insert(self.scope.clone(), draft);
             }
@@ -295,7 +302,7 @@ impl ArtifactBrowser {
         cx.notify();
     }
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.saving {
+        if self.saving || self.opening {
             return;
         }
         let Some(root) = self.root.clone() else {
@@ -354,6 +361,15 @@ impl ArtifactBrowser {
                                 }
                                 _ => None,
                             });
+                            if let Some(snapshot) = &pinned
+                                && !this
+                                    .list
+                                    .artifacts
+                                    .iter()
+                                    .any(|s| s.artifact.id == snapshot.artifact.id)
+                            {
+                                this.list.artifacts.insert(0, snapshot.clone());
+                            }
                             let selection = this
                                 .selected_id
                                 .as_ref()
@@ -362,8 +378,11 @@ impl ArtifactBrowser {
                                 })
                                 .cloned()
                                 .or(pinned)
+                                .filter(|s| {
+                                    this.kind_filter.is_none_or(|kind| s.artifact.kind == kind)
+                                })
                                 .or_else(|| this.draft.as_ref().map(|d| d.snapshot.clone()))
-                                .or_else(|| this.list.artifacts.first().cloned());
+                                .or_else(|| this.visible_artifacts().next().cloned());
                             this.select(selection, cx);
                         }
                         Err(error) => this.error = Some(error),
@@ -377,7 +396,68 @@ impl ArtifactBrowser {
         })
         .detach();
     }
+    /// Open a referenced resource even if it is archived or beyond the current
+    /// page. Do not replace a draft or let an older list refresh win the race.
+    pub(crate) fn open_by_id(&mut self, id: String, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.draft.is_none() && !self.saving,
+            "Save or cancel the resource draft before opening another resource"
+        );
+        let root = self
+            .root
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Portable data is unavailable"))?;
+        self.open_generation = self.open_generation.wrapping_add(1);
+        let generation = self.open_generation;
+        self.opening = true;
+        self.refresh.generation = self.refresh.generation.wrapping_add(1);
+        self.error = None;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    ArtifactStore::new(&root)
+                        .get(&id)
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.open_generation {
+                    return;
+                }
+                this.opening = false;
+                match result {
+                    Ok(snapshot) if this.draft.is_none() && !this.saving => {
+                        this.kind_filter = None;
+                        this.include_archived |= snapshot.artifact.archived;
+                        if !this
+                            .list
+                            .artifacts
+                            .iter()
+                            .any(|s| s.artifact.id == snapshot.artifact.id)
+                        {
+                            this.list.artifacts.insert(0, snapshot.clone());
+                        }
+                        this.select(Some(snapshot), cx);
+                    }
+                    Ok(_) => {
+                        this.error = Some(
+                            "Save or cancel the resource draft before opening another resource"
+                                .into(),
+                        )
+                    }
+                    Err(error) => this.error = Some(format!("Could not open resource: {error}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+        Ok(())
+    }
+
     fn select(&mut self, snapshot: Option<Snapshot>, cx: &mut Context<Self>) {
+        self.open_generation = self.open_generation.wrapping_add(1);
+        self.opening = false;
         if self.selected.as_ref().map(|s| &s.artifact.content)
             != snapshot.as_ref().map(|s| &s.artifact.content)
             || self.preview.is_none()
@@ -389,8 +469,16 @@ impl ArtifactBrowser {
                     })
                 }
                 (_, Some(s)) => {
-                    let preview =
-                        cx.new(|cx| PreviewView::embedded(s.artifact.content.clone().into(), cx));
+                    let preview = cx.new(|cx| {
+                        let mut view = PreviewView::embedded(s.artifact.content.clone().into(), cx);
+                        view.set_reference_root(self.root.clone(), cx);
+                        view
+                    });
+                    cx.subscribe(
+                        &preview,
+                        |_, _, event: &crate::preview::OpenReference, cx| cx.emit(event.clone()),
+                    )
+                    .detach();
                     cx.subscribe(&preview, |this, _, event: &TocActive, cx| {
                         this.toc_active = event.0;
                         cx.notify();
@@ -822,13 +910,6 @@ impl Render for ArtifactBrowser {
                     )
             });
         let visible: Vec<Snapshot> = self.visible_artifacts().cloned().collect();
-        if visible.is_empty() && !self.list.artifacts.is_empty() {
-            sidebar = sidebar.child(
-                div()
-                    .text_xs()
-                    .child("No matching resources for this filter."),
-            );
-        }
         for snapshot in &visible {
             let snapshot = snapshot.clone();
             let artifact = &snapshot.artifact;
@@ -1150,7 +1231,44 @@ impl Render for ArtifactBrowser {
             if let Some(error) = &self.error {
                 detail = detail.child(div().text_color(cx.theme().danger).child(error.clone()));
             }
-            detail = detail.child(if self.refresh.busy { "Loading resources…" } else { "No resources for this repository. Ask an agent to create an artifact with devcroft artifact create --repository <key>." });
+            if self.refresh.busy || self.opening {
+                detail = detail.child("Loading resources…");
+            } else if self.error.is_some() || !self.list.errors.is_empty() {
+                detail = detail.child(Button::new("retry-resources").label("Retry").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.error = None;
+                        this.refresh(cx);
+                    }),
+                ));
+            } else if self.kind_filter.is_some() {
+                detail = detail.child(
+                    crate::empty_state::empty_state(
+                        gpui_kit::component::IconName::Search,
+                        "No matching resources",
+                        "Try showing every resource type.",
+                    )
+                    .content(
+                        gpui_kit::component::empty::EmptyContent::new().child(
+                            Button::new("clear-resource-filter")
+                                .label("Clear filter")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.set_kind_filter(None, cx)),
+                                ),
+                        ),
+                    ),
+                );
+            } else if self.scope == Scope::Repository(None) {
+                detail = detail.child(crate::empty_state::empty_state(
+                    gpui_kit::component::IconName::Folder,
+                    "Repository not registered",
+                    "Add this checkout from Projects to give its resources a home.",
+                ));
+            } else {
+                detail = detail.child(crate::empty_state::empty_state(
+                    gpui_kit::component::IconName::FileText, "No resources yet",
+                    "Ask your agent to save a plan, RFC, or note here. It will appear automatically.",
+                ));
+            }
         }
         h_flex()
             .id("resources")

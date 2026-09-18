@@ -195,6 +195,7 @@ fn project_opened_label(last_opened_at: Option<&str>, now_secs: i64) -> Option<S
 }
 
 pub(crate) enum HomeEvent {
+    OpenReference(crate::markdown_references::Reference),
     OpenRepository { key: String, label: String },
     AddRepository,
     Relationships,
@@ -401,6 +402,13 @@ impl HomeView {
         let artifacts = cx.new(|cx| crate::artifacts::ArtifactBrowser::new(root.clone(), cx));
         cx.subscribe(
             &artifacts,
+            |_, _, event: &crate::preview::OpenReference, cx| {
+                cx.emit(HomeEvent::OpenReference(event.0.clone()));
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &artifacts,
             |_, _, event: &crate::artifacts::OpenSession, cx| {
                 cx.emit(HomeEvent::OpenAgentSession(event.0.key.clone()))
             },
@@ -493,6 +501,15 @@ impl HomeView {
             .update(cx, |view, cx| view.set_active(true, cx));
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.reload(cx);
+    }
+
+    pub(crate) fn open_artifact(
+        &mut self,
+        id: String,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.artifacts
+            .update(cx, |view, cx| view.open_by_id(id, cx))
     }
 
     pub(crate) fn is_artifacts_page(&self) -> bool {
@@ -1339,13 +1356,43 @@ impl HomeView {
                 ),
         );
         if visible.is_empty() {
-            page = page.child(div().text_color(cx.theme().muted_foreground).child(
-                if self.all_projects.is_empty() {
-                    "No repositories yet. Add your first project below."
-                } else {
-                    "No repositories in this group."
-                },
-            ));
+            use gpui_kit::component::empty::EmptyContent;
+            let no_projects = self.all_projects.is_empty();
+            if self.project_errors.is_empty() {
+                page = page.child(
+                    crate::empty_state::empty_state(
+                        gpui_kit::component::IconName::Folder,
+                        if no_projects {
+                            "No repositories yet"
+                        } else {
+                            "No repositories in this group"
+                        },
+                        if no_projects {
+                            "Add a repository to organize its resources and agent sessions."
+                        } else {
+                            "Choose another group or show all repositories."
+                        },
+                    )
+                    .content(
+                        EmptyContent::new().child(
+                            Button::new("empty-project-action")
+                                .label(if no_projects {
+                                    "Add repository"
+                                } else {
+                                    "Show all repositories"
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if no_projects {
+                                        cx.emit(HomeEvent::AddRepository)
+                                    } else {
+                                        this.project_group_filter = ProjectGroupFilter::All;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                    ),
+                );
+            }
         }
         let mut grid = h_flex().gap_4().flex_wrap();
         for (index, entry) in visible.iter().enumerate() {
@@ -1367,13 +1414,15 @@ impl HomeView {
                 .label("Relationships")
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::Relationships))),
         )
-        .child(
-            Button::new("add-project-page")
-                .self_start()
-                .ghost()
-                .label("+ Add project")
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository))),
-        )
+        .when(!visible.is_empty(), |page| {
+            page.child(
+                Button::new("add-project-page")
+                    .self_start()
+                    .ghost()
+                    .label("+ Add project")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository))),
+            )
+        })
     }
 
     /// Group radios: All, each present group, and Ungrouped when relevant.

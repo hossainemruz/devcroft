@@ -1016,29 +1016,21 @@ impl Workspace {
             ));
         }
         if recent.is_empty() {
-            list = list.child(
-                v_flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_6()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(Icon::new(IconName::SquareTerminal).size(px(24.)))
-                    .child(if self.session_snapshot.loaded {
-                        "No recent sessions yet"
-                    } else {
-                        "Loading sessions…"
-                    })
-                    .when(self.session_snapshot.loaded, |empty| {
-                        empty.child(
-                            div()
-                                .text_xs()
-                                .text_center()
-                                .child("Start a session to work with an agent."),
-                        )
-                    }),
-            );
+            list = if !self.session_snapshot.loaded {
+                list.child(div().p_3().text_sm().child("Loading sessions…"))
+            } else if self.session_snapshot.errors.is_empty() {
+                list.child(
+                    crate::empty_state::empty_state(
+                        IconName::SquareTerminal,
+                        "No recent sessions yet",
+                        "Use New session below to start working with an agent.",
+                    )
+                    .p_3()
+                    .flex_none(),
+                )
+            } else {
+                list
+            };
         }
         for error in &self.session_snapshot.errors {
             list = list.child(

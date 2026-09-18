@@ -48,36 +48,6 @@ pub(super) fn panel_title(
         .child(section_title(title, count, cx))
 }
 
-fn empty_state(
-    icon: IconName,
-    title: &'static str,
-    description: &'static str,
-    cx: &Context<HomeView>,
-) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .gap_4()
-        .p_5()
-        .rounded_xl()
-        .border_1()
-        .border_color(cx.theme().border.opacity(0.7))
-        .bg(cx.theme().secondary.opacity(0.22))
-        .child(icon_tile(icon, cx.theme().muted_foreground, cx))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(div().text_sm().font_medium().child(title))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(description),
-                ),
-        )
-}
-
 impl HomeView {
     pub(super) fn dashboard(&self, card_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
@@ -244,20 +214,17 @@ impl HomeView {
             );
         }
         if self.sessions.is_empty() {
-            sessions = sessions.child(empty_state(
-                IconName::Bot,
-                if self.sessions_loaded {
-                    "Ready when you are"
+            sessions =
+                if !self.sessions_loaded {
+                    sessions.child(div().p_5().text_sm().child("Finding your recent sessions…"))
+                } else if self.session_errors.is_empty() {
+                    sessions.child(crate::empty_state::empty_state(
+                    IconName::Bot, "Ready when you are",
+                    "Start an agent in a project. Your recent conversations will appear here.",
+                ).flex_none())
                 } else {
-                    "Finding your recent sessions…"
-                },
-                if self.sessions_loaded {
-                    "Start an agent in a project. Your recent conversations will appear here."
-                } else {
-                    "Your conversations will appear here in a moment."
-                },
-                cx,
-            ));
+                    sessions
+                };
         }
         v_flex()
             .gap_3()

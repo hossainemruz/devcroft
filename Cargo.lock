@@ -3280,13 +3280,16 @@ dependencies = [
 
 [[package]]
 name = "gpui-base"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit.git?rev=501c73923280859a5de2b16fe64d4aac960bb040#501c73923280859a5de2b16fe64d4aac960bb040"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "256fb935007c75f850d9e4e405bed5aa09f9e155af2cb9563148384971177471"
 dependencies = [
  "aho-corasick",
  "anyhow",
+ "ashpd",
  "async-channel",
  "chrono",
+ "data-url",
  "futures",
  "gpui-pre",
  "gpui-pre-macros",
@@ -3310,12 +3313,14 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "web-time",
+ "windows 0.58.0",
 ]
 
 [[package]]
 name = "gpui-component"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit.git?rev=501c73923280859a5de2b16fe64d4aac960bb040#501c73923280859a5de2b16fe64d4aac960bb040"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae035e9a52e26045c33a3e3e39502275ee51525e5c211ac3217da37540320d21"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3357,8 +3362,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-component-macros"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit.git?rev=501c73923280859a5de2b16fe64d4aac960bb040#501c73923280859a5de2b16fe64d4aac960bb040"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26eb2217a73fabce2140761af76f3b8220cefd8feb854d0681a8b34d4eb640cb"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3368,8 +3374,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit.git?rev=501c73923280859a5de2b16fe64d4aac960bb040#501c73923280859a5de2b16fe64d4aac960bb040"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00f2c1157a8dc5ad0dd51fb2a184d1ca178962ae997a9f1e0a2d1a25f51398e6"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -3381,8 +3388,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit-assets"
-version = "0.6.1"
-source = "git+https://github.com/longbridge/gpui-kit.git?rev=501c73923280859a5de2b16fe64d4aac960bb040#501c73923280859a5de2b16fe64d4aac960bb040"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4589df8dc603a2a389415cf8ea03ded91a06117456dc2051c73efb4ad76fe825"
 dependencies = [
  "anyhow",
  "gpui-pre",

@@ -267,6 +267,10 @@ fn active_heading(toc: &[TocEntry], top: usize, bottom: usize, total: usize) -> 
 /// overlay. Focused on mount (see `run_preview`) so keyboard
 /// scrolling works without a click first.
 pub(crate) struct PreviewView {
+    content: SharedString,
+    reference_root: Option<crate::data::DataRoot>,
+    reference_generation: u64,
+    reference_details: std::sync::Arc<crate::markdown_references::ReferenceDetails>,
     state: Entity<TextViewState>,
     toc: Vec<TocEntry>,
     /// Top-level block count from our own parse (== the list's item count).
@@ -285,7 +289,24 @@ pub(crate) struct PreviewView {
 pub(crate) struct TocActive(pub usize);
 impl EventEmitter<TocActive> for PreviewView {}
 
+#[derive(Clone)]
+pub(crate) struct OpenReference(pub crate::markdown_references::Reference);
+impl EventEmitter<OpenReference> for PreviewView {}
+
 impl PreviewView {
+    fn reference_handler(&self, cx: &Context<Self>) -> crate::markdown_references::OpenHandler {
+        let view = cx.entity().downgrade();
+        std::sync::Arc::new(move |reference, window, cx| {
+            let _ = view.update(cx, |view, cx| {
+                if view.embedded {
+                    cx.emit(OpenReference(reference));
+                } else {
+                    crate::markdown_references::open_in_workspace(reference, window, cx);
+                }
+            });
+        })
+    }
+
     pub(crate) fn new(content: SharedString, cx: &mut Context<Self>) -> Self {
         let content = metadata_line_breaks(&content);
         let (toc, blocks) = extract_toc(&content);
@@ -309,6 +330,10 @@ impl PreviewView {
                 });
         });
         Self {
+            content: content.into(),
+            reference_root: None,
+            reference_generation: 0,
+            reference_details: Default::default(),
             state,
             toc,
             blocks,
@@ -328,6 +353,32 @@ impl PreviewView {
         view
     }
 
+    pub(crate) fn set_reference_root(
+        &mut self,
+        root: Option<crate::data::DataRoot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.reference_root = root;
+        self.reference_generation = self.reference_generation.wrapping_add(1);
+        let generation = self.reference_generation;
+        let content = self.content.clone();
+        let root = self.reference_root.clone();
+        cx.spawn(async move |this, cx| {
+            let details = cx
+                .background_spawn(async move {
+                    crate::markdown_references::load_details(&content, root.as_ref())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.reference_generation == generation {
+                    this.reference_details = std::sync::Arc::new(details);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Keep keyboard focus and the nearest outline position on live revisions.
     /// Unchanged Markdown never calls this, so ordinary polling preserves exact scroll.
     pub(crate) fn set_content(&mut self, content: SharedString, cx: &mut Context<Self>) {
@@ -336,12 +387,15 @@ impl PreviewView {
         next.focus_handle = self.focus_handle.clone();
         next.toc_focus = self.toc_focus.clone();
         next.embedded = self.embedded;
+        next.reference_generation = self.reference_generation;
+        next.reference_root = self.reference_root.clone();
         if let Some(index) =
             heading.and_then(|title| next.toc.iter().position(|entry| entry.title == title))
         {
             next.on_toc_click(index, cx);
         }
         *self = next;
+        self.set_reference_root(self.reference_root.clone(), cx);
         cx.notify();
     }
 
@@ -588,6 +642,18 @@ impl Render for PreviewView {
                             TextView::new(&self.state)
                                 .markdown_extensions(MarkdownExtensions::default().frontmatter())
                                 .plugin(FrontmatterPlugin)
+                                .plugin(crate::markdown_references::ReferencePlugin {
+                                    details: self.reference_details.clone(),
+                                    open: self.reference_handler(cx),
+                                })
+                                .on_link_click({
+                                    let open = self.reference_handler(cx);
+                                    move |url, event, window, cx| {
+                                        crate::markdown_references::open_link(
+                                            url, event, window, cx, &open,
+                                        )
+                                    }
+                                })
                                 .style(style)
                                 .code_block_highlighter({
                                     let dark = cx.theme().is_dark();

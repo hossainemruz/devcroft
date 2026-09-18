@@ -520,7 +520,7 @@ fn snapshot(artifact: Artifact, bytes: &[u8]) -> Result<Snapshot> {
     })
 }
 
-pub(super) fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     ensure!(
         id.strip_prefix("art-")
             .is_some_and(|suffix| suffix.len() == 8

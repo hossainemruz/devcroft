@@ -33,7 +33,7 @@ pub(crate) struct Cli {
 /// the header dot sees, for loader-vs-CLI disagreements.
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub(crate) enum Command {
-    /// Boot the GPUI workspace (the current app behavior, unchanged).
+    /// Boot the GPUI workspace, optionally opening a Markdown reference.
     App(AppArgs),
     /// Preview a file in a dialog (currently Markdown; e.g. from Neovim:
     /// `:!devcroft preview %`).
@@ -62,6 +62,9 @@ pub(crate) struct AppArgs {
     /// here.
     #[arg(long, value_name = "PATH")]
     pub(crate) checkout: Option<PathBuf>,
+    /// Open a portable repository, artifact, or session reference after startup.
+    #[arg(long, value_name = "URL")]
+    pub(crate) open_reference: Option<crate::markdown_references::Reference>,
 }
 
 /// Arguments for `devcroft preview <path>`.
@@ -109,7 +112,13 @@ mod tests {
     #[test]
     fn app_with_no_checkout_parses() {
         let cli = Cli::try_parse_from(["devcroft", "app"]).unwrap();
-        assert_eq!(cli.command, Command::App(AppArgs { checkout: None }));
+        assert_eq!(
+            cli.command,
+            Command::App(AppArgs {
+                checkout: None,
+                open_reference: None
+            })
+        );
     }
 
     #[test]
@@ -119,7 +128,32 @@ mod tests {
             cli.command,
             Command::App(AppArgs {
                 checkout: Some(PathBuf::from("/tmp/work")),
+                open_reference: None,
             })
+        );
+    }
+
+    #[test]
+    fn app_reference_is_validated_before_desktop_startup() {
+        let cli = Cli::try_parse_from([
+            "devcroft",
+            "app",
+            "--open-reference",
+            "devcroft:repository/backend",
+        ])
+        .unwrap();
+        let Command::App(args) = cli.command else {
+            panic!("expected app")
+        };
+        assert_eq!(
+            args.open_reference,
+            Some(crate::markdown_references::Reference::Repository(
+                "backend".into()
+            ))
+        );
+        assert!(
+            Cli::try_parse_from(["devcroft", "app", "--open-reference", "https://example.com"])
+                .is_err()
         );
     }
 

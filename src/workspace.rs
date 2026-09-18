@@ -525,6 +525,9 @@ impl Workspace {
         let home = cx.new(|cx| HomeView::new(data_root.clone(), sync_tracker.clone(), cx));
         home.read(cx).focus_handle.clone().focus(window, cx);
         cx.subscribe_in(&home, window, |this, _, event, window, cx| match event {
+            HomeEvent::OpenReference(reference) => {
+                this.open_reference(reference.clone(), window, cx)
+            }
             HomeEvent::OpenRepository { key, label } => {
                 this.switch_repository(key, label, window, cx)
             }
@@ -615,6 +618,14 @@ impl Workspace {
                 cx,
             )
         });
+        cx.subscribe_in(
+            &resources,
+            window,
+            |this, _, event: &crate::preview::OpenReference, window, cx| {
+                this.open_reference(event.0.clone(), window, cx);
+            },
+        )
+        .detach();
         cx.subscribe_in(
             &resources,
             window,
@@ -1429,6 +1440,54 @@ impl Workspace {
             .update(cx, |view, cx| view.show_artifacts_page(cx));
         self.focus_active_pane(window, cx);
         cx.notify();
+    }
+
+    pub(crate) fn open_reference(
+        &mut self,
+        reference: crate::markdown_references::Reference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::markdown_references::Reference;
+        match reference {
+            Reference::Repository(key) => self.switch_repository(&key, &key, window, cx),
+            Reference::Artifact(id) => {
+                match self.home.update(cx, |home, cx| home.open_artifact(id, cx)) {
+                    Ok(()) => self.browse_artifacts(window, cx),
+                    Err(error) => window.push_notification(error.to_string(), cx),
+                }
+            }
+            reference @ Reference::Session { .. } => {
+                let Some(root) = self.data_root.clone() else {
+                    window.push_notification("Portable data is unavailable", cx);
+                    return;
+                };
+                self.session_navigation = self.session_navigation.wrapping_add(1);
+                let generation = self.session_navigation;
+                let catalog = self.session_catalog.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            catalog.refresh();
+                            reference.resolve_session(&root, &catalog.snapshot().sessions)
+                        })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if this.session_navigation != generation {
+                            return;
+                        }
+                        match result {
+                            Ok(key) => this.open_agent_session(key, window, cx),
+                            Err(error) => window.push_notification(
+                                format!("Could not open session reference: {error}"),
+                                cx,
+                            ),
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     /// Return from the global artifact browser to its captured origin.

@@ -15,6 +15,28 @@ Use `--kind rfc`, `plan`, or `note`. Reads include Markdown, repository, origina
 
 Discover session keys with `devcroft session list --json`. To associate one or more originating sessions, pass `--sessions-file /absolute/path/sessions.json` on create or update. Its JSON array contains entries shaped as `{"repository":"KEY","title":"Requirements discussion","key":{"provider":"codex","store":"/absolute/provider/store","id":"native-session-id"}}`. Copy `key` from session discovery; do not guess it. Each entry can belong to a different repository. Supplying `[]` clears origins. The desktop opens an origin in that session's workspace.
 
+## Inline references
+
+Markdown bodies can link to Devcroft records with ordinary inline link syntax:
+
+```markdown
+[Backend](devcroft:repository/backend)
+[Design](devcroft:artifact/art-23456789)
+[Discussion](devcroft:session/backend/codex/native-session-id)
+```
+
+Use discovered repository keys, artifact IDs, and session identities, not the
+illustrative values above. Percent-encode the session ID as one URL path
+segment. Session URLs support `opencode`, `codex`, and `claude`; never include
+device-local `store` or checkout paths in them. The desktop resolves the local
+checkout and unique session at click time. Keep labels short and meaningful.
+Hover details use local metadata; unavailable targets remain readable. These
+links work in Resources and standalone previews. To open one directly, use
+`devcroft app --open-reference 'devcroft:artifact/ART_ID'`.
+
+This does not replace `--sessions-file` provenance. Mermaid and math rendering
+are not enabled, and other custom link schemes have no special rendering.
+
 ## Artifact feedback
 
 ```sh

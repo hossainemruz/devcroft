@@ -17,10 +17,12 @@ mod commands;
 /// surface is allow-listed until then — tests cover it now.
 #[allow(dead_code, unused_imports)]
 mod data;
+mod empty_state;
 mod fonts;
 mod git_status;
 mod home;
 mod keys;
+mod markdown_references;
 mod metrics;
 mod navigation;
 mod pane;
@@ -56,7 +58,7 @@ fn main() -> Result<()> {
     // without ever opening a window.
     let cli = Cli::parse();
     match cli.command {
-        Command::App(args) => run_app(args.checkout),
+        Command::App(args) => run_app(args),
         Command::Preview(args) => run_preview(args.path),
         Command::GitStatus(args) => run_git_status(args.checkout, args.limit),
         Command::Session(args) => commands::sessions(args).context("devcroft session"),
@@ -69,10 +71,10 @@ fn main() -> Result<()> {
 
 /// Boot path for `devcroft app [--checkout <path>]`: the previous `main()`
 /// behavior verbatim, rooted at `--checkout` (or cwd when absent).
-fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
+fn run_app(args: crate::cli::AppArgs) -> Result<()> {
     // Resolve `--checkout` before touching the GUI so a bad path fails fast
     // with a runtime error instead of opening a window rooted elsewhere.
-    let working_directory = crate::cli::resolve_working_directory(checkout)?;
+    let working_directory = crate::cli::resolve_working_directory(args.checkout)?;
     let (theme_mode, app_font_size) = resolve_appearance();
     // Live pane geometry reads this global at render time; Settings edits it
     // later through the same path.
@@ -138,6 +140,9 @@ fn run_app(checkout: Option<std::path::PathBuf>) -> Result<()> {
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
                 let workspace = cx.new(|cx| Workspace::new(window, cx, &working_directory));
+                if let Some(reference) = args.open_reference.clone() {
+                    workspace.update(cx, |view, cx| view.open_reference(reference, window, cx));
+                }
                 cx.new(|cx| Root::new(workspace, window, cx).bg(cx.theme().background))
             })
             .map_err(|error| anyhow!("failed to open Devcroft window: {error}"))
@@ -192,6 +197,7 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
     let (theme_mode, _) = resolve_appearance();
     let content: SharedString = content.into();
     let window_title = format!("Preview — {title}");
+    let reference_root = data::resolve_data_root().ok();
 
     let app = gpui_kit::application().with_assets(app_assets::AppAssets);
     app.run(move |cx| {
@@ -223,7 +229,11 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
 
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| PreviewView::new(content.clone(), cx));
+                let view = cx.new(|cx| {
+                    let mut view = PreviewView::new(content.clone(), cx);
+                    view.set_reference_root(reference_root.clone(), cx);
+                    view
+                });
                 view.read(cx).focus_handle(cx).focus(window, cx);
                 // Match the workspace host: Root supplies rem sizing, text
                 // selection/copy, focus traversal, and component overlays.

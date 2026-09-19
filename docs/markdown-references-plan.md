@@ -50,3 +50,23 @@ to the shared Markdown reader. Mermaid remains out of scope.
 - Native desktop smoke: empty states/actions, inline layout/hover/copy,
   repository and artifact navigation, and readable unresolved references.
   Record separately anything that cannot be exercised with a real session.
+
+### Completed verification (2026-09-19)
+
+- Formatting, Clippy with warnings denied, and the locked debug build passed.
+- Full suite: 331 unit tests and 6 integration tests passed; 1 test ignored.
+  The direct-resource test uses an archived target beyond the current page
+  and verifies that navigation preserves an existing edit draft.
+- Native Linux/Wayland smoke testing used temporary data roots and a fixture
+  repository registered through the desktop. Verified Projects and recent
+  activity/session empty states, Add repository, the filtered Resources empty
+  state, and Clear filter restoring the resource.
+- Verified inline metadata hover cards, standalone-preview activation opening
+  the target resource, navigation from Resources to its repository, artifact
+  ID copying, and a readable notification for an unavailable session.
+- Verified native select-all/copy preserves reference labels and literal code;
+  the automated renderer test also checks Markdown-source copying. Preview
+  layout was inspected at full width and at 900 and 600 pixels.
+- A real historical provider session was not resumed interactively. Session
+  identity resolution, unavailable targets, and ambiguous matches are covered
+  by automated tests. Mermaid remains disabled.

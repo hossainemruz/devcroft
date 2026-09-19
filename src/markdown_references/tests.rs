@@ -158,7 +158,10 @@ fn inline_references_render_copy_and_activate(cx: &mut gpui_kit::TestAppContext)
         window.render_frame(cx);
         text.update(cx, |state, cx| {
             state.select_all(cx);
-            assert_eq!(state.selected_text().trim_end(), "Before Backend API after.");
+            assert_eq!(
+                state.selected_text().trim_end(),
+                "Before Backend API after."
+            );
             state.set_selection_format(SelectionFormat::Source, cx);
             assert_eq!(state.selected_text(), source);
         });

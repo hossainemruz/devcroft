@@ -52,19 +52,28 @@ fn direct_reference_opens_archived_resource_and_preserves_drafts(
     )
     .unwrap();
     let store = ArtifactStore::new(&root);
-    let target = store
-        .create(NewArtifact {
-            repository: Some("repo".into()),
-            sessions: vec![],
-            title: "Target".into(),
-            kind: Kind::Note,
-            content: "# Target".into(),
+    for index in 0..3 {
+        let target = store
+            .create(NewArtifact {
+                repository: Some("repo".into()),
+                sessions: vec![],
+                title: format!("Target {index}"),
+                kind: Kind::Note,
+                content: "# Target".into(),
+            })
+            .unwrap();
+        store
+            .set_archived(&target.artifact.id, &target.revision, true)
+            .unwrap();
+    }
+    let all = store
+        .list(&ListOptions {
+            include_archived: true,
+            ..Default::default()
         })
         .unwrap();
-    let target = store
-        .set_archived(&target.artifact.id, &target.revision, true)
-        .unwrap();
-    let id = target.artifact.id.clone();
+    // This target is both archived and outside the one-record page used below.
+    let id = all.artifacts.last().unwrap().artifact.id.clone();
     cx.update(gpui_kit::init);
     let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
     let view = browser.clone();

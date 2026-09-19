@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::test::TestWindowExt as _;
 #[test]
 fn refresh_coalesces_requests_and_discards_superseded_results() {
     let mut refresh = Refresh::default();
@@ -102,4 +103,71 @@ fn direct_reference_opens_archived_resource_and_preserves_drafts(
             assert_eq!(browser.selected_id.as_ref(), Some(&id));
         })
     });
+}
+
+#[gpui_kit::test]
+fn block_comment_editor_keeps_reader_and_persists_anchor(cx: &mut gpui_kit::TestAppContext) {
+    use crate::data::artifacts::NewArtifact;
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    crate::data::write_json_atomic(
+        &root
+            .portable_dir()
+            .join("repositories/repo/repository.json"),
+        &serde_json::json!({"key":"repo"}),
+    )
+    .unwrap();
+    let store = ArtifactStore::new(&root);
+    let snapshot = store.create(NewArtifact {
+        repository: Some("repo".into()), sessions: vec![], title: "Block feedback".into(), kind: Kind::Note,
+        content: "# Example\n\nParagraph with **bold** and `code`.\n\n- First\n- Second\n\n```rs\nlet x = 1;\n```\n".into(),
+    }).unwrap();
+    cx.update(gpui_kit::init);
+    let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
+    browser.update(cx, |browser, cx| browser.select(Some(snapshot.clone()), cx));
+    let view = browser.clone();
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+    cx.update(|window, cx| {
+        window.click(("block-comments", 1usize), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        browser.update(cx, |browser, cx| {
+            assert!(browser.show_comments);
+            let draft = browser.draft.as_ref().unwrap();
+            assert!(!draft.document);
+            assert_eq!(draft.block, Some(1));
+            assert!(browser.preview.is_some());
+            draft
+                .input
+                .update(cx, |input, cx| input.set_value("Explain this", window, cx));
+            browser.save_draft(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, _| {
+        assert!(browser.draft.is_none(), "{:?}", browser.error);
+        let saved = browser.selected.as_ref().unwrap();
+        assert_eq!(saved.artifact.comments.len(), 1);
+        let anchor = saved.artifact.comments[0].anchor.as_ref().unwrap().block();
+        assert_eq!(anchor.source, "Paragraph with **bold** and `code`.");
+    });
+    for _ in 0..2 {
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        store
+            .get(&snapshot.artifact.id)
+            .unwrap()
+            .artifact
+            .comments
+            .len(),
+        1
+    );
 }

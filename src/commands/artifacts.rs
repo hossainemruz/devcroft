@@ -42,12 +42,22 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
             use crate::cli::resources::CommentCommand::*;
             use artifacts::CommentChange as Change;
             let (record, change) = match options.command {
-                List(record) => {
+                List(options) => {
+                    let record = options.record;
                     let snapshot = store.get(&record.id)?;
+                    let comments = snapshot
+                        .artifact
+                        .comments
+                        .into_iter()
+                        .filter(|comment| {
+                            (!options.open || !comment.resolved)
+                                && (!options.resolved || comment.resolved)
+                        })
+                        .collect::<Vec<_>>();
                     return output::emit(
                         args.json,
-                        json!({"formatVersion": 1, "artifactId": record.id, "revision": snapshot.revision, "comments": snapshot.artifact.comments}),
-                        &serde_json::to_string_pretty(&snapshot.artifact.comments)?,
+                        json!({"formatVersion": 1, "artifactId": record.id, "revision": snapshot.revision, "comments": comments}),
+                        &serde_json::to_string_pretty(&comments)?,
                         &[],
                         &[],
                     );

@@ -13,6 +13,9 @@
 //! readers and either extend [`PreviewView`] or add a parallel view,
 //! keeping the single `preview` command stable.
 
+mod resource_blocks;
+pub(crate) use resource_blocks::{BlockAction, CommentHandler};
+
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
@@ -40,6 +43,8 @@ pub(crate) const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 fn metadata_line_breaks(source: &str) -> String {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.frontmatter = true;
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
     let Ok(root) = markdown::to_mdast(source, &options) else {
         return source.to_owned();
     };
@@ -189,6 +194,8 @@ pub(crate) struct TocEntry {
 fn extract_toc(source: &str) -> (Vec<TocEntry>, usize) {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.frontmatter = true;
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
     let Ok(root) = markdown::to_mdast(source, &options) else {
         return (Vec::new(), 0);
     };
@@ -268,6 +275,7 @@ fn active_heading(toc: &[TocEntry], top: usize, bottom: usize, total: usize) -> 
 /// scrolling works without a click first.
 pub(crate) struct PreviewView {
     content: SharedString,
+    resources: Option<resource_blocks::ResourceBlocks>,
     reference_root: Option<crate::data::DataRoot>,
     reference_generation: u64,
     reference_details: std::sync::Arc<crate::markdown_references::ReferenceDetails>,
@@ -331,6 +339,7 @@ impl PreviewView {
         });
         Self {
             content: content.into(),
+            resources: None,
             reference_root: None,
             reference_generation: 0,
             reference_details: Default::default(),
@@ -348,7 +357,8 @@ impl PreviewView {
 
     /// Embedded readers share Tab traversal with their surrounding controls.
     pub(crate) fn embedded(content: SharedString, cx: &mut Context<Self>) -> Self {
-        let mut view = Self::new(content, cx);
+        let mut view = Self::new(content.clone(), cx);
+        view.resources = Some(resource_blocks::ResourceBlocks::new(content, &view.content));
         view.embedded = true;
         view
     }
@@ -383,7 +393,11 @@ impl PreviewView {
     /// Unchanged Markdown never calls this, so ordinary polling preserves exact scroll.
     pub(crate) fn set_content(&mut self, content: SharedString, cx: &mut Context<Self>) {
         let heading = self.toc.get(self.active).map(|entry| entry.title.clone());
-        let mut next = Self::new(content, cx);
+        let mut next = if self.embedded {
+            Self::embedded(content, cx)
+        } else {
+            Self::new(content, cx)
+        };
         next.focus_handle = self.focus_handle.clone();
         next.toc_focus = self.toc_focus.clone();
         next.embedded = self.embedded;
@@ -639,36 +653,9 @@ impl Render for PreviewView {
                         // Keeping the virtualized list preserves TOC offsets,
                         // selection, and keyboard scrolling.
                         div().relative().size_full().overflow_hidden().child(
-                            TextView::new(&self.state)
-                                .markdown_extensions(MarkdownExtensions::default().frontmatter())
-                                .plugin(FrontmatterPlugin)
-                                .plugin(crate::markdown_references::ReferencePlugin {
-                                    details: self.reference_details.clone(),
-                                    open: self.reference_handler(cx),
-                                })
-                                .on_link_click({
-                                    let open = self.reference_handler(cx);
-                                    move |url, event, window, cx| {
-                                        crate::markdown_references::open_link(
-                                            url, event, window, cx, &open,
-                                        )
-                                    }
-                                })
-                                .style(style)
-                                .code_block_highlighter({
-                                    let dark = cx.theme().is_dark();
-                                    let cache = self.code_highlights.clone();
-                                    move |block| {
-                                        let code = block.code();
-                                        let language = block.lang();
-                                        cache
-                                            .lock()
-                                            .entry((code.clone(), language.clone(), dark))
-                                            .or_insert_with(|| {
-                                                highlight_code(&code, language.as_deref(), dark)
-                                            })
-                                            .clone()
-                                    }
+                            self.text_view(&self.state, style.clone(), cx)
+                                .when(self.resources.is_some(), |view| {
+                                    view.plugin(self.resource_plugin(style, cx))
                                 })
                                 .scrollable(true)
                                 // Both hosts stretch 16px past the clip box to
@@ -777,8 +764,11 @@ mod tests {
             }
             let close = |a: Pixels, b: Pixels| (a - b).abs() < px(0.1);
             assert!(close(layouts[0].0.width, layouts[1].0.width));
-            assert!(close(layouts[0].0.height, layouts[1].0.height));
-            assert!(close(layouts[0].1.height, layouts[1].1.height));
+            // Resources reserves a comment gutter inside the same column.
+            // Its narrower text may wrap onto more lines, but never reserve
+            // less height or overlap the following block.
+            assert!(layouts[1].0.height >= layouts[0].0.height);
+            assert!(layouts[1].1.height >= layouts[0].1.height);
         }
     }
 

@@ -1,4 +1,6 @@
 //! Repository resources, shared by the workspace and global artifact browser.
+mod comments;
+
 use crate::data::DataRoot;
 use crate::data::artifacts::{
     ArtifactList, ArtifactPatch, ArtifactStore, CommentChange, Kind, ListOptions, Snapshot,
@@ -61,6 +63,8 @@ struct Draft {
     snapshot: Snapshot,
     comment: Option<String>,
     document: bool,
+    block: Option<usize>,
+    quote: Option<String>,
 }
 
 pub(crate) struct ArtifactBrowser {
@@ -78,6 +82,9 @@ pub(crate) struct ArtifactBrowser {
     preview: Option<Entity<PreviewView>>,
     toc: Vec<TocEntry>,
     toc_active: usize,
+    show_comments: bool,
+    active_comment: Option<String>,
+    comments_scroll: gpui_kit::ScrollHandle,
     draft: Option<Draft>,
     saved_drafts: std::collections::HashMap<Scope, Draft>,
     saving: bool,
@@ -126,6 +133,9 @@ impl ArtifactBrowser {
             preview: None,
             toc: Vec::new(),
             toc_active: 0,
+            show_comments: false,
+            active_comment: None,
+            comments_scroll: gpui_kit::ScrollHandle::new(),
             draft: None,
             saved_drafts: Default::default(),
             saving: false,
@@ -152,23 +162,19 @@ impl ArtifactBrowser {
         if self.selected.is_none() {
             return panes;
         }
-        let document = self
-            .draft
-            .as_ref()
-            .map(|draft| draft.input.read(cx).focus_handle(cx))
-            .unwrap_or_else(|| self.detail_focus.clone());
-        panes.push((
-            if self.draft.is_some() {
-                "Draft"
+        if let Some(draft) = self.draft.as_ref().filter(|d| d.document) {
+            panes.push(("Draft", draft.input.read(cx).focus_handle(cx)));
+        } else {
+            panes.push(("Document", self.detail_focus.clone()));
+            if self.show_comments {
+                let focus = self
+                    .draft
+                    .as_ref()
+                    .map(|d| d.input.read(cx).focus_handle(cx))
+                    .unwrap_or_else(|| self.comments_focus.clone());
+                panes.push(("Comments", focus));
             } else {
-                "Document"
-            },
-            document,
-        ));
-        if self.draft.is_none() {
-            panes.push(("Comments", self.comments_focus.clone()));
-            if !self.toc.is_empty() {
-                panes.push(("Outline", self.outline_focus.clone()));
+                panes.push(("On this page", self.outline_focus.clone()));
             }
         }
         panes
@@ -206,6 +212,7 @@ impl ArtifactBrowser {
         if self.draft.is_some() && !self.saving {
             self.draft = None;
             self.error = None;
+            self.sync_preview_comments(cx);
             self.detail_focus.focus(window, cx);
             cx.notify();
         }
@@ -219,6 +226,8 @@ impl ArtifactBrowser {
             }
             self.scope = scope;
             self.draft = self.saved_drafts.remove(&self.scope);
+            self.show_comments |= self.draft.as_ref().is_some_and(|d| !d.document);
+            self.active_comment = None;
             self.selected_id = self.draft.as_ref().map(|d| d.snapshot.artifact.id.clone());
             self.selected = None;
             self.preview = None;
@@ -458,8 +467,12 @@ impl ArtifactBrowser {
     fn select(&mut self, snapshot: Option<Snapshot>, cx: &mut Context<Self>) {
         self.open_generation = self.open_generation.wrapping_add(1);
         self.opening = false;
-        if self.selected.as_ref().map(|s| &s.artifact.content)
-            != snapshot.as_ref().map(|s| &s.artifact.content)
+        if self.selected_id != snapshot.as_ref().map(|s| s.artifact.id.clone()) {
+            self.active_comment = None;
+        }
+        if self.selected_id != snapshot.as_ref().map(|s| s.artifact.id.clone())
+            || self.selected.as_ref().map(|s| &s.artifact.content)
+                != snapshot.as_ref().map(|s| &s.artifact.content)
             || self.preview.is_none()
         {
             match (self.preview.as_ref(), snapshot.as_ref()) {
@@ -491,6 +504,7 @@ impl ArtifactBrowser {
         }
         self.selected_id = snapshot.as_ref().map(|s| s.artifact.id.clone());
         self.selected = snapshot;
+        self.sync_preview_comments(cx);
         if let Some(preview) = self.preview.as_ref() {
             let (entries, active) = preview.read(cx).toc_snapshot();
             self.toc = entries;
@@ -507,6 +521,9 @@ impl ArtifactBrowser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.draft.is_some() || self.saving {
+            return;
+        }
         let Some(snapshot) = self.selected.clone() else {
             return;
         };
@@ -529,7 +546,16 @@ impl ArtifactBrowser {
             snapshot,
             comment,
             document,
+            block: None,
+            quote: None,
         });
+        if !document {
+            self.show_comments = true;
+        }
+        if let Some(draft) = &self.draft {
+            draft.input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        self.sync_preview_comments(cx);
         self.error = None;
         cx.notify();
     }
@@ -543,6 +569,12 @@ impl ArtifactBrowser {
             Mutation::Document(value)
         } else if let Some(id) = &draft.comment {
             Mutation::Comment(CommentChange::Edit(id.clone(), value))
+        } else if let Some(block) = draft.block {
+            Mutation::Comment(CommentChange::CreateBlock {
+                body: value,
+                block,
+                quote: draft.quote.clone(),
+            })
         } else {
             Mutation::Comment(CommentChange::Create(value))
         };
@@ -562,6 +594,7 @@ impl ArtifactBrowser {
             return;
         };
         self.saving = true;
+        self.sync_preview_comments(cx);
         self.error = None;
         self.refresh.generation = self.refresh.generation.wrapping_add(1);
         let scope = self.scope.clone();
@@ -596,6 +629,21 @@ impl ArtifactBrowser {
                 if this.scope == scope {
                     match result {
                         Ok(snapshot) => {
+                            if close_draft && this.draft.as_ref().is_some_and(|d| !d.document) {
+                                let id =
+                                    this.draft.as_ref().and_then(|d| d.comment.clone()).or_else(
+                                        || snapshot.artifact.comments.last().map(|c| c.id.clone()),
+                                    );
+                                this.active_comment = id;
+                                if let Some(index) = snapshot
+                                    .artifact
+                                    .comments
+                                    .iter()
+                                    .position(|c| Some(&c.id) == this.active_comment.as_ref())
+                                {
+                                    this.comments_scroll.scroll_to_item(index);
+                                }
+                            }
                             if close_draft {
                                 this.draft = None;
                             }
@@ -607,6 +655,7 @@ impl ArtifactBrowser {
                         }
                     }
                 }
+                this.sync_preview_comments(cx);
                 this.refresh(cx);
                 cx.notify();
             });
@@ -1104,7 +1153,7 @@ impl Render for ArtifactBrowser {
                         .pr(px(16.)),
                 ),
             );
-            if let Some(draft) = &self.draft {
+            if let Some(draft) = self.draft.as_ref().filter(|draft| draft.document) {
                 main = main
                     .child(
                         div()
@@ -1137,121 +1186,62 @@ impl Render for ArtifactBrowser {
                 if let Some(preview) = &self.preview {
                     main = main.child(div().flex_1().min_h_0().child(preview.clone()));
                 }
-                let mut comments = v_flex()
-                    .id("artifact-comments")
-                    .track_focus(&self.comments_focus)
-                    .focus(|style| style.border_1().border_color(cx.theme().ring))
-                    .max_h(px(240.))
-                    .overflow_y_scroll()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().font_semibold().child("Comments"))
-                            .child(
-                                Button::new("new-artifact-comment")
-                                    .label("Add comment")
-                                    .disabled(self.saving)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.edit(false, None, window, cx)
-                                    })),
-                            ),
-                    );
-                for (index, comment) in artifact.comments.iter().enumerate() {
-                    let edit_id = comment.id.clone();
-                    let resolve_id = comment.id.clone();
-                    let delete_id = comment.id.clone();
-                    let resolved = comment.resolved;
-                    comments = comments.child(
-                        v_flex()
-                            .gap_1()
-                            .p_2()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .child(div().text_sm().child(comment.body.clone()))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .when(resolved, |row| row.child("Resolved"))
-                                    .child(
-                                        Button::new(("edit-comment", index))
-                                            .ghost()
-                                            .label("Edit")
-                                            .disabled(self.saving)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.edit(false, Some(edit_id.clone()), window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("resolve-comment", index))
-                                            .ghost()
-                                            .label(if resolved { "Reopen" } else { "Resolve" })
-                                            .disabled(self.saving)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let Some(s) = this.selected.clone() {
-                                                    this.mutate(
-                                                        s,
-                                                        Mutation::Comment(CommentChange::Resolve(
-                                                            resolve_id.clone(),
-                                                            !resolved,
-                                                        )),
-                                                        false,
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("delete-comment", index))
-                                            .ghost()
-                                            .label("Delete")
-                                            .disabled(self.saving)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let Some(s) = this.selected.clone() {
-                                                    this.mutate(
-                                                        s,
-                                                        Mutation::Comment(CommentChange::Delete(
-                                                            delete_id.clone(),
-                                                        )),
-                                                        false,
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
-                                    ),
-                            ),
-                    );
-                }
-                main = main.child(comments);
-                let mut rail = v_flex()
-                    .track_focus(&self.outline_focus)
-                    .focus(|style| style.border_1().border_color(cx.theme().ring))
+                let rail = v_flex()
+                    .w(px(310.))
                     .flex_none()
                     .h_full()
-                    .when(!self.toc.is_empty(), |rail| {
-                        rail.w(px(260.))
-                            .border_l_1()
-                            .border_color(cx.theme().border)
-                    });
-                rail = rail.child({
-                    let mut head = h_flex().items_center().gap_2().px_4().pt_4();
-                    if !self.toc.is_empty() {
-                        head = head.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("On this page"),
-                        );
+                    .min_h_0()
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .py_2()
+                            .gap_1()
+                            .child(
+                                Button::new("resource-outline-tab")
+                                    .ghost()
+                                    .small()
+                                    .label("On this page")
+                                    .when(!self.show_comments, |b| b.bg(cx.theme().accent))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_comments = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("resource-comments-tab")
+                                    .ghost()
+                                    .small()
+                                    .label(format!("Comments ({})", artifact.comments.len()))
+                                    .when(self.show_comments, |b| b.bg(cx.theme().accent))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_comments = true;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .child(self.render_options_menu(snapshot.clone(), archived, cx)),
+                    )
+                    .child(if self.show_comments {
+                        self.render_comments_panel(&snapshot, cx).into_any_element()
                     } else {
-                        head = head.justify_end();
-                    }
-                    head.child(self.render_options_menu(snapshot.clone(), archived, cx))
-                });
-                if !self.toc.is_empty() {
-                    rail = rail.child(self.render_toc_panel(cx));
-                }
+                        v_flex()
+                            .track_focus(&self.outline_focus)
+                            .flex_1()
+                            .min_h_0()
+                            .when(self.toc.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .p_3()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No headings on this page"),
+                                )
+                            })
+                            .child(self.render_toc_panel(cx))
+                            .into_any_element()
+                    });
                 detail = detail.child(
                     h_flex()
                         .flex_1()

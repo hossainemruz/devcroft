@@ -213,3 +213,114 @@ fn symlink_document_is_rejected_without_touching_target() {
     assert!(store.get(&first.artifact.id).is_err());
     assert_eq!(fs::read_to_string(target).unwrap(), "unchanged");
 }
+
+#[test]
+fn block_comments_roundtrip_relocate_and_keep_original_text_when_outdated() {
+    let (_dir, store) = fixture();
+    let first = store.create(input("repo")).unwrap();
+    let id = &first.artifact.id;
+    let added = store
+        .comment(
+            id,
+            &first.revision,
+            CommentChange::CreateBlock {
+                body: "Clarify this step".into(),
+                block: 1,
+                quote: Some("Ship λ".into()),
+            },
+        )
+        .unwrap();
+    assert_eq!(store.get(id).unwrap(), added);
+    let anchor = added.artifact.comments[0].anchor.as_ref().unwrap().block();
+    assert_eq!(anchor.source, "- [ ] Ship λ");
+    assert_eq!(anchor.start_line, 3);
+    assert_eq!(anchor.quote.as_deref(), Some("Ship λ"));
+    assert_eq!(added.artifact.content, first.artifact.content);
+    assert!(
+        store
+            .comment(
+                id,
+                &added.revision,
+                CommentChange::CreateBlock {
+                    body: "Invalid".into(),
+                    block: 99,
+                    quote: None,
+                }
+            )
+            .is_err()
+    );
+    let moved = store
+        .update(
+            id,
+            &added.revision,
+            ArtifactPatch {
+                content: Some(format!("Intro.\n\n{}", first.artifact.content)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        moved.artifact.comments[0]
+            .anchor
+            .as_ref()
+            .unwrap()
+            .block()
+            .start_line,
+        5
+    );
+    let edited = store
+        .update(
+            id,
+            &moved.revision,
+            ArtifactPatch {
+                content: Some(moved.artifact.content.replace("Ship λ", "Ship β")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let anchor = edited.artifact.comments[0].anchor.as_ref().unwrap().block();
+    assert!(anchor.outdated);
+    assert_eq!(anchor.source, "- [ ] Ship λ");
+    let comment_id = &edited.artifact.comments[0].id;
+    assert!(
+        store
+            .comment(
+                id,
+                &moved.revision,
+                CommentChange::Resolve(comment_id.clone(), true)
+            )
+            .is_err()
+    );
+    let resolved = store
+        .comment(
+            id,
+            &edited.revision,
+            CommentChange::Resolve(comment_id.clone(), true),
+        )
+        .unwrap();
+    assert!(resolved.artifact.comments[0].resolved);
+    assert!(
+        resolved.artifact.comments[0]
+            .anchor
+            .as_ref()
+            .unwrap()
+            .block()
+            .outdated
+    );
+    // Raw body changes from an external editor get relocation on read, without writing.
+    let path = store.checked_path(Some(id)).unwrap().join("artifact.md");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("Ship β", "Ship λ");
+    fs::write(&path, &text).unwrap();
+    let restored = store.get(id).unwrap();
+    assert!(
+        !restored.artifact.comments[0]
+            .anchor
+            .as_ref()
+            .unwrap()
+            .block()
+            .outdated
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), text);
+}

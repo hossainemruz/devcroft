@@ -259,12 +259,21 @@ pub(crate) struct CommentArgs {
 }
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub(crate) enum CommentCommand {
-    List(IdArgs),
+    List(CommentList),
     Create(CommentCreate),
     Edit(CommentEdit),
     Resolve(CommentIdentity),
     Reopen(CommentIdentity),
     Delete(CommentIdentity),
+}
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct CommentList {
+    #[command(flatten)]
+    pub record: IdArgs,
+    #[arg(long, conflicts_with = "resolved")]
+    pub open: bool,
+    #[arg(long, conflicts_with = "open")]
+    pub resolved: bool,
 }
 #[derive(Debug, PartialEq, Eq, Args)]
 pub(crate) struct CommentCreate {

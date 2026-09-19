@@ -185,3 +185,122 @@ fn task_commands_are_removed_and_repository_is_required() {
     assert!(text.contains("artifact"));
     assert!(text.contains("session"));
 }
+
+#[test]
+fn desktop_block_feedback_is_discoverable_and_resolvable_headlessly() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let dir = root.join("portable/artifacts/art-23456789");
+    fs::create_dir_all(&dir).unwrap();
+    // A desktop-produced artifact fixture. CLI reads the same metadata record.
+    let metadata = serde_json::json!({
+        "schemaVersion": 4, "id": "art-23456789", "title": "Block feedback", "kind": "note",
+        "archived": false, "createdAt": 1, "updatedAt": 1,
+        "comments": [{"id": "comment-23456789", "body": "Explain this", "resolved": false,
+            "anchor": {"kind": "block", "start": 9, "end": 19, "startLine": 3, "endLine": 3,
+                "source": "Paragraph.", "prefix": "# Title\n\n", "suffix": "\n", "quote": "Paragraph",
+                "outdated": false}}]
+    });
+    fs::write(
+        dir.join("artifact.md"),
+        format!("---\n{metadata}\n---\n# Title\n\nParagraph.\n"),
+    )
+    .unwrap();
+    let listed = json(
+        root,
+        &[
+            "artifact",
+            "comment",
+            "list",
+            "art-23456789",
+            "--open",
+            "--json",
+        ],
+    );
+    assert_eq!(listed["comments"][0]["anchor"]["kind"], "block");
+    assert_eq!(listed["comments"][0]["anchor"]["source"], "Paragraph.");
+    assert_eq!(listed["comments"][0]["anchor"]["outdated"], false);
+    let resolved = json(
+        root,
+        &[
+            "artifact",
+            "comment",
+            "resolve",
+            "art-23456789",
+            "comment-23456789",
+            "--revision",
+            listed["revision"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        resolved["artifact"]["comments"][0]["resolved"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        json(
+            root,
+            &[
+                "artifact",
+                "comment",
+                "list",
+                "art-23456789",
+                "--open",
+                "--json"
+            ]
+        )["comments"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        json(
+            root,
+            &[
+                "artifact",
+                "comment",
+                "list",
+                "art-23456789",
+                "--resolved",
+                "--json"
+            ]
+        )["comments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !run(
+            root,
+            &[
+                "artifact",
+                "comment",
+                "list",
+                "art-23456789",
+                "--open",
+                "--resolved"
+            ]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !run(
+            root,
+            &[
+                "artifact",
+                "comment",
+                "reopen",
+                "art-23456789",
+                "comment-23456789",
+                "--revision",
+                listed["revision"].as_str().unwrap(),
+                "--json"
+            ]
+        )
+        .status
+        .success()
+    );
+}

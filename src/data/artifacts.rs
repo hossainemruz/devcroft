@@ -14,6 +14,9 @@ use super::DataRoot;
 use super::record::{MAX_BYTES, atomic_replace, nonblank, random_id, read_bounded, timestamp};
 use super::store_lock::{artifact_lock, ensure_directory, portable_gate, reject_symlink};
 
+pub(crate) mod anchors;
+pub(crate) use anchors::CommentAnchor;
+
 const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +53,8 @@ pub(crate) struct Comment {
     pub id: String,
     pub body: String,
     pub resolved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<CommentAnchor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,6 +81,17 @@ pub(crate) struct Artifact {
 }
 
 impl Artifact {
+    fn relocate_comments(&mut self) {
+        if !self.comments.iter().any(|c| c.anchor.is_some()) {
+            return;
+        }
+        let blocks = anchors::blocks(&self.content);
+        for comment in &mut self.comments {
+            if let Some(anchor) = &mut comment.anchor {
+                anchor.relocate(&self.content, &blocks);
+            }
+        }
+    }
     fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == SCHEMA_VERSION,
@@ -97,6 +113,9 @@ impl Artifact {
             nonblank(&comment.id, "comment ID")?;
             nonblank(&comment.body, "comment body")?;
             ensure!(ids.insert(&comment.id), "duplicate comment ID");
+            if let Some(anchor) = &comment.anchor {
+                anchor.validate()?;
+            }
         }
         ensure!(
             self.updated_at >= self.created_at,
@@ -331,7 +350,10 @@ impl ArtifactStore {
         change: CommentChange,
     ) -> Result<Snapshot> {
         // Validate before entering the mutation so errors never commit partial changes.
-        if let CommentChange::Create(body) | CommentChange::Edit(_, body) = &change {
+        if let CommentChange::Create(body)
+        | CommentChange::CreateBlock { body, .. }
+        | CommentChange::Edit(_, body) = &change
+        {
             nonblank(body, "comment body")?;
         }
         self.mutate_result(id, revision, |artifact| {
@@ -340,7 +362,19 @@ impl ArtifactStore {
                     id: random_id().replacen("art-", "comment-", 1),
                     body,
                     resolved: false,
+                    anchor: None,
                 }),
+                CommentChange::CreateBlock { body, block, quote } => {
+                    let blocks = anchors::blocks(&artifact.content);
+                    let block = blocks.get(block).context("comment block not found")?;
+                    ensure!(!block.definition, "cannot comment on a link definition");
+                    artifact.comments.push(Comment {
+                        id: random_id().replacen("art-", "comment-", 1),
+                        body,
+                        resolved: false,
+                        anchor: Some(CommentAnchor::new(&artifact.content, block, quote)),
+                    });
+                }
                 CommentChange::Edit(id, body) => {
                     artifact
                         .comments
@@ -399,6 +433,7 @@ impl ArtifactStore {
         let old_repository = old.artifact.repository.clone();
         let mut artifact = old.artifact;
         change(&mut artifact)?;
+        artifact.relocate_comments();
         if artifact.repository != old_repository
             && let Some(key) = &artifact.repository
         {
@@ -444,7 +479,7 @@ impl ArtifactStore {
         let dir = self.checked_path(Some(id))?;
         let path = dir.join("artifact.md");
         reject_symlink(&path)?;
-        let (bytes, artifact) = if path.try_exists()? {
+        let (bytes, mut artifact) = if path.try_exists()? {
             let bytes = read_bounded(&path)?;
             let text = std::str::from_utf8(&bytes)?;
             let rest = text
@@ -480,6 +515,7 @@ impl ArtifactStore {
             artifact.id == id,
             "artifact ID does not match directory {id}"
         );
+        artifact.relocate_comments();
         snapshot(artifact, &bytes)
     }
 
@@ -534,6 +570,11 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
 
 pub(crate) enum CommentChange {
     Create(String),
+    CreateBlock {
+        body: String,
+        block: usize,
+        quote: Option<String>,
+    },
     Edit(String, String),
     Resolve(String, bool),
     Delete(String),

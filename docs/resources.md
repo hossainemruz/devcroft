@@ -2,7 +2,13 @@
 
 The Resources tab replaces task tracking. Its sidebar lists the current repository's artifacts by most recent update, selects the first by default, and renders Markdown. Selection remains stable across refreshes. Browse artifacts in the command palette provides a global view, including legacy artifacts that do not yet have a repository.
 
-Use Edit Markdown to change a document and Save or Cancel. The comment panel supports creating, editing, resolving, reopening, and deleting document-level feedback. Originating sessions appear as links and open through the existing session navigator in their associated checkout. Missing sessions report an error without starting a different session.
+Use Edit Markdown to change a document and Save or Cancel. The right sidebar has **On this page** and **Comments** tabs. Right-click a rendered block and choose **Comment on this block**, or use its **+** button. A block is a paragraph, heading, list, table, blockquote, or code block. Select words within that block first to include an optional quote. The editor opens in the Comments tab while the document stays visible. Each comment attaches to one whole block; precise word highlighting can be added when the renderer exposes selection locations.
+
+Saved blocks have a subtle highlight and a comment-count button. Click the button to open the comment, or click a comment card's content to return to its block. Multiple comments on the same block remain separate cards. Each card's **⋯** menu contains **Edit**, **Resolve / Reopen**, and **Delete**. **Add document comment** retains the existing document-level feedback workflow. Use the artifact options menu's **Copy Markdown** to copy the whole source.
+
+Block anchors retain their original Markdown excerpt, optional selected quote, UTF-8 byte offsets, one-based source lines, and surrounding context. Unchanged blocks can relocate after insertions or moves. Edited, removed, or ambiguously repeated blocks are marked **Outdated** and retain their original excerpt; their cards can still be edited, resolved, reopened, or deleted. Restoring an identifiable original block restores navigation. Resolved comments remain visible and can be reopened. Desktop polling picks up CLI changes. Comment mutations retain the artifact's revision checks, and conflicting saves keep the draft. 
+
+Originating sessions appear as links and open through the existing session navigator in their associated checkout. Missing sessions report an error without starting a different session.
 
 Keyboard navigation (`Cmd+J` on macOS, `Ctrl+J` on Linux/Windows) offers `m` Edit Markdown and `c` Add comment for a selected resource, or `w` Save draft and `q` Cancel draft while drafting, alongside `h`/`l` pane movement. See the [keyboard reference](keyboard-reference.md).
 
@@ -47,7 +53,7 @@ and optional math rendering.
 
 ## Storage and concurrency
 
-`portable/artifacts/<art-id>/artifact.md` is the atomic record. Schema version 4 metadata is JSON (a YAML subset), enclosed by `---` lines. The Markdown body follows the closing delimiter. Metadata includes ID, title, kind, repository key, originating sessions, comments, archive state, and creation/update timestamps. Unknown metadata round-trips unchanged.
+`portable/artifacts/<art-id>/artifact.md` is the atomic record. Schema version 4 metadata is JSON (a YAML subset), enclosed by `---` lines. The Markdown body follows the closing delimiter. Metadata includes ID, title, kind, repository key, originating sessions, comments, archive state, and creation/update timestamps. Comments may have a tagged `anchor` with `kind: "block"`; older comments without an anchor remain document-level feedback. Comment metadata does not insert markers into the Markdown body. Unknown metadata round-trips unchanged.
 
 App and CLI mutations share a portable gate and per-artifact lock. A hash of the complete file is the revision. Saves check the revision, write and sync a temporary file, then atomically rename it. Conflicts leave editor drafts intact. Files must be regular UTF-8 files, no symlinks, at most 4 MiB including metadata.
 
@@ -59,4 +65,4 @@ See the bundled [agent resource instructions](../assets/skills/devcroft/referenc
 
 ## Manual desktop check
 
-With an isolated data root and registered checkouts, create artifacts for two repositories. Open Resources and check filtering, ordering, default selection, Markdown rendering, long sidebar scrolling, and archive filtering. Edit Markdown, cancel once, then save. Add feedback in the desktop, read/resolve/reopen it with the CLI, and verify the polling update. Edit concurrently in the CLI and desktop and verify the desktop retains its draft after a conflict. Link sessions from both repositories and verify each opens the correct workspace. Check empty repositories, malformed records, and missing sessions.
+With an isolated data root and registered checkouts, create artifacts for two repositories. Open Resources and check filtering, ordering, default selection, Markdown rendering, long sidebar scrolling, and archive filtering. Edit Markdown, cancel once, then save. Add block feedback with and without a selected quote, check both directions of navigation, and edit/delete through the card menu. Insert text before an anchor, then change its block and check the Outdated state. Add feedback in the desktop, read/resolve/reopen it with the CLI, and verify the polling update. Edit concurrently in the CLI and desktop and verify the desktop retains its draft after a conflict. Link sessions from both repositories and verify each opens the correct workspace. Check empty repositories, malformed records, and missing sessions.

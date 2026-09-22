@@ -1,6 +1,6 @@
 # Repository resources
 
-Start with a conversation, clarify requirements, and write an RFC or plan. Track phases with Markdown checkboxes. Use the same artifact across implementation sessions.
+Start with a conversation, clarify requirements, and write an RFC or plan. Track phases with Markdown checkboxes. Use the same artifact across implementation sessions. Record agent review findings as a review artifact.
 
 Discover repository keys with `devcroft repository list --json`. Create an artifact:
 
@@ -11,7 +11,7 @@ devcroft artifact get ART_ID --json
 devcroft artifact update ART_ID --revision TOKEN --content-file /absolute/path/plan.md --json
 ```
 
-Use `--kind rfc`, `plan`, or `note`. Reads include Markdown, repository, originating sessions, comments, and an opaque revision. Updates require the latest revision and preserve omitted fields. Archived artifacts are hidden from lists; use `--include-archived`, `archive`, or `unarchive`.
+Use `--kind rfc`, `plan`, `note`, or `review`. Reads include Markdown, repository, originating sessions, comments, and an opaque revision. Updates require the latest revision and preserve omitted fields. Archived artifacts are hidden from lists; use `--include-archived`, `archive`, or `unarchive`.
 
 Discover session keys with `devcroft session list --json`. To associate one or more originating sessions, pass `--sessions-file /absolute/path/sessions.json` on create or update. Its JSON array contains entries shaped as `{"repository":"KEY","title":"Requirements discussion","key":{"provider":"codex","store":"/absolute/provider/store","id":"native-session-id"}}`. Copy `key` from session discovery; do not guess it. Each entry can belong to a different repository. Supplying `[]` clears origins. The desktop opens an origin in that session's workspace.
 

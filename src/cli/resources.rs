@@ -150,7 +150,7 @@ pub(crate) enum ArtifactCommand {
     List(ListArgs),
     /// Read current metadata and Markdown, including archived artifacts.
     Get(IdArgs),
-    /// Create a standalone RFC, plan, or note from UTF-8 Markdown.
+    /// Create a standalone RFC, plan, note, or review from UTF-8 Markdown.
     Create(ArtifactCreateArgs),
     /// Patch metadata and/or Markdown with one revision-checked mutation.
     Update(ArtifactUpdateArgs),
@@ -202,6 +202,7 @@ pub(crate) enum KindArg {
     Rfc,
     Plan,
     Note,
+    Review,
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]

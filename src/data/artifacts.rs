@@ -25,16 +25,18 @@ pub(crate) enum Kind {
     Rfc,
     Plan,
     Note,
+    Review,
 }
 
 impl Kind {
-    pub(crate) const ALL: [Self; 3] = [Self::Rfc, Self::Plan, Self::Note];
+    pub(crate) const ALL: [Self; 4] = [Self::Rfc, Self::Plan, Self::Note, Self::Review];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Rfc => "RFC",
             Self::Plan => "Plan",
             Self::Note => "Note",
+            Self::Review => "Review",
         }
     }
 }

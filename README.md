@@ -31,7 +31,7 @@ Press **Cmd+J** on macOS (**Ctrl+J** on Linux/Windows) anywhere in the workspace
 
 ## Repository resources
 
-Use the Resources tab to browse plans, RFCs, and notes for the current repository. Edit Markdown, comment on documents, and reopen originating agent sessions. Plans can track implementation phases using checkboxes.
+Use the Resources tab to browse plans, RFCs, notes, and reviews for the current repository. Edit Markdown, comment on documents, and reopen originating agent sessions. Plans can track implementation phases using checkboxes. Reviews record agent review findings.
 
 ```sh
 devcroft repository list --json

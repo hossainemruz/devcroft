@@ -194,6 +194,7 @@ impl PaletteCommand {
                 "rfc",
                 "plan",
                 "note",
+                "review",
                 "browse",
                 "read",
             ],

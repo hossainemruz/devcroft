@@ -11,6 +11,7 @@ fn kind(value: KindArg) -> artifacts::Kind {
         KindArg::Rfc => artifacts::Kind::Rfc,
         KindArg::Plan => artifacts::Kind::Plan,
         KindArg::Note => artifacts::Kind::Note,
+        KindArg::Review => artifacts::Kind::Review,
     }
 }
 

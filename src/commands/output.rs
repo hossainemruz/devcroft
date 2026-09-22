@@ -38,6 +38,7 @@ pub(super) fn kind(value: artifacts::Kind) -> &'static str {
         artifacts::Kind::Rfc => "rfc",
         artifacts::Kind::Plan => "plan",
         artifacts::Kind::Note => "note",
+        artifacts::Kind::Review => "review",
     }
 }
 

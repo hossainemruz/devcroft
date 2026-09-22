@@ -20,7 +20,7 @@ Use the `devcroft` CLI for Devcroft records. Artifact and review operations work
 | --- | --- |
 | Query or edit repository relationships | `devcroft repository relationships` / `relationship` — read [relationships](references/relationships.md) |
 | Discover repositories | `devcroft repository list --json` |
-| Store RFCs, plans, notes as Markdown artifacts | `devcroft artifact` — read [resources](references/resources.md) |
+| Store RFCs, plans, notes, reviews as Markdown artifacts | `devcroft artifact` — read [resources](references/resources.md) |
 | Read and manage document/block artifact comments | `devcroft artifact comment` — read [resources](references/resources.md) |
 | Discover session identities | `devcroft session list --json` |
 | Read and address local review comments | `devcroft review` — read [review](references/review.md) |

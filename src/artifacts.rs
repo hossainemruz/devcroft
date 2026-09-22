@@ -869,11 +869,14 @@ enum Mutation {
 /// without reading. Hues are type-neutral on purpose: green/red are reserved
 /// elsewhere for status (open/pass/clean vs closed/fail), so `Plan` uses sky
 /// instead of green and `RFC` uses violet for proposal-like content.
+/// `Review` uses teal to stay distinct from sky/violet/amber while avoiding
+/// status hues.
 fn kind_tag_color(kind: Kind) -> ColorName {
     match kind {
         Kind::Rfc => ColorName::Violet,
         Kind::Plan => ColorName::Sky,
         Kind::Note => ColorName::Amber,
+        Kind::Review => ColorName::Teal,
     }
 }
 
@@ -1291,7 +1294,7 @@ impl Render for ArtifactBrowser {
             } else {
                 detail = detail.child(crate::empty_state::empty_state(
                     gpui_kit::component::IconName::FileText, "No resources yet",
-                    "Ask your agent to save a plan, RFC, or note here. It will appear automatically.",
+                    "Ask your agent to save a plan, RFC, note, or review here. It will appear automatically.",
                 ));
             }
         }

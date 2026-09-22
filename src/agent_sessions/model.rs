@@ -12,14 +12,26 @@ pub(crate) const HOME_LIMIT: usize = 4;
 /// Default recent-session rows per repository in the Agent sidebar.
 /// Persisted per machine as `recent_sessions_limit` (see
 /// [`crate::data::DeviceState`]); out-of-range values clamp on read.
+/// Settable in Settings > Agent with a 10–50 slider stepping by 5.
 pub(crate) const DEFAULT_SIDEBAR_LIMIT: usize = 25;
-pub(crate) const MIN_SIDEBAR_LIMIT: usize = 5;
-pub(crate) const MAX_SIDEBAR_LIMIT: usize = 100;
+pub(crate) const MIN_SIDEBAR_LIMIT: usize = 10;
+pub(crate) const MAX_SIDEBAR_LIMIT: usize = 50;
+/// Step for the Settings slider. Pure stepping helper stays unit-testable.
+pub(crate) const SIDEBAR_LIMIT_STEP: usize = 5;
 
 /// Clamp a stored or stepped sidebar limit into the settable range. Pure
 /// so Settings stepping stays unit-testable without a window.
 pub(crate) fn clamp_sidebar_limit(limit: usize) -> usize {
     limit.clamp(MIN_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT)
+}
+
+/// Snap a limit to the Settings slider step (nearest multiple of
+/// [`SIDEBAR_LIMIT_STEP`]), then clamp into range. Pure so the
+/// slider stays unit-testable without a window.
+pub(crate) fn snap_sidebar_limit(limit: usize) -> usize {
+    let step = SIDEBAR_LIMIT_STEP;
+    let snapped = (limit.saturating_add(step / 2) / step) * step;
+    clamp_sidebar_limit(snapped)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

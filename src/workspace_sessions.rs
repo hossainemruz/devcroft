@@ -46,9 +46,12 @@ fn session_section(title: &'static str, count: usize, cx: &App) -> impl IntoElem
 /// Keyboard-navigable agent chooser behind `New session…`.
 /// Backed by the kit's `List`, so up/down move the selection, Enter confirms,
 /// Esc closes, and the global default (Settings > Agent) starts selected
-/// with a `Default` badge. `ListDelegate` callbacks cannot borrow the
-/// workspace, so the delegate holds a weak handle instead.
+/// with a `Default` badge. Only enabled harnesses are offered; the list never
+/// ends empty — an empty enable set falls back to all harnesses.
+/// `ListDelegate` callbacks cannot borrow the workspace, so the delegate
+/// holds a weak handle instead.
 struct AgentPicker {
+    agents: Vec<AgentKind>,
     default: AgentKind,
     selected: usize,
     workspace: WeakEntity<Workspace>,
@@ -59,7 +62,7 @@ impl ListDelegate for AgentPicker {
     type Item = ListItem;
 
     fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        AgentKind::ALL.len()
+        self.agents.len()
     }
 
     fn render_item(
@@ -68,7 +71,7 @@ impl ListDelegate for AgentPicker {
         _window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let agent = AgentKind::ALL[ix.row];
+        let agent = self.agents.get(ix.row).copied()?;
         let icon = crate::agent_icons::agent_icon(agent, &self.icons, crate::agent_icons::ICON_PX);
         Some(
             ListItem::new(("new-session-agent", ix.row)).child(
@@ -115,9 +118,11 @@ impl ListDelegate for AgentPicker {
         window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) {
-        let agent = AgentKind::ALL
+        let agent = self
+            .agents
             .get(self.selected)
             .copied()
+            .or_else(|| self.agents.first().copied())
             .unwrap_or(AgentKind::DEFAULT);
         let workspace = self.workspace.clone();
         window.close_dialog(cx);
@@ -481,14 +486,23 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let project = self.project_name.clone();
         let icons = self.agent_icon_tiles.clone();
-        let selected = AgentKind::ALL
+        let mut agents = self.enabled_agents.clone();
+        if agents.is_empty() {
+            agents = AgentKind::ALL.to_vec();
+        }
+        let default = if agents.contains(&self.default_agent) {
+            self.default_agent
+        } else {
+            agents.first().copied().unwrap_or(AgentKind::DEFAULT)
+        };
+        let selected = agents
             .iter()
-            .position(|agent| *agent == self.default_agent)
+            .position(|agent| *agent == default)
             .unwrap_or(0);
-        let default = self.default_agent;
         let list_state = cx.new(|cx| {
             ListState::new(
                 AgentPicker {
+                    agents,
                     default,
                     selected,
                     workspace,

@@ -5,8 +5,8 @@ mod providers;
 
 use crate::data::DataRoot;
 pub(crate) use model::{
-    DEFAULT_SIDEBAR_LIMIT, HOME_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, SessionKey,
-    SessionSummary, clamp_sidebar_limit,
+    DEFAULT_SIDEBAR_LIMIT, HOME_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, SIDEBAR_LIMIT_STEP,
+    SessionKey, SessionSummary, snap_sidebar_limit,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};

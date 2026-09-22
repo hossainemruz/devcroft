@@ -193,8 +193,13 @@ pub(crate) struct Workspace {
     /// Global default harness (Settings > Agent): what fresh Agent panes
     /// launch and what the New-session picker pre-selects. Loaded from
     /// `device.json` at startup and pushed live by Settings; open sessions
-    /// keep running with the harness they started with.
+    /// keep running with the harness they started with. Always one of
+    /// [`Self::enabled_agents`].
     default_agent: AgentKind,
+    /// Enabled harnesses (Settings > Agent). Fresh Agent panes and the
+    /// New-session picker only offer these; open sessions keep running even
+    /// if their harness is later disabled. Never empty.
+    enabled_agents: Vec<AgentKind>,
     /// Strong entity handles keep hidden PTYs and their output tasks alive.
     inactive_repositories: HashMap<PathBuf, RepositoryTabs>,
     settings: Entity<SettingsView>,
@@ -348,11 +353,28 @@ impl Workspace {
         // Global default harness (Settings > Agent). Fresh Agent panes
         // start with it; returning to a checkout resumes its most recent
         // session instead. Later edits come through `set_default_agent`.
-        let default_agent = data_root
+        // The default always stays within the enabled set; later edits come
+        // through `set_enabled_agents` / `set_default_agent`.
+        let stored = data_root.as_ref().and_then(|root| {
+            DeviceStore::new(root).load().ok()
+        });
+        let mut enabled_agents = stored
             .as_ref()
-            .and_then(|root| DeviceStore::new(root).load().ok())
+            .map(|state| state.enabled_agents_or_default())
+            .unwrap_or_else(|| AgentKind::ALL.to_vec());
+        if enabled_agents.is_empty() {
+            enabled_agents = AgentKind::ALL.to_vec();
+        }
+        let mut default_agent = stored
+            .as_ref()
             .map(|state| state.default_agent_or_default())
             .unwrap_or(AgentKind::DEFAULT);
+        if !enabled_agents.contains(&default_agent) {
+            default_agent = enabled_agents
+                .first()
+                .copied()
+                .unwrap_or(AgentKind::DEFAULT);
+        }
         // Home must not launch an agent or editor in the startup directory.
         // Panes are created only when the user enters a repository workspace.
         let active_tab = WorkspaceTab::Agent;
@@ -668,6 +690,7 @@ impl Workspace {
             review,
             session_agent,
             default_agent,
+            enabled_agents,
             inactive_repositories: HashMap::new(),
             settings,
             project_name: project_name.into(),
@@ -1514,10 +1537,10 @@ impl Workspace {
 
     /// Apply a Settings > Agent sidebar limit live: re-project the
     /// in-memory snapshot so the sidebar updates immediately. The caller
-    /// owns persistence; values are clamped for defense in depth.
+    /// owns persistence; values snap to the slider step for defense in depth.
     pub(crate) fn set_session_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
-        use crate::agent_sessions::clamp_sidebar_limit;
-        let limit = clamp_sidebar_limit(limit);
+        use crate::agent_sessions::snap_sidebar_limit;
+        let limit = snap_sidebar_limit(limit);
         if self.session_limit == limit {
             return;
         }
@@ -1525,11 +1548,54 @@ impl Workspace {
         self.publish_sessions(cx);
     }
 
+    /// Apply a Settings > Agent enable set live: fresh Agent panes and the
+    /// New-session picker only offer these afterwards. The caller owns
+    /// persistence; open sessions keep running. Never ends empty — an empty
+    /// update falls back to all harnesses — and the default always stays
+    /// within the enabled set.
+    pub(crate) fn set_enabled_agents(
+        &mut self,
+        enabled: Vec<AgentKind>,
+        default: AgentKind,
+        cx: &mut Context<Self>,
+    ) {
+        let mut enabled = enabled;
+        if enabled.is_empty() {
+            enabled = AgentKind::ALL.to_vec();
+        }
+        let mut ordered: Vec<AgentKind> = AgentKind::ALL
+            .into_iter()
+            .filter(|agent| enabled.contains(agent))
+            .collect();
+        if ordered.is_empty() {
+            ordered = AgentKind::ALL.to_vec();
+        }
+        let default = if ordered.contains(&default) {
+            default
+        } else {
+            ordered.first().copied().unwrap_or(AgentKind::DEFAULT)
+        };
+        let changed = self.enabled_agents != ordered || self.default_agent != default;
+        self.enabled_agents = ordered;
+        self.default_agent = default;
+        if !self.enabled_agents.contains(&self.session_agent) {
+            // Open panes keep running; only future fresh panes use the
+            // default. No session_agent rewrite needed.
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// Apply a Settings > Agent default harness live: fresh Agent panes and
     /// the New-session picker pick it up immediately. The caller owns
     /// persistence; open sessions keep running with the harness they
-    /// started with.
+    /// started with. Disabled harnesses are ignored so the default never
+    /// leaves the enabled set.
     pub(crate) fn set_default_agent(&mut self, agent: AgentKind, cx: &mut Context<Self>) {
+        if !self.enabled_agents.contains(&agent) {
+            return;
+        }
         if self.default_agent == agent {
             return;
         }

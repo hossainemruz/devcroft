@@ -41,6 +41,21 @@ impl Target {
             Self::Agents => "Codex / shared agents",
         }
     }
+    /// Short description for the Settings skill cards.
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code skills directory.",
+            Self::Agents => "Shared agents skills directory.",
+        }
+    }
+    /// Stable `~/…` location label for the Settings skill cards. The real
+    /// path joins `$HOME`; this label stays readable without I/O.
+    pub(crate) fn location_label(self) -> &'static str {
+        match self {
+            Self::Claude => "~/.claude/skills/devcroft",
+            Self::Agents => "~/.agents/skills/devcroft",
+        }
+    }
     fn path(self, home: &Path) -> PathBuf {
         home.join(match self {
             Self::Claude => ".claude",

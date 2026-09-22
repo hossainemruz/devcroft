@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::{DataRoot, write_json_atomic};
 use crate::agent::AgentKind;
-use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, clamp_sidebar_limit};
+use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, snap_sidebar_limit};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
 /// Selectable automatic portable-sync intervals, in minutes (see
@@ -59,6 +59,12 @@ pub(crate) struct DeviceState {
     /// later can never break older builds' startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_agent: Option<String>,
+    /// Enabled agent harness ids (Settings > Agent). Absent or empty means
+    /// all harnesses; unknown ids are ignored on read so a harness removed
+    /// later can never break startup. Stored as plain strings like
+    /// `default_agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) enabled_agents: Option<Vec<String>>,
     /// Machine-local checkout bindings by repository key: the linked local
     /// checkout plus remote alias. Portable metadata lives in
     /// `portable/repositories/<key>/repository.json`; only the binding that
@@ -94,12 +100,12 @@ impl DeviceState {
             .map_or(DEFAULT_APP_FONT_SIZE, clamp_app_font_size)
     }
 
-    /// Effective Agent sidebar limit: the stored value clamped to the
-    /// settable range, or the default when unset.
+    /// Effective Agent sidebar limit: the stored value snapped to the
+    /// Settings slider step and clamped to range, or the default when unset.
     pub(crate) fn recent_sessions_limit_or_default(&self) -> usize {
         self.recent_sessions_limit
             .map_or(DEFAULT_SIDEBAR_LIMIT, |limit| {
-                clamp_sidebar_limit(limit as usize)
+                snap_sidebar_limit(limit as usize)
             })
     }
 
@@ -111,6 +117,36 @@ impl DeviceState {
             .as_deref()
             .and_then(AgentKind::parse)
             .unwrap_or(AgentKind::DEFAULT)
+    }
+
+    /// Effective enabled harnesses in display order: the stored ids with
+    /// unknown entries dropped, or every harness when unset, empty, or fully
+    /// unknown. Never fails and never returns empty — at least one harness
+    /// must stay selectable so the Agent tab and New-session picker cannot
+    /// dead-end.
+    pub(crate) fn enabled_agents_or_default(&self) -> Vec<AgentKind> {
+        match self.enabled_agents.as_ref() {
+            None => AgentKind::ALL.to_vec(),
+            Some(ids) => {
+                let enabled: Vec<AgentKind> = AgentKind::ALL
+                    .into_iter()
+                    .filter(|agent| {
+                        ids.iter()
+                            .any(|id| AgentKind::parse(id).is_some_and(|parsed| parsed == *agent))
+                    })
+                    .collect();
+                if enabled.is_empty() {
+                    AgentKind::ALL.to_vec()
+                } else {
+                    enabled
+                }
+            }
+        }
+    }
+
+    /// Whether `agent` is in the effective enabled set.
+    pub(crate) fn is_agent_enabled(&self, agent: AgentKind) -> bool {
+        self.enabled_agents_or_default().contains(&agent)
     }
 
     /// Drop legacy selection fields: derived paths are never honored, and
@@ -269,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_sessions_limit_defaults_and_clamps_on_read() {
+    fn recent_sessions_limit_defaults_and_snaps_on_read() {
         use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT};
         assert_eq!(
             DeviceState::default().recent_sessions_limit_or_default(),
@@ -290,6 +326,48 @@ mod tests {
             ..DeviceState::default()
         };
         assert_eq!(exact.recent_sessions_limit_or_default(), 40);
+        // Off-step values snap to the slider step.
+        let off_step = DeviceState {
+            recent_sessions_limit: Some(23),
+            ..DeviceState::default()
+        };
+        assert_eq!(off_step.recent_sessions_limit_or_default(), 25);
+    }
+
+    #[test]
+    fn enabled_agents_default_to_all_and_tolerate_unknown_ids() {
+        use crate::agent::AgentKind;
+        assert_eq!(
+            DeviceState::default().enabled_agents_or_default(),
+            AgentKind::ALL.to_vec()
+        );
+        let exact = DeviceState {
+            enabled_agents: Some(vec!["opencode".to_owned(), "claude".to_owned()]),
+            ..DeviceState::default()
+        };
+        assert_eq!(
+            exact.enabled_agents_or_default(),
+            vec![AgentKind::Opencode, AgentKind::Claude]
+        );
+        // Display order follows AgentKind::ALL, not stored order.
+        let reversed = DeviceState {
+            enabled_agents: Some(vec!["claude".to_owned(), "opencode".to_owned()]),
+            ..DeviceState::default()
+        };
+        assert_eq!(
+            reversed.enabled_agents_or_default(),
+            vec![AgentKind::Opencode, AgentKind::Claude]
+        );
+        for stored in [None, Some(vec![]), Some(vec!["gemini".to_owned()])] {
+            let state = DeviceState {
+                enabled_agents: stored,
+                ..DeviceState::default()
+            };
+            assert_eq!(
+                state.enabled_agents_or_default(),
+                AgentKind::ALL.to_vec()
+            );
+        }
     }
 
     #[test]

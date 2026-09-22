@@ -3,9 +3,11 @@
 //! General hosts the live app-wide font size — persisted to `device.json`
 //! and applied to the Agent/Editor/Terminal/Review panes without a restart.
 //! Sync hosts the portable-data Git remote, the automatic sync schedule, and
-//! a manual Sync-now action with live status. Every other section is an
-//! honest placeholder (disabled controls with a `Soon` badge) until its
-//! backend exists.
+//! a manual Sync-now action with live status. Agent hosts the enabled
+//! harness cards with per-agent toggles, the default-agent dropdown (enabled
+//! agents only), the sidebar session-limit slider (10–50, step 5), and
+//! Devcroft skill cards with a header refresh action.
+//! Keybindings documents the current global shortcuts.
 //!
 //! [`SettingsView`] is a long-lived [`Workspace`](crate::workspace::Workspace)
 //! entity rendered inside a dialog (`window.open_dialog`): the dialog owns
@@ -15,7 +17,10 @@
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -29,7 +34,8 @@ use std::rc::Rc;
 use crate::agent::AgentKind;
 use crate::agent_icons::{self, AgentIconTiles};
 use crate::agent_sessions::{
-    DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, clamp_sidebar_limit,
+    DEFAULT_SIDEBAR_LIMIT, MAX_SIDEBAR_LIMIT, MIN_SIDEBAR_LIMIT, SIDEBAR_LIMIT_STEP,
+    snap_sidebar_limit,
 };
 use crate::command_palette::{
     PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
@@ -44,25 +50,21 @@ use crate::metrics::{
     DEFAULT_APP_FONT_SIZE, MAX_APP_FONT_SIZE, MIN_APP_FONT_SIZE, clamp_app_font_size,
     review_font_size, set_app_font_size,
 };
-use crate::workspace::{Workspace, WorkspaceTab};
+use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     General,
     Sync,
-    Editor,
     Agent,
-    Terminal,
     Keybindings,
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 4] = [
         Self::General,
         Self::Sync,
-        Self::Editor,
         Self::Agent,
-        Self::Terminal,
         Self::Keybindings,
     ];
 
@@ -70,9 +72,7 @@ impl SettingsSection {
         match self {
             Self::General => "General",
             Self::Sync => "Sync",
-            Self::Editor => "Editor",
             Self::Agent => "Agent",
-            Self::Terminal => "Terminal",
             Self::Keybindings => "Keybindings",
         }
     }
@@ -81,9 +81,7 @@ impl SettingsSection {
         match self {
             Self::General => "App-wide appearance.",
             Self::Sync => "Portable data Git sync.",
-            Self::Editor => "Editor pane preferences.",
             Self::Agent => "Agent pane preferences.",
-            Self::Terminal => "Terminal pane preferences.",
             Self::Keybindings => "Current shortcuts.",
         }
     }
@@ -111,10 +109,13 @@ pub(crate) struct SettingsView {
     branch_notice: Option<String>,
     workspace: Option<WeakEntity<Workspace>>,
     skill_busy: bool,
-    skill_report: String,
+    skill_statuses: Vec<String>,
     skill_environment: String,
     session_limit: usize,
+    session_slider: Entity<SliderState>,
     session_limit_error: Option<String>,
+    enabled_agents: Vec<AgentKind>,
+    enabled_agents_error: Option<String>,
     default_agent: AgentKind,
     default_agent_error: Option<String>,
     /// Full-color harness logos for the default-agent options. The harness
@@ -153,18 +154,61 @@ impl SettingsView {
         });
         let branch_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. experiment"));
         let (branches, current_branch, branch_upstream) = load_branch_state(data_root.as_ref());
-        let session_limit = data_root
+        let stored = data_root.as_ref().and_then(|root| {
+            DeviceStore::new(root).load().ok()
+        });
+        let session_limit = stored
             .as_ref()
-            .and_then(|root| DeviceStore::new(root).load().ok())
             .map(|state| state.recent_sessions_limit_or_default())
             .unwrap_or(DEFAULT_SIDEBAR_LIMIT);
-        let default_agent = data_root
+        let mut enabled_agents = stored
             .as_ref()
-            .and_then(|root| DeviceStore::new(root).load().ok())
+            .map(|state| state.enabled_agents_or_default())
+            .unwrap_or_else(|| AgentKind::ALL.to_vec());
+        if enabled_agents.is_empty() {
+            enabled_agents = AgentKind::ALL.to_vec();
+        }
+        let mut default_agent = stored
+            .as_ref()
             .map(|state| state.default_agent_or_default())
             .unwrap_or(AgentKind::DEFAULT);
+        if !enabled_agents.contains(&default_agent) {
+            default_agent = enabled_agents
+                .first()
+                .copied()
+                .unwrap_or(AgentKind::DEFAULT);
+        }
+        let session_slider = cx.new(|_| {
+            SliderState::new()
+                .min(MIN_SIDEBAR_LIMIT as f32)
+                .max(MAX_SIDEBAR_LIMIT as f32)
+                .step(SIDEBAR_LIMIT_STEP as f32)
+                .default_value(session_limit as f32)
+        });
+        cx.subscribe(
+            &session_slider,
+            |this, _, event: &SliderEvent, cx| match event {
+                SliderEvent::Change(value) | SliderEvent::Release(value) => {
+                    let limit = snap_sidebar_limit(value.end().round() as usize);
+                    if limit != this.session_limit {
+                        this.set_session_limit(limit, cx);
+                    }
+                }
+            },
+        )
+        .detach();
         let mut agent_icon_tiles = AgentIconTiles::new();
         agent_icons::ensure_tiles(AgentKind::ALL, &mut agent_icon_tiles, cx);
+        let skill_statuses = crate::agent_skill::Target::ALL
+            .into_iter()
+            .map(|target| {
+                crate::agent_skill::perform(
+                    crate::agent_skill::Action::Status,
+                    Some(target),
+                )
+                .text
+            })
+            .collect::<Vec<_>>();
         Self {
             focus_handle: cx.focus_handle(),
             active_section: SettingsSection::General,
@@ -187,11 +231,13 @@ impl SettingsView {
             branch_notice: None,
             workspace: None,
             skill_busy: false,
-            skill_report: crate::agent_skill::perform(crate::agent_skill::Action::Status, None)
-                .text,
+            skill_statuses,
             skill_environment: crate::agent_skill::environment(),
             session_limit,
+            session_slider,
             session_limit_error: None,
+            enabled_agents,
+            enabled_agents_error: None,
             default_agent,
             default_agent_error: None,
             agent_icon_tiles: Rc::new(agent_icon_tiles),
@@ -204,32 +250,51 @@ impl SettingsView {
         self.workspace = Some(workspace);
     }
 
-    /// Re-read persisted Sync state plus the Agent sidebar limit so the
-    /// dialog never shows stale state (e.g. after external git or CLI
-    /// edits). Called before the dialog opens.
+    /// Re-read persisted Sync state plus the Agent section so the dialog
+    /// never shows stale state (e.g. after external git or CLI edits).
+    /// Called before the dialog opens.
     pub(crate) fn refresh_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(root) = self.data_root.clone() {
-            self.sync_interval = DeviceStore::new(&root)
-                .load()
-                .ok()
+            let stored = DeviceStore::new(&root).load().ok();
+            self.sync_interval = stored
+                .as_ref()
                 .and_then(|state| state.sync_interval_minutes);
             self.saved_origin = get_origin(&root).unwrap_or(None);
-            self.session_limit = DeviceStore::new(&root)
-                .load()
-                .ok()
+            self.session_limit = stored
+                .as_ref()
                 .map(|state| state.recent_sessions_limit_or_default())
                 .unwrap_or(DEFAULT_SIDEBAR_LIMIT);
-            self.default_agent = DeviceStore::new(&root)
-                .load()
-                .ok()
+            let mut enabled = stored
+                .as_ref()
+                .map(|state| state.enabled_agents_or_default())
+                .unwrap_or_else(|| AgentKind::ALL.to_vec());
+            if enabled.is_empty() {
+                enabled = AgentKind::ALL.to_vec();
+            }
+            self.enabled_agents = enabled;
+            let mut default = stored
+                .as_ref()
                 .map(|state| state.default_agent_or_default())
                 .unwrap_or(AgentKind::DEFAULT);
+            if !self.enabled_agents.contains(&default) {
+                default = self
+                    .enabled_agents
+                    .first()
+                    .copied()
+                    .unwrap_or(AgentKind::DEFAULT);
+            }
+            self.default_agent = default;
         } else {
             self.sync_interval = None;
             self.saved_origin = None;
             self.session_limit = DEFAULT_SIDEBAR_LIMIT;
+            self.enabled_agents = AgentKind::ALL.to_vec();
             self.default_agent = AgentKind::DEFAULT;
         }
+        let limit = self.session_limit;
+        self.session_slider.update(cx, |state, cx| {
+            state.set_value(limit as f32, window, cx);
+        });
         let saved = self.saved_origin.clone().unwrap_or_default();
         self.origin_input.update(cx, |state, cx| {
             state.set_value(saved, window, cx);
@@ -243,11 +308,17 @@ impl SettingsView {
             state.set_value("", window, cx);
         });
         if !self.skill_busy {
-            self.skill_report =
-                crate::agent_skill::perform(crate::agent_skill::Action::Status, None).text;
+            self.skill_statuses = crate::agent_skill::Target::ALL
+                .into_iter()
+                .map(|target| {
+                    crate::agent_skill::perform(crate::agent_skill::Action::Status, Some(target))
+                        .text
+                })
+                .collect::<Vec<_>>();
             self.skill_environment = crate::agent_skill::environment();
         }
         self.session_limit_error = None;
+        self.enabled_agents_error = None;
         self.default_agent_error = None;
         self.origin_busy = false;
         self.origin_error = None;
@@ -494,18 +565,12 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Step the Agent sidebar limit in fives, clamped into range. Pure so
-    /// the bounds stay unit-testable without a window.
-    fn stepped_session_limit(current: usize, delta: i32) -> usize {
-        clamp_sidebar_limit(current.saturating_add_signed(delta as isize))
-    }
-
     /// Persist the Agent sidebar limit and push it to the owning workspace
     /// so the sidebar re-projects immediately. The live value applies even
     /// when the write fails (same spirit as the font size); the error line
-    /// says persistence is what broke.
+    /// says persistence is what broke. Values snap to the slider step.
     fn set_session_limit(&mut self, limit: usize, cx: &mut Context<Self>) {
-        let limit = clamp_sidebar_limit(limit);
+        let limit = snap_sidebar_limit(limit);
         if self.session_limit == limit {
             return;
         }
@@ -526,12 +591,98 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Sync the slider thumb after a programmatic limit change (refresh from
+    /// disk, reset button). Slider drags already own the thumb, so they call
+    /// [`Self::set_session_limit`] directly without this.
+    fn sync_session_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let limit = self.session_limit;
+        self.session_slider.update(cx, |state, cx| {
+            state.set_value(limit as f32, window, cx);
+        });
+    }
+
+    /// Enable or disable one harness. The last enabled harness cannot be
+    /// turned off; disabling the default falls back to the first remaining
+    /// enabled harness. Persists to `device.json` and pushes live to the
+    /// owning workspace so fresh Agent panes and the New-session picker pick
+    /// it up immediately.
+    fn set_agent_enabled(&mut self, agent: AgentKind, enabled: bool, cx: &mut Context<Self>) {
+        let currently = self.enabled_agents.contains(&agent);
+        if currently == enabled {
+            return;
+        }
+        if !enabled && self.enabled_agents.len() <= 1 {
+            self.enabled_agents_error =
+                Some("Keep at least one agent enabled.".to_owned());
+            cx.notify();
+            return;
+        }
+        let mut next: Vec<AgentKind> = AgentKind::ALL
+            .into_iter()
+            .filter(|candidate| {
+                if *candidate == agent {
+                    enabled
+                } else {
+                    self.enabled_agents.contains(candidate)
+                }
+            })
+            .collect();
+        if next.is_empty() {
+            next = AgentKind::ALL.to_vec();
+        }
+        self.enabled_agents = next;
+        self.enabled_agents_error = None;
+        if !self.enabled_agents.contains(&self.default_agent) {
+            let fallback = self
+                .enabled_agents
+                .first()
+                .copied()
+                .unwrap_or(AgentKind::DEFAULT);
+            self.default_agent = fallback;
+            self.default_agent_error = None;
+        }
+        let enabled_ids = self
+            .enabled_agents
+            .iter()
+            .map(|agent| agent.id().to_owned())
+            .collect::<Vec<_>>();
+        let default_id = self.default_agent.id().to_owned();
+        if let Some(root) = self.data_root.clone()
+            && let Err(error) = DeviceStore::new(&root).update(|state| {
+                state.enabled_agents = Some(enabled_ids.clone());
+                state.default_agent = Some(default_id.clone());
+            })
+        {
+            self.enabled_agents_error =
+                Some(format!("Could not save the enabled agents: {error:#}"));
+        }
+        if let Some(workspace) = self.workspace.clone() {
+            let enabled = self.enabled_agents.clone();
+            let default = self.default_agent;
+            workspace
+                .update(cx, |this, cx| {
+                    this.set_enabled_agents(enabled, default, cx)
+                })
+                .ok();
+        }
+        cx.notify();
+    }
+
     /// Persist the default agent harness and push it to the owning workspace
     /// so fresh Agent panes and the New-session picker pick it up
-    /// immediately. Open sessions keep running with the harness they started
-    /// with; the live value applies even when the write fails (same spirit
-    /// as the font size), and the error line says persistence is what broke.
+    /// immediately. Only enabled harnesses are selectable; open sessions keep
+    /// running with the harness they started with. The live value applies
+    /// even when the write fails (same spirit as the font size), and the
+    /// error line says persistence is what broke.
     fn set_default_agent(&mut self, agent: AgentKind, cx: &mut Context<Self>) {
+        if !self.enabled_agents.contains(&agent) {
+            self.default_agent_error = Some(format!(
+                "{} is disabled — enable it first.",
+                agent.label()
+            ));
+            cx.notify();
+            return;
+        }
         if self.default_agent == agent {
             return;
         }
@@ -663,11 +814,7 @@ impl SettingsView {
                                     self.render_general(cx).into_any_element()
                                 }
                                 SettingsSection::Sync => self.render_sync(cx).into_any_element(),
-                                SettingsSection::Editor => self.render_editor().into_any_element(),
                                 SettingsSection::Agent => self.render_agent(cx).into_any_element(),
-                                SettingsSection::Terminal => {
-                                    self.render_terminal().into_any_element()
-                                }
                                 SettingsSection::Keybindings => {
                                     self.render_keybindings().into_any_element()
                                 }
@@ -1064,28 +1211,6 @@ impl SettingsView {
             })
     }
 
-    fn render_editor(&self) -> impl IntoElement {
-        v_flex().gap_4().child(
-            dummy_group("Editor", "Coming soon — these controls are placeholders.")
-                .child(dummy_row(
-                    "Default command",
-                    "Launched when the Editor tab opens.",
-                    dummy_value(editor_command_label()),
-                ))
-                .child(font_size_note_row(self.font_size, "Editor panes"))
-                .child(dummy_row(
-                    "Tab width",
-                    "Spaces per indent in the TUI editor.",
-                    dummy_value("4"),
-                ))
-                .child(dummy_row(
-                    "Word wrap",
-                    "Wrap long lines in the TUI editor.",
-                    dummy_switch(false),
-                )),
-        )
-    }
-
     fn manage_skill(
         &mut self,
         action: crate::agent_skill::Action,
@@ -1099,21 +1224,28 @@ impl SettingsView {
         self.skill_busy = true;
         cx.notify();
         cx.spawn_in(window, async move |view, cx| {
-            let (report, environment) = cx
+            let (statuses, environment) = cx
                 .background_spawn(async move {
-                    let mut report = crate::agent_skill::perform(action, target);
-                    if action != crate::agent_skill::Action::Status {
-                        let status =
-                            crate::agent_skill::perform(crate::agent_skill::Action::Status, None);
-                        report.text = format!("{}\n\n{}", report.text, status.text);
-                    }
-                    (report, crate::agent_skill::environment())
+                    // Run the requested action, then re-read per-target status
+                    // so the cards show the fresh result.
+                    let _ = crate::agent_skill::perform(action, target);
+                    let statuses = crate::agent_skill::Target::ALL
+                        .into_iter()
+                        .map(|target| {
+                            crate::agent_skill::perform(
+                                crate::agent_skill::Action::Status,
+                                Some(target),
+                            )
+                            .text
+                        })
+                        .collect::<Vec<_>>();
+                    (statuses, crate::agent_skill::environment())
                 })
                 .await;
             let _ = cx.update(|_, cx| {
                 view.update(cx, |this, cx| {
                     this.skill_busy = false;
-                    this.skill_report = report.text;
+                    this.skill_statuses = statuses;
                     this.skill_environment = environment;
                     cx.notify();
                 })
@@ -1127,168 +1259,342 @@ impl SettingsView {
         use crate::agent_skill::{Action, Target};
         let busy = self.skill_busy;
         let current = self.default_agent;
+        let enabled = self.enabled_agents.clone();
         let tiles = self.agent_icon_tiles.clone();
+        let view = cx.entity().downgrade();
+
+        let agents = group(
+            "Agents",
+            Some("Choose which harnesses are available. The default and New session… only offer enabled agents."),
+        )
+        .child(
+            v_flex()
+                .gap_2()
+                .children(AgentKind::ALL.into_iter().enumerate().map(|(index, agent)| {
+                    let is_enabled = enabled.contains(&agent);
+                    let icon = agent_icons::agent_icon(agent, &tiles, agent_icons::ICON_PX);
+                    let toggle_view = view.clone();
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(0x292b2b))
+                        .bg(rgb(0x0e0f0f))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(icon)
+                                        .child(
+                                            v_flex()
+                                                .gap_0()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_semibold()
+                                                        .text_color(rgb(0xe7e7e7))
+                                                        .child(agent.label().to_owned()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x737878))
+                                                        .child(agent.description().to_owned()),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    Switch::new(("agent-enabled", index))
+                                        .checked(is_enabled)
+                                        .on_change(move |next, _, cx| {
+                                            toggle_view
+                                                .update(cx, |this, cx| {
+                                                    this.set_agent_enabled(agent, *next, cx)
+                                                })
+                                                .ok();
+                                        }),
+                                ),
+                        )
+                })),
+        )
+        .when_some(self.enabled_agents_error.clone(), |this, error| {
+            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+        });
+
+        let dropdown_view = view.clone();
+        let dropdown_enabled = enabled.clone();
+        let dropdown_tiles = tiles.clone();
+        let current_icon = agent_icons::agent_icon(current, &tiles, agent_icons::ICON_PX);
         let default = group(
             "Default agent",
             Some("Launched when the Agent tab opens without history, and pre-selected in New session…. Open sessions keep running."),
         )
         .child(
-            h_flex()
-                .gap_2()
-                .flex_wrap()
-                .children(AgentKind::ALL.into_iter().map(|agent| {
-                    let selected = agent == current;
-                    let icon =
-                        agent_icons::agent_icon(agent, &tiles, agent_icons::ICON_PX);
-                    div()
-                        .flex_1()
-                        .min_w(px(220.))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .border_1()
-                        .cursor_pointer()
-                        .when(selected, |this| {
-                            this.border_color(rgb(0x2f81f7)).bg(rgb(0x0e1a2b))
-                        })
-                        .when(!selected, |this| {
-                            this.border_color(rgb(0x292b2b)).bg(rgb(0x0e0f0f))
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.set_default_agent(agent, cx)
-                            }),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(icon)
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .text_color(rgb(0xe7e7e7))
-                                        .child(agent.label().to_owned()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x737878))
-                                .child(agent.description().to_owned()),
-                        )
-                })),
+            h_flex().gap_2().items_center().child(
+                Button::new("default-agent")
+                    .accessibility_label(current.label().to_owned())
+                    .outline()
+                    .dropdown_caret(true)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(current_icon)
+                            .child(div().child(current.label().to_owned())),
+                    )
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for agent in dropdown_enabled.clone() {
+                            let item_view = dropdown_view.clone();
+                            let row_tiles = dropdown_tiles.clone();
+                            menu = menu.item(
+                                PopupMenuItem::element(move |_, _| {
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(agent_icons::agent_icon(
+                                            agent,
+                                            &row_tiles,
+                                            agent_icons::ICON_PX,
+                                        ))
+                                        .child(div().child(agent.label().to_owned()))
+                                })
+                                .checked(agent == current)
+                                .on_click(move |_, _, cx| {
+                                    item_view
+                                        .update(cx, |this, cx| {
+                                            this.set_default_agent(agent, cx)
+                                        })
+                                        .ok();
+                                }),
+                            );
+                        }
+                        menu
+                    }),
+            ),
         )
         .when_some(self.default_agent_error.clone(), |this, error| {
             this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
         });
+
         let limit = self.session_limit;
         let is_default = limit == DEFAULT_SIDEBAR_LIMIT;
         let sessions = group(
             "Sessions",
             Some("How many recent sessions the Agent sidebar lists per repository."),
         )
-        .child(live_row(
-            "Recent sessions in sidebar",
-            "Applies immediately; open sessions always stay reachable.",
-            h_flex()
+        .child(
+            v_flex()
                 .gap_2()
-                .items_center()
-                .child(step_button(
-                    "-",
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_session_limit(SettingsView::stepped_session_limit(limit, -5), cx)
-                    }),
-                ))
                 .child(
-                    div()
-                        .w(px(48.))
-                        .text_center()
-                        .text_sm()
-                        .text_color(rgb(0xe7e7e7))
-                        .child(format!("{limit}")),
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Slider::new(&self.session_slider)),
+                        )
+                        .child(
+                            div()
+                                .w(px(48.))
+                                .text_center()
+                                .text_sm()
+                                .text_color(rgb(0xe7e7e7))
+                                .child(format!("{limit}")),
+                        ),
                 )
-                .child(step_button(
-                    "+",
-                    cx.listener(move |this, _, _, cx| {
-                        this.set_session_limit(SettingsView::stepped_session_limit(limit, 5), cx)
-                    }),
-                ))
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x555a5a))
-                        .child(format!("{MIN_SIDEBAR_LIMIT}–{MAX_SIDEBAR_LIMIT}")),
-                )
-                .when(!is_default, |this| {
-                    this.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .text_color(rgb(0x858989))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.set_session_limit(DEFAULT_SIDEBAR_LIMIT, cx)
-                                }),
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x555a5a))
+                                .child(format!(
+                                    "{MIN_SIDEBAR_LIMIT}–{MAX_SIDEBAR_LIMIT} · step {SIDEBAR_LIMIT_STEP}"
+                                )),
+                        )
+                        .when(!is_default, |this| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(0x858989))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.set_session_limit(DEFAULT_SIDEBAR_LIMIT, cx);
+                                            this.sync_session_slider(window, cx);
+                                        }),
+                                    )
+                                    .child(format!("Reset to {DEFAULT_SIDEBAR_LIMIT}")),
                             )
-                            .child(format!("Reset to {DEFAULT_SIDEBAR_LIMIT}")),
-                    )
-                }),
-        ))
+                        }),
+                ),
+        )
         .when_some(self.session_limit_error.clone(), |this, error| {
             this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
         });
-        let mut skill = group(
-            "Devcroft skill",
-            Some(
-                "Teach agents to use repository artifacts and artifact/review comments. OpenCode also reads these skill locations.",
-            ),
-        );
-        for (index, target) in Target::ALL.into_iter().enumerate() {
-            skill = skill.child(live_row(
-                target.label(),
-                "Install for all projects on this machine.",
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new(("skill-install", index))
-                            .label("Install / update")
+
+        let skill_header = v_flex().gap_1().child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(rgb(0xe7e7e7))
+                        .child("Devcroft skill".to_owned()),
+                )
+                .child(
+                    div().flex_none().child(
+                        Button::new("skill-status")
+                            .label(if busy { "Working…" } else { "Refresh" })
                             .disabled(busy)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.manage_skill(Action::Install, Some(target), window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(("skill-remove", index))
-                            .label("Remove")
-                            .disabled(busy)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.manage_skill(Action::Uninstall, Some(target), window, cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.manage_skill(Action::Status, None, window, cx);
                             })),
                     ),
-            ));
-        }
-        skill = skill
-            .child(
-                Button::new("skill-status")
-                    .label(if busy { "Working…" } else { "Refresh status" })
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.manage_skill(Action::Status, None, window, cx);
-                    })),
-            )
-            .child(
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x737878))
+                .child(
+                    "Teach agents to use repository artifacts and artifact/review comments. OpenCode also reads these skill locations."
+                        .to_owned(),
+                ),
+        );
+        let mut skill_cards = v_flex().gap_2();
+        for (index, target) in Target::ALL.into_iter().enumerate() {
+            let status = self
+                .skill_statuses
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| "Status unavailable.".to_owned());
+            let mut lines = status.lines();
+            let status_line = lines.next().unwrap_or("").trim().to_owned();
+            let path_line = lines.next().unwrap_or("").trim().to_owned();
+            skill_cards = skill_cards.child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(0xe7e7e7))
-                    .child(self.skill_report.clone()),
-            )
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x292b2b))
+                    .bg(rgb(0x0e0f0f))
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        v_flex()
+                                            .gap_0()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .text_color(rgb(0xe7e7e7))
+                                                    .child(target.label().to_owned()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x737878))
+                                                    .child(target.description().to_owned()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x555a5a))
+                                                    .child(target.location_label().to_owned()),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Button::new(("skill-install", index))
+                                                    .label("Install / update")
+                                                    .disabled(busy)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.manage_skill(
+                                                                Action::Install,
+                                                                Some(target),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(("skill-remove", index))
+                                                    .label("Remove")
+                                                    .disabled(busy)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.manage_skill(
+                                                                Action::Uninstall,
+                                                                Some(target),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_0()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x858989))
+                                            .child(status_line),
+                                    )
+                                    .when(!path_line.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x555a5a))
+                                                .child(path_line),
+                                        )
+                                    }),
+                            ),
+                    ),
+            );
+        }
+        let skill = v_flex()
+            .gap_3()
+            .child(skill_header)
+            .child(skill_cards)
             .child(
                 div()
                     .text_xs()
@@ -1303,50 +1609,10 @@ impl SettingsView {
             );
         v_flex()
             .gap_4()
+            .child(agents)
             .child(default)
             .child(sessions)
             .child(skill)
-            .child(
-                dummy_group("Agent", "Coming soon — these controls are placeholders.")
-                    .child(font_size_note_row(self.font_size, "Agent panes"))
-                    .child(dummy_row(
-                        "Provider",
-                        "Used for activity detection.",
-                        dummy_dropdown("Auto"),
-                    ))
-                    .child(dummy_row(
-                        "Approval mode",
-                        "When the agent may edit without asking.",
-                        dummy_dropdown("Ask before edits"),
-                    )),
-            )
-    }
-
-    fn render_terminal(&self) -> impl IntoElement {
-        v_flex().gap_4().child(
-            dummy_group("Terminal", "Coming soon — these controls are placeholders.")
-                .child(dummy_row(
-                    "Shell",
-                    "Login shell launched in new terminals.",
-                    dummy_value(default_shell_label()),
-                ))
-                .child(font_size_note_row(self.font_size, "Terminal panes"))
-                .child(dummy_row(
-                    "Scrollback",
-                    "Lines kept per terminal.",
-                    dummy_value("10,000 lines"),
-                ))
-                .child(dummy_row(
-                    "Cursor blink",
-                    "Blink the terminal cursor.",
-                    dummy_switch(true),
-                ))
-                .child(dummy_row(
-                    "Audible bell",
-                    "Play a sound on the terminal bell.",
-                    dummy_switch(false),
-                )),
-        )
     }
 
     fn render_keybindings(&self) -> impl IntoElement {
@@ -1381,30 +1647,7 @@ impl SettingsView {
                     kbd("Esc"),
                 )),
             )
-            .child(
-                h_flex().gap_2().items_center().child(soon_badge()).child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x737878))
-                        .child("Custom keybindings are coming soon."),
-                ),
-            )
     }
-}
-
-/// `nvim .` today; read from the workspace contract so the label cannot drift.
-fn editor_command_label() -> String {
-    WorkspaceTab::Editor
-        .command()
-        .unwrap_or("nvim .")
-        .to_owned()
-}
-
-fn default_shell_label() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|shell| !shell.is_empty())
-        .unwrap_or_else(|| "/bin/sh".to_owned())
 }
 
 fn format_font_size(size: f32) -> String {
@@ -1519,95 +1762,6 @@ fn live_row(
         .child(control)
 }
 
-/// A placeholder row: dimmed, non-interactive, with a `Soon` badge.
-fn dummy_row(
-    title: impl Into<String>,
-    description: impl Into<String>,
-    control: impl IntoElement,
-) -> impl IntoElement {
-    h_flex()
-        .justify_between()
-        .items_center()
-        .gap_4()
-        .opacity(0.7)
-        .child(
-            v_flex()
-                .gap_1()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0xe7e7e7))
-                        .child(title.into()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x737878))
-                        .child(description.into()),
-                ),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(control)
-                .child(soon_badge()),
-        )
-}
-
-/// A placeholder group: title with a `Soon` badge plus dimmed rows.
-fn dummy_group(title: &str, description: &str) -> gpui_kit::Div {
-    v_flex().gap_3().child(
-        v_flex()
-            .gap_1()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(rgb(0xe7e7e7))
-                            .child(title.to_owned()),
-                    )
-                    .child(soon_badge()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x737878))
-                    .child(description.to_owned()),
-            ),
-    )
-}
-
-/// Read-only note pointing a pane section at the General size. Live in the
-/// sense that it shows the current value; the control itself lives in General.
-fn font_size_note_row(current: f32, panes: &str) -> impl IntoElement {
-    live_row(
-        "Font size",
-        format!("{panes} follow the app-wide size in General."),
-        div()
-            .text_sm()
-            .text_color(rgb(0x858989))
-            .child(format_font_size(current)),
-    )
-}
-
-fn soon_badge() -> impl IntoElement {
-    div()
-        .px_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(0x292b2b))
-        .text_xs()
-        .text_color(rgb(0x737878))
-        .child("Soon")
-}
-
 fn step_button(
     label: &str,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -1625,58 +1779,6 @@ fn step_button(
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label.to_owned())
-}
-
-fn dummy_value(text: impl Into<String>) -> impl IntoElement {
-    div()
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(0x292b2b))
-        .bg(rgb(0x0e0f0f))
-        .text_xs()
-        .text_color(rgb(0x858989))
-        .child(text.into())
-}
-
-fn dummy_dropdown(label: &str) -> impl IntoElement {
-    h_flex()
-        .gap_2()
-        .items_center()
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(0x292b2b))
-        .bg(rgb(0x0e0f0f))
-        .text_xs()
-        .text_color(rgb(0x858989))
-        .child(label.to_owned())
-        .child(div().text_color(rgb(0x555a5a)).child("▾"))
-}
-
-fn dummy_switch(on: bool) -> impl IntoElement {
-    h_flex()
-        .w(px(38.))
-        .h(px(22.))
-        .px(px(3.))
-        .rounded_md()
-        .items_center()
-        .when(on, |this| this.justify_end().bg(rgb(0x2f5f46)))
-        .when(!on, |this| {
-            this.justify_start()
-                .bg(rgb(0x0e0f0f))
-                .border_1()
-                .border_color(rgb(0x292b2b))
-        })
-        .child(
-            div()
-                .size(px(15.))
-                .rounded_md()
-                .when(on, |this| this.bg(rgb(0xe7e7e7)))
-                .when(!on, |this| this.bg(rgb(0x555a5a))),
-        )
 }
 
 fn kbd(label: &str) -> impl IntoElement {
@@ -1726,17 +1828,7 @@ mod tests {
             .into_iter()
             .map(|section| section.label())
             .collect();
-        assert_eq!(
-            labels,
-            vec![
-                "General",
-                "Sync",
-                "Editor",
-                "Agent",
-                "Terminal",
-                "Keybindings"
-            ]
-        );
+        assert_eq!(labels, vec!["General", "Sync", "Agent", "Keybindings"]);
         for section in SettingsSection::ALL {
             assert!(
                 !section.description().is_empty(),
@@ -1804,20 +1896,50 @@ mod tests {
     }
 
     #[test]
-    fn session_limit_steps_stay_in_bounds() {
-        assert_eq!(SettingsView::stepped_session_limit(25, 5), 30);
-        assert_eq!(SettingsView::stepped_session_limit(25, -5), 20);
+    fn session_slider_snaps_and_stays_in_bounds() {
+        assert_eq!(snap_sidebar_limit(25), 25);
+        assert_eq!(snap_sidebar_limit(23), 25);
+        assert_eq!(snap_sidebar_limit(22), 20);
+        assert_eq!(snap_sidebar_limit(MIN_SIDEBAR_LIMIT), MIN_SIDEBAR_LIMIT);
+        assert_eq!(snap_sidebar_limit(MAX_SIDEBAR_LIMIT), MAX_SIDEBAR_LIMIT);
+        assert_eq!(snap_sidebar_limit(1), MIN_SIDEBAR_LIMIT);
+        assert_eq!(snap_sidebar_limit(usize::MAX), MAX_SIDEBAR_LIMIT);
+        assert_eq!(SIDEBAR_LIMIT_STEP, 5);
+        assert_eq!(MIN_SIDEBAR_LIMIT, 10);
+        assert_eq!(MAX_SIDEBAR_LIMIT, 50);
+    }
+
+    #[test]
+    fn enabled_agents_default_to_all_and_tolerate_unknown_ids() {
+        use crate::data::DeviceState;
         assert_eq!(
-            SettingsView::stepped_session_limit(MAX_SIDEBAR_LIMIT, 5),
-            MAX_SIDEBAR_LIMIT
+            DeviceState::default().enabled_agents_or_default(),
+            AgentKind::ALL.to_vec()
         );
+        let exact = DeviceState {
+            enabled_agents: Some(vec!["claude".to_owned(), "codex".to_owned()]),
+            ..DeviceState::default()
+        };
         assert_eq!(
-            SettingsView::stepped_session_limit(MIN_SIDEBAR_LIMIT, -50),
-            MIN_SIDEBAR_LIMIT
+            exact.enabled_agents_or_default(),
+            vec![AgentKind::Claude, AgentKind::Codex]
         );
-        assert_eq!(
-            SettingsView::stepped_session_limit(usize::MAX, 5),
-            MAX_SIDEBAR_LIMIT
-        );
+        assert!(exact.is_agent_enabled(AgentKind::Claude));
+        assert!(!exact.is_agent_enabled(AgentKind::Opencode));
+        for stored in [
+            None,
+            Some(vec![]),
+            Some(vec!["gemini".to_owned()]),
+        ] {
+            let state = DeviceState {
+                enabled_agents: stored,
+                ..DeviceState::default()
+            };
+            assert_eq!(
+                state.enabled_agents_or_default(),
+                AgentKind::ALL.to_vec(),
+                "empty or unknown should fall back to all"
+            );
+        }
     }
 }

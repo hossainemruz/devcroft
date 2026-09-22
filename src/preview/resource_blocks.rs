@@ -244,26 +244,24 @@ impl PreviewView {
         } else {
             gpui_kit::rgb(0xb8860b).into()
         };
+        // Comments tint the block background only; the colored left border
+        // read as decorative chrome rather than document state. One wash
+        // strength keeps every commented block equally scannable; only the
+        // tint color distinguishes open, resolved, and currently-selected.
         let mut block = h_flex()
             .id(("commentable-block", index))
             .items_start()
             .w_full()
             .gap_1()
             .rounded_md()
-            .border_l_2()
-            .border_color(if count > 0 {
-                tint
-            } else {
-                gpui_kit::transparent_black()
-            })
-            .when(count > 0, |d| {
-                d.bg(tint.opacity(if active { 0.12 } else { 0.05 }))
-            })
+            .when(count > 0, |d| d.bg(tint.opacity(0.18)))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .pl_1()
+                    // The old 2px left border plus 4px padding kept text at a
+                    // 6px inset; keep that now that the border is gone.
+                    .pl_1p5()
                     .child(self.text_view(&state, style, cx).selectable(true)),
             );
         // A fixed gutter keeps text wrapping unchanged when comments are saved.

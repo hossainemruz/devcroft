@@ -1,7 +1,6 @@
 //! Portable repository records plus checkout inspection.
 //!
-//! Mirrors the Electron `RepositoryService` create path
-//! (`docs/feature-parity.md` §§2–3): a checkout directory is inspected with
+//! Repository creation inspects a checkout directory with
 //! the git CLI (toplevel, remotes, base branch), an editable key suggestion
 //! is derived, `portable/repositories/<key>/repository.json` is written
 //! atomically, and the checkout binding is saved to machine-local

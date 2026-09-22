@@ -52,8 +52,8 @@ use crate::{
 };
 
 fn main() -> Result<()> {
-    // CLI dispatch happens before any GPUI init so later headless commands
-    // stay fast (see `docs/cli-plan.md`). `app` boots the workspace;
+    // CLI dispatch happens before any GPUI init so headless commands
+    // stay fast. `app` boots the workspace;
     // `preview` validates its file first so a bad path fails
     // without ever opening a window.
     let cli = Cli::parse();

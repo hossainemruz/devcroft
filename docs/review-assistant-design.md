@@ -1,7 +1,7 @@
 # Review Assistant: guided change review and impact investigation
 
 Status: revised design proposal, 2026-09-18. Repository Relationships is
-[implemented](repository-relationships-validation.md). Review Assistant
+[implemented](../assets/skills/devcroft/references/relationships.md). Review Assistant
 application implementation has not started.
 
 Confirmed product direction: an interactive review session built around a rich,
@@ -161,7 +161,7 @@ unavailable source is a separate, explicit context gap.
 
 ## How relationships guide a review
 
-Reuse the existing [relationship model](repository-relationships-design.md) and
+Reuse the existing [relationship model](../assets/skills/devcroft/references/relationships.md) and
 `src/data/relationships.rs`. Definitions remain high-level, portable knowledge.
 Agents discover RPCs, fields, invariants, and workflows during a review; these
 are investigation results, not additional mandatory relationship metadata.

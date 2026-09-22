@@ -595,8 +595,9 @@ impl HomeView {
 
     /// Ordered stops for navigation-mode `j`/`k` in visual order: recent
     /// sessions, recent projects, Add project, then inbox items (PRs grouped
-    /// by category, then todos, then reading) matching the dashboard render order. Only
-    /// the dashboard and PR board participate; the board follows its filter.
+    /// by category, then todos, then reading) matching the dashboard render order. The
+    /// dashboard, PR board, Todos board, and To Read page participate; other
+    /// pages offer no stops. The boards follow their filters.
     fn navigation_targets(&self) -> Vec<HomeNavTarget> {
         if self.is_pull_requests_page() {
             return Category::ALL

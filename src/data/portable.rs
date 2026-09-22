@@ -14,7 +14,7 @@ use serde_json::Value;
 use super::{DataRoot, ensure_dirs, run_git_in, write_json_atomic};
 
 /// Portable workspace descriptor. `formatVersion` is informational only and
-/// must never gate loading (see `feature-parity.md` §2).
+/// must never gate loading.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceDoc {
     #[serde(default, rename = "formatVersion")]

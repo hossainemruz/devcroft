@@ -39,8 +39,8 @@ use crate::data::{
 /// What the dialog does on submit. Create writes a portable record plus a
 /// device binding; Link binds an existing portable record to a checkout
 /// (recovery for synced-but-unlinked records); Edit overwrites portable
-/// metadata in place. Key renames are out of scope (deferred per
-/// feature-parity), so Link/Edit carry a fixed key shown as static text.
+/// metadata in place. Key renames remain deferred, so Link/Edit carry a
+/// fixed key shown as static text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RepositoryDialogMode {
     Create,

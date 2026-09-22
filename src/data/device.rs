@@ -17,8 +17,8 @@ use crate::agent::AgentKind;
 use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, snap_sidebar_limit};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
-/// Selectable automatic portable-sync intervals, in minutes (see
-/// `feature-parity.md` §12). `None` (absent in `device.json`) means Off.
+/// Selectable automatic portable-sync intervals, in minutes.
+/// `None` (absent in `device.json`) means Off.
 /// Reads stay tolerant — any positive stored value schedules — while the
 /// Settings UI only ever writes these options (or clears to Off).
 pub(crate) const SYNC_INTERVAL_OPTIONS: [u64; 4] = [2, 5, 15, 30];

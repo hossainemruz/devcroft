@@ -267,12 +267,23 @@ impl PreviewView {
                     .child(self.text_view(&state, style, cx).selectable(true)),
             );
         // A fixed gutter keeps text wrapping unchanged when comments are saved.
+        // Empty "+" affordances stay dim so long documents scan cleanly;
+        // the ghost hover surface still raises them to full accent on hover.
+        // Note: Button reserves `hover()`/`opacity()` for its variant
+        // styling, so dim here via normal-state text color only.
+        let empty = count == 0;
+        let gutter_color = if empty {
+            cx.theme().muted_foreground.opacity(0.35)
+        } else {
+            cx.theme().secondary_foreground
+        };
         block = block.child(
             div().w(px(30.)).flex_none().child(
                 Button::new(("block-comments", index))
                     .ghost()
                     .small()
                     .compact()
+                    .text_color(gutter_color)
                     .label(if count == 0 {
                         "+".to_owned()
                     } else {

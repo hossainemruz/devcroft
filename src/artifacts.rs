@@ -537,7 +537,13 @@ impl ArtifactBrowser {
                 .unwrap_or_default()
         };
         let input = cx.new(|cx| {
-            let mut input = TextareaState::new(window, cx).rows(if document { 24 } else { 4 });
+            let mut input = if document {
+                TextareaState::new(window, cx).rows(24)
+            } else {
+                // Sidebar comment drafts start roomier than the 2-row default
+                // and grow with content instead of trapping long feedback.
+                TextareaState::new(window, cx).auto_grow(4, 10)
+            };
             input.set_value(value, window, cx);
             input
         });

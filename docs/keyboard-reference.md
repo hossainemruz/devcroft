@@ -19,11 +19,17 @@ at the bottom-right of the window.
 
 These three also work inside navigation mode: the palettes exit to normal mode and
 open, while quit closes navigation and quits. There are no other direct shortcuts — tab jumps, session
-creation, and settings live in navigation mode and the palettes.
+creation, and settings live in navigation mode and the palettes. In normal mode
+**Tab** and **Shift+Tab** belong to the focused component: terminal panes send
+them to the pty (agent harnesses such as opencode switch agents/models/modes
+with them), inputs and lists keep them, and nothing moves focus. Dialogs are
+the exception: their own keyboard layer keeps gpui-kit's Tab traversal for form
+fields.
 
 ## While navigation mode is open
 
 - Press an action key to run it exactly once and return to normal mode.
+- `Tab` and `Shift+Tab` move focus to the next/previous focusable component and keep the mode open so traversal can repeat. This is the only place the app traverses focus; it reaches the controls in the current area (the command bar, dashboard cards, graph nodes and toolbar controls, resource and review panes). `Enter` then keeps focus on the traversed control and returns to normal mode.
 - `h` and `l` (or `←`/`→`) move focus between visible panes (left/right) and keep the mode open so movement can repeat. Movement clamps at the outer panes.
 - `j` and `k` (or `↓`/`↑`) move within the focused pane and keep the mode open so movement can repeat. Movement clamps at the ends. On the sessions sidebar and on Home cards the cursor only moves keyboard focus highlighting: `Enter` opens the highlighted session, project, or card once and returns to normal mode. On artifact/resource lists and review files the selection applies live while the mode stays open, and on the review diff `j`/`k` scrolls; there `Enter` only keeps the focused pane and returns to normal mode.
 - `Escape` or the toggle again returns to normal mode without running anything. Focus stays where pane movement left it, otherwise where it was. Sidebar and Home cursor highlights clear on exit.
@@ -37,6 +43,7 @@ creation, and settings live in navigation mode and the palettes.
 
 | Location | Keys |
 | --- | --- |
+| Everywhere in navigation mode | `Tab` Next focusable component, `Shift+Tab` Previous focusable component (mode stays open) |
 | Home dashboard | `a` Add repository, `r` Browse artifacts |
 | Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Home, `n` New agent session |
 | Global Artifacts page | `g` Home, `b` Back to origin, plus artifact actions below when available |
@@ -58,9 +65,10 @@ Pane movement follows the rendered left-to-right layout and only includes region
 ## Repository Relationships
 
 Open **Repository relationships** from the action palette or Projects.
-Use **Tab / Shift+Tab** to focus toolbar controls, repository nodes, edge labels,
-and inspector controls. **Enter** on a node or edge selects it. The **Add
-relationship** form supports provider/consumer choices without dragging.
+With navigation mode open, use **Tab / Shift+Tab** to focus toolbar controls,
+repository nodes, edge labels, and inspector controls. **Enter** leaves the mode
+on the focused control, and a second **Enter** selects the node or edge. The
+**Add relationship** form supports provider/consumer choices without dragging.
 **Escape** cancels an active gesture or dismisses the editor without saving.
 Normal typing remains in the focused input; no single-key graph shortcuts are
 installed. Navigation mode offers Home and Back.

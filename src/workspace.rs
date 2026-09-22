@@ -78,6 +78,20 @@ const GIT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// interval reasonably tight while each tick costs one small JSON read.
 const AUTO_SYNC_POLL: Duration = Duration::from_secs(10);
 
+/// Key context of the workspace subtree. `bind_app_keys` (see `main.rs`)
+/// unbinds Tab/Shift+Tab here, so normal-mode focus traversal stays out of
+/// the focused component's way — a terminal sends both keys to the pty
+/// (agent harnesses switch agents/models/modes with them) instead of moving
+/// focus. Component traversal lives in navigation mode (see
+/// `move_navigation_component_focus`).
+pub(crate) const WORKSPACE_KEY_CONTEXT: &str = "Workspace";
+
+/// Key context marker for the dialog layer. Dialogs render inside the
+/// workspace subtree but own a keyboard trap, so the marker disables the
+/// workspace Tab unbind while one is on screen and gpui-component's `Root`
+/// traversal keeps working for their forms.
+pub(crate) const DIALOG_KEY_CONTEXT: &str = "dialog";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceTab {
     Agent,
@@ -2162,6 +2176,36 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Navigation-mode `Tab`/`Shift+Tab`: move keyboard focus to the next or
+    /// previous focusable component and keep the mode open so traversal can
+    /// repeat, like `h`/`l`. This is the workspace's only component
+    /// traversal: outside navigation mode the key belongs to the focused
+    /// component (see `WORKSPACE_KEY_CONTEXT`), so terminals forward it to
+    /// the pty and inputs keep it.
+    fn move_navigation_component_focus(
+        &mut self,
+        next: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if next {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
+        }
+        // Traversal can cross a pane boundary (or leave every pane for a
+        // titlebar control). Re-anchor the HUD's pane label — and `h`/`l`'s
+        // starting point — whenever focus landed inside a pane.
+        let panes = self.navigation_panes(cx);
+        if let Some(index) = panes
+            .iter()
+            .rposition(|(_, focus)| focus.contains_focused(window, cx))
+        {
+            self.navigation_pane = index;
+        }
+        cx.notify();
+    }
+
     /// Move the item cursor within the focused pane for navigation-mode
     /// `j`/`k`. Keeps the mode open for repeats; locations without a list
     /// consume the key and stay open. Clamps at the ends like pane movement.
@@ -2366,6 +2410,23 @@ impl Workspace {
         if trigger {
             return NavigationInput::Trigger;
         }
+        // Tab/Shift+Tab are the mode's component traversal (see
+        // `move_navigation_component_focus`); they are the only modified
+        // keystrokes the mode acts on, every other one stays consumed below.
+        if key == "tab" {
+            let shift_only = modifiers.shift
+                && !modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform
+                && !modifiers.function;
+            return if shift_only {
+                NavigationInput::BackTab
+            } else if modifiers.modified() {
+                NavigationInput::Modified
+            } else {
+                NavigationInput::Tab
+            };
+        }
         if modifiers.modified() {
             return NavigationInput::Modified;
         }
@@ -2472,6 +2533,10 @@ impl Workspace {
             NavigationDecision::AcceptFocus => self.accept_navigation_focus(window, cx),
             NavigationDecision::FocusLeft => self.move_navigation_focus(false, window, cx),
             NavigationDecision::FocusRight => self.move_navigation_focus(true, window, cx),
+            NavigationDecision::FocusNext => self.move_navigation_component_focus(true, window, cx),
+            NavigationDecision::FocusPrevious => {
+                self.move_navigation_component_focus(false, window, cx)
+            }
             NavigationDecision::PrevItem => self.move_navigation_item(false, cx),
             NavigationDecision::NextItem => self.move_navigation_item(true, cx),
             NavigationDecision::Execute(command) => {
@@ -2574,14 +2639,16 @@ impl Workspace {
                             "Ctrl+J"
                         };
                         let hint = match (panes.len() > 1, item) {
-                            (true, true) => {
-                                format!("h/l focus pane · j/k move · {enter} · Esc/{toggle} close")
-                            }
+                            (true, true) => format!(
+                                "Tab focus · h/l pane · j/k move · {enter} · Esc/{toggle} close"
+                            ),
                             (true, false) => {
-                                format!("h/l focus pane · {enter} · Esc/{toggle} close")
+                                format!("Tab focus · h/l pane · {enter} · Esc/{toggle} close")
                             }
-                            (false, true) => format!("j/k move · {enter} · Esc/{toggle} close"),
-                            (false, false) => format!("Esc/{toggle} close"),
+                            (false, true) => {
+                                format!("Tab focus · j/k move · {enter} · Esc/{toggle} close")
+                            }
+                            (false, false) => format!("Tab focus · Esc/{toggle} close"),
                         };
                         div()
                             .pt_2()
@@ -2763,6 +2830,11 @@ impl Render for Workspace {
 
         v_flex()
             .relative()
+            // The workspace's key context (`bind_app_keys` unbinds
+            // Tab/Shift+Tab here): normal mode leaves both keys to the
+            // focused component, component traversal lives in navigation
+            // mode.
+            .key_context(WORKSPACE_KEY_CONTEXT)
             .when(
                 self.home_visible || self.active_tab == WorkspaceTab::Resources,
                 |this| this.tab_group(),
@@ -3241,7 +3313,13 @@ impl Render for Workspace {
             // never paints them itself — the app must render this layer on
             // top of its content, otherwise an opened dialog stays invisible.
             // Last child so dialogs float above the command palette too.
-            .children(Root::render_dialog_layer(window, cx))
+            // The `dialog` marker disables the workspace Tab unbind while a
+            // dialog is on screen: its form fields and focus trap keep
+            // gpui-component's traversal.
+            .children(
+                Root::render_dialog_layer(window, cx)
+                    .map(|layer| div().key_context(DIALOG_KEY_CONTEXT).child(layer)),
+            )
     }
 }
 
@@ -3430,6 +3508,224 @@ mod tests {
             !is_open(test_cx),
             "held trigger repeat without modifier movement stays swallowed"
         );
+    }
+
+    /// Component focus traversal is a navigation-mode command. In normal mode
+    /// the workspace unbind (`bind_app_keys`) keeps gpui-component's `Root`
+    /// traversal from stealing Tab, so the key stays with the focused
+    /// component — a terminal sends it to the pty there. The mode itself
+    /// traverses with Tab/Shift+Tab and stays open for repeats.
+    #[gpui_kit::test]
+    fn tab_traverses_components_only_in_navigation_mode(cx: &mut gpui_kit::TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        cx.update(gpui_kit::init);
+        // The shipped keymap, so the unbind under test is the real one.
+        cx.update(crate::bind_app_keys);
+        const TRIGGER: &str = if cfg!(target_os = "macos") {
+            "cmd-j"
+        } else {
+            "ctrl-j"
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+        let holder_for_window = holder.clone();
+        let (_root, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            *holder_for_window.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        let home_focus = view.update(test_cx, |view, cx| view.home.read(cx).focus_handle.clone());
+        let focused = |test_cx: &mut gpui_kit::VisualTestContext| {
+            test_cx.update(|window, cx| window.focused(cx))
+        };
+        let claimed_tab = |test_cx: &mut gpui_kit::VisualTestContext| {
+            view.update(test_cx, |view, _| {
+                view.navigation_claimed_keys.contains_key("tab")
+            })
+        };
+        let is_open = |test_cx: &mut gpui_kit::VisualTestContext| {
+            view.update(test_cx, |view, _| view.navigation_open)
+        };
+        // Held-key bookkeeping: a claimed key stays swallowed until its
+        // release, so consecutive Tab presses need a key-up in between.
+        let release_tab = |test_cx: &mut gpui_kit::VisualTestContext| {
+            test_cx.simulate_event(gpui_kit::KeyUpEvent {
+                keystroke: gpui_kit::Keystroke::parse("tab").unwrap(),
+            });
+        };
+        // Home's handle is not a tab stop, so traversal must visibly move
+        // focus; a stolen-and-dropped key would leave it exactly here.
+        test_cx.update(|window, cx| home_focus.focus(window, cx));
+
+        // Normal mode: Tab must reach the focused component instead of
+        // moving focus. Without the unbind, `Root`'s traversal would jump to
+        // the first tab stop (the dashboard's add-project button) here.
+        test_cx.simulate_keystrokes("tab");
+        assert_eq!(
+            focused(test_cx),
+            Some(home_focus.clone()),
+            "normal mode must not traverse focus"
+        );
+        assert!(
+            !claimed_tab(test_cx),
+            "normal mode must not consume Tab for navigation"
+        );
+
+        // Navigation mode: both directions traverse and keep the mode open.
+        test_cx.simulate_keystrokes(TRIGGER);
+        assert!(is_open(test_cx));
+        test_cx.simulate_keystrokes("shift-tab");
+        assert!(is_open(test_cx), "Shift+Tab keeps navigation mode open");
+        assert!(
+            claimed_tab(test_cx),
+            "Shift+Tab is a navigation input, not a component key"
+        );
+        assert_ne!(
+            focused(test_cx),
+            Some(home_focus.clone()),
+            "Shift+Tab moves focus to the previous component"
+        );
+        release_tab(test_cx);
+        test_cx.update(|window, cx| home_focus.focus(window, cx));
+        test_cx.simulate_keystrokes("tab");
+        assert!(is_open(test_cx), "Tab keeps navigation mode open");
+        assert_ne!(
+            focused(test_cx),
+            Some(home_focus.clone()),
+            "Tab moves focus to the next component"
+        );
+    }
+
+    /// Two focusable tab stops inside the workspace key context, with the
+    /// first one recording raw Tab key events. Isolates the unbind's
+    /// mechanism from the dashboard's tab-stop ring.
+    struct TabUnbindHarness {
+        first: gpui_kit::FocusHandle,
+        second: gpui_kit::FocusHandle,
+        tab_events: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl gpui_kit::Render for TabUnbindHarness {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::{InteractiveElement as _, Styled as _};
+            let tab_events = self.tab_events.clone();
+            gpui_kit::div()
+                .key_context(WORKSPACE_KEY_CONTEXT)
+                .size_full()
+                .child(
+                    gpui_kit::div()
+                        .id("first")
+                        .track_focus(&self.first)
+                        .size(px(8.))
+                        .on_key_down(move |event, _, _| {
+                            if event.keystroke.key == "tab" {
+                                tab_events.set(tab_events.get() + 1);
+                            }
+                        }),
+                )
+                .child(
+                    gpui_kit::div()
+                        .id("second")
+                        .track_focus(&self.second)
+                        .size(px(8.)),
+                )
+        }
+    }
+
+    /// Open the harness window with `first` focused, returning the recorded
+    /// Tab-event counter.
+    fn open_tab_unbind_harness(
+        cx: &mut gpui_kit::TestAppContext,
+    ) -> (
+        Entity<TabUnbindHarness>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        &mut gpui_kit::VisualTestContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let tab_events = Rc::new(std::cell::Cell::new(0));
+        let events = tab_events.clone();
+        let holder: Rc<RefCell<Option<Entity<TabUnbindHarness>>>> = Rc::new(RefCell::new(None));
+        let holder_for_window = holder.clone();
+        let (_root, test_cx) = cx.add_window_view(move |window, cx| {
+            let harness = cx.new(|cx| TabUnbindHarness {
+                first: cx.focus_handle().tab_stop(true),
+                second: cx.focus_handle().tab_stop(true),
+                tab_events: events,
+            });
+            *holder_for_window.borrow_mut() = Some(harness.clone());
+            // Wrapped like the app's workspace, so gpui-component's `Root`
+            // traversal and its "Root" key context are in play.
+            Root::new(harness, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        let first = view.update(test_cx, |view, _| view.first.clone());
+        test_cx.update(|window, cx| first.focus(window, cx));
+        (view, tab_events, test_cx)
+    }
+
+    /// Control for the unbind test below: without the shipped bindings,
+    /// gpui-component's `Root` traversal fires first, moves focus to the
+    /// second tab stop, and the key never reaches the focused component.
+    /// This is the behavior `bind_app_keys` removes inside the workspace.
+    #[gpui_kit::test]
+    fn root_traversal_steals_tab_without_the_workspace_unbind(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, tab_events, test_cx) = open_tab_unbind_harness(cx);
+        let second = view.update(test_cx, |view, _| view.second.clone());
+        test_cx.simulate_keystrokes("tab");
+        assert_eq!(
+            test_cx.update(|window, cx| window.focused(cx)),
+            Some(second),
+            "Root's traversal owns Tab without the unbind"
+        );
+        assert_eq!(tab_events.get(), 0, "the component never sees the key");
+    }
+
+    /// Inside the workspace key context the unbind suppresses `Root`'s Tab
+    /// binding: focus stays put and the raw key reaches the focused
+    /// component's own listener — what terminal panes use to forward it to
+    /// the pty.
+    #[gpui_kit::test]
+    fn workspace_context_unbinds_tab_for_the_focused_component(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let (view, tab_events, test_cx) = open_tab_unbind_harness(cx);
+        let first = view.update(test_cx, |view, _| view.first.clone());
+        test_cx.simulate_keystrokes("tab");
+        assert_eq!(
+            test_cx.update(|window, cx| window.focused(cx)),
+            Some(first.clone()),
+            "the unbind must keep focus on the component"
+        );
+        assert_eq!(tab_events.get(), 1, "the component receives the raw key");
+        test_cx.simulate_keystrokes("shift-tab");
+        assert_eq!(
+            test_cx.update(|window, cx| window.focused(cx)),
+            Some(first),
+            "Shift+Tab is unbound the same way"
+        );
+        assert_eq!(tab_events.get(), 2, "the component receives Shift+Tab too");
+    }
+
+    #[test]
+    fn navigation_tab_maps_to_component_traversal() {
+        let input =
+            |key: &str| Workspace::navigation_input(&gpui_kit::Keystroke::parse(key).unwrap());
+        assert_eq!(input("tab"), NavigationInput::Tab);
+        assert_eq!(input("shift-tab"), NavigationInput::BackTab);
+        // Every other modified form stays a consumed modified key: only
+        // Shift+Tab is a navigation input.
+        assert_eq!(input("cmd-tab"), NavigationInput::Modified);
+        assert_eq!(input("ctrl-shift-tab"), NavigationInput::Modified);
     }
 
     #[test]

@@ -39,8 +39,8 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser as _;
 use gpui_kit::component::{ActiveTheme as _, Root, Theme, ThemeMode};
 use gpui_kit::{
-    App, AppContext as _, Focusable as _, KeyBinding, SharedString, Styled as _, WindowBounds,
-    WindowOptions, px, rgb, size,
+    App, AppContext as _, Focusable as _, KeyBinding, NoAction, SharedString, Styled as _,
+    WindowBounds, WindowOptions, px, rgb, size,
 };
 
 use crate::cli::{Cli, Command};
@@ -69,6 +69,60 @@ fn main() -> Result<()> {
     }
 }
 
+/// Direct shortcuts and the workspace Tab unbind, shared by the app and its
+/// tests so the keymap under test is the shipped one.
+pub(crate) fn bind_app_keys(cx: &mut App) {
+    // Direct shortcuts are deliberately few and OS-primary: `cmd-k`
+    // opens the action commands, `cmd-p` the project switcher, and
+    // `cmd-q` quits on macOS; `ctrl-k` / `ctrl-p` / `ctrl-q` on
+    // Linux/Windows. (`platform` is the
+    // OS key — `Cmd` on macOS, `Win/Super` elsewhere — so binding
+    // `cmd-*` unconditionally would steal `Win+K`/`Win+P`/`Win+Q` from the
+    // Windows projector, Cast, and Linux window managers; binding
+    // `ctrl-*` on macOS would steal readline kill-line/history-prev
+    // from terminals. One binding per OS avoids both.)
+    // Everything else keyboard-driven lives in navigation mode (`cmd-j`
+    // on macOS, `ctrl-j` elsewhere, see `docs/keyboard-reference.md`)
+    // and the palettes: tab jumps, session creation, and settings have no
+    // direct bindings, so `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow
+    // control), `ctrl-n` (readline), `ctrl-d` (end-of-file), and `ctrl-/`
+    // keep reaching terminal applications. The terminal pane still forwards
+    // the two palette toggles and quit explicitly (see
+    // `TerminalPane::on_key_down`), since its raw key handler would
+    // otherwise swallow the event while focused.
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-k", ToggleActionsPalette, None),
+            KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+    } else {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
+            KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
+            KeyBinding::new("ctrl-q", Quit, None),
+        ]);
+    }
+    // Component focus traversal (gpui-component's `Root` Tab bindings) is a
+    // navigation-mode command, so inside the workspace subtree both keys are
+    // unbound: the keystroke then falls through to the focused component —
+    // terminal panes send Tab/Shift+Tab to the pty (agent harnesses switch
+    // agents/models/modes with them) instead of losing focus. Navigation
+    // mode handles both keys itself before key resolution
+    // (`Workspace::on_navigation_keystroke`). The `!dialog` term keeps
+    // gpui-component's traversal for dialog forms and focus traps, which
+    // render under the workspace element but own their keyboard layer.
+    let unbind_context = format!(
+        "{} && !{}",
+        workspace::WORKSPACE_KEY_CONTEXT,
+        workspace::DIALOG_KEY_CONTEXT
+    );
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction, Some(&unbind_context)),
+        KeyBinding::new("shift-tab", NoAction, Some(&unbind_context)),
+    ]);
+}
+
 /// Boot path for `devcroft app [--checkout <path>]`: the previous `main()`
 /// behavior verbatim, rooted at `--checkout` (or cwd when absent).
 fn run_app(args: crate::cli::AppArgs) -> Result<()> {
@@ -83,38 +137,7 @@ fn run_app(args: crate::cli::AppArgs) -> Result<()> {
     let app = gpui_kit::application().with_assets(app_assets::AppAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);
-        // Direct shortcuts are deliberately few and OS-primary: `cmd-k`
-        // opens the action commands, `cmd-p` the project switcher, and
-        // `cmd-q` quits on macOS; `ctrl-k` / `ctrl-p` / `ctrl-q` on
-        // Linux/Windows. (`platform` is the
-        // OS key — `Cmd` on macOS, `Win/Super` elsewhere — so binding
-        // `cmd-*` unconditionally would steal `Win+K`/`Win+P`/`Win+Q` from the
-        // Windows projector, Cast, and Linux window managers; binding
-        // `ctrl-*` on macOS would steal readline kill-line/history-prev
-        // from terminals. One binding per OS avoids both.)
-        // Everything else keyboard-driven lives in navigation mode (`cmd-j`
-        // on macOS, `ctrl-j` elsewhere, see `docs/keyboard-reference.md`)
-        // and the palettes: tab
-        // jumps, session creation, and settings have no direct bindings, so
-        // `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow control),
-        // `ctrl-n` (readline), `ctrl-d` (end-of-file), and `ctrl-/` keep
-        // reaching terminal applications. The terminal pane still forwards
-        // the two palette toggles and quit explicitly (see
-        // `TerminalPane::on_key_down`), since its raw key handler would
-        // otherwise swallow the event while focused.
-        if cfg!(target_os = "macos") {
-            cx.bind_keys([
-                KeyBinding::new("cmd-k", ToggleActionsPalette, None),
-                KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
-                KeyBinding::new("cmd-q", Quit, None),
-            ]);
-        } else {
-            cx.bind_keys([
-                KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
-                KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
-                KeyBinding::new("ctrl-q", Quit, None),
-            ]);
-        }
+        bind_app_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         load_bundled_fonts(cx).expect("failed to load bundled application fonts");
         Theme::change(theme_mode, None, cx);

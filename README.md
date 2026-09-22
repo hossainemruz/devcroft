@@ -25,9 +25,9 @@ Home lists and todo ordering are saved in `portable/dashboard.json` and particip
 
 ### Keyboard navigation
 
-Use **Tab / Shift+Tab** to move through Home's controls, including the command bar and whole project cards, and **Enter / Space** to activate buttons or toggle checkboxes. Focused project cards support **arrow keys** (following the current grid) and **Home / End** (first/last project). **Page Up / Page Down** scroll the dashboard. Existing command-palette shortcuts remain available, and dialogs retain gpui-kit's keyboard focus handling.
+With navigation mode open, **Tab / Shift+Tab** move through the visible controls, including the command bar and whole project cards, and **Enter** leaves the mode on the focused control, where **Enter / Space** activates buttons or toggles checkboxes. Focused project cards support **arrow keys** (following the current grid) and **Home / End** (first/last project). **Page Up / Page Down** scroll the dashboard. Existing command-palette shortcuts remain available, and dialogs retain gpui-kit's keyboard focus handling.
 
-Press **Cmd+J** on macOS (**Ctrl+J** on Linux/Windows) anywhere in the workspace to enter navigation mode: nothing edits while it owns the keyboard, and the keyboard shortcut badge right after the command bar becomes an amber `Navigation` indicator. The bottom-right list shows the keys available at the current location: tab and creation commands in a repository, back navigation on the Artifacts page, and edit/comment/save/cancel commands when a resource selection or draft allows them. Palettes stay on their direct shortcuts (`Cmd+K`, `Cmd+P` on macOS; `Ctrl+K`, `Ctrl+P` on Linux/Windows), which also work inside navigation mode. An action key runs once and returns to normal mode; `h`/`l` move between visible panes and keep the mode open; `j`/`k` move within the focused list (sessions sidebar, Home cards in visual order, resource lists, review files, review diff scroll) and keep the mode open; `Enter` opens the highlighted session or Home card, otherwise it keeps the focused pane; `Escape`, the toggle again, or a click exits without acting. The only direct shortcuts in normal mode are the palettes: `Cmd+K` actions, `Cmd+P` projects on macOS (`Ctrl+K` / `Ctrl+P` on Linux/Windows). See the [keyboard reference](docs/keyboard-reference.md).
+Press **Cmd+J** on macOS (**Ctrl+J** on Linux/Windows) anywhere in the workspace to enter navigation mode: nothing edits while it owns the keyboard, and the keyboard shortcut badge right after the command bar becomes an amber `Navigation` indicator. The bottom-right list shows the keys available at the current location: tab and creation commands in a repository, back navigation on the Artifacts page, and edit/comment/save/cancel commands when a resource selection or draft allows them. Palettes stay on their direct shortcuts (`Cmd+K`, `Cmd+P` on macOS; `Ctrl+K`, `Ctrl+P` on Linux/Windows), which also work inside navigation mode. An action key runs once and returns to normal mode; **Tab / Shift+Tab** move through the visible components and keep the mode open; `h`/`l` move between visible panes and keep the mode open; `j`/`k` move within the focused list (sessions sidebar, Home cards in visual order, resource lists, review files, review diff scroll) and keep the mode open; `Enter` opens the highlighted session or Home card, otherwise it keeps the focused pane; `Escape`, the toggle again, or a click exits without acting. The only direct shortcuts in normal mode are the palettes: `Cmd+K` actions, `Cmd+P` projects on macOS (`Ctrl+K` / `Ctrl+P` on Linux/Windows); normal mode leaves **Tab** to the focused component, so terminals and the agent harness keep it (opencode switches agents/models/modes with it). See the [keyboard reference](docs/keyboard-reference.md).
 
 ## Repository resources
 
@@ -51,9 +51,10 @@ or delete it. Selected edge endpoints can also be rewired by dragging their
 handles; changes remain drafts until Save. Cycles are supported.
 
 Drag the background to pan, scroll to zoom about the pointer, and use **Fit view**
-or **Auto arrange**. **Tab / Shift+Tab**, then **Enter**, selects nodes or edge
-labels; **Add relationship** provides a keyboard form. **Escape** cancels the
-active gesture or dismisses the draft. Groups change the view only; a node's
+or **Auto arrange**. In navigation mode, **Tab / Shift+Tab** move focus to nodes
+or edge labels, then **Enter** selects the focused one; **Add relationship**
+provides a keyboard form. **Escape** cancels the active gesture or dismisses the
+draft. Groups change the view only; a node's
 inspector lists connections across groups. Choose a group using the radio buttons;
 the last selected group and its layout are remembered. **Auto arrange** puts
 unconnected repositories in a compact grid. Click **Open repository** to enter

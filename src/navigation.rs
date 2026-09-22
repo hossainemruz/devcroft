@@ -188,6 +188,10 @@ pub(crate) enum Input {
     Right,
     Up,
     Down,
+    /// `Tab`: move focus to the next focusable component.
+    Tab,
+    /// `Shift+Tab`: move focus to the previous focusable component.
+    BackTab,
     Key(char),
     Modified,
     /// Raw held-key events are normalized by the platform before the
@@ -203,6 +207,10 @@ pub(crate) enum Decision {
     Close,
     FocusLeft,
     FocusRight,
+    /// `Tab`: move focus to the next focusable component.
+    FocusNext,
+    /// `Shift+Tab`: move focus to the previous focusable component.
+    FocusPrevious,
     PrevItem,
     NextItem,
     AcceptFocus,
@@ -229,6 +237,8 @@ pub(crate) fn decide(
         Input::Enter => Decision::AcceptFocus,
         Input::Left => Decision::FocusLeft,
         Input::Right => Decision::FocusRight,
+        Input::Tab => Decision::FocusNext,
+        Input::BackTab => Decision::FocusPrevious,
         Input::Up => Decision::PrevItem,
         Input::Down => Decision::NextItem,
         Input::Key(key) => {
@@ -407,6 +417,44 @@ mod tests {
                 ResourceState::default()
             ),
             Decision::AcceptFocus
+        );
+        assert_eq!(
+            decide(
+                true,
+                Input::Tab,
+                Context::Workspace,
+                ResourceState::default()
+            ),
+            Decision::FocusNext
+        );
+        assert_eq!(
+            decide(
+                true,
+                Input::BackTab,
+                Context::Workspace,
+                ResourceState::default()
+            ),
+            Decision::FocusPrevious
+        );
+        // Closed, Tab belongs to the focused component (a terminal sends it
+        // to the pty), so the mode must not claim it.
+        assert_eq!(
+            decide(
+                false,
+                Input::Tab,
+                Context::Workspace,
+                ResourceState::default()
+            ),
+            Decision::Ignore
+        );
+        assert_eq!(
+            decide(
+                false,
+                Input::BackTab,
+                Context::Workspace,
+                ResourceState::default()
+            ),
+            Decision::Ignore
         );
         assert_eq!(
             decide(

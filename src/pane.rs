@@ -396,7 +396,10 @@ impl TerminalPane {
         // creation live in navigation mode and the palettes, so `cmd-a`,
         // `cmd-e`, `cmd-/`, `cmd-d`, `cmd-t`, and `cmd-n` keep reaching the
         // pty here, as do `ctrl-s` (XOFF flow control) and, on macOS,
-        // `ctrl-k`/`ctrl-p` (readline kill-line/history-prev).
+        // `ctrl-k`/`ctrl-p` (readline kill-line/history-prev). Tab and
+        // Shift+Tab are unbound in the workspace key context (see
+        // `bind_app_keys`), so they arrive here and reach the pty — agent
+        // harnesses switch agents/models/modes with them.
         if let Some(mode) = palette_mode_for_shortcut(
             &event.keystroke.key,
             event.keystroke.modifiers.platform,

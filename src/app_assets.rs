@@ -4,7 +4,10 @@ use std::borrow::Cow;
 
 use gpui_kit::{AssetSource, SharedString};
 
-gpui_kit::assets::icon_assets!(WorkspaceIcons, [GitBranch, GitCommitHorizontal, Keyboard]);
+gpui_kit::assets::icon_assets!(
+    WorkspaceIcons,
+    [GitBranch, GitCommitHorizontal, Keyboard, Braces]
+);
 
 pub(crate) struct AppAssets;
 
@@ -36,6 +39,7 @@ mod tests {
             IconName::GitBranch,
             IconName::GitCommitHorizontal,
             IconName::Keyboard,
+            IconName::Braces,
             IconName::Search,
             IconName::ChevronLeft,
             IconName::TriangleAlert,

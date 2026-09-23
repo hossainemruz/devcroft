@@ -83,6 +83,14 @@ Comments persist locally per branch pair and scope; changed code is re-anchored
 when possible, with removed or ambiguous ranges marked outdated. See the
 [review workflow and CLI](docs/review-comments.md).
 
+## Tools
+
+Developer tools live in the action palette (`Cmd+K` on macOS, `Ctrl+K` on Linux/Windows) under **Tools**. Each tool opens a dialog with its own inputs.
+
+- **Format JSON:** paste JSON into the syntax-highlighted editor, then **Format** to pretty-print it with two-space indentation. The formatted document replaces the input in place, so what stays in the dialog — and what is saved — is already laid out; one undo restores the text as you pasted it. Formatting lays the document out instead of rebuilding it, so key order, duplicate keys, number literals, and string escapes stay exactly as written, and invalid input reports the line and column while leaving the text untouched. **Copy** puts the current text on the clipboard. **Clear** empties the input and the saved copy.
+
+Tool inputs are machine-local: they autosave as you type, flush when the dialog closes, and reload the next time you open the tool. They live under `tools/<tool>/` in the data root (`~/.local/share/devcroft` by default), never inside `portable/`, so tool scratch content does not participate in portable sync.
+
 ## Requirements
 
 [mise](https://mise.jdx.dev/) manages the required Rust and Zig toolchains. The application expects `nvim` and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) to already be available in the environment inherited by your default shell.

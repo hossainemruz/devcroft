@@ -198,16 +198,21 @@ pub(crate) fn default_root_for(
     }
 }
 
-/// Two-space JSON plus trailing newline, written to a hidden temp sibling in
-/// the same directory and then renamed over the target. Same-filesystem
-/// rename keeps replacement atomic; readers never see a torn file.
+/// Two-space JSON plus trailing newline, written atomically.
 pub(crate) fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let mut text = serde_json::to_string_pretty(value).context("serializing JSON")?;
+    text.push('\n');
+    write_text_atomic(path, &text)
+}
+
+/// Raw text written to a hidden temp sibling in the same directory and then
+/// renamed over the target. Same-filesystem rename keeps replacement atomic;
+/// readers never see a torn file.
+pub(crate) fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut text = serde_json::to_string_pretty(value).context("serializing JSON")?;
-    text.push('\n');
     let tmp = path.with_file_name(format!(
         ".{}.tmp",
         path.file_name()

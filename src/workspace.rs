@@ -57,6 +57,7 @@ use crate::navigation::{
 use crate::pane::TerminalPane;
 use crate::review::ReviewView;
 use crate::settings::SettingsView;
+use crate::tools::{ToolKind, ToolView};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
@@ -217,6 +218,11 @@ pub(crate) struct Workspace {
     /// Strong entity handles keep hidden PTYs and their output tasks alive.
     inactive_repositories: HashMap<PathBuf, RepositoryTabs>,
     settings: Entity<SettingsView>,
+    /// Tool dialogs opened from the command bar's Tools section: one
+    /// long-lived view per tool, created on first open. Reopening shows
+    /// exactly what was left there, and a close-time save flush can still
+    /// reach the view after the dialog layer drops it.
+    tool_views: HashMap<ToolKind, Entity<ToolView>>,
     project_name: SharedString,
     git_poll: GitPoll,
     command_open: bool,
@@ -707,6 +713,7 @@ impl Workspace {
             enabled_agents,
             inactive_repositories: HashMap::new(),
             settings,
+            tool_views: HashMap::new(),
             project_name: project_name.into(),
             git_poll: GitPoll::default(),
             command_open: false,
@@ -955,6 +962,23 @@ impl Workspace {
         });
     }
 
+    /// Open a developer tool as a modal dialog. The view is created once per
+    /// tool and kept here, so its inputs and derived output survive
+    /// close/reopen; the tool view owns the dialog chrome, including the
+    /// close-time save flush.
+    fn open_tool(&mut self, tool: ToolKind, window: &mut Window, cx: &mut Context<Self>) {
+        let view = match self.tool_views.get(&tool) {
+            Some(view) => view.clone(),
+            None => {
+                let data_root = self.data_root.clone();
+                let view = cx.new(|cx| ToolView::new(window, cx, tool, data_root));
+                self.tool_views.insert(tool, view.clone());
+                view
+            }
+        };
+        ToolView::open_dialog(view, window, cx);
+    }
+
     /// Run the confirmed palette entry. `index` addresses the model installed
     /// by the latest `Command` render (before filtering), so it resolves
     /// against [`palette_model`](Self::palette_model) however the query
@@ -988,6 +1012,7 @@ impl Workspace {
                     self.select_tab(WorkspaceTab::Agent as usize, window, cx);
                 }
             }
+            PaletteItem::Tool(tool) => self.open_tool(tool, window, cx),
             PaletteItem::Command(command) => match command {
                 PaletteCommand::GoAgent => self.select_tab(0, window, cx),
                 PaletteCommand::GoEditor => self.select_tab(1, window, cx),
@@ -1862,6 +1887,9 @@ impl Workspace {
                                 PaletteItem::Command(command) => CommandItem::new()
                                     .label(item.label())
                                     .icon(palette_icon(*command)),
+                                PaletteItem::Tool(tool) => {
+                                    CommandItem::new().label(item.label()).icon(tool.icon())
+                                }
                                 PaletteItem::SwitchRepository { key, .. } => {
                                     let label = item.label().to_owned();
                                     let repository = self

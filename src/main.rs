@@ -33,6 +33,7 @@ mod repository_graph;
 mod review;
 mod session;
 mod settings;
+mod tools;
 mod workspace;
 
 use anyhow::{Context as _, Result, anyhow};

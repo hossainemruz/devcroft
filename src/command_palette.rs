@@ -1,5 +1,5 @@
 //! The command bar model: searchable palette entries for navigation,
-//! repository switching, settings, and portable-data sync.
+//! repository switching, developer tools, settings, and portable-data sync.
 //!
 //! [`PaletteItem`] is deliberately UI-free so filtering and the
 //! section/row mapping stay unit-testable without a window. `Workspace`
@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::data::RecentRepository;
+use crate::tools::ToolKind;
 
 gpui_kit::actions!(
     devcroft,
@@ -205,12 +206,16 @@ impl PaletteCommand {
     }
 }
 
-/// One rendered palette row: a static command, a switch target for a recent
-/// repository, or a historical session. The key is the stable identity; the
-/// label is display text (display name when set, otherwise the key).
+/// One rendered palette row: a static command, a developer tool, a switch
+/// target for a recent repository, or a historical session. The key is the
+/// stable identity; the label is display text (display name when set,
+/// otherwise the key).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteItem {
     Command(PaletteCommand),
+    /// A tool dialog, generated from [`ToolKind::ALL`] so the registry is
+    /// the single source of truth for what the Tools section offers.
+    Tool(ToolKind),
     SwitchRepository {
         key: String,
         label: String,
@@ -247,6 +252,7 @@ impl PaletteItem {
     pub(crate) fn label(&self) -> &str {
         match self {
             Self::Command(command) => command.label(),
+            Self::Tool(tool) => tool.label(),
             Self::SwitchRepository { label, .. } | Self::OpenCheckout { label, .. } => label,
         }
     }
@@ -257,6 +263,7 @@ impl PaletteItem {
     pub(crate) fn keywords(&self) -> Vec<&str> {
         match self {
             Self::Command(command) => command.keywords().to_vec(),
+            Self::Tool(tool) => tool.keywords().to_vec(),
             Self::SwitchRepository { key, .. } => {
                 vec![key.as_str(), "repo", "repository", "project", "switch"]
             }
@@ -307,6 +314,10 @@ pub(crate) fn palette_sections(recents: &[RecentRepository]) -> Vec<PaletteSecti
             items: command_items(&GO_TO_COMMANDS),
         },
         PaletteSection {
+            heading: "Tools",
+            items: tool_items(),
+        },
+        PaletteSection {
             heading: "Repositories",
             items: repository_items(recents),
         },
@@ -322,12 +333,13 @@ pub(crate) fn palette_sections(recents: &[RecentRepository]) -> Vec<PaletteSecti
 }
 
 /// Build the rendered sections for one [`PaletteMode`]: actions show the
-/// go-to, settings, and sync groups (no repositories group at all);
+/// go-to, tools, settings, and sync groups (no repositories group at all);
 /// projects show just the repositories group (switch targets plus the add
 /// command). On
 /// Home (`home_visible`) the workspace tab jumps are omitted — they select a
 /// repository tab, so offering them there would silently change `active_tab`
-/// behind the still-visible Home. Confirmations resolve against exactly this
+/// behind the still-visible Home. Tools stay available on Home: they belong
+/// to no repository. Confirmations resolve against exactly this
 /// model, same contract as [`palette_sections`].
 pub(crate) fn palette_sections_for_mode(
     recents: &[RecentRepository],
@@ -346,6 +358,10 @@ pub(crate) fn palette_sections_for_mode(
                 PaletteSection {
                     heading: "Go to",
                     items: go_to,
+                },
+                PaletteSection {
+                    heading: "Tools",
+                    items: tool_items(),
                 },
                 PaletteSection {
                     heading: "Settings",
@@ -369,6 +385,10 @@ fn command_items(commands: &[PaletteCommand]) -> Vec<PaletteItem> {
         .iter()
         .map(|command| PaletteItem::Command(*command))
         .collect()
+}
+
+fn tool_items() -> Vec<PaletteItem> {
+    ToolKind::ALL.into_iter().map(PaletteItem::Tool).collect()
 }
 
 fn repository_items(recents: &[RecentRepository]) -> Vec<PaletteItem> {
@@ -456,7 +476,9 @@ mod tests {
             .flat_map(|section| section.items)
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(command),
-                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
+                PaletteItem::Tool(_)
+                | PaletteItem::SwitchRepository { .. }
+                | PaletteItem::OpenCheckout { .. } => None,
             })
             .collect();
         assert_eq!(commands.len(), PaletteCommand::ALL.len());
@@ -471,12 +493,42 @@ mod tests {
     }
 
     #[test]
+    fn tools_section_covers_every_tool_exactly_once() {
+        let sections = palette_sections(&[]);
+        let tools: Vec<ToolKind> = sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .filter_map(|item| match item {
+                PaletteItem::Tool(tool) => Some(*tool),
+                PaletteItem::Command(_)
+                | PaletteItem::SwitchRepository { .. }
+                | PaletteItem::OpenCheckout { .. } => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), ToolKind::ALL.len());
+        let unique: HashSet<_> = tools.iter().collect();
+        assert_eq!(unique.len(), ToolKind::ALL.len());
+        // Tools live in their own section, in registry order.
+        let tools_section = sections
+            .iter()
+            .find(|section| section.heading == "Tools")
+            .expect("Tools section is missing");
+        assert_eq!(
+            tools_section.items,
+            ToolKind::ALL
+                .into_iter()
+                .map(PaletteItem::Tool)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn sections_list_recents_ahead_of_static_repository_commands() {
         let sections = palette_sections(&fixture_recents());
-        assert_eq!(sections.len(), 4);
-        assert_eq!(sections[1].heading, "Repositories");
+        assert_eq!(sections.len(), 5);
+        assert_eq!(sections[2].heading, "Repositories");
         assert_eq!(
-            sections[1].items,
+            sections[2].items,
             vec![
                 PaletteItem::SwitchRepository {
                     key: "aaa-first".to_owned(),
@@ -492,7 +544,7 @@ mod tests {
         // No recents: the group holds just the static commands, never empty.
         let sections = palette_sections(&[]);
         assert_eq!(
-            sections[1].items,
+            sections[2].items,
             vec![PaletteItem::Command(PaletteCommand::AddRepository)]
         );
     }
@@ -500,16 +552,19 @@ mod tests {
     #[test]
     fn actions_mode_holds_every_command_but_add_repository() {
         let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false);
-        assert_eq!(sections.len(), 3);
+        assert_eq!(sections.len(), 4);
         assert_eq!(sections[0].heading, "Go to");
-        assert_eq!(sections[1].heading, "Settings");
-        assert_eq!(sections[2].heading, "Sync");
+        assert_eq!(sections[1].heading, "Tools");
+        assert_eq!(sections[2].heading, "Settings");
+        assert_eq!(sections[3].heading, "Sync");
         let commands: Vec<PaletteCommand> = sections
             .iter()
             .flat_map(|section| section.items.iter())
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(*command),
-                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
+                PaletteItem::Tool(_)
+                | PaletteItem::SwitchRepository { .. }
+                | PaletteItem::OpenCheckout { .. } => None,
             })
             .collect();
         // Every static command except `AddRepository`, which lives only in
@@ -534,14 +589,16 @@ mod tests {
     #[test]
     fn home_hides_workspace_tab_jumps_but_keeps_home_destinations() {
         let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true);
-        assert_eq!(sections.len(), 3);
+        assert_eq!(sections.len(), 4);
         assert_eq!(sections[0].heading, "Go to");
         let commands: Vec<PaletteCommand> = sections[0]
             .items
             .iter()
             .filter_map(|item| match item {
                 PaletteItem::Command(command) => Some(*command),
-                PaletteItem::SwitchRepository { .. } | PaletteItem::OpenCheckout { .. } => None,
+                PaletteItem::Tool(_)
+                | PaletteItem::SwitchRepository { .. }
+                | PaletteItem::OpenCheckout { .. } => None,
             })
             .collect();
         // Tab jumps make no sense on Home: selecting one would flip
@@ -567,6 +624,11 @@ mod tests {
                 PaletteCommand::BrowseArtifacts,
                 PaletteCommand::RepositoryRelationships
             ]
+        );
+        // Tools belong to no repository, so Home keeps its whole section.
+        assert_eq!(
+            sections[1].heading, "Tools",
+            "tools must stay reachable on Home"
         );
         // Projects mode is page-agnostic: switching checkouts is how you
         // leave Home, so recents stay put there too.
@@ -720,34 +782,39 @@ mod tests {
         );
         assert_eq!(
             item_at(&sections, 1, 0),
+            Some(PaletteItem::Tool(ToolKind::ALL[0]))
+        );
+        assert_eq!(
+            item_at(&sections, 2, 0),
             Some(PaletteItem::SwitchRepository {
                 key: "aaa-first".to_owned(),
                 label: "First Repo".to_owned(),
             })
         );
         assert_eq!(
-            item_at(&sections, 1, 2),
+            item_at(&sections, 2, 2),
             Some(PaletteItem::Command(PaletteCommand::AddRepository))
         );
         assert_eq!(
-            item_at(&sections, 2, 0),
+            item_at(&sections, 3, 0),
             Some(PaletteItem::Command(PaletteCommand::OpenSettings))
         );
         assert_eq!(
-            item_at(&sections, 3, 0),
+            item_at(&sections, 4, 0),
             Some(PaletteItem::Command(PaletteCommand::SyncPortable))
         );
         assert_eq!(item_at(&sections, 0, 8), None);
-        assert_eq!(item_at(&sections, 4, 0), None);
+        assert_eq!(item_at(&sections, 1, 1), None);
+        assert_eq!(item_at(&sections, 5, 0), None);
     }
 
     #[test]
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 8 go-to + 2 switch + 1 add + 1 settings + 1 sync.
-        assert_eq!(all.len(), 13);
-        assert_eq!(filter_items(&sections, "   ").len(), 13);
+        // 8 go-to + 1 tool + 2 switch + 1 add + 1 settings + 1 sync.
+        assert_eq!(all.len(), 14);
+        assert_eq!(filter_items(&sections, "   ").len(), 14);
     }
 
     #[test]
@@ -810,6 +877,15 @@ mod tests {
         assert_eq!(
             filter_items(&sections, "BROWSE ARTIFACTS"),
             vec![PaletteItem::Command(PaletteCommand::BrowseArtifacts)]
+        );
+        // Tools are found by label and by their search terms.
+        assert_eq!(
+            filter_items(&sections, "format json"),
+            vec![PaletteItem::Tool(ToolKind::JsonFormatter)]
+        );
+        assert_eq!(
+            filter_items(&sections, "pretty"),
+            vec![PaletteItem::Tool(ToolKind::JsonFormatter)]
         );
     }
 

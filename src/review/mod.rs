@@ -11,8 +11,10 @@ mod feedback;
 pub(crate) mod git;
 mod icons;
 pub(crate) mod model;
-mod stream;
-mod syntax;
+// Crate-visible so the text diff tool renders and highlights its result with
+// the same rows and syntax machinery the review uses.
+pub(crate) mod stream;
+pub(crate) mod syntax;
 mod tree;
 
 use std::cell::{Cell, RefCell};

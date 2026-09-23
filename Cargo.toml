@@ -13,10 +13,33 @@ clap = { version = "4.6.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 gix = { version = "0.87.1", default-features = false, features = ["parallel", "revision", "sha1", "status"] }
-# `tree-sitter` brings the JSON grammar the tool dialog's editor
-# highlights with; without it the highlighter factory has no parser and the
-# editor renders plain text.
-gpui-kit = { version = "0.6.2", features = ["tree-sitter"] }
+# The diff tool's paste editors highlight with the editor's tree-sitter
+# grammars; the diff pane uses syntect (see `review::syntax`). These are the
+# picker's languages that both engines can color, so a picked language means
+# the same thing on both tabs. SQL is the exception: `tree-sitter-sequel`
+# pins an old `cc`, which conflicts with the rest of the graph.
+gpui-kit = { version = "0.6.2", features = [
+  "tree-sitter",
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-csharp",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-go",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-lua",
+  "tree-sitter-make",
+  "tree-sitter-markdown",
+  "tree-sitter-php",
+  "tree-sitter-python",
+  "tree-sitter-ruby",
+  "tree-sitter-rust",
+  "tree-sitter-scala",
+  "tree-sitter-yaml",
+] }
 ignore = "0.4.33"
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "5988a0b78b4aa804d1c12e66bbfe662bd97d81c0", default-features = false }
 markdown = "1.0"
@@ -24,7 +47,7 @@ parking_lot = "0.12"
 portable-pty = "0.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 similar = "3.2.0"
-syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig"] }
 
 [dev-dependencies]
 gpui-kit = { version = "0.6.2", features = ["test-support"] }
@@ -48,6 +71,12 @@ gpui-pre-linux = { opt-level = 3 }
 gpui-pre-wgpu = { opt-level = 3 }
 cosmic-text = { opt-level = 3 }
 swash = { opt-level = 3 }
+# Diff highlighting: syntect parses every line of a review file or a pasted
+# document. At dev opt-level 0 it is an order of magnitude slower, which the
+# diff tool pays on every comparison and every language switch.
+syntect = { opt-level = 3 }
+# `regex-onig` (see the dependency above) is compiled C; optimize it too.
+onig_sys = { opt-level = 3 }
 skrifa = { opt-level = 3 }
 harfrust = { opt-level = 3 }
 read-fonts = { opt-level = 3 }

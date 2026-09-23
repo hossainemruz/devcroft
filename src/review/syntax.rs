@@ -1,15 +1,25 @@
-//! Cached syntax styles for review diff lines.
+//! Cached syntax styles for diff lines.
 //!
 //! Highlighting is computed once with the diff on the background executor.
 //! The nested cache mirrors `files -> hunks -> lines`, so virtualized row
 //! rendering only has to look up already-resolved byte ranges.
+//!
+//! The Review tab resolves the syntax from each file's path ([`highlight`]);
+//! the text diff tool has no path, so its dialog offers a language picker
+//! ([`syntax_names`]) and highlights its single document with
+//! [`highlight_hunks`]. The row rendering they share lives in
+//! [`super::stream`].
 
 use std::path::Path;
 use std::sync::LazyLock;
 
+use gpui_kit::{FontStyle as TextFontStyle, FontWeight, HighlightStyle, UnderlineStyle, px, rgba};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style, Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+/// Re-exported so callers that detect a language without a file path (the
+/// text diff tool) can name what they get back.
+pub(crate) use syntect::parsing::SyntaxReference;
+use syntect::parsing::SyntaxSet;
 
 use super::model::{FileContent, Hunk, LineTag, ReviewDiff};
 
@@ -26,6 +36,33 @@ pub(crate) struct SyntaxSpan {
     pub(crate) bold: bool,
     pub(crate) italic: bool,
     pub(crate) underline: bool,
+}
+
+/// Convert resolved spans into the style runs GPUI text wants. Shared by the
+/// review stream and the diff tool's cells, so a span paints identically in
+/// both surfaces.
+pub(crate) fn styled_highlights(
+    spans: &[SyntaxSpan],
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    spans
+        .iter()
+        .map(|span| {
+            (
+                span.range.clone(),
+                HighlightStyle {
+                    color: Some(rgba(span.rgba).into()),
+                    font_weight: span.bold.then_some(FontWeight::BOLD),
+                    font_style: span.italic.then_some(TextFontStyle::Italic),
+                    underline: span.underline.then_some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(rgba(span.rgba).into()),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -58,6 +95,12 @@ impl SyntaxHighlights {
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
+
+    /// One line of a single-document highlight ([`highlight_hunks`]): the
+    /// text diff tool's comparison, which has no file dimension.
+    pub(crate) fn document_line(&self, dark: bool, hunk: usize, line: usize) -> &[SyntaxSpan] {
+        self.line(dark, 0, hunk, line)
+    }
 }
 
 pub(crate) fn highlight(diff: &ReviewDiff) -> SyntaxHighlights {
@@ -65,6 +108,43 @@ pub(crate) fn highlight(diff: &ReviewDiff) -> SyntaxHighlights {
         light: highlight_with_theme(diff, &THEMES.themes[LIGHT_THEME]),
         dark: highlight_with_theme(diff, &THEMES.themes[DARK_THEME]),
     }
+}
+
+/// Highlight the hunks of one document with `syntax`, for the text diff
+/// tool. The review's files go through [`highlight`] instead, which resolves
+/// a syntax per path; this is the same per-hunk machinery for a comparison
+/// that has no path to resolve from.
+pub(crate) fn highlight_hunks(hunks: &[Hunk], syntax: &SyntaxReference) -> SyntaxHighlights {
+    let palette = |theme: &Theme| PaletteHighlights {
+        files: vec![FileHighlights {
+            hunks: hunks
+                .iter()
+                .map(|hunk| highlight_hunk(hunk, syntax, theme))
+                .collect(),
+        }],
+    };
+    SyntaxHighlights {
+        light: palette(&THEMES.themes[LIGHT_THEME]),
+        dark: palette(&THEMES.themes[DARK_THEME]),
+    }
+}
+
+/// Resolve a syntax by display name (`"JSON"`, `"Rust"`), for callers that
+/// know the language without a file path.
+pub(crate) fn syntax_by_name(name: &str) -> Option<&'static SyntaxReference> {
+    SYNTAXES.find_syntax_by_name(name)
+}
+
+/// Every bundled syntax's display name, sorted, for a language picker.
+pub(crate) fn syntax_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = SYNTAXES
+        .syntaxes()
+        .iter()
+        .map(|syntax| syntax.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 fn highlight_with_theme(diff: &ReviewDiff, theme: &Theme) -> PaletteHighlights {
@@ -236,6 +316,42 @@ mod tests {
             highlights.line(false, 0, 0, 1)[0].rgba,
             highlights.line(true, 0, 0, 1)[0].rgba,
         );
+    }
+
+    #[test]
+    fn looks_up_syntaxes_by_name_and_lists_them_for_a_picker() {
+        assert_eq!(syntax_by_name("JSON").unwrap().name, "JSON");
+        assert!(syntax_by_name("No Such Language").is_none());
+        let names = syntax_names();
+        assert!(names.contains(&"Rust"), "{names:?}");
+        assert!(names.contains(&"Plain Text"), "{names:?}");
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, names, "the picker list must be sorted and unique");
+    }
+
+    #[test]
+    fn single_document_highlighting_uses_the_review_machine() {
+        let diff = rust_diff();
+        let FileContent::Text { hunks, .. } = &diff.files[0].content else {
+            panic!("the fixture must be a text diff");
+        };
+        let highlights = highlight_hunks(hunks, syntax_by_name("Rust").unwrap());
+        for dark in [false, true] {
+            for line in [0, 1] {
+                let spans = highlights.document_line(dark, 0, line);
+                assert!(
+                    spans
+                        .iter()
+                        .any(|span| span.range.start == 0 && span.range.end >= 2),
+                    "Rust's `fn` keyword should be highlighted"
+                );
+            }
+        }
+        // Indices past the document are empty, not panics.
+        assert!(highlights.document_line(true, 9, 0).is_empty());
+        assert!(highlights.document_line(true, 0, 9).is_empty());
     }
 
     #[test]

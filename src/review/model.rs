@@ -8,12 +8,16 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use similar::{Algorithm, ChangeTag, TextDiff};
+use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
 
 /// Context lines kept around each change when grouping hunks.
 pub(crate) const CONTEXT_LINES: usize = 3;
 /// Maximum hunk lines (context + changes) emitted per file before truncation.
 pub(crate) const MAX_HUNK_LINES_PER_FILE: usize = 4_000;
+/// Maximum lines a full merged listing ([`diff_text_merged`]) emits before
+/// truncation. Far above the per-file review cap: the listing is the whole
+/// document, and a single pasted document is not a whole changeset.
+pub(crate) const MAX_MERGED_LINES: usize = 20_000;
 
 /// A complete reviewable changeset: one base tree compared against one
 /// worktree state.
@@ -153,45 +157,7 @@ pub(crate) fn diff_text(old: &str, new: &str) -> (Vec<Hunk>, bool) {
     for group in diff.grouped_ops(CONTEXT_LINES) {
         let (old_range, new_range) = group_ranges(&group);
         let collapsed_before = new_range.start.saturating_sub(consumed_new) as u32;
-        // The diff algorithm may emit insertions before deletions at one
-        // position; unified diffs conventionally show all removals first,
-        // so stable-partition each contiguous change run accordingly.
-        // Per-line numbers travel with their lines, keeping anchors exact.
-        let mut lines = Vec::new();
-        let mut pending: Vec<HunkLine> = Vec::new();
-        let flush = |pending: &mut Vec<HunkLine>, lines: &mut Vec<HunkLine>| {
-            let mut insertions = Vec::new();
-            for line in pending.drain(..) {
-                if line.tag == LineTag::Addition {
-                    insertions.push(line);
-                } else {
-                    lines.push(line);
-                }
-            }
-            lines.extend(insertions);
-        };
-        for op in &group {
-            for change in diff.iter_changes(op) {
-                let tag = match change.tag() {
-                    ChangeTag::Equal => LineTag::Context,
-                    ChangeTag::Delete => LineTag::Deletion,
-                    ChangeTag::Insert => LineTag::Addition,
-                };
-                let line = HunkLine {
-                    tag,
-                    old_no: change.old_index().map(|index| index as u32 + 1),
-                    new_no: change.new_index().map(|index| index as u32 + 1),
-                    text: change.value().trim_end_matches(['\r', '\n']).to_owned(),
-                };
-                if tag == LineTag::Context {
-                    flush(&mut pending, &mut lines);
-                    lines.push(line);
-                } else {
-                    pending.push(line);
-                }
-            }
-        }
-        flush(&mut pending, &mut lines);
+        let lines = group_lines(&diff, &group);
         if emitted + lines.len() > MAX_HUNK_LINES_PER_FILE {
             truncated = true;
             break;
@@ -208,6 +174,85 @@ pub(crate) fn diff_text(old: &str, new: &str) -> (Vec<Hunk>, bool) {
         });
     }
     (hunks, truncated)
+}
+
+/// Diff two texts into one merged listing: every line of both sides in order,
+/// with nothing collapsed, capped at [`MAX_MERGED_LINES`].
+///
+/// The review's grouping ([`diff_text`]) is deliberately not used here. A
+/// collapsed run is fine when a file is only being reviewed, but a caller that
+/// has to line the diff up with the text it came from — the diff tool, which
+/// shows the pasted documents side by side — needs every line present to
+/// reference it by number.
+pub(crate) fn diff_text_merged(old: &str, new: &str) -> (Vec<Hunk>, bool) {
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Myers)
+        .diff_lines(old, new);
+    let (old_range, new_range) = group_ranges(diff.ops());
+    let mut lines = group_lines(&diff, diff.ops());
+    // Nothing changed: no listing, exactly like [`diff_text`], so callers can
+    // keep treating "no hunks" as "no differences".
+    if lines.iter().all(|line| line.tag == LineTag::Context) {
+        return (Vec::new(), false);
+    }
+    let truncated = lines.len() > MAX_MERGED_LINES;
+    if truncated {
+        lines.truncate(MAX_MERGED_LINES);
+    }
+    let hunk = Hunk {
+        old_start: old_range.start as u32 + 1,
+        old_lines: old_range.len() as u32,
+        new_start: new_range.start as u32 + 1,
+        new_lines: new_range.len() as u32,
+        collapsed_before: 0,
+        lines,
+    };
+    (vec![hunk], truncated)
+}
+
+/// Build one hunk's lines from a run of diff operations.
+///
+/// The diff algorithm may emit insertions before deletions at one position;
+/// unified diffs conventionally show all removals first, so stable-partition
+/// each contiguous change run accordingly. Per-line numbers travel with their
+/// lines, keeping anchors exact.
+fn group_lines(diff: &TextDiff<'_, '_, str>, ops: &[DiffOp]) -> Vec<HunkLine> {
+    let mut lines = Vec::new();
+    let mut pending: Vec<HunkLine> = Vec::new();
+    let flush = |pending: &mut Vec<HunkLine>, lines: &mut Vec<HunkLine>| {
+        let mut insertions = Vec::new();
+        for line in pending.drain(..) {
+            if line.tag == LineTag::Addition {
+                insertions.push(line);
+            } else {
+                lines.push(line);
+            }
+        }
+        lines.extend(insertions);
+    };
+    for op in ops {
+        for change in diff.iter_changes(op) {
+            let tag = match change.tag() {
+                ChangeTag::Equal => LineTag::Context,
+                ChangeTag::Delete => LineTag::Deletion,
+                ChangeTag::Insert => LineTag::Addition,
+            };
+            let line = HunkLine {
+                tag,
+                old_no: change.old_index().map(|index| index as u32 + 1),
+                new_no: change.new_index().map(|index| index as u32 + 1),
+                text: change.value().trim_end_matches(['\r', '\n']).to_owned(),
+            };
+            if tag == LineTag::Context {
+                flush(&mut pending, &mut lines);
+                lines.push(line);
+            } else {
+                pending.push(line);
+            }
+        }
+    }
+    flush(&mut pending, &mut lines);
+    lines
 }
 
 /// Count added and deleted lines between two texts without keeping hunks.
@@ -361,6 +406,75 @@ mod tests {
         assert_eq!(hunks[0].collapsed_before, 0);
         assert!(hunks[1].collapsed_before > 10);
         assert_eq!(hunks[1].new_start, 25);
+    }
+
+    #[test]
+    fn merged_listing_keeps_every_line_with_its_numbers() {
+        let old = (1..=30)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let new = old
+            .replacen("line 2", "line TWO", 1)
+            .replacen("line 28", "line TWENTYEIGHT", 1);
+        let (hunks, truncated) = diff_text_merged(&old, &new);
+        assert!(!truncated);
+        assert_eq!(hunks.len(), 1, "a merged listing is one hunk");
+        let hunk = &hunks[0];
+        assert_eq!(hunk.collapsed_before, 0);
+        assert_eq!((hunk.old_start, hunk.new_start), (1, 1));
+        assert_eq!((hunk.old_lines, hunk.new_lines), (30, 30));
+        // Every original line is present: 30 context or removed lines carry
+        // an old number, and 30 context or added lines carry a new one.
+        assert_eq!(
+            hunk.lines
+                .iter()
+                .filter(|line| line.old_no.is_some())
+                .count(),
+            30
+        );
+        assert_eq!(
+            hunk.lines
+                .iter()
+                .filter(|line| line.new_no.is_some())
+                .count(),
+            30
+        );
+        // The two changes sit at their absolute line numbers, not at hunk
+        // offsets, so a reader can reference the pasted text directly.
+        let changed: Vec<_> = hunk
+            .lines
+            .iter()
+            .filter(|line| line.tag != LineTag::Context)
+            .map(|line| (line.tag, line.old_no, line.new_no, line.text.as_str()))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                (LineTag::Deletion, Some(2), None, "line 2"),
+                (LineTag::Addition, None, Some(2), "line TWO"),
+                (LineTag::Deletion, Some(28), None, "line 28"),
+                (LineTag::Addition, None, Some(28), "line TWENTYEIGHT"),
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_listing_truncates_a_pathological_document() {
+        let old: String = (1..=(MAX_MERGED_LINES + 10))
+            .map(|n| format!("old {n}\n"))
+            .collect();
+        let new: String = (1..=(MAX_MERGED_LINES + 10))
+            .map(|n| format!("new {n}\n"))
+            .collect();
+        let (hunks, truncated) = diff_text_merged(&old, &new);
+        assert!(truncated);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), MAX_MERGED_LINES);
+        // The hunk still describes the whole document, even though only its
+        // first lines are listed.
+        assert_eq!(hunks[0].old_lines, MAX_MERGED_LINES as u32 + 10);
     }
 
     #[test]

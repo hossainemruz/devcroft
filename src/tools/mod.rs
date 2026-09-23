@@ -1,11 +1,15 @@
 //! Developer tools opened from the command bar's `Tools` section.
 //!
-//! A tool is a dialog with persisted inputs and an output derived from them.
+//! A tool is a dialog with persisted inputs and a result derived from them.
 //! Every tool input is machine-local: it lives under `tools/<tool-id>/` in
 //! the data root, never inside `portable/`, so scratch content cannot ride
 //! portable sync. [`ToolKind`] is the registry the palette and the dialog
 //! read from, so a new tool is a variant plus its slots and compute step.
+//!
+//! [`ToolResultKind`] says how that result is presented: an in-place tool
+//! edits one document, a diff tool compares two and renders the changes.
 
+mod diff;
 mod json;
 mod store;
 mod view;
@@ -19,6 +23,25 @@ use gpui_kit::assets::IconName;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ToolKind {
     JsonFormatter,
+    DiffChecker,
+}
+
+/// What a run of a tool produces from its inputs.
+#[derive(Debug)]
+pub(crate) enum ToolOutput {
+    /// Rewritten text for the tool's document (its first input).
+    Text(String),
+    /// A line diff between the tool's two inputs.
+    Diff(diff::DiffResult),
+}
+
+/// How a tool presents its result, and therefore how its dialog is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolResultKind {
+    /// One document; the result replaces its text in place.
+    InPlaceText,
+    /// Two paste editors; the result is a diff rendered below them.
+    Diff,
 }
 
 /// One persisted input of a tool. `file_name` is the storage key under
@@ -30,13 +53,14 @@ pub(crate) struct ToolInput {
 }
 
 impl ToolKind {
-    pub(crate) const ALL: [Self; 1] = [Self::JsonFormatter];
+    pub(crate) const ALL: [Self; 2] = [Self::JsonFormatter, Self::DiffChecker];
 
     /// Stable storage key. Never reused for a different tool, so old
     /// persisted content cannot surface under a new tool's name.
     pub(crate) fn id(self) -> &'static str {
         match self {
             Self::JsonFormatter => "json-formatter",
+            Self::DiffChecker => "diff-checker",
         }
     }
 
@@ -44,6 +68,7 @@ impl ToolKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::JsonFormatter => "Format JSON",
+            Self::DiffChecker => "Diff Checker",
         }
     }
 
@@ -51,22 +76,35 @@ impl ToolKind {
     pub(crate) fn keywords(self) -> &'static [&'static str] {
         match self {
             Self::JsonFormatter => &["json", "format", "pretty", "print", "tool"],
+            Self::DiffChecker => &["diff", "compare", "text", "checker", "patch", "tool"],
         }
     }
 
     pub(crate) fn icon(self) -> IconName {
         match self {
             Self::JsonFormatter => IconName::Braces,
+            Self::DiffChecker => IconName::Diff,
         }
     }
 
-    /// Persisted inputs in display order.
+    /// Persisted inputs in display order. The diff tool's two sides are its
+    /// old and new documents, in that order.
     pub(crate) fn inputs(self) -> &'static [ToolInput] {
         match self {
             Self::JsonFormatter => &[ToolInput {
                 file_name: "input",
                 placeholder: "Paste JSON here",
             }],
+            Self::DiffChecker => &[
+                ToolInput {
+                    file_name: "old",
+                    placeholder: "Paste the old text here",
+                },
+                ToolInput {
+                    file_name: "new",
+                    placeholder: "Paste the new text here",
+                },
+            ],
         }
     }
 
@@ -75,17 +113,49 @@ impl ToolKind {
     pub(crate) fn editor_language(self) -> Option<&'static str> {
         match self {
             Self::JsonFormatter => Some("json"),
+            Self::DiffChecker => None,
+        }
+    }
+
+    /// How the dialog presents this tool's result. Must agree with the
+    /// [`ToolOutput`] variant [`Self::compute`] returns.
+    pub(crate) fn result_kind(self) -> ToolResultKind {
+        match self {
+            Self::JsonFormatter => ToolResultKind::InPlaceText,
+            Self::DiffChecker => ToolResultKind::Diff,
+        }
+    }
+
+    /// Label of the dialog's primary action button.
+    pub(crate) fn action_label(self) -> &'static str {
+        match self {
+            Self::JsonFormatter => "Format",
+            Self::DiffChecker => "Diff",
+        }
+    }
+
+    /// Test id of the primary action button.
+    pub(crate) fn action_id(self) -> &'static str {
+        match self {
+            Self::JsonFormatter => "tool-format",
+            Self::DiffChecker => "tool-diff",
         }
     }
 
     /// Derive the tool's result from the current inputs, in slot order. For
     /// the formatter that result is the document rewritten in place; errors
-    /// are user-facing text and leave the input untouched.
-    pub(crate) fn compute(self, inputs: &[String]) -> Result<String, String> {
+    /// are user-facing text and leave the input untouched. Comparing text
+    /// cannot fail.
+    pub(crate) fn compute(self, inputs: &[String]) -> Result<ToolOutput, String> {
         match self {
             Self::JsonFormatter => {
                 json::format(inputs.first().map(String::as_str).unwrap_or_default())
+                    .map(ToolOutput::Text)
             }
+            Self::DiffChecker => Ok(ToolOutput::Diff(diff::compare(
+                inputs.first().map(String::as_str).unwrap_or_default(),
+                inputs.get(1).map(String::as_str).unwrap_or_default(),
+            ))),
         }
     }
 }
@@ -132,5 +202,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The dialog lays itself out from `result_kind` and then renders whatever
+    /// `compute` returns, so the two must agree for every tool.
+    #[test]
+    fn compute_returns_the_result_kind_the_tool_declares() {
+        for tool in ToolKind::ALL {
+            let inputs: Vec<String> = vec![String::new(); tool.inputs().len()];
+            let output = tool.compute(&inputs);
+            match (tool.result_kind(), output) {
+                (ToolResultKind::InPlaceText, Ok(ToolOutput::Text(_))) => {}
+                (ToolResultKind::Diff, Ok(ToolOutput::Diff(_))) => {}
+                (kind, output) => panic!("{tool:?} declares {kind:?} but computed {output:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_diff_tool_compares_its_two_slots() {
+        let inputs = vec!["one\ntwo\n".to_owned(), "one\nTWO\n".to_owned()];
+        let Ok(ToolOutput::Diff(result)) = ToolKind::DiffChecker.compute(&inputs) else {
+            panic!("the diff tool must produce a diff");
+        };
+        assert_eq!((result.additions, result.deletions), (1, 1));
+        assert_eq!(result.hunks.len(), 1);
     }
 }

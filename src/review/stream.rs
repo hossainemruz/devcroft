@@ -7,15 +7,18 @@
 //! Per-load flattening plus per-frame visible-only rendering is what keeps
 //! large diffs smooth: fully expanded, a big review would otherwise be tens
 //! of thousands of flex elements laid out on every frame.
+//!
+//! The message rows ("no line changes", truncation) are crate-visible so the
+//! text diff tool says the same things the same way; the diff rows themselves
+//! are the review's, since the tool renders its own side-by-side cells.
 
 use std::collections::HashSet;
 
 use gpui_kit::component::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Entity, FontStyle, FontWeight, HighlightStyle,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, StyledText,
-    UnderlineStyle, div, px, rgb, rgba,
+    AnyElement, App, AppContext as _, Entity, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Styled, StyledText, div, px, rgb,
 };
 
 use crate::fonts::TERMINAL_FONT_FAMILY;
@@ -29,6 +32,11 @@ use super::model::{
 /// Height of every diff content row. File headers use [`FILE_HEADER_H`] so
 /// they stand out from code lines (see module docs).
 pub(crate) const ROW_H: f32 = 24.0;
+/// Tint of a removed line. Shared so the diff tool's cells read as the same
+/// kind of change the review rows do.
+pub(crate) const DELETION_BG: u32 = 0x33191a;
+/// Tint of an added line, shared the same way.
+pub(crate) const ADDITION_BG: u32 = 0x0e2a1a;
 /// Height of file section headers. Taller than [`ROW_H`] so each file
 /// boundary is noticeable while scrolling.
 pub(crate) const FILE_HEADER_H: f32 = 36.0;
@@ -274,11 +282,11 @@ pub(crate) fn file_header_row(
         .into_any_element()
 }
 
-fn line_row(line: &HunkLine, syntax: &[super::syntax::SyntaxSpan], selected: bool) -> AnyElement {
+fn line_row(line: &HunkLine, spans: &[super::syntax::SyntaxSpan], selected: bool) -> AnyElement {
     let (background, sign, sign_color) = match line.tag {
         LineTag::Context => (None, " ", 0x555a5a),
-        LineTag::Deletion => (Some(0x33191a), "-", 0xf87171),
-        LineTag::Addition => (Some(0x0e2a1a), "+", 0x4ade80),
+        LineTag::Deletion => (Some(DELETION_BG), "-", 0xf87171),
+        LineTag::Addition => (Some(ADDITION_BG), "+", 0x4ade80),
     };
     let old_no = match line.old_no {
         Some(number) => format!("{number:>5}"),
@@ -323,27 +331,10 @@ fn line_row(line: &HunkLine, syntax: &[super::syntax::SyntaxSpan], selected: boo
                 .child(sign),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    StyledText::new(line.text.clone()).with_highlights(syntax.iter().map(|span| {
-                        (
-                            span.range.clone(),
-                            HighlightStyle {
-                                color: Some(rgba(span.rgba).into()),
-                                font_weight: span.bold.then_some(FontWeight::BOLD),
-                                font_style: span.italic.then_some(FontStyle::Italic),
-                                underline: span.underline.then_some(UnderlineStyle {
-                                    thickness: px(1.),
-                                    color: Some(rgba(span.rgba).into()),
-                                    wavy: false,
-                                }),
-                                ..Default::default()
-                            },
-                        )
-                    })),
-                ),
+            div().flex_1().min_w_0().child(
+                StyledText::new(line.text.clone())
+                    .with_highlights(super::syntax::styled_highlights(spans)),
+            ),
         )
         .into_any_element()
 }
@@ -404,7 +395,7 @@ fn unavailable_row(reason: UnavailableReason) -> AnyElement {
         .into_any_element()
 }
 
-fn no_changes_row() -> AnyElement {
+pub(crate) fn no_changes_row() -> AnyElement {
     div()
         .h(px(ROW_H))
         .flex_none()
@@ -418,7 +409,7 @@ fn no_changes_row() -> AnyElement {
         .into_any_element()
 }
 
-fn truncated_row() -> AnyElement {
+pub(crate) fn truncated_row() -> AnyElement {
     div()
         .h(px(ROW_H))
         .flex_none()

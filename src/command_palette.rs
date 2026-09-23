@@ -785,6 +785,10 @@ mod tests {
             Some(PaletteItem::Tool(ToolKind::ALL[0]))
         );
         assert_eq!(
+            item_at(&sections, 1, 1),
+            Some(PaletteItem::Tool(ToolKind::ALL[1]))
+        );
+        assert_eq!(
             item_at(&sections, 2, 0),
             Some(PaletteItem::SwitchRepository {
                 key: "aaa-first".to_owned(),
@@ -804,7 +808,7 @@ mod tests {
             Some(PaletteItem::Command(PaletteCommand::SyncPortable))
         );
         assert_eq!(item_at(&sections, 0, 8), None);
-        assert_eq!(item_at(&sections, 1, 1), None);
+        assert_eq!(item_at(&sections, 1, ToolKind::ALL.len()), None);
         assert_eq!(item_at(&sections, 5, 0), None);
     }
 
@@ -812,9 +816,9 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 8 go-to + 1 tool + 2 switch + 1 add + 1 settings + 1 sync.
-        assert_eq!(all.len(), 14);
-        assert_eq!(filter_items(&sections, "   ").len(), 14);
+        // 8 go-to + 2 tools + 2 switch + 1 add + 1 settings + 1 sync.
+        assert_eq!(all.len(), 15);
+        assert_eq!(filter_items(&sections, "   ").len(), 15);
     }
 
     #[test]
@@ -886,6 +890,15 @@ mod tests {
         assert_eq!(
             filter_items(&sections, "pretty"),
             vec![PaletteItem::Tool(ToolKind::JsonFormatter)]
+        );
+        assert_eq!(
+            filter_items(&sections, "diff checker"),
+            vec![PaletteItem::Tool(ToolKind::DiffChecker)]
+        );
+        // "diff" is also a search term of the Review tab command, so the
+        // tool shares the results rather than owning the term.
+        assert!(
+            filter_items(&sections, "diff").contains(&PaletteItem::Tool(ToolKind::DiffChecker))
         );
     }
 

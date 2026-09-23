@@ -93,6 +93,10 @@ pub(crate) const WORKSPACE_KEY_CONTEXT: &str = "Workspace";
 /// traversal keeps working for their forms.
 pub(crate) const DIALOG_KEY_CONTEXT: &str = "dialog";
 
+/// Restore terminal Tab input inside the Git dialog without changing focus
+/// traversal in other dialogs (see `bind_app_keys`).
+pub(crate) const TERMINAL_DIALOG_KEY_CONTEXT: &str = "terminal-dialog";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceTab {
     Agent,
@@ -100,6 +104,8 @@ pub(crate) enum WorkspaceTab {
     Terminal,
     Review,
     Resources,
+    /// Dialog-only terminal; intentionally excluded from `ALL` and the tab bar.
+    Git,
 }
 
 impl WorkspaceTab {
@@ -118,6 +124,7 @@ impl WorkspaceTab {
             Self::Terminal => "Terminal",
             Self::Review => "Review",
             Self::Resources => "Resources",
+            Self::Git => "Git",
         }
     }
 
@@ -127,6 +134,7 @@ impl WorkspaceTab {
             // label in Settings and the spawned command cannot drift.
             Self::Agent => Some(AgentKind::DEFAULT.command()),
             Self::Editor => Some("nvim ."),
+            Self::Git => Some("lazygit"),
             Self::Terminal | Self::Review | Self::Resources => None,
         }
     }
@@ -977,6 +985,51 @@ impl Workspace {
             }
         };
         ToolView::open_dialog(view, window, cx);
+    }
+
+    /// A window-sized, minimally framed terminal dialog running lazygit in the
+    /// current checkout. Each opening starts a new session, so quitting
+    /// lazygit never leaves a stale shell prompt on the next opening.
+    fn open_git_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = cx.new(|cx| {
+            TerminalPane::new(
+                WorkspaceTab::Git,
+                &self.working_directory,
+                self.default_agent,
+                &self.agent_activity,
+                cx,
+            )
+        });
+        let dialog_pane = pane.clone();
+        window.open_dialog(cx, move |dialog, window, _| {
+            dialog
+                .title(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .pr(px(40.))
+                        .child("Git changes")
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x808888))
+                                .child("Shift+Esc to close"),
+                        ),
+                )
+                // The dialog component clamps to a small safety inset; ask
+                // for the whole viewport and let it take everything it can.
+                .w(window.viewport_size().width)
+                .h(window.viewport_size().height)
+                .margin_top(px(0.))
+                .p(px(8.))
+                // Enter and Escape must reach lazygit, not confirm/dismiss
+                // the dialog. Shift+Esc, Cmd/Ctrl+J, and the close button do.
+                .keyboard(false)
+                .child(dialog_pane.clone().into_any_element())
+        });
+        let focus = pane.read(cx).focus_handle.clone();
+        focus.focus(window, cx);
     }
 
     /// Run the confirmed palette entry. `index` addresses the model installed
@@ -2115,6 +2168,8 @@ impl Workspace {
                 .and_then(|pane| pane.as_ref())
                 .map(|pane| vec![(self.active_tab.label(), pane.read(cx).focus_handle.clone())])
                 .unwrap_or_default(),
+            // Dialog-only surface, never selected as the active workspace tab.
+            WorkspaceTab::Git => Vec::new(),
         }
     }
 
@@ -2271,7 +2326,7 @@ impl Workspace {
                         .update(cx, |view, cx| view.move_diff_scroll(down, cx)),
                     _ => {}
                 },
-                WorkspaceTab::Editor | WorkspaceTab::Terminal => {}
+                WorkspaceTab::Editor | WorkspaceTab::Terminal | WorkspaceTab::Git => {}
             }
         }
         cx.notify();
@@ -2326,6 +2381,7 @@ impl Workspace {
             NavigationCommand::Resources => {
                 self.select_tab(WorkspaceTab::Resources as usize, window, cx)
             }
+            NavigationCommand::GitChanges => self.open_git_changes(window, cx),
             NavigationCommand::Home => self.go_home(window, cx),
             NavigationCommand::Back => {
                 if self.relationships_visible {
@@ -2386,7 +2442,7 @@ impl Workspace {
             }
             WorkspaceTab::Resources => self.navigation_pane == 0,
             WorkspaceTab::Review => matches!(self.navigation_pane, 0 | 1),
-            WorkspaceTab::Editor | WorkspaceTab::Terminal => false,
+            WorkspaceTab::Editor | WorkspaceTab::Terminal | WorkspaceTab::Git => false,
         }
     }
 
@@ -2422,7 +2478,7 @@ impl Workspace {
     /// distinct from plain-`j` move-down.) Plain `m` stays free as the Edit
     /// Markdown action key, `cmd-m` returns to the system (Minimize on
     /// macOS), and `ctrl-m` returns to terminals as an Enter alias.
-    fn is_trigger(keystroke: &gpui_kit::Keystroke) -> bool {
+    pub(crate) fn is_trigger(keystroke: &gpui_kit::Keystroke) -> bool {
         let modifiers = &keystroke.modifiers;
         keystroke.key.eq_ignore_ascii_case("j")
             && is_primary_modifier(modifiers.platform, modifiers.control)
@@ -2461,6 +2517,8 @@ impl Workspace {
         match key.as_str() {
             "escape" => NavigationInput::Escape,
             "enter" => NavigationInput::Enter,
+            // GPUI reports Space by name rather than as a one-character key.
+            "space" => NavigationInput::Key(' '),
             "h" | "left" | "arrowleft" => NavigationInput::Left,
             "l" | "right" | "arrowright" => NavigationInput::Right,
             "j" | "down" | "arrowdown" => NavigationInput::Down,
@@ -2522,6 +2580,12 @@ impl Workspace {
         // the current key and let that key reach the overlay.
         if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
             self.close_navigation(cx);
+            // The Git dialog lets this trigger reach its terminal pane to
+            // dismiss it. Claim the chord so held repeats cannot reopen the
+            // HUD after the dialog closes; leave ordinary dialog typing alone.
+            if Self::is_trigger(&event.keystroke) {
+                self.navigation_claimed_keys.insert(key, false);
+            }
             return;
         }
         // The two palette shortcuts stay live inside navigation mode (quit is
@@ -2616,7 +2680,7 @@ impl Workspace {
                             .text_sm()
                             .font_semibold()
                             .text_color(rgb(0x60a5fa))
-                            .child(row.key.to_string()),
+                            .child(row.key_label()),
                     )
                     .child(div().text_sm().child(row.label)),
             );
@@ -3750,6 +3814,7 @@ mod tests {
             |key: &str| Workspace::navigation_input(&gpui_kit::Keystroke::parse(key).unwrap());
         assert_eq!(input("tab"), NavigationInput::Tab);
         assert_eq!(input("shift-tab"), NavigationInput::BackTab);
+        assert_eq!(input("space"), NavigationInput::Key(' '));
         // Every other modified form stays a consumed modified key: only
         // Shift+Tab is a navigation input.
         assert_eq!(input("cmd-tab"), NavigationInput::Modified);
@@ -3792,6 +3857,10 @@ mod tests {
         assert_eq!(WorkspaceTab::Resources.label(), "Resources");
         assert_eq!(WorkspaceTab::Resources.command(), None);
         assert!(!WorkspaceTab::Resources.has_terminal());
+        assert!(!WorkspaceTab::ALL.contains(&WorkspaceTab::Git));
+        assert_eq!(WorkspaceTab::Git.label(), "Git");
+        assert_eq!(WorkspaceTab::Git.command(), Some("lazygit"));
+        assert!(WorkspaceTab::Git.has_terminal());
     }
 
     fn dirty_status() -> GitStatus {

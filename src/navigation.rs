@@ -28,6 +28,7 @@ pub(crate) enum Command {
     Terminal,
     Review,
     Resources,
+    GitChanges,
     Home,
     Back,
     NewSession,
@@ -45,6 +46,17 @@ pub(crate) struct Row {
     pub command: Command,
 }
 
+impl Row {
+    /// The key as shown in the HUD: space renders as the open-box glyph
+    /// so its row reads as a real trigger instead of a blank.
+    pub(crate) fn key_label(&self) -> String {
+        match self.key {
+            ' ' => "␣".to_owned(),
+            key => key.to_string(),
+        }
+    }
+}
+
 const HOME: [Row; 2] = [
     Row {
         key: 'a',
@@ -60,7 +72,7 @@ const HOME: [Row; 2] = [
     },
 ];
 
-const WORKSPACE: [Row; 7] = [
+const WORKSPACE: [Row; 8] = [
     Row {
         key: 'a',
         label: "Agent",
@@ -93,6 +105,12 @@ const WORKSPACE: [Row; 7] = [
     },
     Row {
         key: 'g',
+        label: "Git changes (lazygit)",
+        group: "Navigate",
+        command: Command::GitChanges,
+    },
+    Row {
+        key: ' ',
         label: "Home",
         group: "Navigate",
         command: Command::Home,
@@ -107,7 +125,7 @@ const WORKSPACE: [Row; 7] = [
 
 const ARTIFACTS: [Row; 2] = [
     Row {
-        key: 'g',
+        key: ' ',
         label: "Home",
         group: "Navigate",
         command: Command::Home,
@@ -279,6 +297,30 @@ mod tests {
             resolve(Context::Artifacts, ResourceState::default(), 'b'),
             Some(Command::Back)
         );
+    }
+
+    #[test]
+    fn git_replaces_home_on_g_and_space_goes_home() {
+        let resource = ResourceState::default();
+        assert_eq!(
+            resolve(Context::Workspace, resource, 'g'),
+            Some(Command::GitChanges)
+        );
+        assert_eq!(
+            resolve(Context::Workspace, resource, ' '),
+            Some(Command::Home)
+        );
+        for context in [Context::Artifacts, Context::Relationships] {
+            assert_eq!(resolve(context, resource, ' '), Some(Command::Home));
+            assert_eq!(resolve(context, resource, 'g'), None);
+        }
+        assert_eq!(resolve(Context::Home, resource, 'g'), None);
+        assert_eq!(resolve(Context::Home, resource, ' '), None);
+        let home = rows(Context::Workspace, resource)
+            .into_iter()
+            .find(|row| row.command == Command::Home)
+            .unwrap();
+        assert_eq!(home.key_label(), "␣");
     }
 
     #[test]

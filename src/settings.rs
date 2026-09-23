@@ -1642,8 +1642,8 @@ impl SettingsView {
                     },
                 ))
                 .child(live_row(
-                    "Close palette or dialog",
-                    "Dismisses the topmost overlay.",
+                    "Close palette or form dialog",
+                    "Git changes sends Esc to lazygit; use Shift+Esc or the close button.",
                     kbd("Esc"),
                 )),
             )

@@ -121,6 +121,18 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("tab", NoAction, Some(&unbind_context)),
         KeyBinding::new("shift-tab", NoAction, Some(&unbind_context)),
+        // The Git dialog embeds a terminal rather than a form: restore Tab
+        // for lazygit without disabling traversal for other dialog controls.
+        KeyBinding::new(
+            "tab",
+            NoAction,
+            Some(workspace::TERMINAL_DIALOG_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "shift-tab",
+            NoAction,
+            Some(workspace::TERMINAL_DIALOG_KEY_CONTEXT),
+        ),
     ]);
 }
 

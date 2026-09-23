@@ -35,7 +35,7 @@ use crate::{
         WORKSPACE_HEADER_HEIGHT, app_font_size, cell_height, cell_width,
     },
     session::{BlockKind, RenderRun, TerminalSession},
-    workspace::WorkspaceTab,
+    workspace::{TERMINAL_DIALOG_KEY_CONTEXT, Workspace, WorkspaceTab},
 };
 
 pub(crate) struct TerminalPane {
@@ -83,6 +83,16 @@ pub(crate) struct TerminalPane {
 /// Marker id for the terminal copy confirmation toast. A stable id makes
 /// rapid copies replace one another instead of stacking.
 struct TerminalCopyFeedback;
+
+fn is_git_dialog_close_shortcut(keystroke: &gpui_kit::Keystroke) -> bool {
+    let modifiers = &keystroke.modifiers;
+    keystroke.key.eq_ignore_ascii_case("escape")
+        && modifiers.shift
+        && !modifiers.platform
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.function
+}
 
 impl TerminalPane {
     /// One pane for `tab`. The Agent tab launches `agent`; every other
@@ -414,6 +424,17 @@ impl TerminalPane {
                     window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
                 }
             }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        // Plain Escape and Enter belong to lazygit. Shift+Esc closes only
+        // this dialog; the navigation toggle remains an alternative.
+        if self.tab == WorkspaceTab::Git
+            && (is_git_dialog_close_shortcut(&event.keystroke)
+                || Workspace::is_trigger(&event.keystroke))
+        {
+            window.close_dialog(cx);
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -1149,6 +1170,9 @@ impl Render for TerminalPane {
 
         div()
             .id(("terminal-pane", self.tab as usize))
+            .when(self.tab == WorkspaceTab::Git, |pane| {
+                pane.key_context(TERMINAL_DIALOG_KEY_CONTEXT)
+            })
             .size_full()
             .p(px(TERMINAL_PADDING))
             .overflow_hidden()
@@ -1289,6 +1313,22 @@ fn coalesce_scroll_lines(remainder: &mut f32, delta_pixels_y: f32) -> isize {
 mod tests {
     use super::*;
     use crate::session::CellStyle;
+
+    #[test]
+    fn only_shift_escape_closes_the_git_dialog() {
+        let close =
+            |key: &str| is_git_dialog_close_shortcut(&gpui_kit::Keystroke::parse(key).unwrap());
+        assert!(close("shift-escape"));
+        for key in [
+            "escape",
+            "enter",
+            "shift-enter",
+            "cmd-shift-escape",
+            "ctrl-shift-escape",
+        ] {
+            assert!(!close(key), "{key} must remain terminal input");
+        }
+    }
 
     #[test]
     fn app_scroll_scales_one_notch_to_one_line() {

@@ -212,15 +212,25 @@ impl ArtifactBrowser {
                         .gap_1()
                         .items_center()
                         .child(
-                            div()
+                            // The line range stays muted; state words carry the
+                            // color so a card's status is readable at a glance.
+                            h_flex()
                                 .flex_1()
+                                .min_w_0()
+                                .gap_1()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(format!(
-                                    "{label}{}{}",
-                                    if outdated { " · Outdated" } else { "" },
-                                    if comment.resolved { " · Resolved" } else { "" }
-                                )),
+                                .child(label)
+                                .when(outdated, |d| {
+                                    d.child(
+                                        div().text_color(cx.theme().warning).child("· Outdated"),
+                                    )
+                                })
+                                .when(comment.resolved, |d| {
+                                    d.child(
+                                        div().text_color(cx.theme().success).child("· Resolved"),
+                                    )
+                                }),
                         )
                         .child(
                             Button::new(("artifact-comment-options", index))

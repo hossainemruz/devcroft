@@ -34,7 +34,7 @@ use crate::{
         INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT, TERMINAL_PADDING,
         WORKSPACE_HEADER_HEIGHT, app_font_size, cell_height, cell_width,
     },
-    session::{BlockKind, RenderRun, TerminalSession},
+    session::{BlockKind, CursorPresentation, CursorShape, RenderRun, TerminalSession},
     workspace::{TERMINAL_DIALOG_KEY_CONTEXT, Workspace, WorkspaceTab},
 };
 
@@ -78,6 +78,15 @@ pub(crate) struct TerminalPane {
     /// Small raw-output overlap so an OSC exit marker split across PTY
     /// reads is still recognized.
     activity_output_tail: Vec<u8>,
+    /// Cursor state of the latest presented frame (see
+    /// [`TerminalSession::cursor_presentation`]).
+    cursor: CursorPresentation,
+    /// Whether a blinking cursor is in its visible half. Pure view state:
+    /// toggling it repaints from the cached rows without a snapshot.
+    cursor_blink_on: bool,
+    /// Whether a blink-phase timer is already scheduled, so repeated
+    /// presents do not stack timers.
+    cursor_blink_armed: bool,
 }
 
 /// Marker id for the terminal copy confirmation toast. A stable id makes
@@ -148,6 +157,9 @@ impl TerminalPane {
             last_activity_observation: None,
             activity_observation_armed: false,
             activity_output_tail: Vec::new(),
+            cursor: CursorPresentation::HIDDEN,
+            cursor_blink_on: true,
+            cursor_blink_armed: false,
         };
 
         let (startup, startup_environment) = pane
@@ -276,6 +288,13 @@ impl TerminalPane {
             match session.snapshot() {
                 Ok(Some(rows)) => {
                     self.rows = rows;
+                    let cursor = session.cursor_presentation();
+                    // Any cursor activity (movement, restyle, show) restarts
+                    // the blink in its visible half, like other terminals.
+                    if cursor != self.cursor {
+                        self.cursor = cursor;
+                        self.cursor_blink_on = true;
+                    }
                     self.error = None;
                     changed = true;
                 }
@@ -289,7 +308,44 @@ impl TerminalPane {
             self.last_present = Some(Instant::now());
             cx.notify();
         }
+        self.arm_cursor_blink(cx);
         self.observe_activity_paced(cx);
+    }
+
+    /// One blink half-period. DECSCUSR carries no rate, so the terminal
+    /// picks one like every other terminal; this matches nvim's own
+    /// `blinkon500-blinkoff500` default.
+    const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+    /// Keep the blink phase ticking while the presented cursor is visible
+    /// and blinking. Each timer flips the phase, repaints from the cached
+    /// rows, and re-arms; a cursor that stops blinking (or hides) simply
+    /// does not re-arm, so no timer survives the state that created it.
+    fn arm_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        if self.cursor_blink_armed || !self.cursor_should_blink() {
+            return;
+        }
+        self.cursor_blink_armed = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Self::CURSOR_BLINK_INTERVAL)
+                .await;
+            let _ = this.update(cx, |pane, cx| {
+                pane.cursor_blink_armed = false;
+                if pane.cursor_should_blink() {
+                    pane.cursor_blink_on = !pane.cursor_blink_on;
+                    cx.notify();
+                    pane.arm_cursor_blink(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Only schedule repaints for a visible cursor that actually requests
+    /// blinking. Steady nvim cursors must not keep a timer running.
+    fn cursor_should_blink(&self) -> bool {
+        self.cursor.blinking && self.cursor.cell.is_some()
     }
 
     fn observe_activity_paced(&mut self, cx: &mut Context<Self>) {
@@ -743,7 +799,11 @@ impl TerminalPane {
         row: &[RenderRun],
         index: usize,
         selection: Option<(usize, usize)>,
+        cursor: Option<CursorPaint>,
     ) -> AnyElement {
+        // Block cursors paint through the text highlights; the other shapes
+        // paint an overlay rect below.
+        let invert_cursor = matches!(cursor, Some(CursorPaint::Invert));
         let mut text = String::with_capacity(row.iter().map(|run| run.text.len()).sum());
         let mut highlights = Vec::with_capacity(row.len());
         let mut fills = Vec::new();
@@ -754,7 +814,7 @@ impl TerminalPane {
             let start = text.len();
             text.push_str(&run.text);
             let end = text.len();
-            let (foreground, background) = if run.style.cursor {
+            let (foreground, background) = if run.style.cursor && invert_cursor {
                 (run.style.background, run.style.foreground)
             } else {
                 (run.style.foreground, run.style.background)
@@ -831,8 +891,130 @@ impl TerminalPane {
                         .opacity(0.35),
                 )
             })
+            .when_some(cursor, |this, cursor| match cursor {
+                // The cursor paints over a selection drag, like the fills.
+                CursorPaint::Invert => this,
+                CursorPaint::Overlay {
+                    column,
+                    shape,
+                    color,
+                } => this.child(cursor_overlay_element(column, shape, color)),
+            })
             .into_any_element()
     }
+}
+
+/// How one row paints the cursor cell this frame.
+///
+/// [`CursorPaint::Invert`] swaps the flagged cell's colors through the
+/// text highlights (the solid block style, and the only cursor rendering
+/// that shows the cell's own colors inverted); the other shapes draw a
+/// rect over the row (see [`cursor_overlay_element`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CursorPaint {
+    /// Swap the flagged cell's colors: the solid block style.
+    Invert,
+    /// Paint a rect (bar/underline/hollow) at the cursor column.
+    Overlay {
+        column: usize,
+        shape: CursorOverlay,
+        color: u32,
+    },
+}
+
+/// The rect-drawn cursor shapes (everything DECSCUSR offers besides the
+/// solid block).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CursorOverlay {
+    /// A thin vertical rect at the cursor column's left edge.
+    Bar,
+    /// A thin horizontal rect under the cursor column.
+    Underline,
+    /// A stroked rect around the cursor column.
+    Hollow,
+}
+
+impl CursorShape {
+    /// The overlay style for non-block shapes; a block cursor inverts the
+    /// cell instead (see [`CursorPaint::Invert`]).
+    fn overlay(self) -> Option<CursorOverlay> {
+        match self {
+            Self::Bar => Some(CursorOverlay::Bar),
+            Self::Underline => Some(CursorOverlay::Underline),
+            Self::Hollow => Some(CursorOverlay::Hollow),
+            Self::Block => None,
+        }
+    }
+}
+
+/// The cursor's paint plan for a frame: which row, and how. `None` while
+/// the cursor is hidden, scrolled off-viewport, or in the dark half of a
+/// blink.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct CursorFrame {
+    row: u16,
+    paint: CursorPaint,
+}
+
+/// Plans the cursor's paint for the current frame. Pure over the presented
+/// cursor state and the blink phase, so the gating stays unit-testable.
+fn plan_cursor(cursor: CursorPresentation, blink_on: bool, color: u32) -> Option<CursorFrame> {
+    let (column, row) = cursor.cell?;
+    // The dark half of a blink leaves the cell unpainted: the same
+    // visible/invisible cycle Ghostty and xterm draw.
+    if cursor.blinking && !blink_on {
+        return None;
+    }
+    let paint = match cursor.shape.overlay() {
+        Some(shape) => CursorPaint::Overlay {
+            column: column as usize,
+            shape,
+            color,
+        },
+        None => CursorPaint::Invert,
+    };
+    Some(CursorFrame { row, paint })
+}
+
+/// Hairline stroke for the overlay cursor shapes, in pixels. DECSCUSR
+/// carries no thickness, so like other terminals this is fixed: 2px
+/// matches the `▏`/`▁`-sized strokes terminals draw at typical font
+/// sizes.
+const CURSOR_STROKE: f32 = 2.0;
+
+/// Grid-aligned pixel bounds `(x, y, width, height)` for an overlay cursor
+/// shape, row-relative like [`block_fill_bounds`].
+fn cursor_overlay_bounds(column: usize, shape: CursorOverlay) -> (f32, f32, f32, f32) {
+    let cell_w = cell_width();
+    let cell_h = cell_height();
+    let x = column as f32 * cell_w;
+    match shape {
+        CursorOverlay::Bar => (x, 0.0, CURSOR_STROKE.min(cell_w), cell_h),
+        CursorOverlay::Underline => (
+            x,
+            (cell_h - CURSOR_STROKE).max(0.0),
+            cell_w,
+            CURSOR_STROKE.min(cell_h),
+        ),
+        CursorOverlay::Hollow => (x, 0.0, cell_w, cell_h),
+    }
+}
+
+/// The overlay rect for a non-block cursor shape. A hollow block draws a
+/// stroked outline; the others fill their stroke.
+fn cursor_overlay_element(column: usize, shape: CursorOverlay, color: u32) -> AnyElement {
+    let (x, y, width, height) = cursor_overlay_bounds(column, shape);
+    let rect = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(width))
+        .h(px(height));
+    match shape {
+        CursorOverlay::Hollow => rect.border_2().border_color(rgb(color)),
+        _ => rect.bg(rgb(color)),
+    }
+    .into_any_element()
 }
 
 /// Grid-aligned pixel bounds `(x, y, width, height)` for a block fill.
@@ -1238,9 +1420,20 @@ impl Render for TerminalPane {
                 )
             })
             .when(self.error.is_none(), |this| {
+                // Overlays paint in the terminal's default foreground, the
+                // color terminals give a cursor when no OSC 12 override is
+                // set.
+                let cursor_color = self
+                    .session
+                    .as_ref()
+                    .map_or(0xFFFFFF, |session| session.foreground_color());
+                let cursor_frame = plan_cursor(self.cursor, self.cursor_blink_on, cursor_color);
                 this.children(self.rows.iter().enumerate().map(|(row_index, row)| {
                     let selection = self.selection_for_row(row_index);
-                    Self::render_row(row, row_index, selection)
+                    let cursor = cursor_frame
+                        .filter(|frame| frame.row as usize == row_index)
+                        .map(|frame| frame.paint);
+                    Self::render_row(row, row_index, selection, cursor)
                 }))
             })
     }
@@ -1523,6 +1716,113 @@ mod tests {
             },
         ];
         assert_eq!(slice_row_by_columns(&row, 1, 3), "ell");
+    }
+
+    /// Cursor paint planning: hidden cursors paint nothing, blink gates on
+    /// the phase, and each DECSCUSR shape maps to its paint style.
+    #[test]
+    fn cursor_plan_gates_on_visibility_and_blink_phase() {
+        let presented = CursorPresentation {
+            cell: Some((4, 2)),
+            shape: CursorShape::Block,
+            blinking: false,
+        };
+        // A steady block inverts its cell.
+        assert_eq!(
+            plan_cursor(presented, true, 0xE7E7E7),
+            Some(CursorFrame {
+                row: 2,
+                paint: CursorPaint::Invert
+            })
+        );
+        // The phase is irrelevant while the cursor is steady.
+        assert_eq!(
+            plan_cursor(presented, false, 0xE7E7E7),
+            Some(CursorFrame {
+                row: 2,
+                paint: CursorPaint::Invert
+            })
+        );
+
+        // A blinking cursor paints only in its visible half.
+        let blinking = CursorPresentation {
+            blinking: true,
+            ..presented
+        };
+        assert_eq!(
+            plan_cursor(blinking, true, 0xE7E7E7),
+            Some(CursorFrame {
+                row: 2,
+                paint: CursorPaint::Invert
+            })
+        );
+        assert_eq!(plan_cursor(blinking, false, 0xE7E7E7), None);
+
+        // The bar/underline/hollow shapes overlay a rect in the cursor
+        // color instead of inverting the cell (nvim's insert-mode bar).
+        assert_eq!(
+            plan_cursor(
+                CursorPresentation {
+                    shape: CursorShape::Bar,
+                    ..presented
+                },
+                true,
+                0xE7E7E7
+            ),
+            Some(CursorFrame {
+                row: 2,
+                paint: CursorPaint::Overlay {
+                    column: 4,
+                    shape: CursorOverlay::Bar,
+                    color: 0xE7E7E7
+                }
+            })
+        );
+        assert_eq!(
+            plan_cursor(
+                CursorPresentation {
+                    shape: CursorShape::Underline,
+                    ..presented
+                },
+                true,
+                0xE7E7E7
+            )
+            .map(|frame| frame.paint),
+            Some(CursorPaint::Overlay {
+                column: 4,
+                shape: CursorOverlay::Underline,
+                color: 0xE7E7E7
+            })
+        );
+
+        // Hidden (or scrolled-away) cursors paint nothing at any phase.
+        let hidden = CursorPresentation {
+            cell: None,
+            ..blinking
+        };
+        assert_eq!(plan_cursor(hidden, true, 0xE7E7E7), None);
+        assert_eq!(plan_cursor(hidden, false, 0xE7E7E7), None);
+    }
+
+    #[test]
+    fn cursor_overlays_align_to_the_cursor_cell() {
+        let cell_w = cell_width();
+        let cell_h = cell_height();
+        // The bar hugs the column's left edge for the full cell height.
+        assert_eq!(
+            cursor_overlay_bounds(3, CursorOverlay::Bar),
+            (3.0 * cell_w, 0.0, CURSOR_STROKE, cell_h)
+        );
+        // The underline rides the cell's bottom edge.
+        assert_eq!(
+            cursor_overlay_bounds(3, CursorOverlay::Underline),
+            (3.0 * cell_w, cell_h - CURSOR_STROKE, cell_w, CURSOR_STROKE)
+        );
+        // The hollow block outlines exactly the cell.
+        assert_eq!(
+            cursor_overlay_bounds(3, CursorOverlay::Hollow),
+            (3.0 * cell_w, 0.0, cell_w, cell_h)
+        );
     }
 
     #[test]

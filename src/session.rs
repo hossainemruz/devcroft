@@ -21,7 +21,7 @@ use libghostty_vt::{
         self, Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder,
         Event as MouseEvent,
     },
-    render::{CellIterator, Dirty, RenderState, RowIteration, RowIterator},
+    render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIteration, RowIterator},
     screen::CellWide,
     style::RgbColor,
     terminal::{
@@ -50,7 +50,48 @@ pub(crate) struct CellStyle {
     pub(crate) bold: bool,
     pub(crate) italic: bool,
     pub(crate) underline: bool,
+    /// Marks the terminal's cursor cell. The view decides how to paint it
+    /// (see [`CursorShape`] and the pane's cursor rendering): a block
+    /// cursor swaps the run's colors, the other shapes overlay a rect.
     pub(crate) cursor: bool,
+}
+
+/// The cursor shapes applications request through DECSCUSR (`CSI Ps SP q`).
+///
+/// nvim switches between these as the editor mode changes (steady block in
+/// normal mode, steady bar in insert), so the view needs the shape alongside
+/// the presented rows instead of reading only the terminal's cells.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CursorShape {
+    Block,
+    Bar,
+    Underline,
+    /// An outlined block, typically shown by unfocused windows.
+    Hollow,
+}
+
+/// The cursor state of a presented frame.
+///
+/// `cell` is `None` whenever the cursor is not paintable: DEC mode 25 hid
+/// it (nvim hides the cursor around redraws), or the viewport scrolled it
+/// off-screen. It pairs with `shape` and `blinking` so the view can render
+/// the cursor exactly as the application asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CursorPresentation {
+    pub(crate) cell: Option<(u16, u16)>,
+    pub(crate) shape: CursorShape,
+    /// Whether the cursor should blink. DECSCUSR carries no rate, so the
+    /// view picks the interval like every other terminal.
+    pub(crate) blinking: bool,
+}
+
+impl CursorPresentation {
+    /// The state before the first frame presents: no cursor to paint yet.
+    pub(crate) const HIDDEN: Self = Self {
+        cell: None,
+        shape: CursorShape::Block,
+        blinking: false,
+    };
 }
 
 #[derive(Clone)]
@@ -116,9 +157,14 @@ pub(crate) struct TerminalSession {
     /// Terminal defaults the unstyled cells of `cached_rows` were built with.
     /// A palette change without row dirtiness still invalidates the cache.
     cached_defaults: Option<(u32, u32)>,
-    /// Viewport cursor cell of `cached_rows`, to force-rebuild rows the
-    /// cursor entered or left.
-    last_cursor: Option<(u16, u16)>,
+    /// Cursor state of the last presented frame. The cell forces row
+    /// rebuilds when the cursor entered or left a row (cursor motion
+    /// alone dirties nothing), and the whole presentation feeds the
+    /// no-change early return: applications restyle the cursor with
+    /// DECSCUSR sequences that dirty no cells (nvim sends a steady bar on
+    /// every insert-mode entry), so a shape or blink change must present
+    /// a frame too.
+    presented_cursor: CursorPresentation,
 }
 
 impl Drop for TerminalSession {
@@ -210,6 +256,12 @@ impl TerminalSession {
         let grid_size = Arc::new(Mutex::new((INITIAL_COLS, INITIAL_ROWS)));
         let mut terminal = Terminal::new(INITIAL_COLS, INITIAL_ROWS)?;
         terminal.set_scrollback_max_lines(Some(10_000))?;
+        // Ghostty's default cursor blinks (ghostty(5), `cursor-style-blink`:
+        // "If this is not set, the cursor blinks by default"), so a fresh
+        // shell prompt blinks here too. Applications still control both the
+        // shape and the blink through DECSCUSR (nvim requests steady
+        // shapes) and DEC mode 12, exactly like in Ghostty.
+        terminal.set_default_cursor_blink(Some(true))?;
         terminal.resize(
             INITIAL_COLS,
             INITIAL_ROWS,
@@ -282,7 +334,7 @@ impl TerminalSession {
                 _child: child,
                 cached_rows: Vec::new(),
                 cached_defaults: None,
-                last_cursor: None,
+                presented_cursor: CursorPresentation::HIDDEN,
             },
             output,
         ))
@@ -557,6 +609,14 @@ impl TerminalSession {
             .map_or(0x000000, |(_, background)| background)
     }
 
+    /// Foreground of the last presented frame. The view paints bar and
+    /// underline cursors with it, the way terminals default the cursor to
+    /// the cell's foreground when no OSC 12 cursor color is set.
+    pub(crate) fn foreground_color(&self) -> u32 {
+        self.cached_defaults
+            .map_or(0xFFFFFF, |(foreground, _)| foreground)
+    }
+
     pub(crate) fn snapshot(&mut self) -> Result<Option<Vec<Vec<RenderRun>>>> {
         // Respect synchronized output (DEC 2026): applications such as opencode
         // wrap each frame in begin/end sync so capable terminals present it
@@ -570,10 +630,22 @@ impl TerminalSession {
         let snapshot = self.render_state.update(&self.terminal)?;
         let colors = snapshot.colors()?;
         let cursor = snapshot.cursor_viewport()?;
+        let cursor_visible = snapshot.cursor_visible()?;
+        let presentation = CursorPresentation {
+            // DEC mode 25 can hide the cursor while the viewport still
+            // reports its cell, so visibility gates the painted cell.
+            cell: if cursor_visible {
+                cursor.map(|position| (position.x, position.y))
+            } else {
+                None
+            },
+            shape: cursor_shape(snapshot.cursor_visual_style()?),
+            blinking: snapshot.cursor_blinking()?,
+        };
+        let cursor_cell = presentation.cell;
         let default_foreground = color_value(colors.foreground);
         let default_background = color_value(colors.background);
         let row_count = snapshot.rows()? as usize;
-        let cursor_cell = cursor.map(|position| (position.x, position.y));
 
         // Reuse cached rows unless the grid shape, the defaults unstyled
         // cells inherit, or a row's own content changed. The cursor row is
@@ -586,9 +658,15 @@ impl TerminalSession {
         // render state stays clean. Without this check the early return
         // below swallows pure cursor moves and the visible cursor freezes —
         // while full-screen apps such as nvim redraw cells on every move
-        // and keep working. The loop's `cursor_touched` rebuild then
-        // repaints exactly the rows the cursor entered or left.
-        if snapshot.dirty()? == Dirty::Clean && !full_rebuild && cursor_cell == self.last_cursor {
+        // and keep working. The same is true of pure cursor restyles:
+        // nvim's mode switches (DECSCUSR) and blink requests (DEC mode 12)
+        // dirty nothing, so the whole presentation joins the comparison.
+        // The loop's `cursor_touched` rebuild then repaints exactly the
+        // rows the cursor entered or left.
+        if snapshot.dirty()? == Dirty::Clean
+            && !full_rebuild
+            && presentation == self.presented_cursor
+        {
             // Nothing changed since the rows currently on screen were built.
             return Ok(None);
         }
@@ -598,7 +676,7 @@ impl TerminalSession {
         let mut grapheme = String::with_capacity(8);
 
         while let Some(row) = row_iterator.next() {
-            let cursor_touched = Some(row_index) == self.last_cursor.map(|(_, y)| y)
+            let cursor_touched = Some(row_index) == self.presented_cursor.cell.map(|(_, y)| y)
                 || cursor_cell.is_some_and(|(_, y)| y == row_index);
             if !full_rebuild && !cursor_touched && !row.dirty()? {
                 rows.push(self.cached_rows[row_index as usize].clone());
@@ -619,8 +697,14 @@ impl TerminalSession {
         snapshot.set_dirty(Dirty::Clean)?;
         self.cached_rows = rows.clone();
         self.cached_defaults = Some((default_foreground, default_background));
-        self.last_cursor = cursor_cell;
+        self.presented_cursor = presentation;
         Ok(Some(rows))
+    }
+
+    /// The cursor state of the last presented frame (see
+    /// [`CursorPresentation`]). Read by the view after each present.
+    pub(crate) fn cursor_presentation(&self) -> CursorPresentation {
+        self.presented_cursor
     }
 
     /// Builds the [`RenderRun`]s for one grid row from the terminal cells.
@@ -733,6 +817,20 @@ fn default_shell() -> PathBuf {
 
 fn color_value(color: RgbColor) -> u32 {
     ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
+}
+
+/// Maps the render state's cursor visual style onto the app's shape enum.
+/// The libghostty enum is non-exhaustive, so unknown styles fall back to
+/// the terminal's block default.
+fn cursor_shape(style: CursorVisualStyle) -> CursorShape {
+    match style {
+        CursorVisualStyle::Bar => CursorShape::Bar,
+        CursorVisualStyle::Underline => CursorShape::Underline,
+        CursorVisualStyle::BlockHollow => CursorShape::Hollow,
+        CursorVisualStyle::Block => CursorShape::Block,
+        // Future non-exhaustive additions fall back to the terminal default.
+        _ => CursorShape::Block,
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1038,94 @@ mod tests {
             .expect("snapshot should succeed")
             .expect("resized grid should present a frame");
         assert_eq!(rows.len(), 24);
+        session._child.kill().ok();
+    }
+
+    /// Pure cursor restyles and visibility toggles must present a frame.
+    ///
+    /// DECSCUSR (nvim's mode switches) and DEC modes 12/25 change no cells,
+    /// so the render state stays clean; swallowing those frames would freeze
+    /// the cursor's shape and leave a hidden cursor painted. Hiding the
+    /// cursor must also drop its cell flag from the rows.
+    #[test]
+    fn snapshot_presents_cursor_restyles_and_visibility() {
+        let cwd = std::env::temp_dir();
+        let (mut session, _output) = TerminalSession::spawn(
+            crate::workspace::WorkspaceTab::Terminal,
+            &cwd,
+            AgentKind::DEFAULT,
+        )
+        .expect("spawning a shell for the cursor-restyle test");
+        // Only these bytes are fed, so the snapshot is fully determined by
+        // them regardless of any shell output waiting in the channel.
+        session.feed(b"abc");
+        session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("fresh content should present a frame");
+        // The spawn-time default matches Ghostty: a blinking block.
+        assert_eq!(session.cursor_presentation().shape, CursorShape::Block);
+        assert!(session.cursor_presentation().blinking);
+        assert_eq!(session.cursor_presentation().cell, Some((3, 0)));
+
+        // nvim's insert mode: a steady bar. No cell changed, so this
+        // exercises exactly the early return the shape must survive.
+        session.feed(b"\x1b[6 q");
+        session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("a pure restyle should present a frame");
+        assert_eq!(session.cursor_presentation().shape, CursorShape::Bar);
+        assert!(!session.cursor_presentation().blinking);
+
+        // A blink request through DECSCUSR 5 (blinking bar), then DEC 12.
+        session.feed(b"\x1b[5 q");
+        session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("a blink request should present a frame");
+        assert!(session.cursor_presentation().blinking);
+        session.feed(b"\x1b[?12l");
+        session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("a blink stop should present a frame");
+        assert!(!session.cursor_presentation().blinking);
+
+        // Hiding (DEC 25) must drop the cursor flag from the row it sat on.
+        session.feed(b"\x1b[?25l");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("hiding the cursor should present a frame");
+        assert_eq!(session.cursor_presentation().cell, None);
+        assert!(
+            rows[0].iter().all(|run| !run.style.cursor),
+            "a hidden cursor must not flag its cell, got {:?}",
+            rows[0]
+                .iter()
+                .map(|run| (run.text.to_string(), run.style.cursor))
+                .collect::<Vec<_>>(),
+        );
+
+        // Showing restores the cell flag.
+        session.feed(b"\x1b[?25h");
+        let rows = session
+            .snapshot()
+            .expect("snapshot should succeed")
+            .expect("showing the cursor should present a frame");
+        assert_eq!(session.cursor_presentation().cell, Some((3, 0)));
+        assert!(rows[0].iter().any(|run| run.style.cursor));
+
+        // A settled grid with an unchanged cursor presents nothing, so
+        // idle frames stay free.
+        assert!(
+            session
+                .snapshot()
+                .expect("snapshot should succeed")
+                .is_none(),
+            "a settled grid should present no frame"
+        );
         session._child.kill().ok();
     }
 

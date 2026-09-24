@@ -7,8 +7,10 @@
 //! read from, so a new tool is a variant plus its slots and compute step.
 //!
 //! [`ToolResultKind`] says how that result is presented: an in-place tool
-//! edits one document, a diff tool compares two and renders the changes.
+//! edits one document, a text-result tool keeps input and output separate,
+//! and a diff tool compares two documents.
 
+mod base64;
 mod diff;
 mod json;
 mod store;
@@ -24,6 +26,8 @@ use gpui_kit::assets::IconName;
 pub(crate) enum ToolKind {
     JsonFormatter,
     DiffChecker,
+    Base64Encoder,
+    Base64Decoder,
 }
 
 /// What a run of a tool produces from its inputs.
@@ -31,6 +35,8 @@ pub(crate) enum ToolKind {
 pub(crate) enum ToolOutput {
     /// Rewritten text for the tool's document (its first input).
     Text(String),
+    /// Text derived from, but kept separate from, the tool's input.
+    ResultText(String),
     /// A line diff between the tool's two inputs.
     Diff(diff::DiffResult),
 }
@@ -40,6 +46,8 @@ pub(crate) enum ToolOutput {
 pub(crate) enum ToolResultKind {
     /// One document; the result replaces its text in place.
     InPlaceText,
+    /// One paste editor and a separate, copyable result.
+    SeparateText,
     /// Two paste editors; the result is a diff rendered below them.
     Diff,
 }
@@ -53,7 +61,12 @@ pub(crate) struct ToolInput {
 }
 
 impl ToolKind {
-    pub(crate) const ALL: [Self; 2] = [Self::JsonFormatter, Self::DiffChecker];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::JsonFormatter,
+        Self::DiffChecker,
+        Self::Base64Encoder,
+        Self::Base64Decoder,
+    ];
 
     /// Stable storage key. Never reused for a different tool, so old
     /// persisted content cannot surface under a new tool's name.
@@ -61,6 +74,8 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => "json-formatter",
             Self::DiffChecker => "diff-checker",
+            Self::Base64Encoder => "base64-encoder",
+            Self::Base64Decoder => "base64-decoder",
         }
     }
 
@@ -69,6 +84,8 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => "Format JSON",
             Self::DiffChecker => "Diff Checker",
+            Self::Base64Encoder => "Base64 Encoder",
+            Self::Base64Decoder => "Base64 Decoder",
         }
     }
 
@@ -77,6 +94,8 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => &["json", "format", "pretty", "print", "tool"],
             Self::DiffChecker => &["diff", "compare", "text", "checker", "patch", "tool"],
+            Self::Base64Encoder => &["base64", "encode", "text", "tool"],
+            Self::Base64Decoder => &["base64", "decode", "text", "tool"],
         }
     }
 
@@ -84,6 +103,7 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => IconName::Braces,
             Self::DiffChecker => IconName::Diff,
+            Self::Base64Encoder | Self::Base64Decoder => IconName::Braces,
         }
     }
 
@@ -105,6 +125,14 @@ impl ToolKind {
                     placeholder: "Paste the new text here",
                 },
             ],
+            Self::Base64Encoder => &[ToolInput {
+                file_name: "input",
+                placeholder: "Paste text to encode",
+            }],
+            Self::Base64Decoder => &[ToolInput {
+                file_name: "input",
+                placeholder: "Paste Base64 to decode",
+            }],
         }
     }
 
@@ -114,6 +142,7 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => Some("json"),
             Self::DiffChecker => None,
+            Self::Base64Encoder | Self::Base64Decoder => None,
         }
     }
 
@@ -123,6 +152,7 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => ToolResultKind::InPlaceText,
             Self::DiffChecker => ToolResultKind::Diff,
+            Self::Base64Encoder | Self::Base64Decoder => ToolResultKind::SeparateText,
         }
     }
 
@@ -131,6 +161,8 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => "Format",
             Self::DiffChecker => "Diff",
+            Self::Base64Encoder => "Encode",
+            Self::Base64Decoder => "Decode",
         }
     }
 
@@ -139,13 +171,13 @@ impl ToolKind {
         match self {
             Self::JsonFormatter => "tool-format",
             Self::DiffChecker => "tool-diff",
+            Self::Base64Encoder => "tool-encode",
+            Self::Base64Decoder => "tool-decode",
         }
     }
 
-    /// Derive the tool's result from the current inputs, in slot order. For
-    /// the formatter that result is the document rewritten in place; errors
-    /// are user-facing text and leave the input untouched. Comparing text
-    /// cannot fail.
+    /// Derive the tool's result from the current inputs, in slot order.
+    /// Errors are user-facing text and leave the input untouched.
     pub(crate) fn compute(self, inputs: &[String]) -> Result<ToolOutput, String> {
         match self {
             Self::JsonFormatter => {
@@ -156,6 +188,13 @@ impl ToolKind {
                 inputs.first().map(String::as_str).unwrap_or_default(),
                 inputs.get(1).map(String::as_str).unwrap_or_default(),
             ))),
+            Self::Base64Encoder => Ok(ToolOutput::ResultText(base64::encode(
+                inputs.first().map(String::as_str).unwrap_or_default(),
+            ))),
+            Self::Base64Decoder => {
+                base64::decode(inputs.first().map(String::as_str).unwrap_or_default())
+                    .map(ToolOutput::ResultText)
+            }
         }
     }
 }
@@ -213,6 +252,7 @@ mod tests {
             let output = tool.compute(&inputs);
             match (tool.result_kind(), output) {
                 (ToolResultKind::InPlaceText, Ok(ToolOutput::Text(_))) => {}
+                (ToolResultKind::SeparateText, Ok(ToolOutput::ResultText(_))) => {}
                 (ToolResultKind::Diff, Ok(ToolOutput::Diff(_))) => {}
                 (kind, output) => panic!("{tool:?} declares {kind:?} but computed {output:?}"),
             }

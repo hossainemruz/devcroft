@@ -272,6 +272,101 @@ fn copy_copies_the_current_input(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn base64_encoder_keeps_input_separate_and_copies_only_current_output(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let (_dir, root, store) = fixture();
+    let tool = ToolKind::Base64Encoder;
+    let slot = tool.inputs()[0];
+    let (view, cx) = open_with_root(cx, tool, root);
+    cx.update(|window, cx| {
+        replace_input(&view, 0, "Hello, 🌍", window, cx);
+        window.render_frame(cx);
+        window.click("tool-encode", cx);
+    });
+    view.read_with(cx, |view, cx| {
+        assert_eq!(input_text(view, 0, cx), "Hello, 🌍");
+        assert_eq!(
+            view.output.as_ref().unwrap().read(cx).value().to_string(),
+            "SGVsbG8sIPCfjI0="
+        );
+    });
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let input = window.find(("tool-input", 0usize)).bounds();
+        let output = window.find("tool-output").bounds();
+        let copy = window.find("tool-copy").bounds();
+        assert!(input.bottom() <= output.top());
+        assert!(output.bottom() <= copy.top());
+    });
+    assert_eq!(store.load(tool, &slot).unwrap(), "Hello, 🌍");
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("tool-copy", cx);
+    });
+    assert_eq!(clipboard_text(cx), Some("SGVsbG8sIPCfjI0=".to_owned()));
+
+    cx.update(|window, cx| replace_input(&view, 0, "changed", window, cx));
+    view.read_with(cx, |view, _| assert!(view.output.is_none()));
+    // An edit must not leave the old result available to Copy.
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("tool-copy", cx);
+    });
+    assert_eq!(clipboard_text(cx), Some("SGVsbG8sIPCfjI0=".to_owned()));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("tool-clear", cx);
+    });
+    assert_eq!(store.load(tool, &slot).unwrap(), "");
+    view.read_with(cx, |view, _| assert!(view.output.is_none()));
+}
+
+#[gpui_kit::test]
+fn base64_decoder_shows_text_and_rejects_invalid_input_without_stale_output(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let (_dir, root, store) = fixture();
+    let tool = ToolKind::Base64Decoder;
+    let slot = tool.inputs()[0];
+    let (view, cx) = open_with_root(cx, tool, root);
+    cx.update(|window, cx| {
+        replace_input(&view, 0, "SGVs\nbG8=", window, cx);
+        window.render_frame(cx);
+        window.click("tool-decode", cx);
+    });
+    view.read_with(cx, |view, cx| {
+        assert_eq!(input_text(view, 0, cx), "SGVs\nbG8=");
+        assert_eq!(
+            view.output.as_ref().unwrap().read(cx).value().to_string(),
+            "Hello"
+        );
+    });
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("tool-copy", cx);
+    });
+    assert_eq!(clipboard_text(cx), Some("Hello".to_owned()));
+
+    cx.update(|window, cx| {
+        replace_input(&view, 0, "???", window, cx);
+        window.render_frame(cx);
+        window.click("tool-decode", cx);
+    });
+    view.read_with(cx, |view, cx| {
+        assert_eq!(input_text(view, 0, cx), "???");
+        assert!(view.output.is_none());
+        assert!(
+            view.error
+                .as_deref()
+                .unwrap()
+                .starts_with("Invalid Base64:")
+        );
+    });
+    assert_eq!(store.load(tool, &slot).unwrap(), "???");
+}
+
+#[gpui_kit::test]
 fn failed_load_blocks_saving_until_cleared(cx: &mut gpui_kit::TestAppContext) {
     let (_dir, root, store) = fixture();
     // A directory where the input file belongs makes the read fail.

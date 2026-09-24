@@ -816,9 +816,10 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 8 go-to + 2 tools + 2 switch + 1 add + 1 settings + 1 sync.
-        assert_eq!(all.len(), 15);
-        assert_eq!(filter_items(&sections, "   ").len(), 15);
+        // 8 go-to + all tools + 2 switch + 1 add + 1 settings + 1 sync.
+        let expected = 13 + ToolKind::ALL.len();
+        assert_eq!(all.len(), expected);
+        assert_eq!(filter_items(&sections, "   ").len(), expected);
     }
 
     #[test]
@@ -894,6 +895,13 @@ mod tests {
         assert_eq!(
             filter_items(&sections, "diff checker"),
             vec![PaletteItem::Tool(ToolKind::DiffChecker)]
+        );
+        assert_eq!(
+            filter_items(&sections, "base64"),
+            vec![
+                PaletteItem::Tool(ToolKind::Base64Encoder),
+                PaletteItem::Tool(ToolKind::Base64Decoder),
+            ]
         );
         // "diff" is also a search term of the Review tab command, so the
         // tool shares the results rather than owning the term.

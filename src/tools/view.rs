@@ -9,7 +9,8 @@
 //! overwrite content this session never saw.
 //!
 //! How the result is presented comes from [`ToolKind::result_kind`]: an
-//! in-place tool has one editor and rewrites its text, while a diff tool has
+//! in-place tool has one editor and rewrites its text; a text-result tool
+//! keeps a separate read-only output; a diff tool has
 //! two modes the primary button toggles between — `Edit` (the old and new
 //! paste editors, side by side) and `Diff` (the comparison, old against new
 //! side by side). Each mode owns the whole dialog, and one global language
@@ -86,6 +87,12 @@ pub(crate) struct ToolView {
     save_error: Option<String>,
     /// Primary-action failure for the current input, shown with the actions.
     error: Option<String>,
+    /// Last text result, shown in a read-only editor and discarded when its
+    /// input changes. The input alone is persisted.
+    output: Option<Entity<EditorState>>,
+    /// Input that produced the last output or error. Change notifications
+    /// can arrive after the action runs; only a different value invalidates it.
+    result_input: Option<String>,
     /// Last text written to disk per input, so saves skip unchanged content.
     saved: Vec<String>,
     /// Bumped on every input change and on every flush; a debounced save
@@ -229,7 +236,7 @@ impl ToolView {
             });
             let subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.mark_result_stale();
+                    this.mark_result_stale(cx);
                     this.schedule_save(cx);
                 }
             });
@@ -264,6 +271,8 @@ impl ToolView {
             load_error,
             save_error: None,
             error: None,
+            output: None,
+            result_input: None,
             saved,
             save_generation: 0,
             mode: ToolMode::Edit,
@@ -334,6 +343,7 @@ impl ToolView {
     fn primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.tool.result_kind() {
             ToolResultKind::InPlaceText => self.apply_in_place(window, cx),
+            ToolResultKind::SeparateText => self.apply_separate_text(window, cx),
             ToolResultKind::Diff => self.toggle_diff(cx),
         }
     }
@@ -343,6 +353,7 @@ impl ToolView {
     fn primary_label(&self) -> &'static str {
         match self.tool.result_kind() {
             ToolResultKind::InPlaceText => self.tool.action_label(),
+            ToolResultKind::SeparateText => self.tool.action_label(),
             ToolResultKind::Diff if self.mode == ToolMode::Diff => "Edit",
             ToolResultKind::Diff => self.tool.action_label(),
         }
@@ -400,11 +411,40 @@ impl ToolView {
             // Unreachable: `compute` returns the kind `result_kind` declares,
             // which the registry tests pin. Reported rather than panicking so
             // a registry mistake cannot take the dialog down.
-            Ok(ToolOutput::Diff(_)) => {
+            Ok(ToolOutput::Diff(_) | ToolOutput::ResultText(_)) => {
                 self.error = Some("This tool does not format text".to_owned())
             }
             Err(error) => self.error = Some(error),
         }
+        cx.notify();
+    }
+
+    /// Compute a result without replacing the source text. Re-running after
+    /// an edit creates a fresh read-only output, and a failed decode removes
+    /// any previous result so Copy can never hand out stale text.
+    fn apply_separate_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let inputs = self.texts(cx);
+        if inputs.first().is_none_or(|input| input.trim().is_empty()) {
+            return;
+        }
+        self.output = None;
+        self.result_input = inputs.first().cloned();
+        match self.tool.compute(&inputs) {
+            Ok(ToolOutput::ResultText(text)) => {
+                let output = cx.new(|cx| {
+                    let mut editor = editor_state(window, cx, diff::PLAIN_EDITOR_LANGUAGE, None);
+                    editor.set_value(text, window, cx);
+                    editor
+                });
+                self.output = Some(output);
+                self.error = None;
+            }
+            Ok(ToolOutput::Text(_) | ToolOutput::Diff(_)) => {
+                self.error = Some("This tool does not produce a separate text result".to_owned());
+            }
+            Err(error) => self.error = Some(error),
+        }
+        self.flush_save(window, cx);
         cx.notify();
     }
 
@@ -428,7 +468,7 @@ impl ToolView {
                     match tool.compute(&inputs) {
                         Ok(ToolOutput::Diff(result)) => Ok(result),
                         // Unreachable, as above: the registry pins the kind.
-                        Ok(ToolOutput::Text(_)) => {
+                        Ok(ToolOutput::Text(_) | ToolOutput::ResultText(_)) => {
                             Err("This tool does not compute a diff".to_owned())
                         }
                         Err(error) => Err(error),
@@ -534,22 +574,33 @@ impl ToolView {
     /// Note that the shown comparison no longer matches the inputs. Nothing
     /// on screen changes — the comparison is not visible while editing — so
     /// this only marks it: the toggle recomputes before revealing it again.
-    fn mark_result_stale(&mut self) {
+    fn mark_result_stale(&mut self, cx: &mut Context<Self>) {
         if let Some(pane) = self.diff.as_mut() {
             pane.stale = true;
         }
+        if self.tool.result_kind() == ToolResultKind::SeparateText
+            && self.result_input
+                != self
+                    .inputs
+                    .first()
+                    .map(|input| input.editor.read(cx).value().to_string())
+        {
+            self.output = None;
+            self.result_input = None;
+            self.error = None;
+            cx.notify();
+        }
     }
 
-    /// Copy the tool's document. Only in-place tools offer this: their result
-    /// *is* the document, so there is one obvious thing to hand out. A diff
-    /// tool has two documents and a comparison, and none of them is "the"
-    /// text, so it does not offer the action at all.
+    /// Copy the in-place document or the separate text result. A diff has no
+    /// single text result, so it does not offer this action.
     fn copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self
-            .inputs
-            .first()
-            .map(|input| input.editor.read(cx).value().to_string())
-        else {
+        let text = match self.tool.result_kind() {
+            ToolResultKind::InPlaceText => self.inputs.first().map(|input| &input.editor),
+            ToolResultKind::SeparateText => self.output.as_ref(),
+            ToolResultKind::Diff => None,
+        };
+        let Some(text) = text.map(|editor| editor.read(cx).value().to_string()) else {
             return;
         };
         if text.is_empty() {
@@ -572,6 +623,8 @@ impl ToolView {
         self.diff_generation = self.diff_generation.wrapping_add(1);
         self.highlight_generation = self.highlight_generation.wrapping_add(1);
         self.diff = None;
+        self.output = None;
+        self.result_input = None;
         self.mode = ToolMode::Edit;
         for input in &self.inputs {
             input
@@ -642,6 +695,7 @@ impl ToolView {
     fn render_edit_mode(&self) -> AnyElement {
         match self.tool.result_kind() {
             ToolResultKind::InPlaceText => self.render_single_editor(),
+            ToolResultKind::SeparateText => self.render_text_result(),
             ToolResultKind::Diff => h_flex()
                 .w_full()
                 .flex_1()
@@ -652,6 +706,45 @@ impl ToolView {
                 .child(self.render_labelled_editor(1, "New text"))
                 .into_any_element(),
         }
+    }
+
+    /// Input and read-only output each get a full-width, scrollable editor.
+    /// Stacking them keeps both usable when the window is narrow.
+    fn render_text_result(&self) -> AnyElement {
+        let output = match &self.output {
+            Some(output) => Editor::new(output)
+                .readonly(true)
+                .h(relative(1.))
+                .into_any_element(),
+            None => div()
+                .size_full()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(PANE_BORDER))
+                .bg(rgb(PANE_BG))
+                .p_3()
+                .text_sm()
+                .text_color(rgb(MUTED_COLOR))
+                .child("Run the tool to see the output")
+                .into_any_element(),
+        };
+        v_flex()
+            .w_full()
+            .flex_1()
+            .min_h(px(EDITOR_MIN_HEIGHT * 2.))
+            .gap_2()
+            .child(self.render_labelled_editor(0, "Input"))
+            .child(
+                v_flex()
+                    .id("tool-output")
+                    .test_support()
+                    .flex_1()
+                    .min_h(px(EDITOR_MIN_HEIGHT))
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(MUTED_COLOR)).child("Output"))
+                    .child(div().w_full().flex_1().min_h_0().child(output)),
+            )
+            .into_any_element()
     }
 
     /// One editor filling the dialog, for tools whose result rewrites it.
@@ -767,10 +860,17 @@ impl ToolView {
     }
 
     fn render_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let copy_disabled = self
-            .inputs
-            .first()
-            .is_none_or(|input| input.editor.read(cx).value().is_empty());
+        let copy_disabled = match self.tool.result_kind() {
+            ToolResultKind::InPlaceText => self
+                .inputs
+                .first()
+                .is_none_or(|input| input.editor.read(cx).value().is_empty()),
+            ToolResultKind::SeparateText => self
+                .output
+                .as_ref()
+                .is_none_or(|output| output.read(cx).value().is_empty()),
+            ToolResultKind::Diff => true,
+        };
         // The status message holds the free space so the actions stay right,
         // matching the action rows of the other dialogs.
         h_flex()
@@ -817,19 +917,16 @@ impl ToolView {
                     .small()
                     .on_click(cx.listener(|this, _, window, cx| this.clear(window, cx))),
             )
-            .when(
-                self.tool.result_kind() == ToolResultKind::InPlaceText,
-                |row| {
-                    row.child(
-                        Button::new("tool-copy")
-                            .label("Copy")
-                            .ghost()
-                            .small()
-                            .disabled(copy_disabled)
-                            .on_click(cx.listener(|this, _, window, cx| this.copy(window, cx))),
-                    )
-                },
-            )
+            .when(self.tool.result_kind() != ToolResultKind::Diff, |row| {
+                row.child(
+                    Button::new("tool-copy")
+                        .label("Copy")
+                        .ghost()
+                        .small()
+                        .disabled(copy_disabled)
+                        .on_click(cx.listener(|this, _, window, cx| this.copy(window, cx))),
+                )
+            })
             .child(
                 Button::new(self.tool.action_id())
                     .label(self.primary_label())

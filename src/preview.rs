@@ -91,7 +91,7 @@ type CodeHighlights = std::collections::HashMap<
     Vec<(std::ops::Range<usize>, HighlightStyle)>,
 >;
 
-fn highlight_code(
+pub(crate) fn highlight_code(
     code: &str,
     language: Option<&str>,
     dark: bool,

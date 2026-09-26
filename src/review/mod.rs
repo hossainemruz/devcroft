@@ -6,6 +6,7 @@
 //! owns loading, scope selection, the tree/stream layout, viewed-file state,
 //! and refresh.
 
+mod assistant;
 pub(crate) mod comments;
 mod feedback;
 pub(crate) mod git;
@@ -121,6 +122,9 @@ pub(crate) struct ReviewView {
     generation: u64,
     feedback: feedback::Feedback,
     show_comments: bool,
+    assistant: Option<Entity<assistant::AssistantView>>,
+    show_assistant: bool,
+    assistant_source: Option<String>,
 }
 
 impl ReviewView {
@@ -152,6 +156,9 @@ impl ReviewView {
             generation: 0,
             feedback: feedback::Feedback::default(),
             show_comments: true,
+            assistant: None,
+            show_assistant: false,
+            assistant_source: None,
         };
         view.reload(cx);
         view
@@ -196,6 +203,9 @@ impl ReviewView {
                     Ok((diff, syntax, feedback)) => {
                         view.load_comments(feedback);
                         view.apply_diff(diff, syntax, cx);
+                        if let Some(path) = view.assistant_source.take() {
+                            view.scroll_to_assistant_source(&path, cx);
+                        }
                     }
                     Err(error) => {
                         view.state = ReviewState::Failed(format!("{error:#}").into());
@@ -208,6 +218,9 @@ impl ReviewView {
     }
 
     pub(crate) fn navigation_panes(&self) -> Vec<(&'static str, FocusHandle)> {
+        if self.show_assistant {
+            return vec![("Review assistant", self.focus_handle.clone())];
+        }
         if !matches!(self.state, ReviewState::Loaded(_)) {
             return vec![("Review", self.focus_handle.clone())];
         }
@@ -227,6 +240,12 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.show_assistant {
+            if index == 0 {
+                self.focus_handle.focus(window, cx);
+            }
+            return;
+        }
         match index {
             // TreeState owns keyboard tree traversal; use its actual focus
             // handle rather than the layout wrapper used for HUD discovery.
@@ -348,6 +367,10 @@ impl ReviewView {
             self.collapsed.borrow_mut().clear();
             self.viewed.borrow_mut().clear();
             self.review_key = Some(key);
+            if let Some(assistant) = self.assistant.take() {
+                assistant.update(cx, |assistant, cx| assistant.stop(cx));
+            }
+            self.show_assistant = false;
         }
         let (items, metas) = build_file_tree(&diff.files);
         let (rows, file_row_start) = flatten(&diff, &self.collapsed.borrow());
@@ -443,6 +466,30 @@ impl ReviewView {
                 self.last_scrolled = Some(path.to_owned());
             }
         }
+        cx.notify();
+    }
+
+    fn open_assistant_source(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.assistant_source = Some(path.to_owned());
+        self.show_assistant = false;
+        self.reload(cx);
+    }
+
+    fn scroll_to_assistant_source(&mut self, path: &str, cx: &mut Context<Self>) {
+        let ReviewState::Loaded(loaded) = &self.state else {
+            return;
+        };
+        let Some(file_ix) = loaded.diff.files.iter().position(|file| file.path == path) else {
+            return;
+        };
+        let row = loaded.file_row_start[file_ix];
+        self.show_assistant = false;
+        self.list_handle.scroll_to(ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.),
+        });
+        self.stream_top.set(row);
+        self.last_scrolled = Some(path.to_owned());
         cx.notify();
     }
 
@@ -559,6 +606,55 @@ impl ReviewView {
                     .child(self.base_label()),
             )
             .child(div().flex_1())
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if self.show_assistant {
+                        0x7dd3fc
+                    } else {
+                        0x292b2b
+                    }))
+                    .text_xs()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if !this.show_assistant
+                                && this.assistant.is_none()
+                                && let ReviewState::Loaded(loaded) = &this.state
+                            {
+                                let cwd = this.cwd.clone();
+                                let diff = loaded.diff.clone();
+                                let label = this.base_label();
+                                let scope = this.scope();
+                                let assistant = cx.new(|cx| {
+                                    assistant::AssistantView::new(
+                                        cwd, diff, label, scope, window, cx,
+                                    )
+                                });
+                                cx.subscribe_in(
+                                    &assistant,
+                                    window,
+                                    |this, _, event: &assistant::OpenReviewSource, _, cx| {
+                                        this.open_assistant_source(&event.0, cx);
+                                    },
+                                )
+                                .detach();
+                                this.assistant = Some(assistant);
+                            }
+                            this.show_assistant = !this.show_assistant;
+                            cx.notify();
+                        }),
+                    )
+                    .child(if self.show_assistant {
+                        "Review changes"
+                    } else {
+                        "Review assistant"
+                    }),
+            )
             .child(
                 div()
                     .text_xs()
@@ -925,111 +1021,120 @@ impl Render for ReviewView {
         let tree_focus = self.tree_focus.clone();
         let stream_focus = self.stream_focus.clone();
         let comments_focus = self.comments_focus.clone();
-        let body: AnyElement = match &self.state {
-            ReviewState::Loading => div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(rgb(0x737878))
-                .child("Loading review…")
-                .into_any_element(),
-            ReviewState::Failed(message) => {
-                let retry = div()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x292b2b))
-                    .text_sm()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.reload(cx)),
-                    )
-                    .child("Retry");
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .p_6()
-                    .child(
-                        div()
+        let body: AnyElement =
+            if self.show_assistant {
+                if let Some(assistant) = &self.assistant {
+                    assistant.clone().into_any_element()
+                } else {
+                    div()
+                        .flex_1()
+                        .child("Load a review to open the assistant.")
+                        .into_any_element()
+                }
+            } else {
+                match &self.state {
+                    ReviewState::Loading => div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(rgb(0x737878))
+                        .child("Loading review…")
+                        .into_any_element(),
+                    ReviewState::Failed(message) => {
+                        let retry = div()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x292b2b))
                             .text_sm()
-                            .text_color(rgb(0xf87171))
-                            .child(message.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x737878))
-                            .child("Check that the base branch exists and this is a git checkout."),
-                    )
-                    .child(retry)
-                    .into_any_element()
-            }
-            ReviewState::Loaded(loaded) => {
-                let file_count = loaded.diff.files.len();
-                let sticky = self.render_sticky_header(loaded, cx);
-                h_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(
-                        v_flex()
-                            .track_focus(&tree_focus)
-                            .focus(|style| style.border_1().border_color(cx.theme().ring))
-                            .when(self.tree_contains_focus, |this| this.border_1())
-                            .border_color(rgb(0x292b2b))
-                            .when(self.tree_contains_focus, |this| {
-                                this.border_color(cx.theme().ring)
-                            })
-                            .w(px(320.))
-                            .flex_none()
-                            .h_full()
-                            .border_r_1()
-                            .border_color(rgb(0x292b2b))
-                            .child(
-                                div()
-                                    .h(px(32.))
-                                    .flex_none()
-                                    .px_3()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(rgb(0x858989))
-                                    .border_b_1()
-                                    .border_color(rgb(0x1d1f1f))
-                                    .child(format!("Files · {file_count}")),
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.reload(cx)),
                             )
-                            .child(div().flex_1().min_h_0().child(self.render_tree(cx))),
-                    )
-                    .child(
+                            .child("Retry");
                         v_flex()
-                            .track_focus(&stream_focus)
-                            .focus(|style| style.border_1().border_color(cx.theme().ring))
                             .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .min_h_0()
-                            .when_some(sticky, |this, header| this.child(header))
+                            .items_center()
+                            .justify_center()
+                            .gap_3()
+                            .p_6()
                             .child(
                                 div()
+                                    .text_sm()
+                                    .text_color(rgb(0xf87171))
+                                    .child(message.clone()),
+                            )
+                            .child(div().text_xs().text_color(rgb(0x737878)).child(
+                                "Check that the base branch exists and this is a git checkout.",
+                            ))
+                            .child(retry)
+                            .into_any_element()
+                    }
+                    ReviewState::Loaded(loaded) => {
+                        let file_count = loaded.diff.files.len();
+                        let sticky = self.render_sticky_header(loaded, cx);
+                        h_flex()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(
+                                v_flex()
+                                    .track_focus(&tree_focus)
+                                    .focus(|style| style.border_1().border_color(cx.theme().ring))
+                                    .when(self.tree_contains_focus, |this| this.border_1())
+                                    .border_color(rgb(0x292b2b))
+                                    .when(self.tree_contains_focus, |this| {
+                                        this.border_color(cx.theme().ring)
+                                    })
+                                    .w(px(320.))
+                                    .flex_none()
+                                    .h_full()
+                                    .border_r_1()
+                                    .border_color(rgb(0x292b2b))
+                                    .child(
+                                        div()
+                                            .h(px(32.))
+                                            .flex_none()
+                                            .px_3()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(rgb(0x858989))
+                                            .border_b_1()
+                                            .border_color(rgb(0x1d1f1f))
+                                            .child(format!("Files · {file_count}")),
+                                    )
+                                    .child(div().flex_1().min_h_0().child(self.render_tree(cx))),
+                            )
+                            .child(
+                                v_flex()
+                                    .track_focus(&stream_focus)
+                                    .focus(|style| style.border_1().border_color(cx.theme().ring))
                                     .flex_1()
-                                    .min_h_0()
                                     .min_w_0()
-                                    .w_full()
-                                    .child(self.render_stream(loaded, cx)),
-                            ),
-                    )
-                    .into_any_element()
-            }
-        };
+                                    .h_full()
+                                    .min_h_0()
+                                    .when_some(sticky, |this, header| this.child(header))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .min_w_0()
+                                            .w_full()
+                                            .child(self.render_stream(loaded, cx)),
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                }
+            };
         v_flex()
             .size_full()
             .bg(rgb(0x090a0a))
@@ -1050,7 +1155,7 @@ impl Render for ReviewView {
                     .min_w_0()
                     .min_h_0()
                     .child(body)
-                    .when(self.show_comments, |d| {
+                    .when(self.show_comments && !self.show_assistant, |d| {
                         d.child(
                             div()
                                 .track_focus(&comments_focus)

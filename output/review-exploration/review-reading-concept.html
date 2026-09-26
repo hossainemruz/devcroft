@@ -1,0 +1,258 @@
+<div id="dc-review-concept" aria-label="Devcroft review reading concept">
+  <style>
+    #dc-review-concept { --dc-bg:light-dark(#fafafa,#101212); --dc-panel:light-dark(#ffffff,#151818); --dc-soft:light-dark(#f2f4f4,#1b1f1f); --dc-text:light-dark(#202727,#e7ebeb); --dc-muted:light-dark(#586363,#a0adad); --dc-line:light-dark(#dfe5e5,#303838); --dc-accent:light-dark(#126b81,#8dd4e5); --dc-selected:light-dark(#deedf1,#213b42); --dc-add:light-dark(#eff8f1,#15271d); --dc-add-text:light-dark(#267340,#a4d8b2); background:var(--dc-bg); color:var(--dc-text); font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; border:1px solid var(--dc-line); border-radius:10px; overflow-wrap:anywhere; }
+    #dc-review-concept * { box-sizing:border-box; }
+    #dc-review-concept [hidden] { display:none!important; }
+    #dc-review-concept button,#dc-review-concept select,#dc-review-concept input { font:inherit; color:inherit; }
+    #dc-review-concept button { border:1px solid var(--dc-line); background:var(--dc-panel); padding:7px 11px; border-radius:6px; }
+    #dc-review-concept button:hover { background:var(--dc-soft); }
+    #dc-review-concept button:disabled { opacity:.45; }
+    #dc-review-concept button.dc-primary { background:var(--dc-text); color:var(--dc-bg); border-color:var(--dc-text); }
+    #dc-review-concept button.dc-quiet { border-color:transparent; background:transparent; color:var(--dc-muted); }
+    #dc-review-concept select,#dc-review-concept input[type=text] { width:100%; min-width:0; background:var(--dc-panel); border:1px solid var(--dc-line); border-radius:6px; padding:9px; }
+    #dc-review-concept header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:12px 22px; border-bottom:1px solid var(--dc-line); }
+    #dc-review-concept .dc-brand { display:flex; align-items:center; gap:12px; font-weight:600; }
+    #dc-review-concept .dc-brand span { font-weight:400; color:var(--dc-muted); }
+    #dc-review-concept .dc-intro { padding:24px 26px 18px; }
+    #dc-review-concept h2 { font:600 23px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; margin:0 0 5px; }
+    #dc-review-concept h3 { font:600 20px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; margin:8px 0 14px; }
+    #dc-review-concept p { margin:0 0 16px; }
+    #dc-review-concept .dc-muted { color:var(--dc-muted); }
+    #dc-review-concept .dc-small { font-size:12px; }
+    #dc-review-concept .dc-toolbar { padding:0 26px 19px; display:flex; align-items:center; gap:14px; justify-content:space-between; flex-wrap:wrap; }
+    #dc-review-concept .dc-toolbar select { width:auto; max-width:100%; }
+    #dc-review-concept .dc-reader { display:grid; grid-template-columns:minmax(0, .85fr) minmax(0,1.6fr); gap:30px; padding:24px 26px; border-top:1px solid var(--dc-line); align-items:start; }
+    #dc-review-concept .dc-reader.dc-stacked { grid-template-columns:minmax(0,1fr); }
+    #dc-review-concept article,#dc-review-concept .dc-code-panel { min-width:0; }
+    #dc-review-concept .dc-eyebrow { color:var(--dc-muted); font-size:12px; letter-spacing:.04em; }
+    #dc-review-concept .dc-check { padding-top:16px; margin-top:22px; border-top:1px solid var(--dc-line); }
+    #dc-review-concept .dc-label { font-size:12px; font-weight:600; display:block; margin-bottom:6px; }
+    #dc-review-concept details { margin:16px 0; }
+    #dc-review-concept summary { color:var(--dc-accent); }
+    #dc-review-concept details p { padding-top:10px; margin:0; }
+    #dc-review-concept .dc-ask { margin-top:16px; }
+    #dc-review-concept .dc-code-panel { background:var(--dc-panel); border:1px solid var(--dc-line); border-radius:7px; }
+    #dc-review-concept .dc-file-header { display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap; padding:11px 14px; border-bottom:1px solid var(--dc-line); }
+    #dc-review-concept .dc-file-header code { background:transparent; font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dc-text); }
+    #dc-review-concept .dc-code { padding:10px 0; }
+    #dc-review-concept .dc-line { display:grid; grid-template-columns:34px 17px minmax(0,1fr); background:var(--dc-add); font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    #dc-review-concept .dc-number { text-align:right; padding-right:7px; color:var(--dc-muted); user-select:none; }
+    #dc-review-concept .dc-plus { color:var(--dc-add-text); user-select:none; }
+    #dc-review-concept .dc-line code { font:inherit; background:none; color:var(--dc-text); border:0; border-radius:0; padding:0 10px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+    #dc-review-concept .dc-code-footer { padding:9px 12px; border-top:1px solid var(--dc-line); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+    #dc-review-concept .dc-conversation { border-top:1px solid var(--dc-line); margin-top:17px; padding-top:15px; }
+    #dc-review-concept .dc-conversation p { margin:10px 0; }
+    #dc-review-concept .dc-question { text-align:left; width:100%; }
+    #dc-review-concept footer { border-top:1px solid var(--dc-line); padding:14px 26px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; }
+    #dc-review-concept footer label { display:flex; gap:9px; align-items:center; }
+    #dc-review-concept input[type=checkbox] { accent-color:var(--dc-accent); width:16px; height:16px; }
+    #dc-review-concept .dc-actions { display:flex; flex-wrap:wrap; gap:8px; }
+    #dc-review-concept .dc-settings { padding:28px; max-width:570px; margin:auto; }
+    #dc-review-concept .dc-fields { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:22px 0; }
+    #dc-review-concept .dc-fields label { display:flex; flex-direction:column; gap:6px; }
+    #dc-review-concept .dc-fields .dc-full { grid-column:1/-1; }
+    #dc-review-concept .dc-settings-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:26px; flex-wrap:wrap; }
+    #dc-review-concept .dc-complete { padding:24px 26px; border-top:1px solid var(--dc-line); }
+    @media(max-width:670px) { #dc-review-concept .dc-reader { grid-template-columns:minmax(0,1fr); gap:22px; } #dc-review-concept .dc-intro,#dc-review-concept .dc-reader,#dc-review-concept footer { padding-left:17px; padding-right:17px; } #dc-review-concept .dc-toolbar { padding-left:17px; padding-right:17px; } #dc-review-concept .dc-fields { grid-template-columns:1fr; } }
+    @media(pointer:coarse) { #dc-review-concept button,#dc-review-concept select,#dc-review-concept summary,#dc-review-concept footer label { min-height:44px; } #dc-review-concept input[type=text],#dc-review-concept select { font-size:16px; } }
+  </style>
+  <header>
+    <div class="dc-brand">devcroft <span>/</span> <span>Review</span></div>
+    <button type="button" id="dc-settings-open" class="dc-quiet cursor-interaction">Guide settings</button>
+  </header>
+  <section id="dc-reading">
+    <div class="dc-intro">
+      <h2>Understand the review assistant</h2>
+      <div class="dc-muted dc-small">Reading concept · example chapters from your current change</div>
+    </div>
+    <div class="dc-toolbar">
+      <select id="dc-chapter-picker" class="cursor-interaction" aria-label="Review chapter">
+        <option value="0">1. Launch the review</option>
+        <option value="1">2. Handle cancellation</option>
+        <option value="2">3. Read a valid guide</option>
+      </select>
+      <span class="dc-muted dc-small" id="dc-progress" aria-live="polite">0 of 3 chapters reviewed</span>
+    </div>
+    <div class="dc-reader" id="dc-reader">
+      <article>
+        <div class="dc-eyebrow" id="dc-chapter-label">CHAPTER 1 / 3</div>
+        <h3 id="dc-chapter-title">Launch the review</h3>
+        <p id="dc-summary"></p>
+        <p id="dc-why" class="dc-muted"></p>
+        <div class="dc-check">
+          <span class="dc-label">What to check</span>
+          <p id="dc-check-text"></p>
+        </div>
+        <details id="dc-concept">
+          <summary class="cursor-interaction" id="dc-concept-title">Explain the process boundary</summary>
+          <p id="dc-concept-text" class="dc-muted"></p>
+        </details>
+        <button type="button" id="dc-ask" class="dc-ask cursor-interaction" aria-expanded="false" aria-controls="dc-conversation">Ask about this chapter</button>
+        <section class="dc-conversation" id="dc-conversation" hidden aria-label="Example chapter conversation">
+          <span class="dc-label dc-muted">Sample exchange · chapter context attached</span>
+          <button type="button" id="dc-question" class="dc-question cursor-interaction"></button>
+          <p id="dc-answer" hidden aria-live="polite"></p>
+        </section>
+      </article>
+      <div class="dc-code-panel">
+        <div class="dc-file-header"><code id="dc-file">src/review/assistant/runner.rs</code><span class="dc-small dc-muted" id="dc-range"></span></div>
+        <div id="dc-code" class="dc-code" aria-label="Relevant added code"></div>
+        <div class="dc-code-footer">
+          <span class="dc-small dc-muted">+ Added code · focused excerpt</span>
+          <button type="button" id="dc-context" class="dc-quiet cursor-interaction" aria-expanded="false">More context</button>
+        </div>
+      </div>
+    </div>
+    <footer>
+      <label class="cursor-interaction"><input type="checkbox" id="dc-reviewed"> Mark chapter reviewed</label>
+      <div class="dc-actions"><button type="button" id="dc-previous" class="cursor-interaction">Previous</button><button type="button" id="dc-next" class="dc-primary cursor-interaction">Next chapter →</button></div>
+    </footer>
+    <div id="dc-complete" class="dc-complete" hidden aria-live="polite"></div>
+  </section>
+  <section id="dc-settings" class="dc-settings" hidden aria-label="Guide setup concept">
+    <h2>Build a review guide</h2>
+    <p class="dc-muted">Order this change into a useful reading path.</p>
+    <div class="dc-fields">
+      <label>Agent <input type="text" value="Codex" aria-label="Agent" readonly></label>
+      <label>Model <input type="text" value="GPT-6-Sol" aria-label="Model" readonly></label>
+      <label class="dc-full">Effort <select class="cursor-interaction" aria-label="Effort"><option>High</option><option>Medium</option><option>Low</option></select></label>
+    </div>
+    <details><summary class="cursor-interaction">Review context</summary><div class="dc-fields"><label class="dc-full">Design or artifact <input type="text" value="art-ah6zv7ma"></label><label class="dc-full">Focus on <input type="text" placeholder="e.g. cancellation and follow-up behavior"></label></div></details>
+    <div class="dc-muted dc-small">Example settings from your reference. This concept uses a prepared guide.</div>
+    <div class="dc-settings-actions"><button type="button" id="dc-settings-back" class="cursor-interaction">Back</button><button type="button" id="dc-settings-done" class="dc-primary cursor-interaction">Preview guide →</button></div>
+  </section>
+  <template id="dc-launch-code"><pre data-start="54">        let mut command = Command::new("codex");
+        command.arg("exec");
+        if let Some(id) = conversation {
+            command.args([
+                "resume",
+                "--json",
+                "-c",
+                "sandbox_mode=\"read-only\"",
+                &amp;id,
+                "-",
+            ]);
+        } else {
+            command.args(["--json", "-c", "sandbox_mode=\"read-only\"", "-C"]);
+            command.arg(&amp;cwd).arg("-");
+        }
+        command
+            .current_dir(&amp;cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());</pre></template>
+  <template id="dc-launch-extra"><pre data-start="74">        let mut process = match command.spawn() {
+            Ok(process) =&gt; process,
+            Err(error) =&gt; {
+                let _ =
+                    sender.send_blocking(Event::Finished(Err(format!("starting Codex: {error}"))));
+                return;
+            }
+        };</pre></template>
+  <template id="dc-stop-code"><pre data-start="27">    pub(crate) fn stop(&amp;self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Ok(mut child) = self.child.lock()
+            &amp;&amp; let Some(child) = child.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }</pre></template>
+  <template id="dc-stop-extra"><pre data-start="85">        *running.lock().unwrap() = Some(process);
+        if stop_flag.load(Ordering::SeqCst) {
+            let _ = running.lock().unwrap().as_mut().unwrap().kill();
+        }</pre></template>
+  <template id="dc-parse-code"><pre data-start="76">        let tutorial: Self = serde_json::from_str(json).context("reading tutorial JSON")?;
+        if tutorial.title.trim().is_empty() || tutorial.sections.is_empty() {
+            bail!("tutorial needs a title and at least one section");
+        }
+        for section in &amp;tutorial.sections {
+            if section.heading.trim().is_empty() || section.blocks.is_empty() {
+                bail!("every section needs a heading and at least one block");
+            }
+        }
+        Ok(tutorial)</pre></template>
+  <template id="dc-parse-extra"><pre data-start="68">    pub(crate) fn parse(output: &amp;str) -&gt; Result&lt;Self&gt; {
+        let trimmed = output.trim();
+        let json = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .and_then(|body| body.strip_suffix("```"))
+            .map(str::trim)
+            .unwrap_or(trimmed);</pre></template>
+  <script>
+  (function(){
+    var root = document.getElementById('dc-review-concept');
+    var el = function(id){ return root.querySelector('#'+id); };
+    var state = { chapter:0, reviewed:[false,false,false], layout:'beside', depth:false, context:false, asking:false, answered:false };
+    var chapters = [
+      {title:'Launch the review', summary:'The assistant starts Codex in the current checkout and passes the review prompt through standard input.', why:'A new review starts a conversation. Follow-up questions resume it, so the discussion can keep its context.', check:'Do both the new-review and resume paths request read-only execution?', concept:'Explain the process boundary', explanation:'The native app owns the screen and launches a child process. The Codex CLI owns the agent work. Pipes carry the prompt, progress, and final answer between them.', question:'Where does a follow-up get its context?', answer:'The resume branch passes the saved conversation ID to Codex. The view also includes the current tutorial in the follow-up prompt. runner.rs:56 and view.rs:275.', file:'src/review/assistant/runner.rs', code:'dc-launch-code', extra:'dc-launch-extra', range:'L54–73'},
+      {title:'Handle cancellation', summary:'Stopping a review records the cancellation and tries to kill the running process.', why:'Cancellation can arrive before the child process is stored. The startup path checks the flag again after storing the child.', check:'What happens if Stop is clicked while the child is still starting?', concept:'Explain the shared cancellation flag', explanation:'The UI and worker share an atomic flag. The flag preserves the Stop request even when there is no child process available to kill yet.', question:'Why store a flag as well as kill the process?', answer:'An early Stop may find no child process. The flag remembers that request. The worker reads it just after storing the spawned process and kills the child if needed. Expand More context to see runner.rs:85–88.', file:'src/review/assistant/runner.rs', code:'dc-stop-code', extra:'dc-stop-extra', range:'L27–34'},
+      {title:'Read a valid guide', summary:'The response is parsed into a tutorial, then checked for a title, sections, and content in every section.', why:'These checks reject structurally empty responses before the native view tries to display a guide.', check:'How does the screen help the reviewer recover when parsing or validation fails?', concept:'Explain the validation boundary', explanation:'Parsing confirms that the response fits the data structure. These additional checks reject empty titles and sections. Neither check proves that an explanation is correct.', question:'Does successful parsing mean the guide is trustworthy?', answer:'No. This code checks the response shape and a few empty fields. Claims still need to be grounded in real source and diff references that the reviewer can inspect. tutorial.rs:76–83.', file:'src/review/assistant/tutorial.rs', code:'dc-parse-code', extra:'dc-parse-extra', range:'L76–85'}
+    ];
+    function save(){
+      if(window.openai && window.openai.setWidgetState){ window.openai.setWidgetState({modelContent:{concept:'Review chapters beside focused code',layout:state.layout,chapter:chapters[state.chapter].title},privateContent:{chapter:state.chapter,reviewed:state.reviewed,layout:state.layout}}).catch(function(){}); }
+    }
+    function restore(value){
+      var stored=value && value.privateContent;
+      if(!stored)return;
+      if(Number.isInteger(stored.chapter) && stored.chapter>=0 && stored.chapter<3)state.chapter=stored.chapter;
+      if(Array.isArray(stored.reviewed) && stored.reviewed.length===3)state.reviewed=stored.reviewed.map(Boolean);
+      if(stored.layout==='beside'||stored.layout==='above')state.layout=stored.layout;
+    }
+    function appendCode(templateId){
+      var pre=el(templateId).content.querySelector('pre');
+      var lines=pre.textContent.split('\n');
+      var indent=Math.min.apply(null,lines.filter(function(s){return s.trim();}).map(function(s){return s.length-s.trimStart().length;}));
+      lines.forEach(function(text,index){
+        var row=document.createElement('div');row.className='dc-line';
+        var number=document.createElement('span');number.className='dc-number';number.textContent=Number(pre.dataset.start)+index;
+        var plus=document.createElement('span');plus.className='dc-plus';plus.textContent='+';plus.setAttribute('aria-hidden','true');
+        var code=document.createElement('code');code.textContent=text.slice(indent)||' ';
+        row.append(number,plus,code);el('dc-code').appendChild(row);
+      });
+    }
+    function render(){
+      var c=chapters[state.chapter];
+      el('dc-reader').classList.toggle('dc-stacked',state.layout==='above');
+      el('dc-chapter-picker').value=String(state.chapter);
+      el('dc-chapter-label').textContent='CHAPTER '+(state.chapter+1)+' / 3';
+      ['title','summary','why'].forEach(function(key){el(key==='title'?'dc-chapter-title':'dc-'+key).textContent=c[key];});
+      el('dc-check-text').textContent=c.check;el('dc-concept-title').textContent=c.concept;el('dc-concept-text').textContent=c.explanation;
+      el('dc-concept').open=state.depth;
+      el('dc-file').textContent=c.file;el('dc-range').textContent=c.range;
+      el('dc-code').replaceChildren();
+      if(state.context && state.chapter===2)appendCode(c.extra);
+      appendCode(c.code);
+      if(state.context && state.chapter!==2)appendCode(c.extra);
+      el('dc-context').textContent=state.context?'Less context':'More context';el('dc-context').setAttribute('aria-expanded',String(state.context));
+      el('dc-progress').textContent=state.reviewed.filter(Boolean).length+' of 3 chapters reviewed';
+      el('dc-reviewed').checked=state.reviewed[state.chapter];
+      el('dc-previous').disabled=state.chapter===0;
+      el('dc-next').textContent=state.chapter===2?'Review progress':'Next chapter →';
+      el('dc-conversation').hidden=!state.asking;el('dc-ask').setAttribute('aria-expanded',String(state.asking));
+      el('dc-question').textContent=c.question;el('dc-answer').textContent=c.answer;el('dc-answer').hidden=!state.answered;
+    }
+    function choose(index){state.chapter=index;state.context=false;state.asking=false;state.answered=false;el('dc-complete').hidden=true;render();save();}
+    el('dc-chapter-picker').addEventListener('change',function(e){choose(Number(e.target.value));});
+    el('dc-previous').addEventListener('click',function(){if(state.chapter>0)choose(state.chapter-1);});
+    el('dc-next').addEventListener('click',function(){
+      if(state.chapter<2){choose(state.chapter+1);return;}
+      var count=state.reviewed.filter(Boolean).length;
+      el('dc-complete').textContent=count===3?'All three example chapters are marked reviewed. A full review would also account for changes outside this sample guide.':count+' of 3 example chapters marked reviewed. Reading a chapter does not automatically mark it complete.';
+      el('dc-complete').hidden=false;
+    });
+    el('dc-reviewed').addEventListener('change',function(e){state.reviewed[state.chapter]=e.target.checked;render();save();});
+    el('dc-context').addEventListener('click',function(){state.context=!state.context;render();});
+    el('dc-ask').addEventListener('click',function(){state.asking=!state.asking;render();});
+    el('dc-question').addEventListener('click',function(){state.answered=true;render();});
+    el('dc-concept').addEventListener('toggle',function(){state.depth=el('dc-concept').open;});
+    function showSettings(show){el('dc-reading').hidden=show;el('dc-settings').hidden=!show;el('dc-settings-open').hidden=show;}
+    el('dc-settings-open').addEventListener('click',function(){showSettings(true);});
+    el('dc-settings-back').addEventListener('click',function(){showSettings(false);});
+    el('dc-settings-done').addEventListener('click',function(){showSettings(false);});
+    restore(window.openai && window.openai.widgetState);render();
+    window.addEventListener('openai:set_globals',function(e){var globals=e.detail && e.detail.globals;if(globals && globals.widgetState){restore(globals.widgetState);render();}});
+    if(globalThis.Tweak){var tweak=new Tweak({container:root,onChange:function(){render();save();}});tweak.addSelect(state,'layout',{label:'Reading layout',options:[{label:'Guide beside code',value:'beside'},{label:'Guide above code',value:'above'}]});tweak.addToggle(state,'depth',{label:'Show concept explanation'});}
+  })();
+  </script>
+</div>

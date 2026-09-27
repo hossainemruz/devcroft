@@ -28,6 +28,7 @@ const MAX_HTTP_CHUNK: usize = 1024 * 1024;
 #[derive(Default)]
 pub(super) struct ProviderLaunch {
     pub(super) arguments: Vec<String>,
+    pub(super) opencode_v1_arguments: Vec<String>,
     pub(super) environment: Vec<(String, String)>,
     pub(super) cleanup_paths: Vec<PathBuf>,
 }
@@ -59,16 +60,21 @@ fn prepare_opencode(
         .name("opencode-activity".to_owned())
         .spawn(move || observe_opencode(port, &observer_password, emitter, cancelled))
         .context("starting OpenCode activity observer")?;
-    Ok(ProviderLaunch {
-        arguments: vec![
+    Ok(opencode_v1_launch(port, password))
+}
+
+fn opencode_v1_launch(port: u16, password: String) -> ProviderLaunch {
+    ProviderLaunch {
+        opencode_v1_arguments: vec![
             "--hostname".to_owned(),
             "127.0.0.1".to_owned(),
             "--port".to_owned(),
             port.to_string(),
         ],
-        environment: vec![("OPENCODE_SERVER_PASSWORD".to_owned(), password)],
+        environment: vec![("DEVCROFT_OPENCODE_SERVER_PASSWORD".to_owned(), password)],
+        arguments: Vec::new(),
         cleanup_paths: Vec::new(),
-    })
+    }
 }
 
 fn observe_opencode(
@@ -335,6 +341,7 @@ fn prepare_claude(
             "--plugin-dir".to_owned(),
             runtime.to_string_lossy().into_owned(),
         ],
+        opencode_v1_arguments: Vec::new(),
         environment: vec![("DEVCROFT_AGENT_ACTIVITY_TOKEN".to_owned(), token)],
         cleanup_paths: vec![runtime],
     })
@@ -766,6 +773,20 @@ mod tests {
     #[test]
     fn base64_matches_basic_auth_example() {
         assert_eq!(base64_encode(b"opencode:secret"), "b3BlbmNvZGU6c2VjcmV0");
+    }
+
+    #[test]
+    fn opencode_v1_launch_keeps_server_flags_out_of_common_arguments() {
+        let prepared = opencode_v1_launch(4096, "secret".into());
+        assert!(prepared.arguments.is_empty());
+        assert_eq!(
+            prepared.opencode_v1_arguments,
+            ["--hostname", "127.0.0.1", "--port", "4096"]
+        );
+        assert_eq!(
+            prepared.environment,
+            [("DEVCROFT_OPENCODE_SERVER_PASSWORD".into(), "secret".into())]
+        );
     }
 
     #[test]

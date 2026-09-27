@@ -401,6 +401,17 @@ impl PreparedAgentLaunch {
     /// wrapper. Titles can be overwritten by an agent in the same output
     /// batch, so the raw stream is the authoritative exit signal.
     pub(crate) fn observe_output(&self, output: &[u8]) {
+        let v2_marker = format!(
+            "\u{1b}]0;devcroft-opencode-v2-{}\u{7}",
+            self.emitter.generation
+        );
+        if self.lease.agent() == AgentKind::Opencode
+            && find_bytes(output, v2_marker.as_bytes()).is_some()
+            && !self.lease.cancelled.swap(true, Ordering::AcqRel)
+        {
+            self.emitter
+                .unavailable("OpenCode v2 uses terminal activity observation".to_owned());
+        }
         let marker = format!("\u{1b}]0;{}", self.exit_marker);
         let Some(start) = find_bytes(output, marker.as_bytes()) else {
             return;
@@ -752,6 +763,28 @@ fn shell_command(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
+    let invocation = if agent == AgentKind::Opencode && !provider.opencode_v1_arguments.is_empty() {
+        let v1_arguments = provider
+            .opencode_v1_arguments
+            .iter()
+            .map(|argument| shell_quote(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The login shell may resolve a different OpenCode binary than the
+        // GUI process. Check the command used for the actual launch before
+        // applying v1-only server flags. Keep the password in the process
+        // environment so it is never written into terminal input.
+        format!(
+            "case \"$({} --help 2>/dev/null)\" in *--hostname*) OPENCODE_SERVER_PASSWORD=\"$DEVCROFT_OPENCODE_SERVER_PASSWORD\" {} {} ;; *) printf '\\033]0;devcroft-opencode-v2-{}\\007'; {} ;; esac",
+            shell_quote(agent.command()),
+            invocation,
+            v1_arguments,
+            generation,
+            invocation
+        )
+    } else {
+        invocation
+    };
     format!(
         "{}; __devcroft_agent_status=$?{}; printf '\\033]0;{}%s\\007' \"$__devcroft_agent_status\"; unset __devcroft_agent_status",
         invocation, unset_environment, marker
@@ -939,6 +972,104 @@ mod tests {
         let command = shell_command(AgentKind::Claude, 1, &provider);
         assert!(!command.contains("private-value"));
         assert!(command.contains("unset SECRET_TOKEN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_launch_uses_flags_supported_by_the_shell_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("opencode");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nif [ \"$1\" = --help ]; then printf '%s\\n' \"$MOCK_OPENCODE_HELP\"; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$MOCK_OPENCODE_ARGS\"\nprintf '%s' \"${OPENCODE_SERVER_PASSWORD-}\" > \"$MOCK_OPENCODE_PASSWORD\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut provider = providers::ProviderLaunch {
+            arguments: vec!["--session".into(), "ses_123".into()],
+            opencode_v1_arguments: vec![
+                "--hostname".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "4096".into(),
+            ],
+            environment: vec![("DEVCROFT_OPENCODE_SERVER_PASSWORD".into(), "secret".into())],
+            ..Default::default()
+        };
+        let command = shell_command(AgentKind::Opencode, 1, &provider);
+        assert!(!command.contains("secret"));
+        let args_path = dir.path().join("args");
+        let password_path = dir.path().join("password");
+        for (help, expected_args, expected_password, is_v2) in [
+            (
+                "--hostname string --port integer",
+                "--session\nses_123\n--hostname\n127.0.0.1\n--port\n4096\n",
+                "secret",
+                false,
+            ),
+            (
+                "--standalone --server",
+                "--session\nses_123\n",
+                "user-password",
+                true,
+            ),
+        ] {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        dir.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("MOCK_OPENCODE_HELP", help)
+                .env("MOCK_OPENCODE_ARGS", &args_path)
+                .env("MOCK_OPENCODE_PASSWORD", &password_path)
+                .env("OPENCODE_SERVER_PASSWORD", "user-password")
+                .env("DEVCROFT_OPENCODE_SERVER_PASSWORD", "secret")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(std::fs::read_to_string(&args_path).unwrap(), expected_args);
+            assert_eq!(
+                std::fs::read_to_string(&password_path).unwrap(),
+                expected_password
+            );
+            assert_eq!(
+                output
+                    .stdout
+                    .windows(b"devcroft-opencode-v2-1".len())
+                    .any(|window| window == b"devcroft-opencode-v2-1"),
+                is_v2
+            );
+        }
+        provider.opencode_v1_arguments.clear();
+        let plain = shell_command(AgentKind::Opencode, 1, &provider);
+        assert!(!plain.contains("--hostname"));
+    }
+
+    #[test]
+    fn v2_launch_marker_stops_unused_structured_observer() {
+        let (store, checkout) = store();
+        // Use a provider-free launch so this parser test does not bind a port.
+        let launch = store.start(&checkout, AgentKind::Codex);
+        store.update(&checkout, launch.id(), |record| {
+            record.agent = AgentKind::Opencode
+        });
+        let marker = format!("\u{1b}]0;devcroft-opencode-v2-{}\u{7}", launch.id());
+        launch.observe_output(marker.as_bytes());
+        assert!(launch.lease.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            store.snapshot().for_launch(launch.id()).unwrap().state,
+            ActivityState::Unavailable
+        );
     }
 
     #[test]

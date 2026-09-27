@@ -70,6 +70,9 @@ pub(crate) struct AssistantView {
     scope_label: String,
     scope: ReviewScope,
     options: Options,
+    /// Enabled-agent choices for the setup dropdown, refreshed from
+    /// Settings > Agent whenever a guide is generated.
+    providers: Vec<Provider>,
     model: Entity<InputState>,
     instructions: Entity<TextareaState>,
     notes: Entity<TextareaState>,
@@ -108,7 +111,17 @@ impl AssistantView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let options = Options::load();
+        let mut options = Options::load();
+        // Stored providers outlive settings edits: a harness disabled after
+        // the last run falls back to the first enabled one instead of
+        // sticking the dropdown on an unavailable agent.
+        let mut providers = Provider::enabled_providers();
+        if providers.is_empty() {
+            providers = Provider::ALL.to_vec();
+        }
+        if !providers.contains(&options.provider) {
+            options.provider = providers[0];
+        }
         let model = cx.new(|cx| {
             let mut input =
                 InputState::new(window, cx).placeholder("Agent default (or enter a model ID)");
@@ -121,6 +134,7 @@ impl AssistantView {
             scope_label,
             scope,
             options,
+            providers,
             model,
             instructions: cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -259,6 +273,15 @@ impl AssistantView {
     fn generate(&mut self, cx: &mut Context<Self>) {
         if self.loading {
             return;
+        }
+        // Settings may have changed while the assistant was open; re-read
+        // the enabled set so a newly disabled harness cannot be launched.
+        self.providers = Provider::enabled_providers();
+        if self.providers.is_empty() {
+            self.providers = Provider::ALL.to_vec();
+        }
+        if !self.providers.contains(&self.options.provider) {
+            self.options.provider = self.providers[0];
         }
         self.options.model = self.model.read(cx).value().trim().to_owned();
         if let Err(error) = self.options.save() {
@@ -555,16 +578,20 @@ impl AssistantView {
         let provider_view = cx.entity().downgrade();
         let effort_view = cx.entity().downgrade();
         let provider = self.options.provider;
+        let providers = self.providers.clone();
         let effort = self.options.effort;
+        // Opencode's `run` has no reasoning-effort flag, so the control is
+        // disabled rather than silently accepted when it is selected.
+        let effort_enabled = provider.supports_effort();
         v_flex().gap_5().p_6().w_full().max_w(px(720.))
             .child(div().text_xl().font_semibold().child("Understand the change, one chapter at a time"))
             .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Choose your agent. It will organize the comparison into a guided walkthrough, with the actual code beside each explanation."))
             .child(h_flex().flex_wrap().gap_3()
                 .child(v_flex().gap_2().child("Agent").child(Button::new("review-provider").outline().dropdown_caret(true).disabled(self.loading).child(provider.label()).dropdown_menu(move |mut menu, _, _| {
-                    for option in Provider::ALL { let view = provider_view.clone(); menu = menu.item(PopupMenuItem::element(move |_, _| div().child(option.label())).checked(option == provider).on_click(move |_, _, cx| { view.update(cx, |this, cx| { this.options.provider = option; cx.notify(); }).ok(); })); } menu
+                    for option in providers.clone() { let view = provider_view.clone(); menu = menu.item(PopupMenuItem::element(move |_, _| div().child(option.label())).checked(option == provider).on_click(move |_, _, cx| { view.update(cx, |this, cx| { this.options.provider = option; cx.notify(); }).ok(); })); } menu
                 })))
                 .child(v_flex().gap_2().flex_1().min_w(px(220.)).child("Model").child(Input::new(&self.model).disabled(self.loading)))
-                .child(v_flex().gap_2().child("Effort").child(Button::new("review-effort").outline().dropdown_caret(true).disabled(self.loading).child(effort.label()).dropdown_menu(move |mut menu, _, _| {
+                .child(v_flex().gap_2().child(if effort_enabled { "Effort" } else { "Effort (n/a for Opencode)" }).child(Button::new("review-effort").outline().dropdown_caret(true).disabled(self.loading || !effort_enabled).child(effort.label()).dropdown_menu(move |mut menu, _, _| {
                     for option in Effort::ALL { let view = effort_view.clone(); menu = menu.item(PopupMenuItem::element(move |_, _| div().child(option.label())).checked(option == effort).on_click(move |_, _, cx| { view.update(cx, |this, cx| { this.options.effort = option; cx.notify(); }).ok(); })); } menu
                 }))))
             .child(h_flex().gap_3().child(Switch::new("review-concepts").checked(self.options.include_concepts).disabled(self.loading).on_change(cx.listener(|this, checked, _, cx| { this.options.include_concepts = *checked; cx.notify(); }))).child(v_flex().gap_1().child("Include a Key concepts chapter").child(div().text_sm().text_color(cx.theme().muted_foreground).child("A short introduction you can skip or revisit. Optional and off by default."))))

@@ -12,7 +12,7 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, ColorName, Icon, IconName, IndexPath, Root, Sizable, Size, StyledExt as _,
+    ActiveTheme as _, ColorName, Icon, IconName, IndexPath, Sizable, Size, StyledExt as _,
     WindowExt as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex,
@@ -86,12 +86,6 @@ const AUTO_SYNC_POLL: Duration = Duration::from_secs(10);
 /// focus. Component traversal lives in navigation mode (see
 /// `move_navigation_component_focus`).
 pub(crate) const WORKSPACE_KEY_CONTEXT: &str = "Workspace";
-
-/// Key context marker for the dialog layer. Dialogs render inside the
-/// workspace subtree but own a keyboard trap, so the marker disables the
-/// workspace Tab unbind while one is on screen and gpui-component's `Root`
-/// traversal keeps working for their forms.
-pub(crate) const DIALOG_KEY_CONTEXT: &str = "dialog";
 
 /// Restore terminal Tab input inside the Git dialog without changing focus
 /// traversal in other dialogs (see `bind_app_keys`).
@@ -3403,28 +3397,16 @@ impl Render for Workspace {
             .when(self.navigation_open, |this| {
                 this.child(self.render_navigation_hud(window, cx))
             })
-            // Notification layer (`push_notification`, e.g. the terminal copy
-            // feedback): like dialogs, `Root` stores these without painting
-            // them. Without this layer every notification is silently
-            // swallowed. Above content and the palette dim, below dialogs.
-            .children(Root::render_notification_layer(window, cx))
-            // Dialog layer (settings, …): `Root` stores opened dialogs but
-            // never paints them itself — the app must render this layer on
-            // top of its content, otherwise an opened dialog stays invisible.
-            // Last child so dialogs float above the command palette too.
-            // The `dialog` marker disables the workspace Tab unbind while a
-            // dialog is on screen: its form fields and focus trap keep
-            // gpui-component's traversal.
-            .children(
-                Root::render_dialog_layer(window, cx)
-                    .map(|layer| div().key_context(DIALOG_KEY_CONTEXT).child(layer)),
-            )
+        // Dialogs, sheets, notifications, menus and tooltips are hosted
+        // by the component `Root` automatically (registered by
+        // `gpui_kit::init`), above this content.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::component::Root;
     use std::path::PathBuf;
 
     /// End-to-end toggle lifecycle through the real dispatch path: press the

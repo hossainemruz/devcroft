@@ -23,7 +23,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, EventEmitter, Focusable as _,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, TestSupportExt as _, Window,
+    div, px,
 };
 
 use super::exchange::Exchange;
@@ -889,12 +890,12 @@ impl AssistantView {
             .style(
                 TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
                     .with_paragraph_gap(gpui_kit::rems(0.65))
-                    .with_heading_font_size(|level, _| {
-                        px(match level {
+                    .with_heading(|level| {
+                        StyleRefinement::default().text_size(px(match level {
                             1 => 22.,
                             2 => 19.,
                             _ => 16.,
-                        })
+                        }))
                     }),
             )
             .code_block_highlighter({

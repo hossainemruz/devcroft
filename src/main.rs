@@ -38,10 +38,10 @@ mod workspace;
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser as _;
-use gpui_kit::component::{ActiveTheme as _, Root, Theme, ThemeMode};
+use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
-    App, AppContext as _, Focusable as _, KeyBinding, NoAction, SharedString, Styled as _,
-    WindowBounds, WindowOptions, px, rgb, size,
+    App, AppContext as _, Focusable as _, KeyBinding, NoAction, SharedString, WindowBounds,
+    WindowOptions, px, rgb, size,
 };
 
 use crate::cli::{Cli, Command};
@@ -104,23 +104,20 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
             KeyBinding::new("ctrl-q", Quit, None),
         ]);
     }
-    // Component focus traversal (gpui-component's `Root` Tab bindings) is a
-    // navigation-mode command, so inside the workspace subtree both keys are
-    // unbound: the keystroke then falls through to the focused component —
-    // terminal panes send Tab/Shift+Tab to the pty (agent harnesses switch
-    // agents/models/modes with them) instead of losing focus. Navigation
-    // mode handles both keys itself before key resolution
-    // (`Workspace::on_navigation_keystroke`). The `!dialog` term keeps
-    // gpui-component's traversal for dialog forms and focus traps, which
-    // render under the workspace element but own their keyboard layer.
-    let unbind_context = format!(
-        "{} && !{}",
-        workspace::WORKSPACE_KEY_CONTEXT,
-        workspace::DIALOG_KEY_CONTEXT
-    );
+    // Component focus traversal (gpui-component's `Root` Tab bindings, bound
+    // in the `Root` key context) is a navigation-mode command, so inside the
+    // workspace subtree both keys are unbound: the keystroke then falls
+    // through to the focused component — terminal panes send Tab/Shift+Tab to
+    // the pty (agent harnesses switch agents/models/modes with them) instead
+    // of losing focus. Navigation mode handles both keys itself before key
+    // resolution (`Workspace::on_navigation_keystroke`). Dialog forms and
+    // focus traps keep gpui-component's traversal for free: `Root` hosts
+    // dialogs outside the workspace subtree, so this unbind never enters
+    // their key chain.
+    let unbind_context = workspace::WORKSPACE_KEY_CONTEXT;
     cx.bind_keys([
-        KeyBinding::new("tab", NoAction, Some(&unbind_context)),
-        KeyBinding::new("shift-tab", NoAction, Some(&unbind_context)),
+        KeyBinding::new("tab", NoAction, Some(unbind_context)),
+        KeyBinding::new("shift-tab", NoAction, Some(unbind_context)),
         // The Git dialog embeds a terminal rather than a form: restore Tab
         // for lazygit without disabling traversal for other dialog controls.
         KeyBinding::new(
@@ -173,18 +170,17 @@ fn run_app(args: crate::cli::AppArgs) -> Result<()> {
             ..Default::default()
         };
 
-        cx.spawn(async move |cx| {
-            cx.open_window(options, |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(window, cx, &working_directory));
-                if let Some(reference) = args.open_reference.clone() {
-                    workspace.update(cx, |view, cx| view.open_reference(reference, window, cx));
-                }
-                cx.new(|cx| Root::new(workspace, window, cx).bg(cx.theme().background))
-            })
-            .map_err(|error| anyhow!("failed to open Devcroft window: {error}"))
-            .expect("failed to open Devcroft window");
+        // `gpui_kit::open_window` wraps the returned content in the component
+        // `Root` (rem sizing, selection/copy, overlay hosting) itself.
+        gpui_kit::open_window(options, cx, move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, &working_directory));
+            if let Some(reference) = args.open_reference.clone() {
+                workspace.update(cx, |view, cx| view.open_reference(reference, window, cx));
+            }
+            workspace
         })
-        .detach();
+        .map_err(|error| anyhow!("failed to open Devcroft window: {error}"))
+        .expect("failed to open Devcroft window");
     });
     Ok(())
 }
@@ -263,22 +259,20 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
             ..Default::default()
         };
 
-        cx.spawn(async move |cx| {
-            cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| {
-                    let mut view = PreviewView::new(content.clone(), cx);
-                    view.set_reference_root(reference_root.clone(), cx);
-                    view
-                });
-                view.read(cx).focus_handle(cx).focus(window, cx);
-                // Match the workspace host: Root supplies rem sizing, text
-                // selection/copy, focus traversal, and component overlays.
-                cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
-            })
-            .map_err(|error| anyhow!("failed to open preview window: {error}"))
-            .expect("failed to open preview window");
+        // Match the workspace host: `gpui_kit::open_window` supplies the
+        // `Root` (rem sizing, text selection/copy, focus traversal and
+        // component overlays) itself.
+        gpui_kit::open_window(options, cx, move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = PreviewView::new(content.clone(), cx);
+                view.set_reference_root(reference_root.clone(), cx);
+                view
+            });
+            view.read(cx).focus_handle(cx).focus(window, cx);
+            view
         })
-        .detach();
+        .map_err(|error| anyhow!("failed to open preview window: {error}"))
+        .expect("failed to open preview window");
     });
     Ok(())
 }
@@ -288,7 +282,11 @@ fn run_preview(path: std::path::PathBuf) -> Result<()> {
 /// theme ring is neutral gray; tinting it blue keeps focus subtle (1px,
 /// same width as normal borders) yet distinct from divider gray.
 fn apply_focus_theme(cx: &mut App) {
-    Theme::global_mut(cx).ring = rgb(0x2f81f7).into();
+    // `Theme::update` is the write path that keeps the color, its token and
+    // the Base projection in step and refreshes open windows.
+    Theme::update(cx, |theme| {
+        theme.ring = rgb(0x2f81f7).into();
+    });
 }
 
 /// Stored theme name to [`ThemeMode`]. Unknown or absent values keep the

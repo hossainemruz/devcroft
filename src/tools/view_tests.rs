@@ -4,23 +4,6 @@ use super::*;
 use crate::tools::ToolStore;
 use gpui_kit::test::TestWindowExt as _;
 
-/// Window root for dialog and notification tests: both the dialog layer and
-/// notifications only exist under gpui-kit's `Root`.
-struct Harness {
-    tool: Entity<ToolView>,
-}
-
-impl Render for Harness {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(self.tool.clone())
-            // `Root` stores dialogs but never paints them; the layer has to
-            // be rendered by the app, exactly like `Workspace` does.
-            .children(gpui_kit::component::Root::render_dialog_layer(window, cx))
-    }
-}
-
 /// A data root in a temp dir plus the store pointed at it. The temp dir must
 /// outlive the test, so it is returned alongside the root.
 fn fixture() -> (tempfile::TempDir, DataRoot, ToolStore) {
@@ -54,8 +37,8 @@ fn open_tool(
     cx.add_window_view(|window, cx| ToolView::new(window, cx, tool, Some(root)))
 }
 
-/// Like [`open_tool`], but under gpui-kit's `Root` so notifications and the
-/// dialog layer exist (both require that window root).
+/// Like [`open_tool`], but under gpui-kit's `Root`, which hosts dialogs and
+/// notifications automatically.
 fn open_with_root(
     cx: &mut gpui_kit::TestAppContext,
     tool: ToolKind,
@@ -66,8 +49,7 @@ fn open_with_root(
     let (_, cx) = cx.add_window_view(|window, cx| {
         let tool_view = cx.new(|cx| ToolView::new(window, cx, tool, Some(root)));
         view = Some(tool_view.clone());
-        let harness = cx.new(|_| Harness { tool: tool_view });
-        gpui_kit::component::Root::new(harness, window, cx)
+        gpui_kit::component::Root::new(tool_view, window, cx)
     });
     (view.unwrap(), cx)
 }

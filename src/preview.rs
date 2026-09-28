@@ -589,14 +589,16 @@ impl Render for PreviewView {
         let style = TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
             .with_foreground(body)
             .with_paragraph_gap(rems(1.))
-            .with_heading_font_size(|level, _| {
-                px(match level {
+            // Level-aware refinements layer over the renderer's built-in
+            // heading weight and spacing, so only the sizes are overridden.
+            .with_heading(|level| {
+                StyleRefinement::default().text_size(px(match level {
                     1 => 30.,
                     2 => 23.,
                     3 => 20.,
                     4 => 18.,
                     _ => 16.,
-                })
+                }))
             })
             // HighlightStyle cannot change a span's font, padding, or corner
             // radius. Keep the source untouched and use a quiet, theme-aware

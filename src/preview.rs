@@ -19,16 +19,18 @@ pub(crate) use resource_blocks::{BlockAction, CommentHandler};
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+use gpui_kit::base::text::{RangeHighlight, RenderedText};
 use gpui_kit::base::{Scrollbar, TextView, TextViewStyle};
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextViewState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton, Overflow,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, Window, div, px, relative, rems,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    HighlightStyle, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton,
+    Overflow, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, Subscription, Window, div, px, relative, rems,
 };
 
 /// Shared column width for document content and resource metadata.
@@ -270,6 +272,95 @@ fn active_heading(toc: &[TocEntry], top: usize, bottom: usize, total: usize) -> 
     active
 }
 
+/// Upper bound on matches collected per search: a one-character query in a
+/// 4 MiB document would otherwise collect millions of ranges. A capped list
+/// is marked with a trailing `+` in the find bar.
+const MAX_FIND_MATCHES: usize = 10_000;
+
+/// All non-overlapping matches of `needle` in `haystack`, ASCII-case-
+/// insensitive, as byte ranges of `haystack`. Matching walks characters, so
+/// every range covers whole characters; non-ASCII comparisons are exact
+/// (`char::eq_ignore_ascii_case`). Returns whether the list was capped at
+/// [`MAX_FIND_MATCHES`].
+fn find_matches(haystack: &str, needle: &str) -> (Vec<std::ops::Range<usize>>, bool) {
+    if needle.is_empty() {
+        return (Vec::new(), false);
+    }
+    let needle: Vec<char> = needle.chars().collect();
+    let first = needle[0];
+    let mut matches = Vec::new();
+    let mut pos = 0;
+    while pos < haystack.len() {
+        let candidate = haystack[pos..]
+            .chars()
+            .next()
+            .expect("pos is a character boundary");
+        if candidate.eq_ignore_ascii_case(&first) {
+            let mut end = pos;
+            let mut matched = true;
+            for expected in &needle {
+                match haystack[end..].chars().next() {
+                    Some(actual) if actual.eq_ignore_ascii_case(expected) => {
+                        end += actual.len_utf8();
+                    }
+                    _ => {
+                        matched = false;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                if matches.len() == MAX_FIND_MATCHES {
+                    return (matches, true);
+                }
+                matches.push(pos..end);
+                // Standard find semantics: matches never overlap.
+                pos = end;
+                continue;
+            }
+        }
+        pos += candidate.len_utf8();
+    }
+    (matches, false)
+}
+
+/// Status text for the find bar: `None` for an empty query, `"No results"`
+/// when nothing matched, and `"{position}/{total}{+}"` otherwise.
+fn find_status_label(query: &str, total: usize, index: usize, truncated: bool) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    if total == 0 {
+        return Some("No results".to_owned());
+    }
+    Some(format!(
+        "{}/{}{}",
+        index + 1,
+        total,
+        if truncated { "+" } else { "" }
+    ))
+}
+
+/// Live in-document find session: the query input, the matches computed
+/// against the current rendered text, and the active match. Created on the
+/// first `Cmd/Ctrl+F` and dropped when the bar closes.
+struct FindState {
+    input: Entity<InputState>,
+    /// Owns the subscription to `input`'s events.
+    _subscription: Subscription,
+    /// The rendered text the matches were computed against. Comparing it with
+    /// the current revision tells a landing parse or host content swap apart
+    /// from the notifications the highlights themselves produce.
+    searched: Option<RenderedText>,
+    query: String,
+    matches: Vec<std::ops::Range<usize>>,
+    /// Index into `matches`; the active match is revealed and painted with
+    /// the stronger highlight.
+    index: usize,
+    /// Whether `matches` was capped at [`MAX_FIND_MATCHES`].
+    truncated: bool,
+}
+
 /// Standalone preview window content: a centered document with an outline
 /// overlay. Focused on mount (see `run_preview`) so keyboard
 /// scrolling works without a click first.
@@ -291,6 +382,8 @@ pub(crate) struct PreviewView {
     toc_focus: FocusHandle,
     embedded: bool,
     code_highlights: std::sync::Arc<parking_lot::Mutex<CodeHighlights>>,
+    /// Open find session; `None` while the bar is closed.
+    find: Option<FindState>,
 }
 
 /// Scrollspy selection, emitted when the visible section changes.
@@ -337,6 +430,14 @@ impl PreviewView {
                     .ok();
                 });
         });
+        // Find results follow the rendered text: a landing parse or a host
+        // content swap re-runs the search. Setting highlights notifies this
+        // same state, so the observer compares rendered-text revisions to
+        // ignore its own notifications.
+        cx.observe(&state, |this, state, cx| {
+            this.sync_find_with_text(state, cx)
+        })
+        .detach();
         Self {
             content: content.into(),
             resources: None,
@@ -352,6 +453,7 @@ impl PreviewView {
             toc_focus: cx.focus_handle().tab_stop(true),
             embedded: false,
             code_highlights: Default::default(),
+            find: None,
         }
     }
 
@@ -403,12 +505,18 @@ impl PreviewView {
         next.embedded = self.embedded;
         next.reference_generation = self.reference_generation;
         next.reference_root = self.reference_root.clone();
+        // An open find session survives the swap; its matches are recomputed
+        // against the new text below (and again when its parse lands).
+        next.find = self.find.take();
         if let Some(index) =
             heading.and_then(|title| next.toc.iter().position(|entry| entry.title == title))
         {
             next.on_toc_click(index, cx);
         }
         *self = next;
+        if self.find.is_some() {
+            self.refresh_find(cx);
+        }
         self.set_reference_root(self.reference_root.clone(), cx);
         cx.notify();
     }
@@ -447,6 +555,224 @@ impl PreviewView {
             });
         });
         cx.notify();
+    }
+
+    /// Open the find bar, or refocus its query input when it is already open.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = &self.find {
+            find.input.read(cx).focus_handle(cx).focus(window, cx);
+            cx.notify();
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in document"));
+        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => this.refresh_find(cx),
+            InputEvent::PressEnter { shift, .. } => {
+                this.step_find(if *shift { -1 } else { 1 }, cx);
+            }
+            _ => {}
+        });
+        self.find = Some(FindState {
+            input,
+            _subscription: subscription,
+            searched: None,
+            query: String::new(),
+            matches: Vec::new(),
+            index: 0,
+            truncated: false,
+        });
+        self.refresh_find(cx);
+        self.find
+            .as_ref()
+            .expect("find was just created")
+            .input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    /// Dismiss the find bar, clear its highlights, and return focus to the
+    /// document so keyboard scrolling resumes.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_none() {
+            return;
+        }
+        self.state
+            .update(cx, |state, cx| state.clear_range_highlights(cx));
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Re-search the input's current value against the rendered text, then
+    /// repaint the highlights and reveal the first match. Runs on every
+    /// keystroke and after a host content swap.
+    fn refresh_find(&mut self, cx: &mut Context<Self>) {
+        let text = self.state.read(cx).rendered_text();
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        let query = find.input.read(cx).value().to_string();
+        // Not every `Change` moves text (an enter/IME normalization can
+        // re-emit one): only a different query restarts the active match.
+        let query_changed = query != find.query;
+        find.query = query;
+        find.searched = Some(text.clone());
+        let (matches, truncated) = find_matches(text.as_str(), &find.query);
+        find.matches = matches;
+        find.truncated = truncated;
+        if query_changed || find.index >= find.matches.len() {
+            find.index = 0;
+        }
+        self.apply_find_highlights(cx);
+    }
+
+    /// Re-run the search when the rendered text changed under an open find
+    /// bar (a landing parse or a host content swap). The revision comparison
+    /// keeps the highlights' own notifications from starting another search.
+    fn sync_find_with_text(&mut self, state: Entity<TextViewState>, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        let text = state.read(cx).rendered_text();
+        if find.searched.as_ref() == Some(&text) {
+            return;
+        }
+        find.searched = Some(text.clone());
+        let (matches, truncated) = find_matches(text.as_str(), &find.query);
+        find.matches = matches;
+        find.truncated = truncated;
+        if find.index >= find.matches.len() {
+            find.index = 0;
+        }
+        self.apply_find_highlights(cx);
+    }
+
+    /// Move to the next (`delta = 1`) or previous (`delta = -1`) match,
+    /// wrapping at either end.
+    fn step_find(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        let len = find.matches.len() as isize;
+        find.index = (find.index as isize + delta).rem_euclid(len) as usize;
+        self.apply_find_highlights(cx);
+    }
+
+    /// Paint every match and reveal the active one. The rendered text is
+    /// unchanged, so the state's notify does not re-enter the search.
+    fn apply_find_highlights(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_ref() else {
+            return;
+        };
+        let inactive = cx.theme().warning.opacity(0.28);
+        let active = cx.theme().warning.opacity(0.6);
+        let highlights = find
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(index, range)| {
+                RangeHighlight::new(
+                    range.clone(),
+                    if index == find.index {
+                        active
+                    } else {
+                        inactive
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let reveal = find.matches.get(find.index).cloned();
+        self.state.update(cx, |state, cx| {
+            if highlights.is_empty() {
+                state.clear_range_highlights(cx);
+            } else {
+                // Ranges come from the current rendered text; a rejected set
+                // (e.g. the text moved under us) stays unhighlighted until
+                // the next sync.
+                let _ = state.set_range_highlights(highlights, cx);
+            }
+            if let Some(range) = reveal {
+                let _ = state.reveal_range(range, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Floating find widget over the reading column: query input, match
+    /// counter, previous/next and close. Rendered only while find is open.
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(find) = self.find.as_ref() else {
+            return div().into_any_element();
+        };
+        let status = find_status_label(&find.query, find.matches.len(), find.index, find.truncated);
+        h_flex()
+            .id("preview-find")
+            .absolute()
+            .top(px(4.))
+            .right_0()
+            .max_w_full()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .shadow_lg()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close_find(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                Input::new(&find.input)
+                    .small()
+                    .appearance(false)
+                    .w(px(190.)),
+            )
+            .when_some(status, |this, status| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status),
+                )
+            })
+            .child(
+                Button::new("find-prev")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronUp)
+                    .tooltip("Previous match")
+                    .accessibility_label("Previous match")
+                    .on_click(cx.listener(|this, _, _, cx| this.step_find(-1, cx))),
+            )
+            .child(
+                Button::new("find-next")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronDown)
+                    .tooltip("Next match")
+                    .accessibility_label("Next match")
+                    .on_click(cx.listener(|this, _, _, cx| this.step_find(1, cx))),
+            )
+            .child(
+                Button::new("find-close")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Close find")
+                    .accessibility_label("Close find")
+                    .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+            )
+            .into_any_element()
     }
 
     /// The outline overlays the document rather than changing its wrapping.
@@ -613,11 +939,41 @@ impl Render for PreviewView {
             .with_table_cell(table_cell);
         // Both hosts use a bounded reading column. Embedded width must follow
         // the pane rather than the window (Resources can have side rails).
+        let find_bar = self.find.is_some().then(|| self.render_find_bar(cx));
         h_flex()
             .id("preview-reader")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if !this.embedded && event.keystroke.key == "tab" && !this.toc.is_empty() {
+                let modifiers = event.keystroke.modifiers;
+                let find_focused = this
+                    .find
+                    .as_ref()
+                    .is_some_and(|find| find.input.read(cx).focus_handle(cx).is_focused(window));
+                if event.keystroke.key == "f"
+                    && !modifiers.shift
+                    && !modifiers.alt
+                    && crate::command_palette::is_primary_modifier(
+                        modifiers.platform,
+                        modifiers.control,
+                    )
+                    && !find_focused
+                {
+                    this.open_find(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.keystroke.key == "escape" && this.find.is_some() {
+                    this.close_find(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if !this.embedded
+                    && this.find.is_none()
+                    && event.keystroke.key == "tab"
+                    && !this.toc.is_empty()
+                {
                     if this.toc_focus.is_focused(window) {
                         this.focus_handle.focus(window, cx);
                     } else {
@@ -637,6 +993,7 @@ impl Render for PreviewView {
             .font_family(crate::fonts::MARKDOWN_FONT_FAMILY)
             .child(
                 div()
+                    .relative()
                     .w_full()
                     .max_w(px(READING_WIDTH))
                     .min_w_0()
@@ -673,7 +1030,8 @@ impl Render for PreviewView {
                                 .w_auto()
                                 .pr(px(16.)),
                         ),
-                    ),
+                    )
+                    .when_some(find_bar, |this, find_bar| this.child(find_bar)),
             )
             // Both hosts dock the thumb to the pane edge. Match the column's
             // insets so its viewport height and the scrollbar stay in sync.
@@ -997,5 +1355,303 @@ mod tests {
     #[test]
     fn spy_is_zero_without_headings() {
         assert_eq!(active_heading(&[], 5, 10, 20), 0);
+    }
+
+    #[test]
+    fn find_matches_are_ascii_case_insensitive_and_non_overlapping() {
+        let haystack = "Alpha beta ALPHA gamma alpha.";
+        let (matches, truncated) = find_matches(haystack, "alpha");
+        assert_eq!(matches.len(), 3);
+        assert!(!truncated);
+        for range in &matches {
+            assert!(
+                haystack.get(range.clone()).is_some(),
+                "whole-character range"
+            );
+            assert_eq!(&haystack[range.clone()].to_ascii_lowercase(), "alpha");
+        }
+
+        // Empty or missing needles never match; matches never overlap.
+        assert!(find_matches(haystack, "").0.is_empty());
+        assert!(find_matches(haystack, "missing").0.is_empty());
+        assert_eq!(find_matches("aaaa", "aa").0, vec![0..2, 2..4]);
+
+        // Case folding is ASCII-only: accented letters compare exactly.
+        let haystack = "Café CAFÉ café";
+        let (matches, _) = find_matches(haystack, "café");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(&haystack[matches[0].clone()], "Café");
+    }
+
+    #[test]
+    fn find_matches_cap_the_result_count() {
+        let haystack = "a".repeat(MAX_FIND_MATCHES + 5);
+        let (matches, truncated) = find_matches(&haystack, "a");
+        assert_eq!(matches.len(), MAX_FIND_MATCHES);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn find_status_labels_report_progress_and_truncation() {
+        assert_eq!(find_status_label("", 0, 0, false), None);
+        assert_eq!(
+            find_status_label("x", 0, 0, false).as_deref(),
+            Some("No results")
+        );
+        assert_eq!(find_status_label("x", 3, 0, false).as_deref(), Some("1/3"));
+        assert_eq!(find_status_label("x", 3, 2, false).as_deref(), Some("3/3"));
+        assert_eq!(
+            find_status_label("x", MAX_FIND_MATCHES, 0, true).as_deref(),
+            Some("1/10000+")
+        );
+    }
+
+    /// End-to-end find session in a real window: open with the OS-primary
+    /// chord, type a query, step through the matches, and close with Escape.
+    #[test]
+    fn find_in_document_searches_navigates_and_closes() {
+        use gpui_kit::component::Root;
+        use gpui_kit::{Bounds, TestApp, WindowBounds, WindowOptions, point, size};
+
+        const CONTENT: &str =
+            "# Alpha\n\nfirst alpha paragraph\n\n## Beta\n\nsecond ALPHA paragraph\n";
+
+        let mut app = TestApp::new();
+        app.update(gpui_kit::init);
+        let mut reader = None;
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(900.), px(700.)),
+                ))),
+                ..Default::default()
+            },
+            |window, cx| {
+                let view = cx.new(|cx| PreviewView::new(CONTENT.into(), cx));
+                reader = Some(view.clone());
+                Root::new(view, window, cx)
+            },
+        );
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+
+        let reader = reader.unwrap();
+        window.update(|_, window, cx| {
+            reader.read(cx).focus_handle(cx).focus(window, cx);
+        });
+
+        const OPEN: &str = if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-f"
+        };
+        window.simulate_keystroke(OPEN);
+        window.draw();
+        assert_eq!(
+            window.read(|_, cx| reader.read(cx).find.as_ref().map(|f| f.query.clone())),
+            Some(String::new()),
+            "the shortcut opens the find bar with an empty query"
+        );
+
+        window.simulate_input("alpha");
+        window.draw();
+        let (total, index, truncated) = window.read(|_, cx| {
+            let find = reader.read(cx).find.as_ref().unwrap();
+            (find.matches.len(), find.index, find.truncated)
+        });
+        assert_eq!(
+            (total, index),
+            (3, 0),
+            "all three alpha matches, first active"
+        );
+        assert!(!truncated);
+
+        let input_focused = window.update(|_, window, cx| {
+            window.focused(cx)
+                == Some(
+                    reader
+                        .read(cx)
+                        .find
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .read(cx)
+                        .focus_handle(cx),
+                )
+        });
+        assert!(input_focused, "the find input owns focus after typing");
+
+        window.simulate_keystroke("enter");
+        window.draw();
+        assert_eq!(
+            window.read(|_, cx| reader.read(cx).find.as_ref().unwrap().index),
+            1,
+            "Enter steps to the next match"
+        );
+        window.simulate_keystroke("shift-enter");
+        window.draw();
+        assert_eq!(
+            window.read(|_, cx| reader.read(cx).find.as_ref().unwrap().index),
+            0,
+            "Shift+Enter steps back"
+        );
+        window.simulate_keystroke("shift-enter");
+        window.draw();
+        assert_eq!(
+            window.read(|_, cx| reader.read(cx).find.as_ref().unwrap().index),
+            2,
+            "stepping back from the first match wraps to the last"
+        );
+
+        window.simulate_keystroke("escape");
+        window.draw();
+        assert!(
+            window.read(|_, cx| reader.read(cx).find.is_none()),
+            "Escape closes the find bar"
+        );
+        let focused = window.update(|_, window, cx| window.focused(cx));
+        assert_eq!(
+            focused,
+            Some(window.read(|_, cx| reader.read(cx).focus_handle(cx))),
+            "closing returns focus to the document"
+        );
+    }
+
+    /// Stepping to a match below the fold scrolls the document to it
+    /// (`reveal_range`), not just highlights it.
+    #[test]
+    fn find_reveals_a_match_below_the_viewport() {
+        use gpui_kit::component::Root;
+        use gpui_kit::{Bounds, TestApp, WindowBounds, WindowOptions, point, size};
+
+        // Enough filler between the hits that the second one starts well
+        // below a 700px viewport.
+        let mut content = String::from("# Top\n\nneedle one\n\n");
+        for index in 0..40 {
+            content.push_str(&format!("filler paragraph {index}\n\n"));
+        }
+        content.push_str("needle two\n");
+
+        let mut app = TestApp::new();
+        app.update(gpui_kit::init);
+        let mut reader = None;
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(900.), px(700.)),
+                ))),
+                ..Default::default()
+            },
+            |window, cx| {
+                let view = cx.new(|cx| PreviewView::new(content.clone().into(), cx));
+                reader = Some(view.clone());
+                Root::new(view, window, cx)
+            },
+        );
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+
+        let reader = reader.unwrap();
+        window.update(|_, window, cx| {
+            reader.read(cx).focus_handle(cx).focus(window, cx);
+        });
+        window.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-f"
+        });
+        window.draw();
+        window.simulate_input("needle");
+        window.draw();
+        let scroll_top = |window: &mut gpui_kit::TestAppWindow<Root>| {
+            window.read(|_, cx| {
+                reader
+                    .read(cx)
+                    .state
+                    .read(cx)
+                    .list_state()
+                    .logical_scroll_top()
+                    .item_ix
+            })
+        };
+        let before = scroll_top(&mut window);
+        assert_eq!(
+            window.read(|_, cx| reader.read(cx).find.as_ref().unwrap().matches.len()),
+            2
+        );
+
+        window.simulate_keystroke("enter");
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+        let after = scroll_top(&mut window);
+        assert!(
+            after > before,
+            "stepping to the off-screen match scrolls to it: {before} -> {after}"
+        );
+    }
+
+    /// An open find session re-searches when the host replaces the content
+    /// (`set_content`), like the Resources reader does on live revisions.
+    #[test]
+    fn find_follows_a_content_replacement() {
+        use gpui_kit::component::Root;
+        use gpui_kit::{Bounds, TestApp, WindowBounds, WindowOptions, point, size};
+
+        let mut app = TestApp::new();
+        app.update(gpui_kit::init);
+        let mut reader = None;
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(900.), px(700.)),
+                ))),
+                ..Default::default()
+            },
+            |window, cx| {
+                let view = cx.new(|cx| PreviewView::new("Hello there.\n".into(), cx));
+                reader = Some(view.clone());
+                Root::new(view, window, cx)
+            },
+        );
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+
+        let reader = reader.unwrap();
+        window.update(|_, window, cx| {
+            reader.read(cx).focus_handle(cx).focus(window, cx);
+        });
+        window.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-f"
+        });
+        window.draw();
+        window.simulate_input("beta");
+        window.draw();
+        assert_eq!(
+            window.read(|_, cx| reader.read(cx).find.as_ref().unwrap().matches.len()),
+            0,
+            "the initial content has no beta"
+        );
+
+        window.update(|_, _, cx| {
+            reader.update(cx, |view, cx| {
+                view.set_content("# Beta\n\nbeta again\n".into(), cx);
+            });
+        });
+        app.run_until_parked();
+        window.draw();
+        assert_eq!(
+            window.read(|_, cx| reader.read(cx).find.as_ref().unwrap().matches.len()),
+            2,
+            "the open session re-searches the replaced content"
+        );
     }
 }

@@ -53,6 +53,10 @@ Resource actions appear on the Resources tab and on the global Artifacts page. D
 
 Git changes opens a near-window-sized terminal dialog running `lazygit` in the current checkout. Enter, plain Escape, and Tab belong to lazygit, not the dialog; press **Shift+Esc** while the terminal is focused to close it (the shortcut is shown in the dialog title). The ✕ button or navigation toggle (`Cmd+J` / `Ctrl+J`) also closes it. Each opening starts a new lazygit session in the current checkout.
 
+## Preview window
+
+The standalone preview window (`devcroft preview <path>`) and the Resources reader share one document reader, so find works identically in both. `Cmd+F` on macOS (`Ctrl+F` on Linux/Windows) opens the find bar over the document; `Enter` steps to the next match and `Shift+Enter` to the previous one (both wrap); `Escape` closes the bar, clears its highlights, and returns focus to the document. Matching is case-insensitive and runs over the rendered text, so it crosses Markdown formatting.
+
 ## Panes
 
 Pane movement follows the rendered left-to-right layout and only includes regions on screen. Agent covers the sessions sidebar and the terminal; Review covers files, diff, and comments when shown; Resources and Artifacts cover the list, the document or draft, and the comments and outline rails when shown. Editor and Terminal each have one pane. Home has one pane: `j`/`k` there walk every dashboard card (recent sessions, recent projects, then pull requests, todos, and reading items) instead of switching panes. On the Pull Requests board, `j`/`k` walk cards column by column within the selected All/Personal/Work filter and `Enter` edits the selected PR. On the Todos board, `j`/`k` walk cards column by column (Unscoped first, then projects) within the selected group filter and `Enter` toggles the selected todo. On the To Read page, `j`/`k` walk the list in order and `Enter` toggles the selected item read. Card menus also support moving PRs without dragging. The focused pane is named in the list and native panes show a focus ring; the `j`/`k` cursor shows as a ring around the highlighted sidebar row or card.

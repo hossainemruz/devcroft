@@ -128,6 +128,42 @@ impl TerminalPane {
         self.error.is_some()
     }
 
+    pub(crate) fn agent_running(&self) -> bool {
+        self.session.is_some()
+            && self
+                .agent_activity
+                .as_ref()
+                .is_some_and(|launch| !launch.has_exited())
+    }
+
+    /// Paste a single-line task into the same input the user configures.
+    /// The leading shell comment also makes an exit race harmless if the
+    /// harness returns to its login shell before the PTY reports the exit.
+    pub(crate) fn paste_agent_task(&mut self, task: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.agent_running(),
+            "The agent session has closed. Generate a new guide to start another session."
+        );
+        anyhow::ensure!(
+            task.starts_with("# ") && !task.contains(['\n', '\r', '\x1b']),
+            "Invalid terminal task"
+        );
+        self.session.as_mut().unwrap().paste(task)
+    }
+
+    pub(crate) fn submit_agent_task(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.agent_running(), "The agent session has closed.");
+        self.session.as_ref().unwrap().write_input(b"\r")
+    }
+
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
+        self.session = None;
+        if let Some(activity) = &self.agent_activity {
+            activity.exited();
+        }
+        cx.notify();
+    }
+
     pub(crate) fn with_session(
         tab: WorkspaceTab,
         cwd: &Path,
@@ -728,7 +764,15 @@ impl TerminalPane {
     ) {
         if let Some(session) = self.session.as_mut() {
             let error_before = self.error.clone();
-            let viewport = window.viewport_size();
+            let bounds = self.pane_bounds.unwrap_or_else(|| {
+                Bounds::new(
+                    gpui_kit::point(px(0.), px(WORKSPACE_HEADER_HEIGHT)),
+                    gpui_kit::size(
+                        window.viewport_size().width,
+                        window.viewport_size().height - px(WORKSPACE_HEADER_HEIGHT),
+                    ),
+                )
+            });
             // Terminal applications scale each forwarded press themselves
             // (e.g. nvim `mousescroll`), so undo the platform UI multiplier
             // for the application path (see APP_SCROLL_DIVISOR). The local
@@ -764,11 +808,11 @@ impl TerminalPane {
             }
             let scrolled = session.scroll(
                 lines,
-                event.position.x.as_f32(),
-                event.position.y.as_f32(),
+                (event.position.x - bounds.origin.x).as_f32(),
+                (event.position.y - bounds.origin.y).as_f32(),
                 event.modifiers,
-                viewport.width.as_f32(),
-                viewport.height.as_f32(),
+                bounds.size.width.as_f32(),
+                bounds.size.height.as_f32(),
             );
             match scrolled {
                 // Local viewport scrolls repaint through the paced path like
@@ -1368,10 +1412,16 @@ impl Render for TerminalPane {
             .track_focus(&self.focus_handle)
             .focus(|style| style.border_1().border_color(cx.theme().ring))
             .on_prepaint(move |bounds, _, cx| {
-                // Recorded without notifying: the next mouse event reads it.
-                // Notifying here would schedule another paint every frame.
-                entity.update(cx, |pane, _| {
+                // One extra frame on size changes lets the PTY converge even
+                // when an idle agent moves between the tab and review sidebar.
+                entity.update(cx, |pane, cx| {
+                    let resized = pane
+                        .pane_bounds
+                        .is_none_or(|previous| previous.size != bounds.size);
                     pane.pane_bounds = Some(bounds);
+                    if resized {
+                        cx.notify();
+                    }
                 });
             })
             .on_mouse_down(

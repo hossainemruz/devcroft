@@ -349,7 +349,7 @@ impl RepositoryTabs {
                 })
             })
             .collect();
-        let review = cx.new(|cx| ReviewView::new(working_directory, cx));
+        let review = Workspace::new_review(working_directory, cx);
         Self {
             active_tab: WorkspaceTab::Agent,
             tabs,
@@ -383,9 +383,9 @@ impl Workspace {
         // session instead. Later edits come through `set_default_agent`.
         // The default always stays within the enabled set; later edits come
         // through `set_enabled_agents` / `set_default_agent`.
-        let stored = data_root.as_ref().and_then(|root| {
-            DeviceStore::new(root).load().ok()
-        });
+        let stored = data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok());
         let mut enabled_agents = stored
             .as_ref()
             .map(|state| state.enabled_agents_or_default())
@@ -407,7 +407,7 @@ impl Workspace {
         // Panes are created only when the user enters a repository workspace.
         let active_tab = WorkspaceTab::Agent;
         let tabs = vec![None; WorkspaceTab::ALL.len()];
-        let review = cx.new(|cx| ReviewView::new(working_directory, cx));
+        let review = Workspace::new_review(working_directory, cx);
         let session_agent = default_agent;
         let command_state = cx.new(|cx| CommandState::new(window, cx));
         // Interceptors run before GPUI resolves key bindings (unlike element
@@ -803,15 +803,21 @@ impl Workspace {
     }
 
     fn sync_activity_visibility(&self, window: &Window, cx: &App) {
-        let visible = (!self.home_visible
-            && self.active_tab == WorkspaceTab::Agent
-            && window.is_window_active())
-        .then(|| {
-            self.tabs[WorkspaceTab::Agent as usize]
-                .as_ref()
-                .and_then(|p| p.read(cx).launch_id())
-        })
-        .flatten();
+        let visible = if !self.home_visible && window.is_window_active() {
+            match self.active_tab {
+                WorkspaceTab::Agent => self.tabs[WorkspaceTab::Agent as usize]
+                    .as_ref()
+                    .and_then(|pane| pane.read(cx).launch_id()),
+                WorkspaceTab::Review => self
+                    .review
+                    .read(cx)
+                    .visible_agent(cx)
+                    .and_then(|pane| pane.read(cx).launch_id()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         self.agent_activity.set_visible_launch(visible);
     }
 
@@ -2161,7 +2167,7 @@ impl Workspace {
                 panes
             }
             WorkspaceTab::Resources => self.resources.read(cx).navigation_panes(cx),
-            WorkspaceTab::Review => self.review.read(cx).navigation_panes(),
+            WorkspaceTab::Review => self.review.read(cx).navigation_panes(cx),
             WorkspaceTab::Editor | WorkspaceTab::Terminal => self
                 .tabs
                 .get(self.active_tab as usize)
@@ -2862,6 +2868,7 @@ fn activity_state_color(state: ActivityState) -> u32 {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_activity_visibility(window, cx);
         let active_index = self.active_tab as usize;
         let active_content = self.render_active_content(cx);
         // Resources and Artifacts full-pages share the repository workspace

@@ -7,6 +7,7 @@
 //! and refresh.
 
 mod assistant;
+pub(crate) use assistant::ReviewAgentRequested;
 pub(crate) mod comments;
 mod feedback;
 pub(crate) mod git;
@@ -32,10 +33,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, ParentElement,
-    Render, ScrollStrategy, SharedString, Styled, Subscription, Window, div, img, list, px, rgb,
-    svg,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState,
+    MouseButton, ParentElement, Render, ScrollStrategy, SharedString, Styled, Subscription, Window,
+    div, img, list, px, rgb, svg,
 };
 
 use crate::command_palette::{
@@ -127,6 +128,8 @@ pub(crate) struct ReviewView {
     assistant_source: Option<String>,
 }
 
+impl EventEmitter<ReviewAgentRequested> for ReviewView {}
+
 impl ReviewView {
     pub(crate) fn new(cwd: &Path, cx: &mut Context<Self>) -> Self {
         let base_branch = suggest_base_branch(cwd, "origin").unwrap_or_else(|| "main".to_owned());
@@ -217,9 +220,23 @@ impl ReviewView {
         .detach();
     }
 
-    pub(crate) fn navigation_panes(&self) -> Vec<(&'static str, FocusHandle)> {
+    pub(crate) fn visible_agent(&self, cx: &App) -> Option<Entity<crate::pane::TerminalPane>> {
+        self.show_assistant
+            .then(|| {
+                self.assistant
+                    .as_ref()
+                    .and_then(|assistant| assistant.read(cx).visible_agent().cloned())
+            })
+            .flatten()
+    }
+
+    pub(crate) fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
         if self.show_assistant {
-            return vec![("Review assistant", self.focus_handle.clone())];
+            let mut panes = vec![("Review assistant", self.focus_handle.clone())];
+            if let Some(agent) = self.visible_agent(cx) {
+                panes.push(("Review agent", agent.read(cx).focus_handle.clone()));
+            }
+            return panes;
         }
         if !matches!(self.state, ReviewState::Loaded(_)) {
             return vec![("Review", self.focus_handle.clone())];
@@ -243,6 +260,8 @@ impl ReviewView {
         if self.show_assistant {
             if index == 0 {
                 self.focus_handle.focus(window, cx);
+            } else if let Some(agent) = self.visible_agent(cx) {
+                agent.read(cx).focus_handle.clone().focus(window, cx);
             }
             return;
         }
@@ -643,6 +662,19 @@ impl ReviewView {
                                     },
                                 )
                                 .detach();
+                                cx.subscribe(
+                                    &assistant,
+                                    |_, _, event: &ReviewAgentRequested, cx| {
+                                        cx.emit(ReviewAgentRequested {
+                                            assistant: event.assistant.clone(),
+                                            agent: event.agent,
+                                            cwd: event.cwd.clone(),
+                                            request_id: event.request_id,
+                                        });
+                                    },
+                                )
+                                .detach();
+                                cx.observe(&assistant, |_, _, cx| cx.notify()).detach();
                                 this.assistant = Some(assistant);
                             }
                             this.show_assistant = !this.show_assistant;
@@ -1142,7 +1174,11 @@ impl Render for ReviewView {
             .track_focus(&track)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |_, _, window, cx| focus.focus(window, cx)),
+                cx.listener(move |this, _, window, cx| {
+                    if !this.show_assistant {
+                        focus.focus(window, cx);
+                    }
+                }),
             )
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_toolbar(cx))

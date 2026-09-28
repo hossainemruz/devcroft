@@ -133,6 +133,53 @@ impl ListDelegate for AgentPicker {
 }
 
 impl Workspace {
+    pub(super) fn new_review(cwd: &Path, cx: &mut Context<Self>) -> Entity<ReviewView> {
+        let review = cx.new(|cx| ReviewView::new(cwd, cx));
+        cx.subscribe(
+            &review,
+            |this, _, request: &crate::review::ReviewAgentRequested, cx| {
+                if !request.assistant.read(cx).accepts_agent(request.request_id) {
+                    return;
+                }
+                let pane =
+                    this.create_agent_session(request.agent, &request.cwd, "Review tutorial", cx);
+                request.assistant.update(cx, |assistant, cx| {
+                    assistant.attach_agent(pane, request.request_id, cx);
+                });
+                this.refresh_sessions(cx);
+            },
+        )
+        .detach();
+        review
+    }
+
+    fn create_agent_session(
+        &mut self,
+        agent: AgentKind,
+        cwd: &Path,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalPane> {
+        let pane = cx
+            .new(|cx| TerminalPane::new(WorkspaceTab::Agent, cwd, agent, &self.agent_activity, cx));
+        if !pane.read(cx).launch_failed()
+            && let Some(id) = pane.read(cx).launch_id()
+        {
+            self.open_sessions.insert(
+                id,
+                OpenAgentSession {
+                    pane: pane.clone(),
+                    checkout: cwd.to_owned(),
+                    agent,
+                    key: None,
+                    title: title.into(),
+                    created_at: crate::relative_time::current_unix_secs(),
+                },
+            );
+        }
+        pane
+    }
+
     pub(super) fn remember_agent_pane(&mut self, cx: &App) {
         let Some(pane) = self.tabs[WorkspaceTab::Agent as usize].clone() else {
             return;
@@ -562,35 +609,12 @@ impl Workspace {
         // and mark the checkout started either way.
         self.session_navigation += 1;
         self.agent_autostart.insert(self.working_directory.clone());
-        let pane = cx.new(|cx| {
-            TerminalPane::new(
-                WorkspaceTab::Agent,
-                &self.working_directory,
-                agent,
-                &self.agent_activity,
-                cx,
-            )
-        });
+        let pane =
+            self.create_agent_session(agent, &self.working_directory.clone(), "New session", cx);
         if pane.read(cx).launch_failed() {
             window.push_notification("Could not create a session terminal", cx);
             return;
         }
-        let Some(id) = pane.read(cx).launch_id() else {
-            return;
-        };
-        // Track immediately: the async catalog publish must never be the
-        // only owner a repository switch could strand in a hidden tab set.
-        self.open_sessions.insert(
-            id,
-            OpenAgentSession {
-                pane: pane.clone(),
-                checkout: self.working_directory.clone(),
-                agent,
-                key: None,
-                title: "New session".into(),
-                created_at: crate::relative_time::current_unix_secs(),
-            },
-        );
         self.tabs[WorkspaceTab::Agent as usize] = Some(pane);
         self.session_agent = agent;
         // A new session can start from Home or any tab: reveal the Agent tab
@@ -633,7 +657,11 @@ impl Workspace {
         }
     }
     fn remove_agent_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_sessions.remove(&id);
+        if let Some(session) = self.open_sessions.remove(&id) {
+            // Other views can retain the pane, so dropping the sidebar row is
+            // insufficient to stop a terminal shared with a review assistant.
+            session.pane.update(cx, |pane, cx| pane.close(cx));
+        }
         let agent_index = WorkspaceTab::Agent as usize;
         let active = self.tabs[agent_index]
             .as_ref()

@@ -381,6 +381,16 @@ impl PreparedAgentLaunch {
         &self.command_line
     }
 
+    pub(crate) fn has_exited(&self) -> bool {
+        self.emitter
+            .store
+            .inner
+            .lock()
+            .records
+            .get(&(self.emitter.checkout.clone(), self.emitter.generation))
+            .is_none_or(|record| record.exited)
+    }
+
     pub(crate) fn environment(&self) -> &[(String, String)] {
         &self.environment
     }

@@ -36,10 +36,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::{
     agent::AgentKind,
     keys::map_key,
-    metrics::{
-        INITIAL_COLS, INITIAL_ROWS, TERMINAL_PADDING, WORKSPACE_HEADER_HEIGHT, cell_height,
-        cell_width,
-    },
+    metrics::{INITIAL_COLS, INITIAL_ROWS, TERMINAL_PADDING, cell_height, cell_width},
     workspace::WorkspaceTab,
 };
 
@@ -473,7 +470,7 @@ impl TerminalSession {
             }
 
             let padding_left = TERMINAL_PADDING;
-            let padding_top = WORKSPACE_HEADER_HEIGHT + TERMINAL_PADDING;
+            let padding_top = TERMINAL_PADDING;
             let (columns, rows) = *self.grid_size.lock();
             let grid_width = columns as f32 * cell_width();
             let grid_height = rows as f32 * cell_height();

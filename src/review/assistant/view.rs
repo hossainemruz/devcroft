@@ -16,7 +16,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -28,8 +28,10 @@ use gpui_kit::{
 use super::exchange::Exchange;
 use super::runner::{Options, Provider};
 use super::tutorial::{Excerpt, Snapshot, Tutorial};
+use crate::agent_icons::{AgentIconTiles, agent_icon, ensure_tiles};
 use crate::review::git::{ReviewScope, load_review};
-use crate::review::model::ReviewDiff;
+use crate::review::model::{LineTag, ReviewDiff};
+use crate::review::syntax;
 use crate::{agent::AgentKind, pane::TerminalPane};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,8 +88,9 @@ pub(crate) struct AssistantView {
     page: Page,
     details_open: bool,
     chat_open: bool,
+    hovered_selection: Option<String>,
     coverage_excerpt: Option<String>,
-    excerpt_views: Vec<(String, Entity<TextViewState>)>,
+    agent_icons: AgentIconTiles,
     turns: Vec<Turn>,
     agent: Option<Entity<TerminalPane>>,
     show_agent: bool,
@@ -136,7 +139,10 @@ impl AssistantView {
         if !providers.contains(&options.provider) {
             options.select_provider(providers[0]);
         }
+        let mut agent_icons = AgentIconTiles::default();
+        ensure_tiles(AgentKind::ALL, &mut agent_icons, cx);
         Self {
+            agent_icons,
             cwd,
             diff,
             scope_label,
@@ -164,8 +170,8 @@ impl AssistantView {
             page: Page::Chapter(0),
             details_open: false,
             chat_open: false,
+            hovered_selection: None,
             coverage_excerpt: None,
-            excerpt_views: vec![],
             turns: vec![],
             agent: None,
             show_agent: false,
@@ -203,44 +209,10 @@ impl AssistantView {
         self.page = page;
         self.details_open = false;
         self.chat_open = false;
+        self.hovered_selection = None;
         self.coverage_excerpt = None;
         self.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
-        self.prepare_excerpts(cx);
         cx.notify();
-    }
-
-    fn prepare_excerpts(&mut self, cx: &mut Context<Self>) {
-        self.excerpt_views.clear();
-        let Some(guide) = &self.guide else {
-            return;
-        };
-        let ids = match self.page {
-            Page::Chapter(index) => guide.tutorial.chapters[index].excerpt_ids.clone(),
-            Page::Coverage => self.coverage_excerpt.iter().cloned().collect(),
-            Page::Concepts | Page::Overview => vec![],
-        };
-        for id in ids {
-            if let Some(excerpt) = guide
-                .snapshot
-                .excerpts
-                .iter()
-                .find(|excerpt| excerpt.id == id)
-            {
-                // The app owns this text: generated prose can only reference its ID.
-                // A fence longer than any run in the source prevents Markdown injection.
-                let longest = excerpt
-                    .lines
-                    .iter()
-                    .flat_map(|line| line.text.split(|ch| ch != '`'))
-                    .map(str::len)
-                    .max()
-                    .unwrap_or(0);
-                let fence = "`".repeat(longest.max(3) + 1);
-                let text = format!("{fence}diff\n{}{fence}", excerpt.text());
-                self.excerpt_views
-                    .push((id, cx.new(|cx| TextViewState::markdown(&text, cx))));
-            }
-        }
     }
 
     fn install(
@@ -343,6 +315,10 @@ impl AssistantView {
             let (diff, relationships) = cx.background_spawn(async move {
                 let diff = load_review(&cwd, &scope);
                 let relationships = if diff.is_ok() { relationship_context(&cwd) } else { String::new() };
+                let diff = diff.map(|diff| {
+                    let snapshot = Snapshot::new(&diff);
+                    (diff, snapshot)
+                });
                 (diff, relationships)
             }).await;
             let _ = this.update(cx, |view, cx| {
@@ -350,8 +326,7 @@ impl AssistantView {
                 view.loading = false;
                 view.progress = None;
                 match diff {
-                    Ok(diff) => {
-                        let snapshot = Snapshot::new(&diff);
+                    Ok((diff, snapshot)) => {
                         view.diff = Rc::new(diff);
                         if !snapshot.excerpts.iter().any(|excerpt| excerpt.supplied) {
                             view.error = Some("There are no text excerpts to build a guide from. Review binary, metadata-only, or oversized changes in the diff.".into());
@@ -637,27 +612,50 @@ impl AssistantView {
     }
 
     fn preview(&mut self, cx: &mut Context<Self>) {
-        let snapshot = Snapshot::new(&self.diff);
-        if !snapshot.excerpts.iter().any(|excerpt| excerpt.supplied) {
-            self.error = Some("No text excerpts are available for a preview.".into());
-            cx.notify();
+        if self.loading || self.awaiting_configuration {
             return;
         }
-        let tutorial = Tutorial::sample(&snapshot, self.options.include_concepts);
-        self.install(
-            tutorial,
-            Pending {
-                snapshot,
-                options: self.options.clone(),
-                agent: None,
-            },
-            true,
-            cx,
-        );
+        self.loading = true;
+        self.error = None;
+        self.progress = Some("Preparing preview…".into());
+        self.request_id += 1;
+        let id = self.request_id;
+        let diff = self.diff.as_ref().clone();
+        let options = self.options.clone();
+        cx.spawn(async move |this, cx| {
+            let snapshot = cx
+                .background_spawn(async move { Snapshot::new(&diff) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.request_id != id {
+                    return;
+                }
+                view.loading = false;
+                view.progress = None;
+                if !snapshot.excerpts.iter().any(|excerpt| excerpt.supplied) {
+                    view.error = Some("No text excerpts are available for a preview.".into());
+                    cx.notify();
+                    return;
+                }
+                let tutorial = Tutorial::sample(&snapshot, options.include_concepts);
+                view.install(
+                    tutorial,
+                    Pending {
+                        snapshot,
+                        options,
+                        agent: None,
+                    },
+                    true,
+                    cx,
+                );
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
-    fn ask_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = TextSelection::selected_text(window, cx);
+    fn ask_selected(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         if text.trim().is_empty() {
             return;
         }
@@ -703,38 +701,65 @@ impl AssistantView {
             .into_any_element()
     }
 
+    fn render_stop_button(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("stop-review-agent")
+            .ghost()
+            .small()
+            .child("Stop")
+            .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+    }
+
     fn render_setup(&self, cx: &mut Context<Self>) -> AnyElement {
         let provider_view = cx.entity().downgrade();
         let provider = self.options.provider;
         let busy = self.loading || self.awaiting_configuration;
-        v_flex().gap_3().p_4().w_full().max_w(px(760.))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Choose an agent to explain the change. Generate opens its terminal so you can choose your model and effort before continuing."))
-            .child(v_flex().gap_2().child("Agent").child(Button::new("review-provider").outline().dropdown_caret(true).disabled(busy).child(provider.agent_kind().label()).dropdown_menu(move |mut menu, _, _| {
-                for option in Provider::enabled_providers() {
-                    let view = provider_view.clone();
-                    menu = menu.item(PopupMenuItem::element(move |_, _| div().child(option.agent_kind().label())).checked(option == provider).on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| { this.options.select_provider(option); cx.notify(); }).ok();
-                    }));
-                }
-                menu
-            })))
-            .child(h_flex().gap_2().child(Switch::new("review-concepts").checked(self.options.include_concepts).disabled(busy).on_change(cx.listener(|this, checked, _, cx| { this.options.include_concepts = *checked; cx.notify(); }))).child(div().text_sm().child("Include key concepts")))
-            .child(Button::new("review-instructions").ghost().child(if self.custom_instructions { "Hide references and instructions" } else { "Design document or instructions (optional)" }).on_click(cx.listener(|this, _, _, cx| { this.custom_instructions = !this.custom_instructions; cx.notify(); })))
-            .when(self.custom_instructions, |view| view.child(Textarea::new(&self.instructions).disabled(busy).w_full()))
-            .when(self.guide.is_some(), |view| view.child(div().text_sm().text_color(cx.theme().muted_foreground).child("A new guide replaces chapter progress and questions only after generation succeeds. Your notes are kept.")))
+        let tiles = self.agent_icons.clone();
+        v_flex().gap_4().p_6().w_full().max_w(px(640.))
+            .child(v_flex().gap_2()
+                .child(div().text_lg().font_semibold().child("Understand the change, step by step"))
+                .child(div().text_sm().text_color(cx.theme().muted_foreground).child("A focused walkthrough of the code, the reasoning behind it, and what to check.")))
+            .child(v_flex().gap_4().p_4().border_1().border_color(cx.theme().border).rounded_lg()
+                .child(v_flex().gap_2()
+                    .child(div().text_sm().font_semibold().child("Review agent"))
+                    .child(Button::new("review-provider").outline().dropdown_caret(true).disabled(busy)
+                        .child(h_flex().gap_2().child(agent_icon(provider.agent_kind(), &self.agent_icons, 18.)).child(provider.agent_kind().label()))
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for option in Provider::enabled_providers() {
+                                let view = provider_view.clone();
+                                let icons = tiles.clone();
+                                menu = menu.item(PopupMenuItem::element(move |_, _| h_flex().gap_2().child(agent_icon(option.agent_kind(), &icons, 18.)).child(option.agent_kind().label())).checked(option == provider).on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| { this.options.select_provider(option); cx.notify(); }).ok();
+                                }));
+                            }
+                            menu
+                        }))
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Choose your model and effort in the agent terminal before starting.")))
+                .child(h_flex().gap_3()
+                    .child(Switch::new("review-concepts").checked(self.options.include_concepts).disabled(busy).on_change(cx.listener(|this, checked, _, cx| { this.options.include_concepts = *checked; cx.notify(); })))
+                    .child(v_flex().gap_1().child(div().text_sm().child("Include key concepts")).child(div().text_xs().text_color(cx.theme().muted_foreground).child("A short introduction to unfamiliar ideas in this change."))))
+                .child(v_flex().gap_2()
+                    .child(h_flex().child(Button::new("review-instructions").ghost().small().icon(IconName::FileText).child(if self.custom_instructions { "Hide review instructions" } else { "Add context or instructions" }).on_click(cx.listener(|this, _, _, cx| { this.custom_instructions = !this.custom_instructions; cx.notify(); }))))
+                    .when(self.custom_instructions, |view| view.child(Textarea::new(&self.instructions).disabled(busy).w_full()))))
+            .when(self.guide.is_some(), |view| view.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Your current guide stays available until the new one is ready. Notes are kept.")))
             .child(h_flex().gap_2().flex_wrap()
-                .child(Button::new("generate-guide").primary().disabled(busy).child(if self.guide.is_some() { "Generate new guide" } else { "Generate guide" }).on_click(cx.listener(|this, _, _, cx| this.generate(cx))))
-                .when(self.guide.is_none(), |view| view.child(Button::new("preview-reader").outline().disabled(busy).child("Preview layout").on_click(cx.listener(|this, _, _, cx| this.preview(cx)))))
+                .when(busy && self.guide.is_none(), |row| row.child(self.render_stop_button(cx)))
+                .child(Button::new("generate-guide").primary().icon(IconName::BookOpen).disabled(busy).child(if self.guide.is_some() { "Generate new guide" } else { "Generate guide" }).on_click(cx.listener(|this, _, _, cx| this.generate(cx))))
+                .when(self.guide.is_none(), |view| view.child(Button::new("preview-reader").ghost().disabled(busy).child("Preview layout").on_click(cx.listener(|this, _, _, cx| this.preview(cx)))))
                 .when(self.guide.is_some(), |view| view.child(Button::new("return-guide").ghost().child("Return to guide").on_click(cx.listener(|this, _, _, cx| { this.setup = false; cx.notify(); })))))
             .into_any_element()
     }
 
-    fn render_excerpt(
-        &self,
-        excerpt: &Excerpt,
-        state: &Entity<TextViewState>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(crate) fn agent_visibility(&self) -> Option<bool> {
+        self.agent.as_ref().map(|_| self.show_agent)
+    }
+
+    pub(crate) fn toggle_agent(&mut self, cx: &mut Context<Self>) {
+        self.show_agent = !self.show_agent;
+        self.focus_agent = self.show_agent;
+        cx.notify();
+    }
+
+    fn render_excerpt(&self, excerpt: &Excerpt, cx: &mut Context<Self>) -> AnyElement {
         let path = excerpt.path.clone();
         v_flex()
             .min_w_0()
@@ -783,12 +808,106 @@ impl AssistantView {
             )
             .child(
                 div()
-                    .px_3()
-                    .py_2()
+                    .id(format!("excerpt-content-{}", excerpt.id))
+                    .test_support()
                     .min_w_0()
-                    .child(Self::markdown(state, cx)),
+                    .child(self.render_excerpt_code(excerpt, cx)),
             )
             .into_any_element()
+    }
+
+    fn render_excerpt_code(&self, excerpt: &Excerpt, cx: &Context<Self>) -> AnyElement {
+        let mut code = String::new();
+        let mut highlights = Vec::new();
+        let palette = if cx.theme().is_dark() {
+            &excerpt.dark_spans
+        } else {
+            &excerpt.light_spans
+        };
+        for (index, line) in excerpt.lines.iter().enumerate() {
+            let (sign, tint) = match line.tag {
+                LineTag::Addition => ('+', cx.theme().success),
+                LineTag::Deletion => ('-', cx.theme().danger),
+                LineTag::Context => (' ', cx.theme().muted_foreground),
+            };
+            let background = (line.tag != LineTag::Context).then(|| tint.opacity(0.09));
+            let prefix = format!(
+                "{:>5} {:>5} {sign} ",
+                line.old_no.map(|n| n.to_string()).unwrap_or_default(),
+                line.new_no.map(|n| n.to_string()).unwrap_or_default()
+            );
+            let start = code.len();
+            code.push_str(&prefix);
+            highlights.push((
+                start..code.len() - 2,
+                gpui_kit::HighlightStyle {
+                    color: Some(cx.theme().muted_foreground),
+                    background_color: background,
+                    ..Default::default()
+                },
+            ));
+            highlights.push((
+                code.len() - 2..code.len(),
+                gpui_kit::HighlightStyle {
+                    color: Some(tint),
+                    background_color: background,
+                    ..Default::default()
+                },
+            ));
+            let source_start = code.len();
+            code.push_str(&line.text);
+            let mut cursor = 0;
+            for (range, mut style) in
+                syntax::styled_highlights(palette.get(index).map(Vec::as_slice).unwrap_or_default())
+            {
+                if cursor < range.start {
+                    highlights.push((
+                        source_start + cursor..source_start + range.start,
+                        gpui_kit::HighlightStyle {
+                            background_color: background,
+                            ..Default::default()
+                        },
+                    ));
+                }
+                cursor = range.end;
+                style.background_color = background;
+                highlights.push((source_start + range.start..source_start + range.end, style));
+            }
+            if cursor < line.text.len() {
+                highlights.push((
+                    source_start + cursor..code.len(),
+                    gpui_kit::HighlightStyle {
+                        background_color: background,
+                        ..Default::default()
+                    },
+                ));
+            }
+            code.push('\n');
+        }
+        // A longer fence keeps arbitrary source (including backticks) literal.
+        let longest = code.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest.max(3) + 1);
+        let mut block_style = div()
+            .px_3()
+            .py_2()
+            .font_family(crate::fonts::TERMINAL_FONT_FAMILY)
+            .text_size(px(12.))
+            .line_height(px(22.))
+            .whitespace_nowrap()
+            .style()
+            .clone();
+        block_style.overflow.x = Some(gpui_kit::Overflow::Scroll);
+        TextView::markdown(
+            format!("excerpt-code-{}", excerpt.id),
+            format!("{fence}\n{code}{fence}"),
+        )
+        .scrollable(false)
+        .style(
+            TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
+                .with_code_block(block_style),
+        )
+        .code_block_highlighter(move |_| highlights.clone())
+        .into_any_element()
     }
 
     fn render_reader(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -876,14 +995,19 @@ impl AssistantView {
                     .flex_basis(px(490.))
                     .flex_grow(1.)
                     .min_w_0()
-                    .children(self.excerpt_views.iter().filter_map(|(id, state)| {
-                        guide
-                            .snapshot
-                            .excerpts
+                    .children(
+                        guide.tutorial.chapters[index]
+                            .excerpt_ids
                             .iter()
-                            .find(|excerpt| &excerpt.id == id)
-                            .map(|excerpt| self.render_excerpt(excerpt, state, cx))
-                    }));
+                            .filter_map(|id| {
+                                guide
+                                    .snapshot
+                                    .excerpts
+                                    .iter()
+                                    .find(|excerpt| &excerpt.id == id)
+                                    .map(|excerpt| self.render_excerpt(excerpt, cx))
+                            }),
+                    );
                 body = body.child(
                     h_flex()
                         .items_start()
@@ -911,7 +1035,6 @@ impl AssistantView {
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.coverage_excerpt = Some(id.clone());
-                                this.prepare_excerpts(cx);
                                 cx.notify();
                             })),
                     );
@@ -919,14 +1042,14 @@ impl AssistantView {
                 for gap in &guide.snapshot.gaps {
                     body = body.child(div().text_sm().child(gap.clone()));
                 }
-                for (id, state) in &self.excerpt_views {
+                if let Some(id) = &self.coverage_excerpt {
                     if let Some(excerpt) = guide
                         .snapshot
                         .excerpts
                         .iter()
                         .find(|excerpt| &excerpt.id == id)
                     {
-                        body = body.child(self.render_excerpt(excerpt, state, cx));
+                        body = body.child(self.render_excerpt(excerpt, cx));
                     }
                 }
                 if uncovered.is_empty() && guide.snapshot.gaps.is_empty() {
@@ -958,7 +1081,22 @@ impl AssistantView {
                     Button::new("ask-selection")
                         .ghost()
                         .child("Ask about selected text")
-                        .on_click(cx.listener(|this, _, window, cx| this.ask_selected(window, cx))),
+                        .on_hover(cx.listener(|this, hovered, window, cx| {
+                            // Clicking outside text clears window selection during capture.
+                            // Keep the passage while the pointer is over its action.
+                            this.hovered_selection = if *hovered {
+                                Some(TextSelection::selected_text(window, cx))
+                            } else {
+                                None
+                            };
+                        }))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let text = this
+                                .hovered_selection
+                                .take()
+                                .unwrap_or_else(|| TextSelection::selected_text(window, cx));
+                            this.ask_selected(text, window, cx);
+                        })),
                 ),
         );
         if self.chat_open {
@@ -1207,49 +1345,16 @@ impl Render for AssistantView {
                             })),
                     ),
             );
-        } else {
-            header = header.child(
-                h_flex()
-                    .h(px(28.))
-                    .gap_3()
-                    .child(div().text_sm().font_semibold().child("Review guide"))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(self.scope_label.clone()),
-                    ),
-            );
         }
-        if self.agent.is_some() {
-            header = header.child(
-                Button::new("toggle-review-agent")
-                    .ghost()
-                    .small()
-                    .child(if self.show_agent {
-                        "Hide agent"
-                    } else {
-                        "Show agent"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_agent = !this.show_agent;
-                        cx.notify();
-                    })),
-            );
-        }
-        if let Some(progress) = &self.progress {
+        if self.guide.is_some()
+            && !self.awaiting_configuration
+            && let Some(progress) = &self.progress
+        {
             header = header.child(
                 h_flex()
                     .gap_3()
                     .child(div().text_sm().child(progress.clone()))
-                    .child(
-                        Button::new("stop-review-agent")
-                            .ghost()
-                            .child("Stop")
-                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-                    ),
+                    .child(self.render_stop_button(cx)),
             );
         }
         if let Some(error) = &self.error {
@@ -1289,7 +1394,9 @@ impl Render for AssistantView {
         let content = if self.awaiting_configuration {
             v_flex().flex_1().min_w_0().p_4().gap_3()
                 .child(div().text_sm().child("Choose your desired model and effort in the agent terminal. Finish any sign-in or trust prompts, return to the agent input, then click Next."))
-                .child(Button::new("review-agent-next").primary().disabled(self.agent.is_none()).child("Next").on_click(cx.listener(|this, _, _, cx| this.next(cx))))
+                .child(h_flex().gap_2()
+                    .child(Button::new("review-agent-next").primary().disabled(self.agent.is_none()).child("Next").on_click(cx.listener(|this, _, _, cx| this.next(cx))))
+                    .child(self.render_stop_button(cx)))
                 .into_any_element()
         } else if self.setup || self.guide.is_none() && !self.loading {
             div()
@@ -1297,12 +1404,18 @@ impl Render for AssistantView {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .child(self.render_setup(cx))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_center()
+                        .py_6()
+                        .child(self.render_setup(cx)),
+                )
                 .into_any_element()
         } else if self.guide.is_some() {
             self.render_reader(cx)
         } else {
-            v_flex().flex_1().justify_center().items_center().gap_3().child("Preparing your guided review…").child(div().text_sm().text_color(cx.theme().muted_foreground).child("The agent is reading the comparison and organizing its behavior into chapters.")).into_any_element()
+            v_flex().flex_1().justify_center().items_center().gap_3().child("Preparing your guided review…").child(div().text_sm().text_color(cx.theme().muted_foreground).child("The agent is reading the comparison and organizing its behavior into chapters.")).child(self.render_stop_button(cx)).into_any_element()
         };
         v_flex()
             .size_full()
@@ -1321,7 +1434,9 @@ impl Render for AssistantView {
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
-                            .child(header)
+                            .when(self.guide.is_some() || self.error.is_some(), |column| {
+                                column.child(header)
+                            })
                             .child(content),
                     )
                     .when(self.show_agent, |row| {
@@ -1338,23 +1453,13 @@ impl Render for AssistantView {
                                     .border_l_1()
                                     .border_color(cx.theme().border)
                                     .child(
-                                        h_flex()
-                                            .px_3()
-                                            .py_2()
-                                            .justify_between()
-                                            .child(div().text_sm().child("Review agent"))
-                                            .child(
-                                                Button::new("close-review-agent-sidebar")
-                                                    .ghost()
-                                                    .small()
-                                                    .child("Hide")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.show_agent = false;
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    )
-                                    .child(div().flex_1().min_h_0().min_w_0().child(agent)),
+                                        div()
+                                            .relative()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .min_w_0()
+                                            .child(div().absolute().inset_0().child(agent)),
+                                    ),
                             )
                         })
                     }),
@@ -1554,6 +1659,71 @@ mod tests {
     }
 
     #[test]
+    fn highlighted_excerpt_selection_can_be_used_in_a_question() {
+        let mut app = TestApp::new();
+        app.update(gpui_kit::init);
+        let mut reader = None;
+        let mut window = app.open_window(|window, cx| {
+            let view = cx.new(|cx| {
+                let diff = sample_diff();
+                let snapshot = Snapshot::new(&diff);
+                let tutorial = Tutorial::sample(&snapshot, false);
+                let mut view = AssistantView::new(
+                    PathBuf::from("/tmp"),
+                    diff,
+                    "changes".into(),
+                    ReviewScope::UncommittedChanges,
+                    window,
+                    cx,
+                );
+                view.install(
+                    tutorial,
+                    Pending {
+                        snapshot,
+                        options: Options::default(),
+                        agent: None,
+                    },
+                    true,
+                    cx,
+                );
+                view
+            });
+            reader = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+        app.update(|cx| {
+            cx.update_window(window.handle().into(), |_, window, cx| {
+                let bounds = window.find("excerpt-content-f0-h0-p0").bounds();
+                window.drag(
+                    bounds.origin + point(px(2.), px(2.)),
+                    bounds.bottom_right() - point(px(2.), px(2.)),
+                    cx,
+                );
+                let selected = TextSelection::selected_text(window, cx);
+                assert!(
+                    selected.contains("old") && selected.contains("new"),
+                    "source selection was lost: {selected:?}"
+                );
+                window.click("ask-selection", cx);
+                assert!(
+                    reader
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .question
+                        .read(cx)
+                        .value()
+                        .contains("old")
+                );
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
     fn sidebar_toggles_without_losing_the_configuration_or_terminal() {
         let mut app = TestApp::new();
         app.update(gpui_kit::init);
@@ -1607,14 +1777,16 @@ mod tests {
                     let sidebar = window.find("review-agent-sidebar").bounds();
                     let next = window.find("review-agent-next").bounds();
                     assert!(sidebar.right() <= px(width));
+                    assert_eq!(sidebar.top(), px(0.));
+                    assert_eq!(sidebar.size.height, px(700.));
                     assert!(next.right() <= sidebar.left());
                     let entity = reader.as_ref().unwrap();
                     let pane = entity.read(cx).agent.clone().unwrap();
-                    window.click("close-review-agent-sidebar", cx);
+                    entity.update(cx, |view, cx| view.toggle_agent(cx));
                     assert!(!entity.read(cx).show_agent);
                     assert!(entity.read(cx).awaiting_configuration);
                     assert_eq!(entity.read(cx).agent.as_ref().unwrap(), &pane);
-                    window.click("toggle-review-agent", cx);
+                    entity.update(cx, |view, cx| view.toggle_agent(cx));
                     assert!(entity.read(cx).show_agent);
                     assert_eq!(
                         entity.read(cx).prepared_prompt.as_deref(),

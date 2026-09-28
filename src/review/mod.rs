@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
     list::ListItem,
     tab::{Tab, TabBar},
     tree::{TreeState, tree},
@@ -599,6 +601,50 @@ impl ReviewView {
             .border_b_1()
             .border_color(rgb(0x292b2b))
             .child(
+                Button::new("guided-review")
+                    .ghost()
+                    .small()
+                    .selected(self.show_assistant)
+                    .icon(IconName::BookOpen)
+                    .tooltip("Toggle guided review")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !this.show_assistant
+                            && this.assistant.is_none()
+                            && let ReviewState::Loaded(loaded) = &this.state
+                        {
+                            let cwd = this.cwd.clone();
+                            let diff = loaded.diff.clone();
+                            let label = this.base_label();
+                            let scope = this.scope();
+                            let assistant = cx.new(|cx| {
+                                assistant::AssistantView::new(cwd, diff, label, scope, window, cx)
+                            });
+                            cx.subscribe_in(
+                                &assistant,
+                                window,
+                                |this, _, event: &assistant::OpenReviewSource, _, cx| {
+                                    this.open_assistant_source(&event.0, cx);
+                                },
+                            )
+                            .detach();
+                            cx.subscribe(&assistant, |_, _, event: &ReviewAgentRequested, cx| {
+                                cx.emit(ReviewAgentRequested {
+                                    assistant: event.assistant.clone(),
+                                    agent: event.agent,
+                                    cwd: event.cwd.clone(),
+                                    request_id: event.request_id,
+                                });
+                            })
+                            .detach();
+                            cx.observe(&assistant, |_, _, cx| cx.notify()).detach();
+                            this.assistant = Some(assistant);
+                        }
+                        this.show_assistant = !this.show_assistant;
+                        cx.notify();
+                    }))
+                    .child("Guided Review"),
+            )
+            .child(
                 TabBar::new("review-scope")
                     .segmented()
                     .selected_index(scope_index)
@@ -620,126 +666,92 @@ impl ReviewView {
             )
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_xs()
                     .text_color(rgb(0x858989))
                     .child(self.base_label()),
             )
             .child(div().flex_1())
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(if self.show_assistant {
-                        0x7dd3fc
-                    } else {
-                        0x292b2b
-                    }))
-                    .text_xs()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            if !this.show_assistant
-                                && this.assistant.is_none()
-                                && let ReviewState::Loaded(loaded) = &this.state
-                            {
-                                let cwd = this.cwd.clone();
-                                let diff = loaded.diff.clone();
-                                let label = this.base_label();
-                                let scope = this.scope();
-                                let assistant = cx.new(|cx| {
-                                    assistant::AssistantView::new(
-                                        cwd, diff, label, scope, window, cx,
-                                    )
-                                });
-                                cx.subscribe_in(
-                                    &assistant,
-                                    window,
-                                    |this, _, event: &assistant::OpenReviewSource, _, cx| {
-                                        this.open_assistant_source(&event.0, cx);
-                                    },
-                                )
-                                .detach();
-                                cx.subscribe(
-                                    &assistant,
-                                    |_, _, event: &ReviewAgentRequested, cx| {
-                                        cx.emit(ReviewAgentRequested {
-                                            assistant: event.assistant.clone(),
-                                            agent: event.agent,
-                                            cwd: event.cwd.clone(),
-                                            request_id: event.request_id,
-                                        });
-                                    },
-                                )
-                                .detach();
-                                cx.observe(&assistant, |_, _, cx| cx.notify()).detach();
-                                this.assistant = Some(assistant);
-                            }
-                            this.show_assistant = !this.show_assistant;
-                            cx.notify();
-                        }),
-                    )
-                    .child(if self.show_assistant {
-                        "Review changes"
-                    } else {
-                        "Review assistant"
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x737878))
-                    .child(self.summary()),
-            )
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .gap_1()
-                    .items_center()
-                    .border_color(rgb(if self.show_comments {
-                        0x7dd3fc
-                    } else {
-                        0x292b2b
-                    }))
-                    .text_xs()
-                    .text_color(comment_tint)
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.show_comments = !this.show_comments;
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        svg()
-                            .data(COMMENT_ICON)
-                            .size(px(14.))
-                            .text_color(comment_tint),
-                    )
-                    .child(format!("{}", self.comment_count())),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x292b2b))
-                    .text_xs()
-                    .text_color(rgb(0xe7e7e7))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.reload(cx)),
-                    )
-                    .child("Refresh"),
-            )
+            .when(self.show_assistant, |bar| {
+                let assistant = self.assistant.clone();
+                bar.when_some(assistant, |bar, assistant| {
+                    bar.when_some(assistant.read(cx).agent_visibility(), |bar, visible| {
+                        bar.child(
+                            Button::new("toggle-review-agent")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Bot)
+                                .selected(visible)
+                                .tooltip(if visible {
+                                    "Hide review agent"
+                                } else {
+                                    "Show review agent"
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    assistant.update(cx, |view, cx| view.toggle_agent(cx))
+                                })),
+                        )
+                    })
+                })
+            })
+            .when(!self.show_assistant, |bar| {
+                bar.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(0x737878))
+                        .child(self.summary()),
+                )
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .gap_1()
+                        .items_center()
+                        .border_color(rgb(if self.show_comments {
+                            0x7dd3fc
+                        } else {
+                            0x292b2b
+                        }))
+                        .text_xs()
+                        .text_color(comment_tint)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.show_comments = !this.show_comments;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            svg()
+                                .data(COMMENT_ICON)
+                                .size(px(14.))
+                                .text_color(comment_tint),
+                        )
+                        .child(format!("{}", self.comment_count())),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(0x292b2b))
+                        .text_xs()
+                        .text_color(rgb(0xe7e7e7))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.reload(cx)),
+                        )
+                        .child("Refresh"),
+                )
+            })
     }
 
     fn render_tree(&self, _cx: &mut Context<Self>) -> impl IntoElement {

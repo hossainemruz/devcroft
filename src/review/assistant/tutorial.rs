@@ -5,6 +5,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::review::model::{FileContent, HunkLine, LineTag, ReviewDiff};
+use crate::review::syntax::{self, SyntaxSpan};
 
 const EXCERPT_LINES: usize = 48;
 const PROMPT_BYTES: usize = 160_000;
@@ -41,6 +42,8 @@ pub(crate) struct Excerpt {
     pub path: String,
     pub lines: Vec<HunkLine>,
     pub supplied: bool,
+    pub light_spans: Vec<Vec<SyntaxSpan>>,
+    pub dark_spans: Vec<Vec<SyntaxSpan>>,
 }
 
 impl Excerpt {
@@ -87,6 +90,7 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     pub fn new(diff: &ReviewDiff) -> Self {
+        let highlights = syntax::highlight(diff);
         let mut snapshot = Self {
             excerpts: Vec::new(),
             gaps: Vec::new(),
@@ -106,6 +110,30 @@ impl Snapshot {
                                 path: file.path.clone(),
                                 lines: lines.to_vec(),
                                 supplied: false,
+                                light_spans: (0..lines.len())
+                                    .map(|line| {
+                                        highlights
+                                            .line(
+                                                false,
+                                                file_index,
+                                                hunk_index,
+                                                chunk_index * EXCERPT_LINES + line,
+                                            )
+                                            .to_vec()
+                                    })
+                                    .collect(),
+                                dark_spans: (0..lines.len())
+                                    .map(|line| {
+                                        highlights
+                                            .line(
+                                                true,
+                                                file_index,
+                                                hunk_index,
+                                                chunk_index * EXCERPT_LINES + line,
+                                            )
+                                            .to_vec()
+                                    })
+                                    .collect(),
                             };
                             let entry = format!(
                                 "\nEXCERPT {} | {} ({})\n{}",
@@ -284,6 +312,34 @@ mod tests {
             head_commit: "head".into(),
             base_ref: None,
             head_branch: None,
+        }
+    }
+
+    #[test]
+    fn syntax_spans_keep_multiline_context_across_excerpt_boundaries() {
+        let mut diff = diff();
+        let FileContent::Text { hunks, .. } = &mut diff.files[0].content else {
+            unreachable!()
+        };
+        hunks[0].lines[0].text = "/* opening comment".into();
+        hunks[0].lines[48].text = "fn still_in_comment() {}".into();
+        hunks[0].lines[49].text = "*/".into();
+        hunks[0].lines[50].text = "fn real_code() {}".into();
+        let snapshot = Snapshot::new(&diff);
+        let excerpt = &snapshot.excerpts[1];
+        for spans in [&excerpt.light_spans, &excerpt.dark_spans] {
+            assert_eq!(spans.len(), excerpt.lines.len());
+            let comment_color = spans[0]
+                .iter()
+                .find(|span| span.range.contains(&0))
+                .unwrap()
+                .rgba;
+            let keyword_color = spans[2]
+                .iter()
+                .find(|span| span.range.contains(&0))
+                .unwrap()
+                .rgba;
+            assert_ne!(comment_color, keyword_color);
         }
     }
 

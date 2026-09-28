@@ -1,4 +1,5 @@
 mod exchange;
+mod notebook;
 // Retain the legacy transport and its regression tests while preferences
 // migrate to interactive sessions. New requests use the managed terminal.
 #[allow(dead_code)]

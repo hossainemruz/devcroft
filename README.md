@@ -94,6 +94,22 @@ permissions; tutorial instructions ask it to leave repository files unchanged an
 save its response in a temporary handoff directory. **Stop** closes the current
 generation session while preserving the previous guide and notes.
 
+Guides open with an **Overview**, followed by behavior chapters and a **Review
+summary**. Chapters connect before/after behavior to captured diff evidence,
+assumptions to investigate, and identified tests or evidence gaps. An identified
+test does not mean it ran or passed. Concepts and coaching are optional; you can
+jump directly to any behavior.
+
+Choose **Investigate** or **Inspect evidence** to examine a question, optionally
+ask the agent to explain or challenge it, then **Save conclusion** with your own
+outcome: needs follow-up, concern, or satisfied. Conclusions and their captured
+evidence persist locally under Git's `devcroft-review/guided-notes.json`, isolated
+by checkout, branch, and review scope. The summary includes saved conclusions,
+unresolved questions, and changes outside the guide. Earlier comparisons are
+labelled for rechecking; regenerate the guide after editing code. Preview
+conclusions are temporary. Generated guides and unsaved drafts are not restored
+after closing the review.
+
 ## Tools
 
 Developer tools live in the action palette (`Cmd+K` on macOS, `Ctrl+K` on Linux/Windows) under **Tools**. Each tool opens a dialog with its own inputs.

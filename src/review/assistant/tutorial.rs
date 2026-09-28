@@ -34,6 +34,46 @@ pub(crate) struct Chapter {
     pub excerpt_ids: Vec<String>,
     #[serde(default)]
     pub details: Option<String>,
+    #[serde(default)]
+    pub before: String,
+    #[serde(default)]
+    pub after: String,
+    #[serde(default)]
+    pub invariants: Vec<Invariant>,
+    #[serde(default)]
+    pub tests: Vec<TestEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Origin {
+    #[default]
+    Inferred,
+    Source,
+}
+
+impl Origin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inferred => "AI-inferred assumption · unverified",
+            Self::Source => "Source-based interpretation · unverified",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Invariant {
+    pub statement: String,
+    pub origin: Origin,
+    pub excerpt_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TestEvidence {
+    pub behavior: String,
+    /// None is an explicit evidence gap, never a claim that no test exists.
+    pub test_name: Option<String>,
+    pub excerpt_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +122,7 @@ impl Excerpt {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
+    pub capture: String,
     pub excerpts: Vec<Excerpt>,
     /// File-level gaps that cannot honestly count as covered by a text excerpt.
     pub gaps: Vec<String>,
@@ -92,6 +133,7 @@ impl Snapshot {
     pub fn new(diff: &ReviewDiff) -> Self {
         let highlights = syntax::highlight(diff);
         let mut snapshot = Self {
+            capture: String::new(),
             excerpts: Vec::new(),
             gaps: Vec::new(),
             prompt: String::new(),
@@ -180,6 +222,19 @@ impl Snapshot {
             "\nAdditional changes requiring direct review:\n{}",
             snapshot.gaps.join("\n")
         ));
+        // Include omitted excerpts and metadata, not only the prompt. Working-tree
+        // changes can differ while base and HEAD remain identical.
+        let identity = format!(
+            "{}\n{}\n{:?}\n{:?}\n{:?}",
+            diff.base_commit, diff.head_commit, diff.base_ref, diff.head_branch, diff.files
+        );
+        snapshot.capture = gix::objs::compute_hash(
+            gix::hash::Kind::Sha1,
+            gix::objs::Kind::Blob,
+            identity.as_bytes(),
+        )
+        .expect("SHA-1 is enabled")
+        .to_string();
         snapshot
     }
 
@@ -197,6 +252,25 @@ impl Snapshot {
 }
 
 impl Tutorial {
+    pub fn parse_generated(
+        output: &str,
+        snapshot: &Snapshot,
+        include_concepts: bool,
+    ) -> Result<Self> {
+        let tutorial = Self::parse(output, snapshot, include_concepts)?;
+        if tutorial.chapters.iter().any(|chapter| {
+            chapter.before.trim().is_empty()
+                || chapter.after.trim().is_empty()
+                || chapter.invariants.is_empty()
+                || chapter.tests.is_empty()
+        }) {
+            bail!(
+                "generated behavior chapters need before/after descriptions, an invariant to investigate, and test evidence or an explicit gap"
+            );
+        }
+        Ok(tutorial)
+    }
+
     pub fn parse(output: &str, snapshot: &Snapshot, include_concepts: bool) -> Result<Self> {
         let trimmed = output.trim();
         let json = trimmed
@@ -244,6 +318,52 @@ impl Tutorial {
                     bail!("duplicate excerpt in chapter: {id}");
                 }
             }
+            if chapter.before.trim().is_empty() != chapter.after.trim().is_empty() {
+                bail!("before and after must both describe the behavior change");
+            }
+            if chapter.invariants.len() > 4 || chapter.tests.len() > 6 {
+                bail!("each chapter allows at most four invariants and six test evidence entries");
+            }
+            let validate_evidence = |ids: &[String]| -> Result<()> {
+                let mut seen = HashSet::new();
+                for id in ids {
+                    if !chapter.excerpt_ids.contains(id) || !seen.insert(id) {
+                        bail!("evidence must reference distinct excerpts in its chapter: {id}");
+                    }
+                }
+                Ok(())
+            };
+            for invariant in &chapter.invariants {
+                if invariant.statement.trim().is_empty() || invariant.excerpt_ids.is_empty() {
+                    bail!("an invariant needs a statement and captured evidence");
+                }
+                validate_evidence(&invariant.excerpt_ids)?;
+            }
+            for test in &chapter.tests {
+                if test.behavior.trim().is_empty()
+                    || test
+                        .test_name
+                        .as_ref()
+                        .is_some_and(|name| name.trim().is_empty())
+                    || test.test_name.is_some() == test.excerpt_ids.is_empty()
+                {
+                    bail!(
+                        "test evidence needs a behavior and either a named test with excerpts or an explicit gap without excerpts"
+                    );
+                }
+                validate_evidence(&test.excerpt_ids)?;
+                if let Some(name) = &test.test_name {
+                    let found = snapshot
+                        .excerpts
+                        .iter()
+                        .filter(|excerpt| test.excerpt_ids.contains(&excerpt.id))
+                        .flat_map(|excerpt| &excerpt.lines)
+                        .any(|line| line.tag != LineTag::Deletion && line.text.contains(name));
+                    if !found {
+                        bail!("test name must appear in its cited current-side evidence: {name}");
+                    }
+                }
+            }
         }
         if !include_concepts {
             tutorial.concepts.clear();
@@ -271,6 +391,18 @@ impl Tutorial {
                 checkpoints: vec!["Check the failure path and how the caller handles it.".into()],
                 excerpt_ids: vec![excerpt.id.clone()],
                 details: Some("Use **Ask about this chapter** for a focused explanation. The generated guide will group related excerpts by behavior, including changes across files.".into()),
+                before: "Sample: the caller proceeds without an explicit failure check.".into(),
+                after: "Sample: the caller handles the failure before proceeding. Verify the actual change in the captured code.".into(),
+                invariants: vec![Invariant {
+                    statement: "Sample assumption: failure leaves the caller in a recoverable state.".into(),
+                    origin: Origin::Inferred,
+                    excerpt_ids: vec![excerpt.id.clone()],
+                }],
+                tests: vec![TestEvidence {
+                    behavior: "Failure recovery".into(),
+                    test_name: None,
+                    excerpt_ids: vec![],
+                }],
             }).collect(),
         }
     }
@@ -400,5 +532,64 @@ mod tests {
         assert!(
             Tutorial::parse(&serde_json::to_string(&tutorial).unwrap(), &snapshot, false).is_err()
         );
+    }
+
+    #[test]
+    fn evidence_cannot_escape_its_chapter_or_masquerade_as_a_test() {
+        let mut diff = diff();
+        if let FileContent::Text { hunks, .. } = &mut diff.files[0].content {
+            hunks[0].lines[0].text = "fn test_failure() {".into();
+            hunks[0].lines[0].tag = LineTag::Context;
+        }
+        let snapshot = Snapshot::new(&diff);
+        let mut tutorial = Tutorial::sample(&snapshot, false);
+        let parse = |tutorial: &Tutorial| {
+            Tutorial::parse(&serde_json::to_string(tutorial).unwrap(), &snapshot, false)
+        };
+        assert!(parse(&tutorial).is_ok());
+        tutorial.chapters[0].invariants[0].excerpt_ids = vec![snapshot.excerpts[1].id.clone()];
+        assert!(parse(&tutorial).is_err());
+        tutorial.chapters[0].invariants[0].excerpt_ids = vec![snapshot.excerpts[0].id.clone(); 2];
+        assert!(parse(&tutorial).is_err());
+        tutorial.chapters[0].invariants[0].excerpt_ids = vec![snapshot.excerpts[0].id.clone()];
+        tutorial.chapters[0].tests[0].test_name = Some("test_failure".into());
+        assert!(
+            parse(&tutorial).is_err(),
+            "a named test requires captured evidence"
+        );
+        tutorial.chapters[0].tests[0].excerpt_ids = vec![snapshot.excerpts[0].id.clone()];
+        assert!(parse(&tutorial).is_ok());
+        tutorial.chapters[0].tests[0].test_name = Some("invented_test".into());
+        assert!(
+            parse(&tutorial).is_err(),
+            "names must occur in cited source"
+        );
+        tutorial.chapters[0].tests[0].test_name = None;
+        assert!(
+            parse(&tutorial).is_err(),
+            "gaps cannot masquerade as evidence"
+        );
+    }
+
+    #[test]
+    fn older_guides_remain_readable_and_worktree_edits_change_capture_identity() {
+        let original = diff();
+        let snapshot = Snapshot::new(&original);
+        let mut json = serde_json::to_value(Tutorial::sample(&snapshot, false)).unwrap();
+        for chapter in json["chapters"].as_array_mut().unwrap() {
+            for field in ["before", "after", "invariants", "tests"] {
+                chapter.as_object_mut().unwrap().remove(field);
+            }
+        }
+        let parsed = Tutorial::parse(&json.to_string(), &snapshot, false).unwrap();
+        assert!(Tutorial::parse_generated(&json.to_string(), &snapshot, false).is_err());
+        assert!(parsed.chapters[0].invariants.is_empty());
+        let mut changed = original.clone();
+        if let FileContent::Text { hunks, .. } = &mut changed.files[0].content {
+            hunks[0].lines[99].text = "changed outside the first chapter".into();
+        }
+        assert_eq!(snapshot.capture, Snapshot::new(&original).capture);
+        assert_ne!(snapshot.capture, Snapshot::new(&changed).capture);
+        assert_eq!(original.head_commit, changed.head_commit);
     }
 }

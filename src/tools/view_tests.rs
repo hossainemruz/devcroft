@@ -460,8 +460,8 @@ fn the_dialog_editor_fills_the_dialog_height(cx: &mut gpui_kit::TestAppContext) 
     cx.update(|window, cx| ToolView::open_dialog(tool.clone(), window, cx));
     cx.update(|window, cx| {
         window.render_frame(cx);
-        // Scope to the dialog: the harness renders the tool view too, so the
-        // plain id would be ambiguous.
+        // Scope to the dialog: the window root renders the tool view too, so
+        // the plain id would be ambiguous.
         let actions = window.within("dialog-0").find("tool-format").bounds();
         let bottom = window.viewport_size().height;
         // The dialog is clamped to nearly the whole viewport, and the editor
@@ -470,6 +470,30 @@ fn the_dialog_editor_fills_the_dialog_height(cx: &mut gpui_kit::TestAppContext) 
         assert!(
             bottom - actions.bottom() < px(140.),
             "actions should sit near the dialog bottom: {actions:?} in a {bottom:?} viewport"
+        );
+    });
+}
+
+/// The tool dialog asks for more space than any window offers. The popup
+/// layer caps an oversized dialog to the viewport and snaps it to the theme
+/// edge margin: it must start near the top and stay inside the window instead
+/// of hanging past the bottom at the default tenth-of-the-viewport offset.
+#[gpui_kit::test]
+fn the_oversized_tool_dialog_is_clamped_into_the_viewport(cx: &mut gpui_kit::TestAppContext) {
+    let (_dir, root, _store) = fixture();
+    let (tool, cx) = open_with_root(cx, ToolKind::JsonFormatter, root);
+    cx.update(|window, cx| ToolView::open_dialog(tool.clone(), window, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let dialog = window.find("dialog-0").bounds();
+        let viewport = window.viewport_size();
+        assert!(
+            dialog.top() < px(60.),
+            "an oversized dialog is snapped near the top: {dialog:?} in {viewport:?}"
+        );
+        assert!(
+            dialog.bottom() <= viewport.height,
+            "a clamped dialog must stay inside the viewport: {dialog:?} in {viewport:?}"
         );
     });
 }

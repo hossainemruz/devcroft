@@ -1975,6 +1975,13 @@ impl Workspace {
                                     };
                                     let status = format!("{provider} · {state}");
                                     let is_current = current.as_deref() == Some(key.as_str());
+                                    // Custom content on purpose: the colored provider/state
+                                    // text, the working spinner and the current dot are this
+                                    // palette's live status presentation. gpui-kit's command
+                                    // row cache rejects any model containing custom content
+                                    // (`same_layout`), so the projects palette keeps
+                                    // remeasuring; that is the accepted trade for the status
+                                    // display.
                                     CommandItem::new().label(label.clone()).child(move |_, _| {
                                         h_flex()
                                             .flex_1()
@@ -2037,6 +2044,8 @@ impl Workspace {
                                     let status = format!("{provider} · {state}");
                                     let is_current =
                                         current_checkout.as_path() == checkout_path.as_path();
+                                    // Custom child for the same live status as the switch
+                                    // targets above.
                                     CommandItem::new().label(label.clone()).child(move |_, _| {
                                         h_flex()
                                             .flex_1()

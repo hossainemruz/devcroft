@@ -299,15 +299,16 @@ impl ToolView {
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title(tool.label())
-                // Large on purpose: the dialog layer clamps these to the
-                // window, so the tool takes the biggest surface the screen
-                // offers and the panes below fill it.
+                // Large on purpose: the popup layer caps width and height to
+                // the viewport minus the theme edge margin, so the tool takes
+                // the biggest surface the screen offers and the panes below
+                // fill it.
                 .w(px(1760.))
                 .h(px(1400.))
-                // The layer leaves a tenth of the viewport above a dialog by
-                // default, which pushes a full-height tool far down the
-                // screen; a small top margin keeps it near the top and hands
-                // the reclaimed height to the panes.
+                // An overflowing dialog is snapped to the edge margin by the
+                // layer regardless of this offset; the small preferred margin
+                // keeps the tool near the top on displays taller than the
+                // 1400px request instead of the default tenth of the viewport.
                 .margin_top(px(24.))
                 .on_close({
                     let view = view.clone();

@@ -782,15 +782,18 @@ fn shell_command(
             .join(" ");
         // The login shell may resolve a different OpenCode binary than the
         // GUI process. Check the command used for the actual launch before
-        // applying v1-only server flags. Keep the password in the process
-        // environment so it is never written into terminal input.
+        // applying v1-only server flags. OpenCode v2 replaced the server
+        // flags but may still print --hostname in its help (2.0.11 did), so
+        // the v2-only --standalone flag is the discriminator. Keep the
+        // password in the process environment so it is never written into
+        // terminal input.
         format!(
-            "case \"$({} --help 2>/dev/null)\" in *--hostname*) OPENCODE_SERVER_PASSWORD=\"$DEVCROFT_OPENCODE_SERVER_PASSWORD\" {} {} ;; *) printf '\\033]0;devcroft-opencode-v2-{}\\007'; {} ;; esac",
+            "case \"$({} --help 2>/dev/null)\" in *--standalone*) printf '\\033]0;devcroft-opencode-v2-{}\\007'; {} ;; *) OPENCODE_SERVER_PASSWORD=\"$DEVCROFT_OPENCODE_SERVER_PASSWORD\" {} {} ;; esac",
             shell_quote(agent.command()),
-            invocation,
-            v1_arguments,
             generation,
-            invocation
+            invocation,
+            invocation,
+            v1_arguments
         )
     } else {
         invocation
@@ -1023,6 +1026,15 @@ mod tests {
             ),
             (
                 "--standalone --server",
+                "--session\nses_123\n",
+                "user-password",
+                true,
+            ),
+            (
+                // OpenCode 2.0.11 printed --hostname in its help while being
+                // v2; the v2-only flag must win so it never receives the v1
+                // server flags.
+                "--hostname string --port integer --standalone --server",
                 "--session\nses_123\n",
                 "user-password",
                 true,

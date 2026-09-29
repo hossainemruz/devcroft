@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn selections_validate_utf8_and_end_exclusive_lines() {
         let source = "α\r\nβ\nlast";
-        for range in [0..0, 1..2, 0..100, 4..3] {
+        for range in [0..0, 1..2, 0..100, std::ops::Range { start: 4, end: 3 }] {
             assert!(CommentAnchor::selection(source, range, None).is_err());
         }
         let anchor = CommentAnchor::selection(source, 0..4, None).unwrap();

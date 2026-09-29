@@ -33,6 +33,8 @@ mod repository_graph;
 mod review;
 mod session;
 mod settings;
+mod terminal_graphics;
+mod terminal_preferences;
 mod tools;
 mod workspace;
 
@@ -200,13 +202,18 @@ fn resolve_appearance() -> (ThemeMode, f32) {
         }
     };
     match data::DeviceStore::new(&root).load() {
-        Ok(state) => (
-            state
-                .theme
-                .as_deref()
-                .map_or(ThemeMode::Dark, theme_mode_from_name),
-            state.app_font_size_or_default(),
-        ),
+        Ok(state) => {
+            crate::terminal_preferences::set_copy_on_select(
+                state.terminal_copy_on_select.unwrap_or(true),
+            );
+            (
+                state
+                    .theme
+                    .as_deref()
+                    .map_or(ThemeMode::Dark, theme_mode_from_name),
+                state.app_font_size_or_default(),
+            )
+        }
         Err(error) => {
             eprintln!("devcroft: device state unavailable: {error:#}");
             (ThemeMode::Dark, crate::metrics::DEFAULT_APP_FONT_SIZE)

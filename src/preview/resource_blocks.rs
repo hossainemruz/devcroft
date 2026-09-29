@@ -400,9 +400,7 @@ fn selected_range(
     map: &SelectionMap,
     cx: &App,
 ) -> Option<std::ops::Range<usize>> {
-    if selected_quote(state, cx).is_none() {
-        return None;
-    }
+    selected_quote(state, cx)?;
     map.original_range(state.read(cx).selected_source_range()?)
 }
 

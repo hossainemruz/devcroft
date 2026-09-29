@@ -61,12 +61,7 @@ pub(crate) enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 4] = [
-        Self::General,
-        Self::Sync,
-        Self::Agent,
-        Self::Keybindings,
-    ];
+    pub(crate) const ALL: [Self; 4] = [Self::General, Self::Sync, Self::Agent, Self::Keybindings];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -91,6 +86,7 @@ pub(crate) struct SettingsView {
     pub(crate) focus_handle: FocusHandle,
     active_section: SettingsSection,
     font_size: f32,
+    terminal_preferences_error: Option<String>,
     data_root: Option<DataRoot>,
     sync_tracker: SyncTracker,
     sync_interval: Option<u64>,
@@ -154,9 +150,9 @@ impl SettingsView {
         });
         let branch_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. experiment"));
         let (branches, current_branch, branch_upstream) = load_branch_state(data_root.as_ref());
-        let stored = data_root.as_ref().and_then(|root| {
-            DeviceStore::new(root).load().ok()
-        });
+        let stored = data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok());
         let session_limit = stored
             .as_ref()
             .map(|state| state.recent_sessions_limit_or_default())
@@ -202,17 +198,14 @@ impl SettingsView {
         let skill_statuses = crate::agent_skill::Target::ALL
             .into_iter()
             .map(|target| {
-                crate::agent_skill::perform(
-                    crate::agent_skill::Action::Status,
-                    Some(target),
-                )
-                .text
+                crate::agent_skill::perform(crate::agent_skill::Action::Status, Some(target)).text
             })
             .collect::<Vec<_>>();
         Self {
             focus_handle: cx.focus_handle(),
             active_section: SettingsSection::General,
             font_size: clamp_app_font_size(initial_font_size),
+            terminal_preferences_error: None,
             data_root,
             sync_tracker,
             sync_interval,
@@ -540,6 +533,27 @@ impl SettingsView {
         .detach();
     }
 
+    fn set_copy_on_select(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let result = self
+            .data_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Data directory unavailable"))
+            .and_then(|root| {
+                DeviceStore::new(root).update(|state| state.terminal_copy_on_select = Some(enabled))
+            });
+        match result {
+            Ok(()) => {
+                crate::terminal_preferences::set_copy_on_select(enabled);
+                self.terminal_preferences_error = None;
+            }
+            Err(error) => {
+                self.terminal_preferences_error =
+                    Some(format!("Could not save terminal preference: {error:#}"))
+            }
+        }
+        cx.notify();
+    }
+
     /// Step the font size and clamp into range. Pure so the bounds stay
     /// unit-testable without a window.
     fn stepped_font_size(current: f32, delta: f32) -> f32 {
@@ -612,8 +626,7 @@ impl SettingsView {
             return;
         }
         if !enabled && self.enabled_agents.len() <= 1 {
-            self.enabled_agents_error =
-                Some("Keep at least one agent enabled.".to_owned());
+            self.enabled_agents_error = Some("Keep at least one agent enabled.".to_owned());
             cx.notify();
             return;
         }
@@ -660,9 +673,7 @@ impl SettingsView {
             let enabled = self.enabled_agents.clone();
             let default = self.default_agent;
             workspace
-                .update(cx, |this, cx| {
-                    this.set_enabled_agents(enabled, default, cx)
-                })
+                .update(cx, |this, cx| this.set_enabled_agents(enabled, default, cx))
                 .ok();
         }
         cx.notify();
@@ -676,10 +687,8 @@ impl SettingsView {
     /// error line says persistence is what broke.
     fn set_default_agent(&mut self, agent: AgentKind, cx: &mut Context<Self>) {
         if !self.enabled_agents.contains(&agent) {
-            self.default_agent_error = Some(format!(
-                "{} is disabled — enable it first.",
-                agent.label()
-            ));
+            self.default_agent_error =
+                Some(format!("{} is disabled — enable it first.", agent.label()));
             cx.notify();
             return;
         }
@@ -824,10 +833,23 @@ impl SettingsView {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
         let size = self.font_size;
         let is_default = (size - DEFAULT_APP_FONT_SIZE).abs() < f32::EPSILON;
         v_flex()
             .gap_4()
+            .child(group("Terminal", None).child(live_row(
+                "Copy on select",
+                "Automatically copy selected terminal text. Hold Shift to select inside mouse-aware applications. Explicit copy: Ctrl+Shift+C (Cmd+C on macOS).",
+                Switch::new("terminal-copy-on-select")
+                    .checked(crate::terminal_preferences::copy_on_select())
+                    .on_change(move |enabled, _, cx| {
+                        view.update(cx, |this, cx| this.set_copy_on_select(*enabled, cx)).ok();
+                    }),
+            )))
+            .when_some(self.terminal_preferences_error.clone(), |this, error| {
+                this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+            })
             .child(
                 group("Appearance", None).child(live_row(
                     "App font size",
@@ -1419,14 +1441,9 @@ impl SettingsView {
                         .gap_2()
                         .items_center()
                         .justify_between()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x555a5a))
-                                .child(format!(
-                                    "{MIN_SIDEBAR_LIMIT}–{MAX_SIDEBAR_LIMIT} · step {SIDEBAR_LIMIT_STEP}"
-                                )),
-                        )
+                        .child(div().text_xs().text_color(rgb(0x555a5a)).child(format!(
+                            "{MIN_SIDEBAR_LIMIT}–{MAX_SIDEBAR_LIMIT} · step {SIDEBAR_LIMIT_STEP}"
+                        )))
                         .when(!is_default, |this| {
                             this.child(
                                 div()
@@ -1616,37 +1633,35 @@ impl SettingsView {
     }
 
     fn render_keybindings(&self) -> impl IntoElement {
-        v_flex()
-            .gap_4()
-            .child(
-                group(
-                    "Keyboard",
-                    Some("These shortcuts work everywhere, including inside terminals."),
-                )
-                .child(live_row(
-                    "Toggle actions palette",
-                    "Search tabs, settings, and sync.",
-                    if cfg!(target_os = "macos") {
-                        kbd("⌘K")
-                    } else {
-                        kbd("Ctrl+K")
-                    },
-                ))
-                .child(live_row(
-                    "Toggle projects palette",
-                    "Switch between recent repositories.",
-                    if cfg!(target_os = "macos") {
-                        kbd("⌘P")
-                    } else {
-                        kbd("Ctrl+P")
-                    },
-                ))
-                .child(live_row(
-                    "Close palette or form dialog",
-                    "Git changes sends Esc to lazygit; use Shift+Esc or the close button.",
-                    kbd("Esc"),
-                )),
+        v_flex().gap_4().child(
+            group(
+                "Keyboard",
+                Some("These shortcuts work everywhere, including inside terminals."),
             )
+            .child(live_row(
+                "Toggle actions palette",
+                "Search tabs, settings, and sync.",
+                if cfg!(target_os = "macos") {
+                    kbd("⌘K")
+                } else {
+                    kbd("Ctrl+K")
+                },
+            ))
+            .child(live_row(
+                "Toggle projects palette",
+                "Switch between recent repositories.",
+                if cfg!(target_os = "macos") {
+                    kbd("⌘P")
+                } else {
+                    kbd("Ctrl+P")
+                },
+            ))
+            .child(live_row(
+                "Close palette or form dialog",
+                "Git changes sends Esc to lazygit; use Shift+Esc or the close button.",
+                kbd("Esc"),
+            )),
+        )
     }
 }
 
@@ -1926,11 +1941,7 @@ mod tests {
         );
         assert!(exact.is_agent_enabled(AgentKind::Claude));
         assert!(!exact.is_agent_enabled(AgentKind::Opencode));
-        for stored in [
-            None,
-            Some(vec![]),
-            Some(vec!["gemini".to_owned()]),
-        ] {
+        for stored in [None, Some(vec![]), Some(vec!["gemini".to_owned()])] {
             let state = DeviceState {
                 enabled_agents: stored,
                 ..DeviceState::default()

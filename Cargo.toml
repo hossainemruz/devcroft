@@ -42,7 +42,8 @@ gpui-kit = { version = "0.7.0", features = [
   "tree-sitter-yaml",
 ] }
 ignore = "0.4.33"
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "5988a0b78b4aa804d1c12e66bbfe662bd97d81c0", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "5988a0b78b4aa804d1c12e66bbfe662bd97d81c0", default-features = false, features = ["kitty-graphics"] }
 markdown = "1.0"
 parking_lot = "0.12"
 portable-pty = "0.9"

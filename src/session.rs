@@ -135,6 +135,7 @@ fn block_kind(text: &str) -> Option<BlockKind> {
 
 pub(crate) struct TerminalSession {
     terminal: Terminal<'static, 'static>,
+    pub(crate) graphics: crate::terminal_graphics::Graphics,
     render_state: RenderState<'static>,
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
@@ -252,6 +253,7 @@ impl TerminalSession {
 
         let grid_size = Arc::new(Mutex::new((INITIAL_COLS, INITIAL_ROWS)));
         let mut terminal = Terminal::new(INITIAL_COLS, INITIAL_ROWS)?;
+        crate::terminal_graphics::configure(&mut terminal)?;
         terminal.set_scrollback_max_lines(Some(10_000))?;
         // Ghostty's default cursor blinks (ghostty(5), `cursor-style-blink`:
         // "If this is not set, the cursor blinks by default"), so a fresh
@@ -323,6 +325,7 @@ impl TerminalSession {
                 cell_iterator: CellIterator::new()?,
                 key_encoder: KeyEncoder::new()?,
                 key_event: KeyEvent::new()?,
+                graphics: crate::terminal_graphics::Graphics::default(),
                 mouse_encoder: MouseEncoder::new()?,
                 mouse_event: MouseEvent::new()?,
                 writer,
@@ -445,6 +448,94 @@ impl TerminalSession {
             || self.terminal.mode(Mode::ALT_SCREEN_LEGACY)?)
     }
 
+    pub(crate) fn mouse_tracking(&self) -> bool {
+        self.terminal.is_mouse_tracking().unwrap_or(false)
+    }
+
+    pub(crate) fn row_wraps(&self, row: usize) -> bool {
+        self.terminal
+            .grid_ref(Point::Viewport(PointCoordinate {
+                x: 0,
+                y: row as u32,
+            }))
+            .and_then(|cell| cell.row())
+            .and_then(|row| row.is_wrapped())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn hyperlink_at(&self, column: usize, row: usize) -> Option<String> {
+        let cell = self
+            .terminal
+            .grid_ref(Point::Viewport(PointCoordinate {
+                x: column as u16,
+                y: row as u32,
+            }))
+            .ok()?;
+        let mut bytes = vec![0; 8192];
+        let len = cell.hyperlink_uri(&mut bytes).ok()?;
+        (len > 0).then(|| String::from_utf8_lossy(&bytes[..len]).into_owned())
+    }
+
+    pub(crate) fn send_mouse(
+        &mut self,
+        action: MouseAction,
+        button: Option<MouseButton>,
+        position: (f32, f32),
+        modifiers: Modifiers,
+        size: (f32, f32),
+    ) -> Result<()> {
+        self.configure_mouse(position, modifiers, size);
+        self.mouse_event.set_button(button).set_action(action);
+        self.mouse_encoder
+            .set_any_button_pressed(button.is_some() && action != MouseAction::Release);
+        let mut bytes = [0; 128];
+        let len = self.mouse_encoder.encode(&self.mouse_event, &mut bytes)?;
+        self.write_input(&bytes[..len])
+    }
+
+    /// Ghostty's encoder takes integer cell pixels; the GPUI grid has fractional
+    /// metrics. Normalize into the same integer pixel space as Terminal::resize
+    /// so clicks near the bottom/right never drift into the preceding cell.
+    fn configure_mouse(&mut self, position: (f32, f32), modifiers: Modifiers, size: (f32, f32)) {
+        let mut mods = Mods::empty();
+        if modifiers.shift {
+            mods |= Mods::SHIFT;
+        }
+        if modifiers.control {
+            mods |= Mods::CTRL;
+        }
+        if modifiers.alt {
+            mods |= Mods::ALT;
+        }
+        if modifiers.platform {
+            mods |= Mods::SUPER;
+        }
+        let (columns, rows) = *self.grid_size.lock();
+        let cell_w = cell_width().round();
+        let cell_h = cell_height().round();
+        let right = (size.0 - TERMINAL_PADDING - columns as f32 * cell_width()).max(0.) as u32;
+        let bottom = (size.1 - TERMINAL_PADDING - rows as f32 * cell_height()).max(0.) as u32;
+        self.mouse_event
+            .set_mods(mods)
+            .set_position(mouse::Position {
+                x: TERMINAL_PADDING + (position.0 - TERMINAL_PADDING) * cell_w / cell_width(),
+                y: TERMINAL_PADDING + (position.1 - TERMINAL_PADDING) * cell_h / cell_height(),
+            });
+        self.mouse_encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_size(mouse::EncoderSize {
+                screen_width: TERMINAL_PADDING as u32 + columns as u32 * cell_w as u32 + right,
+                screen_height: TERMINAL_PADDING as u32 + rows as u32 * cell_h as u32 + bottom,
+                cell_width: cell_width().round() as u32,
+                cell_height: cell_height().round() as u32,
+                padding_top: TERMINAL_PADDING as u32,
+                padding_left: TERMINAL_PADDING as u32,
+                padding_bottom: bottom,
+                padding_right: right,
+            })
+            .set_track_last_cell(true);
+    }
+
     pub(crate) fn scroll(
         &mut self,
         lines: isize,
@@ -455,45 +546,12 @@ impl TerminalSession {
         viewport_height: f32,
     ) -> Result<bool> {
         if self.terminal.is_mouse_tracking()? {
-            let mut mods = Mods::empty();
-            if modifiers.shift {
-                mods |= Mods::SHIFT;
-            }
-            if modifiers.control {
-                mods |= Mods::CTRL;
-            }
-            if modifiers.alt {
-                mods |= Mods::ALT;
-            }
-            if modifiers.platform {
-                mods |= Mods::SUPER;
-            }
-
-            let padding_left = TERMINAL_PADDING;
-            let padding_top = TERMINAL_PADDING;
-            let (columns, rows) = *self.grid_size.lock();
-            let grid_width = columns as f32 * cell_width();
-            let grid_height = rows as f32 * cell_height();
-            self.mouse_event
-                .set_mods(mods)
-                .set_position(mouse::Position {
-                    x: pointer_x,
-                    y: pointer_y,
-                });
-            self.mouse_encoder
-                .set_options_from_terminal(&self.terminal)
-                .set_size(mouse::EncoderSize {
-                    screen_width: viewport_width.max(1.) as u32,
-                    screen_height: viewport_height.max(1.) as u32,
-                    cell_width: cell_width().round() as u32,
-                    cell_height: cell_height().round() as u32,
-                    padding_top: padding_top as u32,
-                    padding_bottom: (viewport_height - padding_top - grid_height).max(0.) as u32,
-                    padding_right: (viewport_width - padding_left - grid_width).max(0.) as u32,
-                    padding_left: padding_left as u32,
-                })
-                .set_any_button_pressed(false)
-                .set_track_last_cell(true);
+            self.configure_mouse(
+                (pointer_x, pointer_y),
+                modifiers,
+                (viewport_width, viewport_height),
+            );
+            self.mouse_encoder.set_any_button_pressed(false);
 
             let button = if lines < 0 {
                 MouseButton::Four
@@ -624,6 +682,7 @@ impl TerminalSession {
         if self.terminal.mode(Mode::SYNC_OUTPUT)? {
             return Ok(None);
         }
+        let graphics_changed = self.graphics.update(&self.terminal)?;
         let snapshot = self.render_state.update(&self.terminal)?;
         let colors = snapshot.colors()?;
         let cursor = snapshot.cursor_viewport()?;
@@ -660,7 +719,8 @@ impl TerminalSession {
         // dirty nothing, so the whole presentation joins the comparison.
         // The loop's `cursor_touched` rebuild then repaints exactly the
         // rows the cursor entered or left.
-        if snapshot.dirty()? == Dirty::Clean
+        if !graphics_changed
+            && snapshot.dirty()? == Dirty::Clean
             && !full_rebuild
             && presentation == self.presented_cursor
         {
@@ -732,6 +792,11 @@ impl TerminalSession {
                 cell.raw_cell()?.wide()?,
                 CellWide::SpacerTail | CellWide::SpacerHead
             ) {
+                grapheme.push(' ');
+            }
+
+            if grapheme.starts_with('\u{10EEEE}') {
+                grapheme.clear();
                 grapheme.push(' ');
             }
 
@@ -833,6 +898,94 @@ fn cursor_shape(style: CursorVisualStyle) -> CursorShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_reporting_and_osc8_links_follow_terminal_modes() {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut session, _) = TerminalSession::spawn(
+            crate::workspace::WorkspaceTab::Terminal,
+            &std::env::temp_dir(),
+            AgentKind::DEFAULT,
+        )
+        .unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        session.writer = Arc::new(Mutex::new(Box::new(Capture(captured.clone()))));
+        let position = (
+            TERMINAL_PADDING + cell_width() * 2.5,
+            TERMINAL_PADDING + cell_height() * 1.5,
+        );
+        let size = (800., 600.);
+        assert!(!session.mouse_tracking());
+        session.feed(b"\x1b[?1002h\x1b[?1006h");
+        assert!(session.mouse_tracking());
+        session
+            .send_mouse(
+                MouseAction::Press,
+                Some(MouseButton::Left),
+                position,
+                Modifiers::default(),
+                size,
+            )
+            .unwrap();
+        session
+            .send_mouse(
+                MouseAction::Release,
+                Some(MouseButton::Left),
+                position,
+                Modifiers::default(),
+                size,
+            )
+            .unwrap();
+        assert_eq!(&*captured.lock(), b"\x1b[<0;3;2M\x1b[<0;3;2m");
+        captured.lock().clear();
+        session
+            .send_mouse(
+                MouseAction::Motion,
+                None,
+                position,
+                Modifiers::default(),
+                size,
+            )
+            .unwrap();
+        assert!(
+            captured.lock().is_empty(),
+            "button-motion mode must suppress hover"
+        );
+        // Fractional GPUI cell heights must not accumulate a row of drift.
+        captured.lock().clear();
+        let lower_cell = (
+            TERMINAL_PADDING + cell_width() * 90.2,
+            TERMINAL_PADDING + cell_height() * 30.2,
+        );
+        session
+            .send_mouse(
+                MouseAction::Press,
+                Some(MouseButton::Left),
+                lower_cell,
+                Modifiers::default(),
+                (1000., 800.),
+            )
+            .unwrap();
+        assert_eq!(&*captured.lock(), b"\x1b[<0;91;31M");
+        session.feed(b"\x1b[?1002l");
+        assert!(!session.mouse_tracking());
+        session.feed(b"\x1b[H\x1b]8;;https://example.com/hidden\x1b\\label\x1b]8;;\x1b\\");
+        assert_eq!(
+            session.hyperlink_at(0, 0).as_deref(),
+            Some("https://example.com/hidden")
+        );
+        assert_eq!(session.hyperlink_at(5, 0), None);
+        session._child.kill().ok();
+    }
 
     /// Locks in the contract `snapshot()` relies on: DEC 2026 toggles
     /// `Mode::SYNC_OUTPUT`, and skipping `RenderState::update` while sync is

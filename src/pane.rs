@@ -10,7 +10,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::ElementExt as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::v_flex;
@@ -19,7 +18,8 @@ use gpui_kit::{
     AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
     HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, Styled, StyledText, UnderlineStyle, Window, div, px, rgb,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledText, UnderlineStyle,
+    Window, div, px, rgb,
 };
 
 use crate::{
@@ -60,6 +60,8 @@ pub(crate) struct TerminalPane {
     flush_armed: bool,
     /// Drag-selection anchor cell `(column, row)` in grid coordinates.
     selection_anchor: Option<(usize, usize)>,
+    app_mouse_button: Option<MouseButton>,
+    hovered_link: Option<TerminalLink>,
     /// Drag-selection focus cell `(column, row)`, updated while dragging.
     selection_focus: Option<(usize, usize)>,
     /// Whether the left button is currently held for a selection drag.
@@ -185,6 +187,8 @@ impl TerminalPane {
             last_present: None,
             flush_armed: false,
             selection_anchor: None,
+            app_mouse_button: None,
+            hovered_link: None,
             selection_focus: None,
             selecting: false,
             pane_bounds: None,
@@ -324,6 +328,7 @@ impl TerminalPane {
             match session.snapshot() {
                 Ok(Some(rows)) => {
                     self.rows = rows;
+                    self.hovered_link = None;
                     let cursor = session.cursor_presentation();
                     // Any cursor activity (movement, restyle, show) restarts
                     // the blink in its visible half, like other terminals.
@@ -480,6 +485,12 @@ impl TerminalPane {
             cx.stop_propagation();
             return;
         }
+        if is_copy_shortcut(&event.keystroke.key, event.keystroke.modifiers) {
+            self.copy_selection(window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         // Typing dismisses a completed selection highlight; the text is
         // already on the clipboard from the drag release.
         if self.selection_anchor.is_some() || self.selection_focus.is_some() {
@@ -596,16 +607,90 @@ impl TerminalPane {
         cx.stop_propagation();
     }
 
+    fn on_terminal_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.app_mouse_button == Some(event.button) {
+            self.forward_mouse(
+                libghostty_vt::mouse::Action::Release,
+                self.app_mouse_button,
+                event.position,
+                event.modifiers,
+                cx,
+            );
+            self.app_mouse_button = None;
+        } else if event.button == MouseButton::Left {
+            self.finish_selection(event.position, window, cx);
+        }
+    }
+
+    fn forward_mouse(
+        &mut self,
+        action: libghostty_vt::mouse::Action,
+        button: Option<MouseButton>,
+        position: Point<Pixels>,
+        modifiers: gpui_kit::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(session), Some(bounds)) = (self.session.as_mut(), self.pane_bounds) else {
+            return;
+        };
+        let button = button.and_then(|button| match button {
+            MouseButton::Left => Some(libghostty_vt::mouse::Button::Left),
+            MouseButton::Middle => Some(libghostty_vt::mouse::Button::Middle),
+            MouseButton::Right => Some(libghostty_vt::mouse::Button::Right),
+            _ => None,
+        });
+        if let Err(error) = session.send_mouse(
+            action,
+            button,
+            (
+                (position.x - bounds.origin.x).as_f32(),
+                (position.y - bounds.origin.y).as_f32(),
+            ),
+            modifiers,
+            (bounds.size.width.as_f32(), bounds.size.height.as_f32()),
+        ) {
+            self.error = Some(format!("Mouse input failed: {error:#}").into());
+            cx.notify();
+        }
+    }
+
+    fn link_at(&self, position: Point<Pixels>) -> Option<TerminalLink> {
+        let bounds = self.pane_bounds?;
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let (column, row) = self.cell_at(position)?;
+        let session = self.session.as_ref()?;
+        if let Some(url) = session.hyperlink_at(column, row) {
+            if !is_web_link(&url) {
+                return None;
+            }
+            let columns = self.grid_size.0 as usize;
+            let mut start = column;
+            let mut end = column;
+            while start > 0 && session.hyperlink_at(start - 1, row).as_deref() == Some(&url) {
+                start -= 1;
+            }
+            while end + 1 < columns && session.hyperlink_at(end + 1, row).as_deref() == Some(&url) {
+                end += 1;
+            }
+            return Some(TerminalLink {
+                url,
+                spans: vec![(row, start, end)],
+            });
+        }
+        plain_link_at(&self.rows, (column, row), |row| session.row_wraps(row))
+    }
+
     /// Start a drag selection at a window-coordinate mouse position.
     ///
-    /// Plain left-drag always selects (mouse clicks are not forwarded to the
-    /// terminal application today — see the README — so there is no app
-    /// interaction to preserve yet). When click/drag reporting lands, this
-    /// should gain a Shift bypass like other terminals. Double-click selects
-    /// the word under the cursor, triple-click the whole line; the regular
-    /// mouse-up path then copies either one like any drag. Dragging after a
-    /// double-click extends character-wise for now — word-wise extension is
-    /// future work.
+    /// Shift bypasses application mouse reporting. Double-click selects a
+    /// word and triple-click selects a line; release copies the selection.
     fn begin_selection(
         &mut self,
         position: Point<Pixels>,
@@ -689,6 +774,17 @@ impl TerminalPane {
             cx.notify();
             return;
         }
+        if crate::terminal_preferences::copy_on_select() {
+            self.copy_selection(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn copy_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(anchor), Some(focus)) = (self.selection_anchor, self.selection_focus) else {
+            return;
+        };
+        let (start, end) = normalize_selection(anchor, focus);
         let text = selected_text(&self.rows, start, end);
         if text.is_empty() {
             self.selection_anchor = None;
@@ -844,6 +940,8 @@ impl TerminalPane {
         index: usize,
         selection: Option<(usize, usize)>,
         cursor: Option<CursorPaint>,
+        link: Option<(usize, usize)>,
+        separate_background: bool,
     ) -> AnyElement {
         // Block cursors paint through the text highlights; the other shapes
         // paint an overlay rect below.
@@ -878,7 +976,7 @@ impl TerminalPane {
                     color: Some(rgb(foreground).into()),
                     font_weight: run.style.bold.then_some(FontWeight::BOLD),
                     font_style: run.style.italic.then_some(FontStyle::Italic),
-                    background_color: Some(rgb(background).into()),
+                    background_color: (!separate_background).then(|| rgb(background).into()),
                     underline: run.style.underline.then_some(UnderlineStyle {
                         thickness: px(1.),
                         color: Some(rgb(foreground).into()),
@@ -915,6 +1013,17 @@ impl TerminalPane {
                             .bg(rgb(color))
                     }),
             )
+            .when_some(link, |this, (start, end)| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(start as f32 * cell_width()))
+                        .bottom(px(1.))
+                        .w(px((end - start + 1) as f32 * cell_width()))
+                        .h(px(1.))
+                        .bg(rgb(0x58a6ff)),
+                )
+            })
             .when_some(selection, |this, (start_column, end_column)| {
                 // Clamp to the painted row so a drag past the line end still
                 // highlights exactly the visible cells.
@@ -1191,6 +1300,95 @@ fn slice_row_by_columns(row: &[RenderRun], start_col: usize, end_col: usize) -> 
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalLink {
+    url: String,
+    /// Inclusive grid ranges, one per displayed row.
+    spans: Vec<(usize, usize, usize)>,
+}
+
+fn is_web_link(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && !url.chars().any(char::is_control)
+}
+
+/// Scan only the logical line containing the pointer. Soft wraps join;
+/// explicit line breaks remain boundaries. Grid coordinates survive UTF-8.
+fn plain_link_at(
+    rows: &[Vec<RenderRun>],
+    cell: (usize, usize),
+    wraps: impl Fn(usize) -> bool,
+) -> Option<TerminalLink> {
+    let (column, row) = cell;
+    let mut first = row;
+    while first > 0 && wraps(first - 1) {
+        first -= 1;
+    }
+    let mut last = row;
+    while last + 1 < rows.len() && wraps(last) {
+        last += 1;
+    }
+    let mut text = String::new();
+    let mut positions = Vec::new();
+    for (row_index, runs) in rows.iter().enumerate().take(last + 1).skip(first) {
+        for cell in row_cells(runs) {
+            let start = text.len();
+            text.push(cell.ch);
+            positions.push((start, text.len(), row_index, cell.start_col, cell.width));
+        }
+    }
+    let target = positions
+        .iter()
+        .find(|(_, _, r, c, w)| *r == row && column >= *c && column < c + w)?
+        .0;
+    let lower = text.to_ascii_lowercase();
+    for (start, _) in lower.match_indices("http") {
+        if !lower[start..].starts_with("http://") && !lower[start..].starts_with("https://") {
+            continue;
+        }
+        let end = text[start..]
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`'))
+            .map_or(text.len(), |(offset, _)| start + offset);
+        let mut candidate = &text[start..end];
+        loop {
+            let previous = candidate.len();
+            candidate = candidate.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+            for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+                while candidate.ends_with(close)
+                    && candidate.matches(close).count() > candidate.matches(open).count()
+                {
+                    candidate = &candidate[..candidate.len() - 1];
+                }
+            }
+            if candidate.len() == previous {
+                break;
+            }
+        }
+        let end = start + candidate.len();
+        if target < start || target >= end {
+            continue;
+        }
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for &(s, e, r, c, w) in &positions {
+            if s >= end || e <= start || w == 0 {
+                continue;
+            }
+            if let Some((_, _, last)) = spans.last_mut().filter(|(row, _, _)| *row == r) {
+                *last = c + w - 1;
+            } else {
+                spans.push((r, c, c + w - 1));
+            }
+        }
+        return Some(TerminalLink {
+            url: candidate.into(),
+            spans,
+        });
+    }
+    None
+}
+
 /// One visible character with its grid span `[start_col, start_col + width)`.
 /// Zero-width marks (`width == 0`) sit at the column of the character they
 /// attach to.
@@ -1400,6 +1598,8 @@ impl Render for TerminalPane {
                 pane.key_context(TERMINAL_DIALOG_KEY_CONTEXT)
             })
             .size_full()
+            .relative()
+            .when(self.hovered_link.is_some(), |this| this.cursor_pointer())
             .p(px(TERMINAL_PADDING))
             .overflow_hidden()
             // Extend the terminal background through its text inset so the
@@ -1411,43 +1611,102 @@ impl Render for TerminalPane {
             .font_family(TERMINAL_FONT_FAMILY)
             .track_focus(&self.focus_handle)
             .focus(|style| style.border_1().border_color(cx.theme().ring))
-            .on_prepaint(move |bounds, _, cx| {
-                // One extra frame on size changes lets the PTY converge even
-                // when an idle agent moves between the tab and review sidebar.
-                entity.update(cx, |pane, cx| {
-                    let resized = pane
-                        .pane_bounds
-                        .is_none_or(|previous| previous.size != bounds.size);
-                    pane.pane_bounds = Some(bounds);
-                    if resized {
-                        cx.notify();
-                    }
-                });
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    focus.focus(window, cx);
-                    this.begin_selection(event.position, event.click_count, window, cx);
-                }),
+            .child(
+                gpui_kit::canvas(
+                    move |bounds, _, cx| {
+                        // One extra frame on size changes lets the PTY converge even
+                        // when an idle agent moves between the tab and review sidebar.
+                        entity.update(cx, |pane, cx| {
+                            let resized = pane
+                                .pane_bounds
+                                .is_none_or(|previous| previous.size != bounds.size);
+                            pane.pane_bounds = Some(bounds);
+                            if resized {
+                                cx.notify();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
             )
+            .map(|mut element| {
+                for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+                    let focus = focus.clone();
+                    element = element.on_mouse_down(
+                        button,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            focus.focus(window, cx);
+                            if button == MouseButton::Left
+                                && (if cfg!(target_os = "macos") {
+                                    event.modifiers.platform
+                                } else {
+                                    event.modifiers.control
+                                })
+                                && let Some(link) = this.link_at(event.position)
+                            {
+                                cx.open_url(&link.url);
+                                cx.stop_propagation();
+                                return;
+                            }
+                            if !event.modifiers.shift
+                                && this.session.as_ref().is_some_and(|s| s.mouse_tracking())
+                            {
+                                this.app_mouse_button = Some(button);
+                                this.selection_anchor = None;
+                                this.selection_focus = None;
+                                this.forward_mouse(
+                                    libghostty_vt::mouse::Action::Press,
+                                    Some(button),
+                                    event.position,
+                                    event.modifiers,
+                                    cx,
+                                );
+                            } else if button == MouseButton::Left {
+                                this.begin_selection(event.position, event.click_count, window, cx);
+                            }
+                        }),
+                    );
+                    element = element
+                        .on_mouse_up(button, cx.listener(Self::on_terminal_mouse_up))
+                        .on_mouse_up_out(button, cx.listener(Self::on_terminal_mouse_up));
+                }
+                element
+            })
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered && this.hovered_link.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if event.pressed_button == Some(MouseButton::Left) {
+                let link = if event.pressed_button.is_none() {
+                    this.link_at(event.position)
+                } else {
+                    None
+                };
+                if link != this.hovered_link {
+                    this.hovered_link = link;
+                    cx.notify();
+                }
+                if this.app_mouse_button.is_some()
+                    || (!event.modifiers.shift
+                        && !this.selecting
+                        && this.session.as_ref().is_some_and(|s| s.mouse_tracking()))
+                {
+                    this.forward_mouse(
+                        libghostty_vt::mouse::Action::Motion,
+                        this.app_mouse_button,
+                        event.position,
+                        event.modifiers,
+                        cx,
+                    );
+                } else if event.pressed_button == Some(MouseButton::Left) {
                     this.update_selection(event.position, cx);
                 }
             }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.finish_selection(event.position, window, cx);
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.finish_selection(event.position, window, cx);
-                }),
-            )
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .when_some(self.error.clone(), |this, error| {
@@ -1478,13 +1737,95 @@ impl Render for TerminalPane {
                     .as_ref()
                     .map_or(0xFFFFFF, |session| session.foreground_color());
                 let cursor_frame = plan_cursor(self.cursor, self.cursor_blink_on, cursor_color);
-                this.children(self.rows.iter().enumerate().map(|(row_index, row)| {
+                let placements = self
+                    .session
+                    .as_ref()
+                    .map(|s| s.graphics.placements.as_slice())
+                    .unwrap_or(&[]);
+                let has_images = !placements.is_empty();
+                let default_bg = self.session.as_ref().map_or(0, |s| s.background_color());
+                this.children(
+                    placements
+                        .iter()
+                        .filter(|p| p.layer() == 0)
+                        .map(|p| p.element(self.grid_size)),
+                )
+                .when(has_images, |this| {
+                    this.children(self.rows.iter().enumerate().flat_map(|(row_index, row)| {
+                        let invert = cursor_frame.is_some_and(|frame| {
+                            frame.row as usize == row_index
+                                && matches!(frame.paint, CursorPaint::Invert)
+                        });
+                        let mut column = 0;
+                        row.iter().filter_map(move |run| {
+                            let start = column;
+                            column += run.columns;
+                            let bg = if run.style.cursor && invert {
+                                run.style.foreground
+                            } else {
+                                run.style.background
+                            };
+                            (bg != default_bg).then(|| {
+                                div()
+                                    .absolute()
+                                    .left(px(TERMINAL_PADDING + start as f32 * cell_width()))
+                                    .top(px(TERMINAL_PADDING + row_index as f32 * cell_height()))
+                                    .w(px(run.columns as f32 * cell_width()))
+                                    .h(px(cell_height()))
+                                    .bg(rgb(bg))
+                            })
+                        })
+                    }))
+                })
+                .children(
+                    placements
+                        .iter()
+                        .filter(|p| p.layer() == 1)
+                        .map(|p| p.element(self.grid_size)),
+                )
+                .children(self.rows.iter().enumerate().map(|(row_index, row)| {
                     let selection = self.selection_for_row(row_index);
                     let cursor = cursor_frame
                         .filter(|frame| frame.row as usize == row_index)
                         .map(|frame| frame.paint);
-                    Self::render_row(row, row_index, selection, cursor)
+                    let link = self.hovered_link.as_ref().and_then(|link| {
+                        link.spans
+                            .iter()
+                            .find(|(row, _, _)| *row == row_index)
+                            .map(|(_, start, end)| (*start, *end))
+                    });
+                    Self::render_row(row, row_index, selection, cursor, link, has_images)
                 }))
+                .children(
+                    placements
+                        .iter()
+                        .filter(|p| p.layer() == 2)
+                        .map(|p| p.element(self.grid_size)),
+                )
+            })
+            .when_some(self.hovered_link.clone(), |this, link| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .max_w_full()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .bg(rgb(0x202424))
+                        .text_color(rgb(0xc9d1d9))
+                        .overflow_hidden()
+                        .child(format!(
+                            "{}-click: {}",
+                            if cfg!(target_os = "macos") {
+                                "Cmd"
+                            } else {
+                                "Ctrl"
+                            },
+                            link.url
+                        )),
+                )
             })
     }
 }
@@ -1504,6 +1845,16 @@ const APP_SCROLL_DIVISOR: f32 = 3.0;
 /// system's own autohide is a fixed 5s (see `dismiss_copy_feedback`), which
 /// is far too long for a single-word acknowledgement.
 const COPY_FEEDBACK_TTL: Duration = Duration::from_millis(1500);
+
+fn is_copy_shortcut(key: &str, modifiers: gpui_kit::Modifiers) -> bool {
+    key.eq_ignore_ascii_case("c")
+        && !modifiers.alt
+        && if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.control
+        } else {
+            modifiers.control && modifiers.shift && !modifiers.platform
+        }
+}
 
 /// Whether a keystroke is a terminal paste shortcut. Pure over the keystroke
 /// pieces (not `KeyDownEvent`) so the mapping stays unit-testable without a
@@ -1556,6 +1907,48 @@ fn coalesce_scroll_lines(remainder: &mut f32, delta_pixels_y: f32) -> isize {
 mod tests {
     use super::*;
     use crate::session::CellStyle;
+
+    #[test]
+    fn terminal_links_join_only_soft_wraps_and_keep_grid_spans() {
+        let rows = vec![
+            test_row("see https://exam", 16),
+            test_row("ple.com/a?q=1&b=2.", 18),
+        ];
+        let link = plain_link_at(&rows, (3, 1), |row| row == 0).unwrap();
+        assert_eq!(link.url, "https://example.com/a?q=1&b=2");
+        assert_eq!(link.spans, vec![(0, 4, 15), (1, 0, 16)]);
+        assert!(plain_link_at(&rows, (3, 1), |_| false).is_none());
+        let rows = vec![test_row("界 https://example.com/a_(b)).", 29)];
+        let link = plain_link_at(&rows, (10, 0), |_| false).unwrap();
+        assert_eq!(link.url, "https://example.com/a_(b)");
+        assert_eq!(link.spans[0].1, 3);
+        assert!(plain_link_at(&rows, (0, 0), |_| false).is_none());
+    }
+
+    #[test]
+    fn terminal_copy_keeps_interrupt_available() {
+        assert!(!is_copy_shortcut(
+            "c",
+            gpui_kit::Modifiers {
+                control: true,
+                ..Default::default()
+            }
+        ));
+        let modifiers = if cfg!(target_os = "macos") {
+            gpui_kit::Modifiers {
+                platform: true,
+                ..Default::default()
+            }
+        } else {
+            gpui_kit::Modifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            }
+        };
+        assert!(is_copy_shortcut("c", modifiers));
+        assert!(!is_copy_shortcut("v", modifiers));
+    }
 
     #[test]
     fn only_shift_escape_closes_the_git_dialog() {

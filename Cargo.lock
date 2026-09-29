@@ -1553,6 +1553,7 @@ dependencies = [
  "gix",
  "gpui-kit",
  "ignore",
+ "image",
  "libghostty-vt",
  "markdown",
  "parking_lot",

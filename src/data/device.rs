@@ -49,6 +49,9 @@ pub(crate) struct DeviceState {
     /// out-of-range values are clamped on read, never rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) app_font_size: Option<f32>,
+    /// Copy terminal selections on release; absent preserves the historical default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_copy_on_select: Option<bool>,
     /// Recent-session rows per repository in the Agent sidebar (Agents
     /// settings). Absent means the default; out-of-range values are clamped
     /// on read, never rejected.
@@ -238,6 +241,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_copy_preference_preserves_false_and_unknown_fields() {
+        let state: DeviceState =
+            serde_json::from_str(r#"{"terminal_copy_on_select":false,"future_setting":123}"#)
+                .unwrap();
+        assert_eq!(state.terminal_copy_on_select, Some(false));
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(encoded["terminal_copy_on_select"], false);
+        assert_eq!(encoded["future_setting"], 123);
+        assert_eq!(DeviceState::default().terminal_copy_on_select, None);
+    }
+
+    #[test]
     fn missing_file_loads_default() {
         let dir = tempfile::tempdir().unwrap();
         let state = store_in(dir.path()).load().unwrap();
@@ -363,10 +378,7 @@ mod tests {
                 enabled_agents: stored,
                 ..DeviceState::default()
             };
-            assert_eq!(
-                state.enabled_agents_or_default(),
-                AgentKind::ALL.to_vec()
-            );
+            assert_eq!(state.enabled_agents_or_default(), AgentKind::ALL.to_vec());
         }
     }
 

@@ -81,17 +81,30 @@ fn opencode(source: &Source) -> Result<Vec<SessionSummary>> {
     )
     .with_context(|| format!("opening OpenCode session store {}", database.display()))?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    // OpenCode v2 moved sessions to `session_v2` (same database file). Once
+    // that table exists the installed binary is v2, so it resumes only v2
+    // rows: legacy `session` rows the v2 migration skipped are unreachable
+    // from the CLI, and listing them would offer resumes that silently start
+    // a new conversation instead. Installations that predate v2 have no
+    // `session_v2` table and are read from the legacy table as before.
+    let table = if table_exists(&connection, "session_v2")? {
+        "session_v2"
+    } else {
+        "session"
+    };
     let mut statement = connection
-        .prepare(
-            "SELECT id, directory, title, time_updated FROM session WHERE parent_id IS NULL AND time_archived IS NULL",
-        )
+        .prepare(&format!(
+            "SELECT id, directory, title, time_updated FROM {table} WHERE parent_id IS NULL AND time_archived IS NULL"
+        ))
         .context("reading OpenCode sessions")?;
     let rows = statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                // `session_v2.title` is nullable while `session.title` is
+                // not; read both as optional so one query covers them.
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 row.get::<_, i64>(3)?,
             ))
         })
@@ -121,6 +134,21 @@ fn opencode(source: &Source) -> Result<Vec<SessionSummary>> {
         });
     }
     Ok(sessions)
+}
+
+/// Whether a table exists in the attached database. A missing table is a
+/// normal state (a store that predates the schema that adds it), while a
+/// lookup failure on an otherwise-open database is real drift.
+fn table_exists(connection: &rusqlite::Connection, table: &str) -> Result<bool> {
+    match connection.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        rusqlite::params![table],
+        |_| Ok(true),
+    ) {
+        Ok(found) => Ok(found),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error) => Err(error).context("reading OpenCode sessions"),
+    }
 }
 
 fn codex(source: &Source) -> Result<Vec<SessionSummary>> {
@@ -515,6 +543,7 @@ mod tests {
             );
         }
     }
+    /// A store that predates OpenCode v2: only the legacy `session` table.
     fn opencode_fixture() -> (tempfile::TempDir, Source) {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("opencode")).unwrap();
@@ -532,6 +561,42 @@ mod tests {
         };
         (dir, source)
     }
+    /// A store the v2 binary has touched: both table families exist and v2
+    /// rows are the resumable ones.
+    fn opencode_v2_fixture() -> (tempfile::TempDir, Source) {
+        let (dir, source) = opencode_fixture();
+        let connection =
+            rusqlite::Connection::open(dir.path().join("opencode/opencode.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL, title TEXT, time_updated INTEGER NOT NULL, time_archived INTEGER)",
+            )
+            .unwrap();
+        connection.close().unwrap();
+        (dir, source)
+    }
+    /// Insert one row into the given OpenCode session table.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_opencode_row(
+        dir: &tempfile::TempDir,
+        table: &str,
+        id: &str,
+        parent: Option<&str>,
+        directory: &str,
+        title: Option<&str>,
+        updated_ms: i64,
+        archived: Option<i64>,
+    ) {
+        let connection =
+            rusqlite::Connection::open(dir.path().join("opencode/opencode.db")).unwrap();
+        connection
+            .execute(
+                &format!("INSERT INTO {table} (id, parent_id, directory, title, time_updated, time_archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"),
+                rusqlite::params![id, parent, directory, title, updated_ms, archived],
+            )
+            .unwrap();
+        connection.close().unwrap();
+    }
     #[allow(clippy::too_many_arguments)]
     fn insert_opencode_session(
         dir: &tempfile::TempDir,
@@ -542,15 +607,16 @@ mod tests {
         updated_ms: i64,
         archived: Option<i64>,
     ) {
-        let connection =
-            rusqlite::Connection::open(dir.path().join("opencode/opencode.db")).unwrap();
-        connection
-            .execute(
-                "INSERT INTO session (id, parent_id, directory, title, time_updated, time_archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![id, parent, directory, title, updated_ms, archived],
-            )
-            .unwrap();
-        connection.close().unwrap();
+        insert_opencode_row(
+            dir,
+            "session",
+            id,
+            parent,
+            directory,
+            Some(title),
+            updated_ms,
+            archived,
+        );
     }
     #[test]
     fn opencode_reads_every_project_normalizes_milliseconds_and_titles() {
@@ -607,6 +673,101 @@ mod tests {
                 .map(|s| s.key.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["root"]
+        );
+    }
+    #[test]
+    fn opencode_v2_store_lists_only_resumable_v2_sessions() {
+        // Once the store has `session_v2`, the installed binary is v2 and it
+        // resumes only v2 rows. Legacy rows the v2 migration skipped (some
+        // were written after it ran) are unreachable from the CLI, so listing
+        // them would offer resumes that silently start a new conversation.
+        let (dir, source) = opencode_v2_fixture();
+        insert_opencode_session(
+            &dir,
+            "v1-only",
+            None,
+            "/repo",
+            "unmigrated",
+            1700000000000,
+            None,
+        );
+        insert_opencode_row(
+            &dir,
+            "session_v2",
+            "v2",
+            None,
+            "/repo",
+            Some("current"),
+            1700000001000,
+            None,
+        );
+        insert_opencode_row(
+            &dir,
+            "session_v2",
+            "v2-child",
+            Some("v2"),
+            "/repo",
+            Some("child"),
+            1700000002000,
+            None,
+        );
+        insert_opencode_row(
+            &dir,
+            "session_v2",
+            "v2-archived",
+            None,
+            "/repo",
+            Some("old"),
+            1700000003000,
+            Some(1700000004000),
+        );
+        insert_opencode_row(
+            &dir,
+            "session_v2",
+            "v2-untitled",
+            None,
+            "/repo",
+            None,
+            1700000005000,
+            None,
+        );
+        let mut files = HashMap::new();
+        let sessions = discover(&source, &mut files).unwrap();
+        let ids: Vec<_> = sessions.iter().map(|s| s.key.id.as_str()).collect();
+        assert!(!ids.contains(&"v1-only"), "v1-only row must hide: {ids:?}");
+        assert!(
+            !ids.contains(&"v2-child"),
+            "v2 child must stay hidden: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"v2-archived"),
+            "archived v2 session must stay hidden: {ids:?}"
+        );
+        let live = sessions
+            .iter()
+            .find(|s| s.key.id == "v2")
+            .expect("v2 session should list");
+        assert_eq!(live.title, "current");
+        let untitled = sessions
+            .iter()
+            .find(|s| s.key.id == "v2-untitled")
+            .expect("nullable v2 title should still list");
+        assert_eq!(untitled.title, "Untitled session");
+    }
+    #[test]
+    fn opencode_legacy_store_without_v2_table_still_lists_v1_sessions() {
+        // A store the v2 binary never touched has no `session_v2` table; the
+        // legacy read must keep working for those installations.
+        let (dir, source) = opencode_fixture();
+        insert_opencode_session(&dir, "v1", None, "/repo", "legacy", 1700000000000, None);
+        let mut files = HashMap::new();
+        let sessions = discover(&source, &mut files).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| s.key.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v1"]
         );
     }
     #[test]

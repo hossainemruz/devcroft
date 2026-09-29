@@ -64,6 +64,7 @@ struct Draft {
     comment: Option<String>,
     document: bool,
     block: Option<usize>,
+    selection: Option<std::ops::Range<usize>>,
     quote: Option<String>,
 }
 
@@ -553,6 +554,7 @@ impl ArtifactBrowser {
             comment,
             document,
             block: None,
+            selection: None,
             quote: None,
         });
         if !document {
@@ -575,6 +577,12 @@ impl ArtifactBrowser {
             Mutation::Document(value)
         } else if let Some(id) = &draft.comment {
             Mutation::Comment(CommentChange::Edit(id.clone(), value))
+        } else if let Some(range) = &draft.selection {
+            Mutation::Comment(CommentChange::CreateSelection {
+                body: value,
+                range: range.clone(),
+                quote: draft.quote.clone(),
+            })
         } else if let Some(block) = draft.block {
             Mutation::Comment(CommentChange::CreateBlock {
                 body: value,

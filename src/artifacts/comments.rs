@@ -18,18 +18,23 @@ impl ArtifactBrowser {
                         .is_some_and(|s| s.artifact.id == id && s.artifact.content == content)
                     {
                         this.error =
-                            Some("The document changed. Select the block again to comment.".into());
+                            Some("The document changed. Select the text again to comment.".into());
                         cx.notify();
                         return;
                     }
                     match action {
-                        BlockAction::Comment { block, quote } => {
+                        BlockAction::Comment {
+                            block,
+                            quote,
+                            selection,
+                        } => {
                             if this.draft.is_some() || this.saving {
                                 return;
                             }
                             this.edit(false, None, window, cx);
                             if let Some(draft) = &mut this.draft {
                                 draft.block = Some(block);
+                                draft.selection = selection;
                                 draft.quote = quote;
                             }
                             this.comments_scroll
@@ -99,7 +104,7 @@ impl ArtifactBrowser {
             let quote = draft
                 .quote
                 .clone()
-                .or_else(|| anchor.and_then(|a| a.block().quote.clone()));
+                .or_else(|| anchor.and_then(|a| a.location().quote.clone()));
             let block = draft.block.and_then(|index| {
                 crate::data::artifacts::anchors::blocks(&draft.snapshot.artifact.content)
                     .get(index)
@@ -107,6 +112,15 @@ impl ArtifactBrowser {
             });
             let label = if draft.comment.is_some() {
                 "Edit comment".to_owned()
+            } else if let Some(range) = &draft.selection {
+                let span = crate::data::artifacts::anchors::source_span(
+                    &draft.snapshot.artifact.content,
+                    range.clone(),
+                );
+                format!(
+                    "Comment on selected text · Lines {}–{}",
+                    span.start_line, span.end_line
+                )
             } else if let Some(block) = &block {
                 format!("Comment on lines {}–{}", block.start_line, block.end_line)
             } else {
@@ -172,23 +186,32 @@ impl ArtifactBrowser {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(
-                        "No comments yet. Right-click a block or use its + button to add feedback.",
+                        "No comments yet. Select text and right-click to comment, or use a block’s + button.",
                     ),
             );
         }
         for (index, comment) in snapshot.artifact.comments.iter().enumerate() {
             let active = self.active_comment.as_ref() == Some(&comment.id);
-            let outdated = comment.anchor.as_ref().is_some_and(|a| a.block().outdated);
+            let outdated = comment
+                .anchor
+                .as_ref()
+                .is_some_and(|a| a.location().outdated);
             let label = comment
                 .anchor
                 .as_ref()
-                .map(|a| format!("Lines {}–{}", a.block().start_line, a.block().end_line))
+                .map(|a| {
+                    format!(
+                        "Lines {}–{}",
+                        a.location().start_line,
+                        a.location().end_line
+                    )
+                })
                 .unwrap_or_else(|| "Document".into());
             let quote = comment.anchor.as_ref().map(|a| {
-                a.block()
+                a.location()
                     .quote
                     .as_ref()
-                    .unwrap_or(&a.block().source)
+                    .unwrap_or(&a.location().source)
                     .clone()
             });
             let id = comment.id.clone();
@@ -321,7 +344,7 @@ impl ArtifactBrowser {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("Original block changed or is unavailable."),
+                                    .child("Original text changed or is unavailable."),
                             )
                         })
                         .on_click(cx.listener(move |this, _, window, cx| {

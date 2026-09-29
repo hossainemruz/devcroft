@@ -43,12 +43,17 @@ pub(crate) const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 /// reflowing. Work on parsed paragraphs so fences and frontmatter stay intact.
 /// This is a display copy; the saved Markdown is never rewritten.
 fn metadata_line_breaks(source: &str) -> String {
+    metadata_display(source).0
+}
+
+/// Also retain insertion positions in original source coordinates for comments.
+fn metadata_display(source: &str) -> (String, Vec<usize>) {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.frontmatter = true;
     options.constructs.math_text = true;
     options.constructs.math_flow = true;
     let Ok(root) = markdown::to_mdast(source, &options) else {
-        return source.to_owned();
+        return (source.to_owned(), Vec::new());
     };
     let mut insertions = Vec::new();
     for node in root.children().into_iter().flatten() {
@@ -82,10 +87,10 @@ fn metadata_line_breaks(source: &str) -> String {
         }
     }
     let mut result = source.to_owned();
-    for offset in insertions.into_iter().rev() {
+    for &offset in insertions.iter().rev() {
         result.insert_str(offset, "  ");
     }
-    result
+    (result, insertions)
 }
 
 type CodeHighlights = std::collections::HashMap<

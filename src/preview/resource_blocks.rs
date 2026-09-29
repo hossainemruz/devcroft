@@ -12,7 +12,11 @@ use gpui_kit::component::{Disableable as _, Sizable as _};
 use std::sync::Arc;
 
 pub(crate) enum BlockAction {
-    Comment { block: usize, quote: Option<String> },
+    Comment {
+        block: usize,
+        quote: Option<String>,
+        selection: Option<std::ops::Range<usize>>,
+    },
     Open(String),
 }
 pub(crate) type CommentHandler = Arc<dyn Fn(BlockAction, &mut Window, &mut App) + Send + Sync>;
@@ -23,6 +27,7 @@ pub(super) struct ResourceBlocks {
     display_ranges: Arc<Vec<std::ops::Range<usize>>>,
     states: Vec<Option<Entity<TextViewState>>>,
     definitions: String,
+    selection_maps: Vec<Option<Arc<SelectionMap>>>,
     pub comments: Vec<Comment>,
     pub active: Option<String>,
     pub drafting: bool,
@@ -39,6 +44,7 @@ impl ResourceBlocks {
             .join("\n\n");
         Self {
             states: vec![None; blocks.len()],
+            selection_maps: vec![None; blocks.len()],
             source,
             blocks,
             definitions,
@@ -128,12 +134,12 @@ impl PreviewView {
             .find(|c| c.id == id)
             .and_then(|c| c.anchor.as_ref())
         {
-            let anchor = anchor.block();
+            let anchor = anchor.location();
             if !anchor.outdated
                 && let Some(index) = resources
                     .blocks
                     .iter()
-                    .position(|b| b.range.start == anchor.start && b.range.end == anchor.end)
+                    .position(|b| b.range.start <= anchor.start && anchor.start < b.range.end)
             {
                 self.state.read(cx).list_state().scroll_to(ListOffset {
                     item_ix: index,
@@ -203,6 +209,17 @@ impl PreviewView {
         let Some(block) = resources.blocks.get(index) else {
             return div().into_any_element();
         };
+        let selection_map = resources.selection_maps[index]
+            .get_or_insert_with(|| {
+                let (display, insertions) =
+                    metadata_display(&resources.source[block.range.clone()]);
+                Arc::new(SelectionMap {
+                    block: block.range.clone(),
+                    display_len: display.len(),
+                    insertions,
+                })
+            })
+            .clone();
         let state = resources.states[index]
             .get_or_insert_with(|| {
                 let source = metadata_line_breaks(&resources.source[block.range.clone()]);
@@ -220,8 +237,8 @@ impl PreviewView {
             .iter()
             .filter(|c| {
                 c.anchor.as_ref().is_some_and(|a| {
-                    let a = a.block();
-                    !a.outdated && a.start == block.range.start && a.end == block.range.end
+                    let a = a.location();
+                    !a.outdated && a.start < block.range.end && a.end > block.range.start
                 })
             })
             .collect::<Vec<_>>();
@@ -301,6 +318,7 @@ impl PreviewView {
                     .on_click({
                         let handler = handler.clone();
                         let state = state.clone();
+                        let selection_map = selection_map.clone();
                         move |_, window, cx| {
                             if let Some(handler) = &handler {
                                 let action = if let Some(id) = &id {
@@ -309,6 +327,7 @@ impl PreviewView {
                                     BlockAction::Comment {
                                         block: index,
                                         quote: selected_quote(&state, cx),
+                                        selection: selected_range(&state, &selection_map, cx),
                                     }
                                 };
                                 handler(action, window, cx);
@@ -321,27 +340,72 @@ impl PreviewView {
             .context_menu(move |menu, _, cx| {
                 // Capture before moving focus to the menu/editor; never copy through the clipboard.
                 let quote = selected_quote(&state, cx);
+                let selection = selected_range(&state, &selection_map, cx);
                 let handler = handler.clone();
                 menu.item(
-                    PopupMenuItem::new("Comment on this block")
-                        .disabled(disabled)
-                        .on_click(move |_, window, cx| {
-                            if let Some(handler) = &handler {
-                                handler(
-                                    BlockAction::Comment {
-                                        block: index,
-                                        quote: quote.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
-                        }),
+                    PopupMenuItem::new(if selection.is_some() {
+                        "Comment on selected text"
+                    } else {
+                        "Comment on this block"
+                    })
+                    .disabled(disabled)
+                    .on_click(move |_, window, cx| {
+                        if let Some(handler) = &handler {
+                            handler(
+                                BlockAction::Comment {
+                                    block: index,
+                                    quote: quote.clone(),
+                                    selection: selection.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
                 )
             })
             .into_any_element()
     }
 }
+/// Map the inner TextView source back to the artifact body. Appended reference
+/// definitions are invisible support content, never part of a comment selection.
+struct SelectionMap {
+    block: std::ops::Range<usize>,
+    display_len: usize,
+    insertions: Vec<usize>,
+}
+impl SelectionMap {
+    fn original_range(&self, range: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        let endpoint = |offset: usize| {
+            let offset = offset.min(self.display_len);
+            let mut removed = 0;
+            for &insertion in &self.insertions {
+                let start = insertion + removed;
+                if offset <= start {
+                    break;
+                }
+                removed += (offset - start).min(2);
+                if offset < start + 2 {
+                    break;
+                }
+            }
+            self.block.start + offset - removed
+        };
+        let range = endpoint(range.start)..endpoint(range.end);
+        (range.start < range.end && range.end <= self.block.end).then_some(range)
+    }
+}
+fn selected_range(
+    state: &Entity<TextViewState>,
+    map: &SelectionMap,
+    cx: &App,
+) -> Option<std::ops::Range<usize>> {
+    if selected_quote(state, cx).is_none() {
+        return None;
+    }
+    map.original_range(state.read(cx).selected_source_range()?)
+}
+
 fn selected_quote(state: &Entity<TextViewState>, cx: &App) -> Option<String> {
     let text = state.read(cx).selected_text();
     (!text.trim().is_empty()).then_some(text)
@@ -351,6 +415,36 @@ fn selected_quote(state: &Entity<TextViewState>, cx: &App) -> Option<String> {
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[test]
+    fn selection_offsets_exclude_display_breaks_and_reference_definitions() {
+        let source = "**Name:** λ\r\n**Status:** ready\r\n**Owner:** me";
+        let (display, insertions) = metadata_display(source);
+        let map = SelectionMap {
+            block: 12..12 + source.len(),
+            display_len: display.len(),
+            insertions,
+        };
+        let start = display.find("ready").unwrap();
+        let original = source.find("ready").unwrap() + 12;
+        assert_eq!(
+            map.original_range(start..start + 5),
+            Some(original..original + 5)
+        );
+        assert_eq!(
+            map.original_range(0..display.len() + 100),
+            Some(12..12 + source.len())
+        );
+        assert_eq!(
+            map.original_range(display.len() + 2..display.len() + 20),
+            None
+        );
+        let owner = display.rfind("me").unwrap();
+        assert_eq!(
+            map.original_range(owner..owner + 2),
+            Some(12 + source.rfind("me").unwrap()..14 + source.rfind("me").unwrap())
+        );
+    }
 
     #[gpui_kit::test]
     fn right_click_captures_quote_before_editor_focus(cx: &mut gpui_kit::TestAppContext) {
@@ -369,8 +463,13 @@ mod tests {
                 None,
                 false,
                 Arc::new(move |action, _, _| {
-                    if let BlockAction::Comment { block, quote } = action {
-                        events.lock().push((block, quote));
+                    if let BlockAction::Comment {
+                        block,
+                        quote,
+                        selection,
+                    } = action
+                    {
+                        events.lock().push((block, quote, selection));
                     }
                 }),
                 cx,
@@ -405,6 +504,7 @@ mod tests {
         let captured = captured.lock();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, 1);
+        assert_eq!(captured[0].2, Some(9..40));
         assert_eq!(
             captured[0].1.as_deref().unwrap().trim(),
             "Words with bold and code."

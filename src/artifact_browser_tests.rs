@@ -155,7 +155,11 @@ fn block_comment_editor_keeps_reader_and_persists_anchor(cx: &mut gpui_kit::Test
         assert!(browser.draft.is_none(), "{:?}", browser.error);
         let saved = browser.selected.as_ref().unwrap();
         assert_eq!(saved.artifact.comments.len(), 1);
-        let anchor = saved.artifact.comments[0].anchor.as_ref().unwrap().block();
+        let anchor = saved.artifact.comments[0]
+            .anchor
+            .as_ref()
+            .unwrap()
+            .location();
         assert_eq!(anchor.source, "Paragraph with **bold** and `code`.");
     });
     for _ in 0..2 {
@@ -171,4 +175,61 @@ fn block_comment_editor_keeps_reader_and_persists_anchor(cx: &mut gpui_kit::Test
             .len(),
         1
     );
+}
+
+#[gpui_kit::test]
+fn selected_text_draft_saves_selection_instead_of_containing_block(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use crate::data::artifacts::{CommentAnchor, NewArtifact};
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    crate::data::write_json_atomic(
+        &root
+            .portable_dir()
+            .join("repositories/repo/repository.json"),
+        &serde_json::json!({"key":"repo"}),
+    )
+    .unwrap();
+    let store = ArtifactStore::new(&root);
+    let content = "# Title\n\nFirst **word**, second **word**.";
+    let start = content.rfind("word").unwrap();
+    let snapshot = store
+        .create(NewArtifact {
+            repository: Some("repo".into()),
+            sessions: vec![],
+            title: "Selection feedback".into(),
+            kind: Kind::Note,
+            content: content.into(),
+        })
+        .unwrap();
+    cx.update(gpui_kit::init);
+    let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
+    browser.update(cx, |browser, cx| browser.select(Some(snapshot.clone()), cx));
+    let view = browser.clone();
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+    cx.update(|window, cx| {
+        browser.update(cx, |browser, cx| {
+            browser.begin_comment(window, cx);
+            let draft = browser.draft.as_mut().unwrap();
+            draft.block = Some(1);
+            draft.selection = Some(start..start + 4);
+            draft.quote = Some("word".into());
+            draft.input.update(cx, |input, cx| {
+                input.set_value("Explain the second word", window, cx)
+            });
+            browser.save_draft(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, _| {
+        assert!(browser.draft.is_none(), "{:?}", browser.error);
+    });
+    let saved = store.get(&snapshot.artifact.id).unwrap();
+    let anchor = saved.artifact.comments[0].anchor.as_ref().unwrap();
+    assert!(matches!(anchor, CommentAnchor::Selection(_)));
+    assert_eq!(anchor.location().start, start);
+    assert_eq!(anchor.location().source, "word");
+    assert_eq!(anchor.location().start_line, 3);
 }

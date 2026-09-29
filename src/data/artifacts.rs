@@ -354,6 +354,7 @@ impl ArtifactStore {
         // Validate before entering the mutation so errors never commit partial changes.
         if let CommentChange::Create(body)
         | CommentChange::CreateBlock { body, .. }
+        | CommentChange::CreateSelection { body, .. }
         | CommentChange::Edit(_, body) = &change
         {
             nonblank(body, "comment body")?;
@@ -375,6 +376,15 @@ impl ArtifactStore {
                         body,
                         resolved: false,
                         anchor: Some(CommentAnchor::new(&artifact.content, block, quote)),
+                    });
+                }
+                CommentChange::CreateSelection { body, range, quote } => {
+                    let anchor = CommentAnchor::selection(&artifact.content, range, quote)?;
+                    artifact.comments.push(Comment {
+                        id: random_id().replacen("art-", "comment-", 1),
+                        body,
+                        resolved: false,
+                        anchor: Some(anchor),
                     });
                 }
                 CommentChange::Edit(id, body) => {
@@ -575,6 +585,11 @@ pub(crate) enum CommentChange {
     CreateBlock {
         body: String,
         block: usize,
+        quote: Option<String>,
+    },
+    CreateSelection {
+        body: String,
+        range: std::ops::Range<usize>,
         quote: Option<String>,
     },
     Edit(String, String),

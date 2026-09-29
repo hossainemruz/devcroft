@@ -231,7 +231,11 @@ fn block_comments_roundtrip_relocate_and_keep_original_text_when_outdated() {
         )
         .unwrap();
     assert_eq!(store.get(id).unwrap(), added);
-    let anchor = added.artifact.comments[0].anchor.as_ref().unwrap().block();
+    let anchor = added.artifact.comments[0]
+        .anchor
+        .as_ref()
+        .unwrap()
+        .location();
     assert_eq!(anchor.source, "- [ ] Ship λ");
     assert_eq!(anchor.start_line, 3);
     assert_eq!(anchor.quote.as_deref(), Some("Ship λ"));
@@ -264,7 +268,7 @@ fn block_comments_roundtrip_relocate_and_keep_original_text_when_outdated() {
             .anchor
             .as_ref()
             .unwrap()
-            .block()
+            .location()
             .start_line,
         5
     );
@@ -278,7 +282,11 @@ fn block_comments_roundtrip_relocate_and_keep_original_text_when_outdated() {
             },
         )
         .unwrap();
-    let anchor = edited.artifact.comments[0].anchor.as_ref().unwrap().block();
+    let anchor = edited.artifact.comments[0]
+        .anchor
+        .as_ref()
+        .unwrap()
+        .location();
     assert!(anchor.outdated);
     assert_eq!(anchor.source, "- [ ] Ship λ");
     let comment_id = &edited.artifact.comments[0].id;
@@ -304,7 +312,7 @@ fn block_comments_roundtrip_relocate_and_keep_original_text_when_outdated() {
             .anchor
             .as_ref()
             .unwrap()
-            .block()
+            .location()
             .outdated
     );
     // Raw body changes from an external editor get relocation on read, without writing.
@@ -319,8 +327,74 @@ fn block_comments_roundtrip_relocate_and_keep_original_text_when_outdated() {
             .anchor
             .as_ref()
             .unwrap()
-            .block()
+            .location()
             .outdated
     );
     assert_eq!(fs::read_to_string(path).unwrap(), text);
+}
+
+#[test]
+fn selection_comments_roundtrip_and_reject_invalid_or_stale_ranges() {
+    let (_dir, store) = fixture();
+    let mut input = input("repo");
+    input.content = "# Header\n\nFirst λ and second λ.\nMore text.".into();
+    let first = store.create(input).unwrap();
+    let id = &first.artifact.id;
+    let start = first.artifact.content.rfind('λ').unwrap();
+    let range = start..start + 2;
+    let added = store
+        .comment(
+            id,
+            &first.revision,
+            CommentChange::CreateSelection {
+                body: "Second occurrence".into(),
+                range: range.clone(),
+                quote: Some("λ".into()),
+            },
+        )
+        .unwrap();
+    assert_eq!(store.get(id).unwrap(), added);
+    assert!(matches!(
+        added.artifact.comments[0].anchor,
+        Some(CommentAnchor::Selection(_))
+    ));
+    let anchor = added.artifact.comments[0]
+        .anchor
+        .as_ref()
+        .unwrap()
+        .location();
+    assert_eq!(
+        (anchor.start, anchor.end, anchor.start_line),
+        (start, start + 2, 3)
+    );
+    for range in [start + 1..start + 2, 0..0, 0..usize::MAX] {
+        assert!(
+            store
+                .comment(
+                    id,
+                    &added.revision,
+                    CommentChange::CreateSelection {
+                        body: "Invalid".into(),
+                        range,
+                        quote: None,
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(store.get(id).unwrap(), added);
+    }
+    assert!(
+        store
+            .comment(
+                id,
+                &first.revision,
+                CommentChange::CreateSelection {
+                    body: "Stale".into(),
+                    range,
+                    quote: None,
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(store.get(id).unwrap(), added);
 }

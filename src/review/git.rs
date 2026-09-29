@@ -426,10 +426,22 @@ fn classify_tracked(
             });
         }
         WorkContent::TooLarge => {
+            // The rendering cap says nothing about whether the file changed.
+            // Compare bytes without allocating another large worktree buffer.
+            if !base_is_link
+                && !mode_changed(repo, path, entry)
+                && large_worktree_matches(repo, path, entry.oid)
+            {
+                return;
+            }
             files.push(ChangedFile {
                 path: path.to_owned(),
                 old_path: None,
-                status: FileStatus::Modified,
+                status: if base_is_link {
+                    FileStatus::TypeChanged
+                } else {
+                    FileStatus::Modified
+                },
                 additions: 0,
                 deletions: 0,
                 content: FileContent::Unavailable(UnavailableReason::TooLarge),
@@ -487,6 +499,32 @@ fn classify_tracked(
             }
         }
     }
+}
+
+/// Compare oversized content independently of the diff rendering limit.
+/// Failed reads remain visible as unavailable changes.
+fn large_worktree_matches(repo: &gix::Repository, path: &str, oid: gix::ObjectId) -> bool {
+    use std::io::Read as _;
+
+    let Some(root) = repo.workdir() else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(root.join(path)) else {
+        return false;
+    };
+    let Ok(object) = repo.find_object(oid) else {
+        return false;
+    };
+    let Ok(blob) = object.try_into_blob() else {
+        return false;
+    };
+    let mut buffer = [0_u8; 64 * 1024];
+    for chunk in blob.data.chunks(buffer.len()) {
+        if file.read_exact(&mut buffer[..chunk.len()]).is_err() || buffer[..chunk.len()] != *chunk {
+            return false;
+        }
+    }
+    matches!(file.read(&mut buffer[..1]), Ok(0))
 }
 
 /// Whether the worktree executable bit differs from the base tree mode.
@@ -949,6 +987,73 @@ mod tests {
         let deleted = find(&diff, "gone.txt");
         assert_eq!(deleted.status, FileStatus::Deleted);
         assert_eq!((deleted.additions, deleted.deletions), (0, 1));
+    }
+
+    #[test]
+    fn oversized_files_are_only_listed_when_changed() {
+        let dir = init_repo();
+        let original = vec![b'a'; MAX_FILE_BYTES as usize + 1];
+        write(dir.path(), "fixture.yaml", &original);
+        commit_all(dir.path(), "large fixture");
+        git(dir.path(), &["checkout", "-b", "feature"]);
+        let full = ReviewScope::full_diff("main", "origin");
+        for scope in [uncommitted(), full.clone()] {
+            assert!(load_review(dir.path(), &scope).unwrap().files.is_empty());
+        }
+
+        // Same length, differing final byte: size alone cannot detect this.
+        let mut changed = original.clone();
+        *changed.last_mut().unwrap() = b'b';
+        write(dir.path(), "fixture.yaml", &changed);
+        for scope in [uncommitted(), full.clone()] {
+            let diff = load_review(dir.path(), &scope).unwrap();
+            assert_eq!(diff.files.len(), 1);
+            assert_eq!(diff.files[0].status, FileStatus::Modified);
+            assert_eq!(
+                diff.files[0].content,
+                FileContent::Unavailable(UnavailableReason::TooLarge)
+            );
+        }
+        commit_all(dir.path(), "change fixture");
+        assert!(
+            load_review(dir.path(), &uncommitted())
+                .unwrap()
+                .files
+                .is_empty()
+        );
+        assert_eq!(load_review(dir.path(), &full).unwrap().files.len(), 1);
+
+        // Restoring the merge-base contents clears Full diff, but differs from HEAD.
+        write(dir.path(), "fixture.yaml", &original);
+        assert!(load_review(dir.path(), &full).unwrap().files.is_empty());
+        assert_eq!(
+            load_review(dir.path(), &uncommitted()).unwrap().files.len(),
+            1
+        );
+
+        write(dir.path(), "fixture.yaml", b"small now\n");
+        assert_eq!(
+            load_review(dir.path(), &uncommitted()).unwrap().files.len(),
+            1
+        );
+        fs::remove_file(dir.path().join("fixture.yaml")).unwrap();
+        assert_eq!(
+            find(
+                &load_review(dir.path(), &uncommitted()).unwrap(),
+                "fixture.yaml"
+            )
+            .status,
+            FileStatus::Deleted
+        );
+        write(dir.path(), "new.yaml", &original);
+        assert_eq!(
+            find(
+                &load_review(dir.path(), &uncommitted()).unwrap(),
+                "new.yaml"
+            )
+            .status,
+            FileStatus::Added
+        );
     }
 
     #[test]

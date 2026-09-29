@@ -21,7 +21,8 @@ impl HomeView {
     }
 
     pub(super) fn visible_pull_requests(&self, category: Category) -> Vec<Item> {
-        self.data.pull_requests(category, self.group_filter)
+        self.data
+            .pull_requests(category, Some(self.active_space.as_str()))
     }
 
     pub(super) fn refresh_pull_requests(&mut self, force: bool, cx: &mut Context<Self>) {
@@ -103,11 +104,7 @@ impl HomeView {
             .map(|status| status.title.clone())
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| item.title.clone());
-        let mut badges = h_flex().gap_2().flex_wrap().child(
-            Tag::secondary()
-                .with_size(Size::Small)
-                .child(item.group.label()),
-        );
+        let mut badges = h_flex().gap_2().flex_wrap();
         if let Some(status) = status {
             let (state, color) = match status.state.as_str() {
                 "MERGED" => ("Merged", ColorName::Purple),
@@ -281,25 +278,22 @@ impl HomeView {
     }
 
     pub(super) fn pull_requests_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut filters = h_flex().gap_2().flex_wrap().items_center();
-        for group in [None, Some(Group::Personal), Some(Group::Work)] {
-            let label = group.map_or("All", Group::label);
-            let checked = self.group_filter == group;
-            filters = filters.child(
-                Radio::new(item_id("filter-pr", label))
-                    .label(label.to_owned())
-                    .checked(checked)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        // Radios never toggle off: selecting the active one is
-                        // a no-op, any other pick becomes the filter.
-                        if this.group_filter != group {
-                            this.group_filter = group;
-                            this.navigation_cursor = None;
-                            cx.notify();
-                        }
-                    })),
+        let filters = h_flex()
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Space"),
+            )
+            .child(
+                Tag::secondary()
+                    .with_size(Size::Small)
+                    .rounded_full()
+                    .child(self.active_space.clone()),
             );
-        }
         let mut board = h_flex().items_stretch().gap_4().flex_wrap();
         for (index, category) in Category::ALL.into_iter().enumerate() {
             let items = self.visible_pull_requests(category);
@@ -336,7 +330,7 @@ impl HomeView {
             for item in items {
                 column = column.child(self.pr_card(&item, true, cx));
             }
-            let group = self.group_filter.unwrap_or_default();
+            let space = self.active_space.clone();
             column = column.child(
                 Button::new(("add-pr-column", index))
                     .ghost()
@@ -345,7 +339,7 @@ impl HomeView {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let mut item = Item::new(Kind::PullRequest);
                         item.category = category;
-                        item.group = group;
+                        item.space = space.clone();
                         this.editor(item, window, cx);
                     })),
             );

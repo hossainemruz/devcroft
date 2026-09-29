@@ -51,7 +51,8 @@ pub(crate) struct Query {
     pub repository: Option<String>,
     /// None on whole-graph reads; repository reads default to one hop.
     pub depth: Option<u8>,
-    pub group: Option<String>,
+    /// Active-space filter (see [`space_matches_filter`]).
+    pub space: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -95,18 +96,13 @@ impl Node {
     }
 }
 
-/// All/Personal/Work are view choices; preserve free-form stored group spelling.
-pub(crate) fn group_matches(group: Option<&str>, filter: Option<&str>) -> bool {
-    let group = group.map(str::trim).filter(|s| !s.is_empty());
+/// Space filter for graph reads: `None` and `All` show every space; any
+/// other value matches case-insensitively, with blank stored values counting
+/// as the default space (records written before spaces).
+pub(crate) fn space_matches_filter(stored: Option<&str>, filter: Option<&str>) -> bool {
     match filter.map(str::trim) {
         None | Some("All") => true,
-        Some("Ungrouped") => group.is_none(),
-        Some(filter)
-            if filter.eq_ignore_ascii_case("Personal") || filter.eq_ignore_ascii_case("Work") =>
-        {
-            group.is_some_and(|g| g.eq_ignore_ascii_case(filter))
-        }
-        Some(filter) => group == Some(filter),
+        Some(filter) => super::spaces::space_matches(stored, filter),
     }
 }
 
@@ -208,7 +204,7 @@ pub(crate) fn load(root: &DataRoot, query: Query) -> Result<Graph> {
                             revision: String::new(),
                             display_name: None,
                             description: None,
-                            group: None,
+                            space: super::spaces::DEFAULT_SPACE.to_owned(),
                             owner: None,
                             name: None,
                             checkout_path: None,
@@ -259,10 +255,7 @@ pub(crate) fn load(root: &DataRoot, query: Query) -> Result<Graph> {
     }
     let neighborhood = included.clone();
     included.retain(|key| {
-        group_matches(
-            nodes[key].repository.group.as_deref(),
-            query.group.as_deref(),
-        )
+        space_matches_filter(Some(&nodes[key].repository.space), query.space.as_deref())
     });
     let filtered = included.clone();
     let truncated = included.len() > MAX_NODES;
@@ -297,7 +290,7 @@ pub(crate) fn load(root: &DataRoot, query: Query) -> Result<Graph> {
                 directions.insert(edge.id.clone(), direction.to_owned());
             }
             relationships.push(edge);
-        } else if query.group.is_some()
+        } else if query.space.is_some()
             && (neighborhood.contains(&edge.from) || neighborhood.contains(&edge.to))
             && (!filtered.contains(&edge.from) || !filtered.contains(&edge.to))
             && (filtered.contains(&edge.from) || filtered.contains(&edge.to))

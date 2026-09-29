@@ -14,7 +14,7 @@ pub(super) fn query(root: &DataRoot, args: RelationshipQueryArgs, json: bool) ->
         Query {
             repository: args.repository,
             depth: args.depth,
-            group: args.group,
+            space: args.space,
         },
     )?;
     let mut human = format!(
@@ -44,7 +44,7 @@ pub(super) fn query(root: &DataRoot, args: RelationshipQueryArgs, json: bool) ->
     }
     if !graph.excluded_relationships.is_empty() {
         human.push_str(&format!(
-            "{} cross-group connections excluded; query All to see their endpoints.\n",
+            "{} cross-space connections excluded; query with a broader space filter to see their endpoints.\n",
             graph.excluded_relationships.len()
         ));
     }

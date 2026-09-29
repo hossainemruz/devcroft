@@ -82,25 +82,30 @@ fn supplied_topology_reverse_queries_and_cycles() {
     let filtered = load(
         &root,
         Query {
-            group: Some("Work".into()),
+            space: Some("Work".into()),
             ..Default::default()
         },
     )
     .unwrap();
     assert_eq!(filtered.nodes.len(), 3);
     assert_eq!(filtered.excluded_relationships.len(), 3);
+    // A space-less legacy record resolves to the default space, so it shows
+    // under Personal rather than a special "Ungrouped" bucket.
+    let personal = load(
+        &root,
+        Query {
+            space: Some("Personal".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(
-        load(
-            &root,
-            Query {
-                group: Some("Ungrouped".into()),
-                ..Default::default()
-            }
-        )
-        .unwrap()
-        .nodes[0]
-            .key(),
-        "isolated"
+        personal
+            .nodes
+            .iter()
+            .map(|node| node.key().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["isolated".to_owned(), "ui".to_owned()]
     );
 }
 

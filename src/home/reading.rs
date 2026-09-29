@@ -11,7 +11,11 @@ impl HomeView {
         self.data
             .items
             .iter()
-            .filter(|i| i.kind == Kind::Reading && (self.show_completed || !i.completed))
+            .filter(|i| {
+                i.kind == Kind::Reading
+                    && (self.show_completed || !i.completed)
+                    && self.in_active_space(i)
+            })
             .cloned()
             .collect()
     }
@@ -76,7 +80,9 @@ impl HomeView {
                         .ghost()
                         .label("+ Add link")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.editor(Item::new(Kind::Reading), window, cx);
+                            let mut item = Item::new(Kind::Reading);
+                            item.space = this.active_space.clone();
+                            this.editor(item, window, cx);
                         })),
                 ),
             )

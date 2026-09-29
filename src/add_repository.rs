@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -58,7 +59,10 @@ pub(crate) struct AddRepositoryView {
     owner: Entity<InputState>,
     name: Entity<InputState>,
     description: Entity<InputState>,
-    group: Entity<InputState>,
+    /// Isolation profile for Create/Edit, chosen from the catalog; new
+    /// repositories default to the active space.
+    space: String,
+    spaces: Vec<String>,
     tags: Entity<InputState>,
     clone_url: Entity<InputState>,
     base_branch: Entity<InputState>,
@@ -75,6 +79,8 @@ impl AddRepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
         data_root: Option<DataRoot>,
+        spaces: Vec<String>,
+        default_space: String,
     ) -> Self {
         let mut input = |placeholder: &str, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
@@ -89,7 +95,8 @@ impl AddRepositoryView {
             owner: input("e.g. hossainemruz", cx),
             name: input("e.g. devcroft", cx),
             description: input("What is this repository for?", cx),
-            group: input("e.g. personal", cx),
+            space: default_space,
+            spaces,
             tags: input("Comma-separated, e.g. rust, desktop", cx),
             clone_url: input("e.g. git@github.com:hossainemruz/devcroft.git", cx),
             base_branch: input("e.g. main", cx),
@@ -107,8 +114,10 @@ impl AddRepositoryView {
         cx: &mut Context<Self>,
         data_root: Option<DataRoot>,
         key: String,
+        spaces: Vec<String>,
+        default_space: String,
     ) -> Self {
-        let mut view = Self::new(window, cx, data_root);
+        let mut view = Self::new(window, cx, data_root, spaces, default_space);
         view.mode = RepositoryDialogMode::Link { key };
         view
     }
@@ -122,8 +131,10 @@ impl AddRepositoryView {
         data_root: Option<DataRoot>,
         key: String,
         metadata: &RepositoryMetadata,
+        spaces: Vec<String>,
+        default_space: String,
     ) -> Self {
-        let mut view = Self::new(window, cx, data_root);
+        let mut view = Self::new(window, cx, data_root, spaces, default_space);
         view.revision = metadata.revision.clone();
         let mut prefill = |state: &Entity<InputState>, value: &str| {
             if !value.is_empty() {
@@ -140,7 +151,11 @@ impl AddRepositoryView {
             &view.description,
             metadata.description.as_deref().unwrap_or(""),
         );
-        prefill(&view.group, metadata.group.as_deref().unwrap_or(""));
+        view.space = metadata
+            .space
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(view.space);
         prefill(
             &view.tags,
             &metadata.tags.clone().unwrap_or_default().join(", "),
@@ -163,7 +178,7 @@ impl AddRepositoryView {
         owner: &str,
         name: &str,
         description: &str,
-        group: &str,
+        space: &str,
         tags: &str,
         clone_url: &str,
         base_branch: &str,
@@ -177,7 +192,7 @@ impl AddRepositoryView {
             owner: present(owner),
             name: present(name),
             description: present(description),
-            group: present(group),
+            space: present(space),
             tags: tags.split(',').map(str::to_owned).collect(),
             clone_url: present(clone_url),
             base_branch: present(base_branch),
@@ -192,7 +207,7 @@ impl AddRepositoryView {
             &text(&self.owner),
             &text(&self.name),
             &text(&self.description),
-            &text(&self.group),
+            &self.space,
             &text(&self.tags),
             &text(&self.clone_url),
             &text(&self.base_branch),
@@ -434,6 +449,49 @@ impl AddRepositoryView {
             .child(Input::new(state))
     }
 
+    /// Space picker for the metadata form: the catalog's spaces, plus the
+    /// record's own value when the catalog does not know it. New repositories
+    /// default to the active space; Edit prefills the stored one.
+    fn space_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.space.clone();
+        let mut choices = self.spaces.clone();
+        if !choices
+            .iter()
+            .any(|name| crate::data::space_eq(name, &current))
+        {
+            choices.push(current.clone());
+        }
+        let view = cx.entity().downgrade();
+        v_flex()
+            .gap_1()
+            .child(div().text_xs().text_color(rgb(0x858989)).child("Space"))
+            .child(
+                Button::new("add-repository-space")
+                    .w_full()
+                    .label(current.clone())
+                    .dropdown_caret(true)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for name in &choices {
+                            let name = name.clone();
+                            let selected = crate::data::space_eq(&current, &name);
+                            let view = view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone()).checked(selected).on_click(
+                                    move |_, _, cx| {
+                                        let name = name.clone();
+                                        let _ = view.update(cx, |this, cx| {
+                                            this.space = name;
+                                            cx.notify();
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        menu
+                    }),
+            )
+    }
+
     fn render_checkout(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let path_text = self
@@ -498,7 +556,7 @@ impl AddRepositoryView {
             )
     }
 
-    fn render_metadata_fields(&self) -> impl IntoElement {
+    fn render_metadata_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_3()
             .w_full()
@@ -523,12 +581,7 @@ impl AddRepositoryView {
             .child(
                 h_flex()
                     .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(self.field("Group", &self.group)),
-                    )
+                    .child(div().flex_1().min_w_0().child(self.space_field(cx)))
                     .child(
                         div()
                             .flex_1()
@@ -596,7 +649,7 @@ impl Render for AddRepositoryView {
                 body = body
                     .child(self.render_checkout(cx))
                     .child(self.field("Repository key (required, lowercase)", &self.key))
-                    .child(self.render_metadata_fields());
+                    .child(self.render_metadata_fields(cx));
             }
             RepositoryDialogMode::Link { key } => {
                 body = body
@@ -606,7 +659,7 @@ impl Render for AddRepositoryView {
             RepositoryDialogMode::Edit { key } => {
                 body = body
                     .child(self.render_fixed_key(key))
-                    .child(self.render_metadata_fields());
+                    .child(self.render_metadata_fields(cx));
             }
         }
         body = body.when_some(self.error.clone(), |this, error| {
@@ -653,7 +706,7 @@ mod tests {
         assert!(input.owner.is_none());
         assert_eq!(input.name.as_deref(), Some("name"));
         assert!(input.description.is_none());
-        assert_eq!(input.group.as_deref(), Some("personal"));
+        assert_eq!(input.space.as_deref(), Some("personal"));
         assert_eq!(
             input.clone_url.as_deref(),
             Some("https://example.com/o/r.git")

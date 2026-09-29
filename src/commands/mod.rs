@@ -99,7 +99,7 @@ pub(crate) fn repository(args: RepositoryArgs) -> Result<()> {
                 owner: update.owner.or(stored.owner),
                 name: update.name.or(stored.name),
                 description: update.description.or(stored.description),
-                group: update.group.or(stored.group),
+                space: update.space.or(stored.space),
                 tags,
                 clone_url: update.clone_url.or(stored.clone_url),
                 base_branch: update.base_branch.or(stored.base_branch),

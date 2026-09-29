@@ -48,8 +48,10 @@ pub(crate) struct RepositoryMetadata {
     pub(crate) display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
+    /// Isolation profile (see [`super::spaces`]). Legacy records stored this
+    /// as `group`; [`parse_metadata`] migrates that key on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) group: Option<String>,
+    pub(crate) space: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<Vec<String>>,
     #[serde(default, rename = "cloneUrl", skip_serializing_if = "Option::is_none")]
@@ -62,6 +64,19 @@ pub(crate) struct RepositoryMetadata {
     pub(crate) base_branch: Option<String>,
     #[serde(flatten, default)]
     pub(crate) extra: HashMap<String, Value>,
+}
+
+/// Parse portable metadata, migrating the legacy `group` key onto `space`.
+/// Migrate a repository record onto `space` using the shared precedence
+/// (non-blank `space`, else the first non-blank legacy key), dropping the
+/// legacy keys so saves converge on `space`. A null, blank, or non-string
+/// `space` counts as unset, exactly like the catalog rewrite.
+pub(super) fn parse_metadata(bytes: &[u8]) -> serde_json::Result<RepositoryMetadata> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    if let Some(record) = value.as_object_mut() {
+        super::spaces::normalize_space_keys(record);
+    }
+    serde_json::from_value(value)
 }
 
 /// Portable discovery does not require or load machine-local checkout bindings.
@@ -106,7 +121,7 @@ pub(crate) fn list_repositories(root: &DataRoot, limit: usize) -> Result<Reposit
             let key = require_repository_key(&entry.file_name().to_string_lossy())?;
             reject_symlink(&entry.path())?;
             let path = entry.path().join("repository.json");
-            let metadata: RepositoryMetadata = serde_json::from_slice(&read_bounded(&path)?)
+            let metadata = parse_metadata(&read_bounded(&path)?)
                 .with_context(|| format!("malformed repository at {}", path.display()))?;
             let mut warnings = Vec::new();
             if metadata
@@ -153,7 +168,7 @@ pub(crate) struct NewRepositoryInput {
     pub(crate) owner: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
-    pub(crate) group: Option<String>,
+    pub(crate) space: Option<String>,
     pub(crate) tags: Vec<String>,
     pub(crate) clone_url: Option<String>,
     pub(crate) base_branch: Option<String>,
@@ -172,7 +187,10 @@ pub(crate) struct RepositoryEntry {
     pub(crate) key: String,
     pub(crate) display_name: Option<String>,
     pub(crate) description: Option<String>,
-    pub(crate) group: Option<String>,
+    /// Resolved isolation profile: the catalog's canonical spelling, the
+    /// stored value when the catalog does not know it, or the catalog's
+    /// first space when the record predates spaces.
+    pub(crate) space: String,
     pub(crate) owner: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) checkout_path: Option<PathBuf>,
@@ -207,6 +225,7 @@ pub(super) fn all_repositories_unlocked(
     reject_symlink(&root.portable_dir().join("repositories"))?;
     let state = DeviceStore::new(root).load().unwrap_or_default();
     let bindings = state.repositories.unwrap_or_default();
+    let spaces = super::spaces::Spaces::load(root).unwrap_or_default();
     let dir = root.portable_dir().join("repositories");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -265,7 +284,7 @@ pub(super) fn all_repositories_unlocked(
             key,
             display_name: non_empty(metadata.display_name),
             description: non_empty(metadata.description),
-            group: non_empty(metadata.group),
+            space: spaces.resolve(metadata.space.as_deref()),
             owner: non_empty(metadata.owner),
             name: non_empty(metadata.name),
             checkout_path,
@@ -300,7 +319,7 @@ pub(super) fn get_repository_metadata_unlocked(
     reject_symlink(&root.portable_dir().join("repositories"))?;
     reject_symlink(&repository_dir(root, &key))?;
     let bytes = read_bounded(&path)?;
-    let mut metadata: RepositoryMetadata = serde_json::from_slice(&bytes)
+    let mut metadata = parse_metadata(&bytes)
         .with_context(|| format!("malformed repository at {}", path.display()))?;
     metadata.revision = revision(&bytes)?;
     Ok(metadata)
@@ -396,21 +415,22 @@ pub(crate) fn update_repository_metadata(
         name: clean_optional(input.name.as_deref()).map(str::to_owned),
         display_name: clean_optional(input.display_name.as_deref()).map(str::to_owned),
         description: clean_optional(input.description.as_deref()).map(str::to_owned),
-        group: clean_optional(input.group.as_deref()).map(str::to_owned),
+        space: clean_optional(input.space.as_deref()).map(str::to_owned),
         tags: clean_tags(&input.tags),
         clone_url: clean_optional(input.clone_url.as_deref()).map(str::to_owned),
         base_branch: clean_optional(input.base_branch.as_deref()).map(str::to_owned),
         extra: existing.extra,
     };
+    super::spaces::ensure_name_written(root, metadata.space.as_deref().unwrap_or_default());
     save_metadata_unlocked(&path, metadata, expected_revision)
 }
 
-/// Patch only purpose and group, preserving every unrelated metadata field.
+/// Patch only purpose and space, preserving every unrelated metadata field.
 pub(crate) fn patch_repository_purpose(
     root: &DataRoot,
     key: &str,
     description: String,
-    group: String,
+    space: String,
     expected_revision: &str,
 ) -> Result<RepositoryMetadata> {
     let _gate = portable_gate(root, false)?;
@@ -421,7 +441,8 @@ pub(crate) fn patch_repository_purpose(
         "stale repository revision; reload before saving (draft was not saved)"
     );
     metadata.description = clean_optional(Some(&description)).map(str::to_owned);
-    metadata.group = clean_optional(Some(&group)).map(str::to_owned);
+    metadata.space = clean_optional(Some(&space)).map(str::to_owned);
+    super::spaces::ensure_name_written(root, metadata.space.as_deref().unwrap_or_default());
     save_metadata_unlocked(
         &repository_dir(root, key).join("repository.json"),
         metadata,
@@ -436,7 +457,7 @@ fn save_metadata_unlocked(
 ) -> Result<RepositoryMetadata> {
     for value in [
         &metadata.description,
-        &metadata.group,
+        &metadata.space,
         &metadata.display_name,
         &metadata.owner,
         &metadata.name,
@@ -530,7 +551,8 @@ pub(crate) struct RecentRepository {
     pub(crate) checkout_path: PathBuf,
     pub(crate) last_opened_at: Option<String>,
     pub(crate) description: Option<String>,
-    pub(crate) group: Option<String>,
+    /// Resolved isolation profile, like [`RepositoryEntry::space`].
+    pub(crate) space: String,
     pub(crate) owner: Option<String>,
     pub(crate) name: Option<String>,
 }
@@ -551,6 +573,7 @@ pub(crate) fn recent_repositories(root: &DataRoot, limit: usize) -> Vec<RecentRe
     let mut recents = Vec::new();
     let state = DeviceStore::new(root).load().unwrap_or_default();
     let bindings = state.repositories.unwrap_or_default();
+    let spaces = super::spaces::Spaces::load(root).unwrap_or_default();
     let Ok(entries) = std::fs::read_dir(root.portable_dir().join("repositories")) else {
         return recents;
     };
@@ -559,9 +582,9 @@ pub(crate) fn recent_repositories(root: &DataRoot, limit: usize) -> Vec<RecentRe
         if require_repository_key(&key).is_err() {
             continue;
         }
-        let metadata: RepositoryMetadata = match std::fs::read(entry.path().join("repository.json"))
+        let metadata = match std::fs::read(entry.path().join("repository.json"))
             .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|bytes| parse_metadata(&bytes).ok())
         {
             Some(metadata) => metadata,
             None => continue,
@@ -585,7 +608,7 @@ pub(crate) fn recent_repositories(root: &DataRoot, limit: usize) -> Vec<RecentRe
             description: metadata
                 .description
                 .filter(|value| !value.trim().is_empty()),
-            group: metadata.group.filter(|value| !value.trim().is_empty()),
+            space: spaces.resolve(metadata.space.as_deref()),
             owner: metadata.owner.filter(|value| !value.trim().is_empty()),
             name: metadata.name.filter(|value| !value.trim().is_empty()),
         });
@@ -853,7 +876,15 @@ pub(crate) fn create_repository(
             .or(Some(inspection.name.clone())),
         display_name: clean_optional(input.display_name.as_deref()).map(str::to_owned),
         description: clean_optional(input.description.as_deref()).map(str::to_owned),
-        group: clean_optional(input.group.as_deref()).map(str::to_owned),
+        space: clean_optional(input.space.as_deref())
+            .map(str::to_owned)
+            .or_else(|| {
+                Some(
+                    super::spaces::Spaces::load(root)
+                        .unwrap_or_default()
+                        .resolve(None),
+                )
+            }),
         tags: clean_tags(&input.tags),
         clone_url: clean_optional(input.clone_url.as_deref())
             .map(str::to_owned)
@@ -863,6 +894,7 @@ pub(crate) fn create_repository(
             .or(Some(inspection.base_branch.clone())),
         extra: HashMap::new(),
     };
+    super::spaces::ensure_name_written(root, metadata.space.as_deref().unwrap_or_default());
     write_json_atomic(&dir.join("repository.json"), &metadata)
         .with_context(|| format!("saving repository record to {}", dir.display()))?;
     let checkout_display = inspection.checkout_path.to_string_lossy().into_owned();
@@ -1441,7 +1473,7 @@ mod tests {
             &NewRepositoryInput {
                 display_name: Some("Grouped Repo".to_owned()),
                 description: Some("What this checkout is for".to_owned()),
-                group: Some("work".to_owned()),
+                space: Some("work".to_owned()),
                 owner: Some("acme".to_owned()),
                 name: Some("grouped".to_owned()),
                 ..NewRepositoryInput::default()
@@ -1455,7 +1487,7 @@ mod tests {
             recents[0].description.as_deref(),
             Some("What this checkout is for")
         );
-        assert_eq!(recents[0].group.as_deref(), Some("work"));
+        assert_eq!(recents[0].space, "Work");
         assert_eq!(recents[0].owner.as_deref(), Some("acme"));
         assert_eq!(recents[0].name.as_deref(), Some("grouped"));
     }
@@ -1708,5 +1740,91 @@ mod tests {
         );
         assert!(error.contains("no portable record"), "{error}");
         assert!(remove_repository(&root, "Not Valid").is_err());
+    }
+
+    #[test]
+    fn legacy_group_key_migrates_to_space_on_read() {
+        // Legacy record: `group` only.
+        let metadata = parse_metadata(br#"{"key":"acme","group":"Work","future":1}"#).unwrap();
+        assert_eq!(metadata.space.as_deref(), Some("Work"));
+        assert!(!metadata.extra.contains_key("group"));
+
+        // A newer build wrote `space` while an older one round-tripped a
+        // stale `group`: the new key wins, the legacy key is dropped.
+        let metadata =
+            parse_metadata(br#"{"key":"acme","space":"Personal","group":"Work"}"#).unwrap();
+        assert_eq!(metadata.space.as_deref(), Some("Personal"));
+
+        // A null or blank `space` counts as unset, so the legacy value still
+        // wins — the same precedence the catalog rewrite uses.
+        for bytes in [
+            br#"{"key":"acme","space":null,"group":"Work"}"#.as_slice(),
+            br#"{"key":"acme","space":"  ","group":"Work"}"#.as_slice(),
+            br#"{"key":"acme","space":7,"group":"Work"}"#.as_slice(),
+        ] {
+            let metadata = parse_metadata(bytes).unwrap();
+            assert_eq!(metadata.space.as_deref(), Some("Work"), "{bytes:?}");
+            assert!(!metadata.extra.contains_key("group"));
+        }
+
+        // Garbage legacy values are discarded, never a load failure.
+        let metadata = parse_metadata(br#"{"key":"acme","group":{"nested":true}}"#).unwrap();
+        assert!(metadata.space.is_none());
+        let metadata = parse_metadata(br#"{"key":"acme","group":null}"#).unwrap();
+        assert!(metadata.space.is_none());
+
+        // Saves converge on `space` only.
+        let encoded = serde_json::to_value(&metadata).unwrap();
+        assert!(encoded.get("group").is_none());
+    }
+
+    #[test]
+    fn repository_entry_and_recents_resolve_spaces_through_the_catalog() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        create_repository(
+            &root,
+            "acme",
+            checkout.path(),
+            &NewRepositoryInput::default(),
+        )
+        .unwrap();
+        // Rename the catalog spelling; the record is rewritten by the rename,
+        // but a hand-edited record with a different case still resolves.
+        crate::data::spaces::ensure_name_written(&root, "Work");
+        let path = repository_dir(&root, "acme").join("repository.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["space"] = serde_json::json!("work");
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let (entries, errors) = all_repositories(&root).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(entries[0].space, "Work");
+
+        let recents = recent_repositories(&root, 10);
+        assert_eq!(recents[0].space, "Work");
+    }
+
+    #[test]
+    fn create_defaults_space_to_the_catalog_first_space() {
+        let (_dir, root) = fresh_root();
+        let checkout = tempfile::tempdir().unwrap();
+        init_checkout(checkout.path());
+        let created = create_repository(
+            &root,
+            "plain",
+            checkout.path(),
+            &NewRepositoryInput::default(),
+        )
+        .unwrap();
+        let metadata = get_repository_metadata(&root, &created.key).unwrap();
+        assert_eq!(metadata.space.as_deref(), Some("Personal"));
+        assert_eq!(
+            crate::data::spaces::Spaces::load(&root).unwrap().names(),
+            vec!["Personal", "Work"],
+            "the implicit space must land in the catalog"
+        );
     }
 }

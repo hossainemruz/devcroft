@@ -24,9 +24,9 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled, WeakEntity, Window,
-    div, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled,
+    WeakEntity, Window, div, px, rgb,
 };
 
 use std::rc::Rc;
@@ -41,9 +41,10 @@ use crate::command_palette::{
     PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
 };
 use crate::data::{
-    CheckoutOutcome, DataRoot, DeviceStore, SYNC_INTERVAL_OPTIONS, SyncStatus, SyncTracker,
-    checkout_branch, clear_origin, current_branch_name, current_upstream, get_origin,
-    is_supported_sync_interval, list_local_branches, set_origin,
+    CheckoutOutcome, DataRoot, DeviceStore, SYNC_INTERVAL_OPTIONS, SpaceRewrite, Spaces,
+    SyncStatus, SyncTracker, checkout_branch, clear_origin, current_branch_name, current_upstream,
+    delete_space, get_origin, is_supported_sync_interval, list_local_branches, rename_space,
+    set_origin, space_eq,
 };
 use crate::fonts::TERMINAL_FONT_FAMILY;
 use crate::metrics::{
@@ -55,17 +56,25 @@ use crate::workspace::Workspace;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsSection {
     General,
+    Spaces,
     Sync,
     Agent,
     Keybindings,
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 4] = [Self::General, Self::Sync, Self::Agent, Self::Keybindings];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::General,
+        Self::Spaces,
+        Self::Sync,
+        Self::Agent,
+        Self::Keybindings,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Spaces => "Spaces",
             Self::Sync => "Sync",
             Self::Agent => "Agent",
             Self::Keybindings => "Keybindings",
@@ -75,11 +84,20 @@ impl SettingsSection {
     pub(crate) fn description(self) -> &'static str {
         match self {
             Self::General => "App-wide appearance.",
+            Self::Spaces => "Isolation profiles for repositories, Home, and artifacts.",
             Self::Sync => "Portable data Git sync.",
             Self::Agent => "Agent pane preferences.",
             Self::Keybindings => "Current shortcuts.",
         }
     }
+}
+
+/// Inline row editor in the Spaces section: rename one space, or delete it
+/// after choosing where its records move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SpaceEdit {
+    Rename(String),
+    Delete { name: String, destination: String },
 }
 
 pub(crate) struct SettingsView {
@@ -118,6 +136,14 @@ pub(crate) struct SettingsView {
     /// set is fixed, so tiles are rasterized once at creation and shared by
     /// every render.
     agent_icon_tiles: Rc<AgentIconTiles>,
+    /// Spaces section: the portable catalog, the new-space input, and the
+    /// inline rename/delete editor for one row at a time.
+    spaces: Vec<String>,
+    space_input: Entity<InputState>,
+    space_rename_input: Entity<InputState>,
+    space_edit: Option<SpaceEdit>,
+    spaces_error: Option<String>,
+    spaces_notice: Option<String>,
 }
 
 impl SettingsView {
@@ -181,6 +207,9 @@ impl SettingsView {
                 .step(SIDEBAR_LIMIT_STEP as f32)
                 .default_value(session_limit as f32)
         });
+        let space_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Client A"));
+        let space_rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Space name"));
+        let spaces = load_space_names(data_root.as_ref());
         cx.subscribe(
             &session_slider,
             |this, _, event: &SliderEvent, cx| match event {
@@ -234,6 +263,12 @@ impl SettingsView {
             default_agent,
             default_agent_error: None,
             agent_icon_tiles: Rc::new(agent_icon_tiles),
+            spaces,
+            space_input,
+            space_rename_input,
+            space_edit: None,
+            spaces_error: None,
+            spaces_notice: None,
         }
     }
 
@@ -320,6 +355,21 @@ impl SettingsView {
         self.branch_busy = false;
         self.branch_error = None;
         self.branch_notice = None;
+        // Spaces: re-read the portable catalog and drop any inline editor
+        // whose row no longer exists.
+        self.spaces = load_space_names(self.data_root.as_ref());
+        if let Some(SpaceEdit::Rename(name)) = &self.space_edit
+            && !self.spaces.iter().any(|space| space_eq(space, name))
+        {
+            self.space_edit = None;
+        }
+        if let Some(SpaceEdit::Delete { name, .. }) = &self.space_edit
+            && !self.spaces.iter().any(|space| space_eq(space, name))
+        {
+            self.space_edit = None;
+        }
+        self.spaces_error = None;
+        self.spaces_notice = None;
         cx.notify();
     }
 
@@ -719,6 +769,164 @@ impl SettingsView {
         }
     }
 
+    /// Add a space to the portable catalog, then re-project the workspace.
+    fn add_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.data_root.clone() else {
+            self.spaces_error = Some("Portable data is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let raw = self.space_input.read(cx).value().to_string();
+        let result = (|| -> anyhow::Result<String> {
+            let name = crate::data::normalize_name(&raw)?;
+            let mut catalog = Spaces::load(&root)?;
+            let expected = catalog.clone();
+            anyhow::ensure!(
+                !catalog.contains(&name),
+                "The space {name:?} already exists"
+            );
+            catalog.ensure_name(&name);
+            catalog.save(&root, &expected)?;
+            Ok(name)
+        })();
+        match result {
+            Ok(name) => {
+                self.space_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.after_space_change(Some(format!("Added space {name:?}")), None, cx);
+            }
+            Err(error) => self.after_space_change(None, Some(format!("{error:#}")), cx),
+        }
+    }
+
+    /// Start renaming one space: the row's own input prefills with its name.
+    fn begin_space_rename(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.space_rename_input
+            .update(cx, |input, cx| input.set_value(name.to_owned(), window, cx));
+        self.space_edit = Some(SpaceEdit::Rename(name.to_owned()));
+        self.spaces_error = None;
+        self.spaces_notice = None;
+        cx.notify();
+    }
+
+    /// Apply the pending rename. References are rewritten atomically with the
+    /// catalog, so a failure changes nothing.
+    fn save_space_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(SpaceEdit::Rename(from)) = self.space_edit.clone() else {
+            return;
+        };
+        if self.has_unsaved_artifact_draft(cx) {
+            return;
+        }
+        let Some(root) = self.data_root.clone() else {
+            self.spaces_error = Some("Portable data is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let to = self.space_rename_input.read(cx).value().to_string();
+        match rename_space(&root, &from, &to) {
+            Ok(touched) => self.after_space_change(
+                Some(space_rewrite_notice(&format!("Renamed {from:?}"), &touched)),
+                None,
+                cx,
+            ),
+            Err(error) => self.after_space_change(None, Some(format!("{error:#}")), cx),
+        }
+    }
+
+    /// Start deleting one space; the destination defaults to the first other
+    /// space so the confirm action is always well-defined.
+    fn begin_space_delete(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(destination) = self
+            .spaces
+            .iter()
+            .find(|space| !space_eq(space, name))
+            .cloned()
+        else {
+            return;
+        };
+        self.space_edit = Some(SpaceEdit::Delete {
+            name: name.to_owned(),
+            destination,
+        });
+        self.spaces_error = None;
+        self.spaces_notice = None;
+        cx.notify();
+    }
+
+    /// Delete the pending space after moving its records to the destination.
+    fn confirm_space_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(SpaceEdit::Delete { name, destination }) = self.space_edit.clone() else {
+            return;
+        };
+        if self.has_unsaved_artifact_draft(cx) {
+            return;
+        }
+        let Some(root) = self.data_root.clone() else {
+            self.spaces_error = Some("Portable data is unavailable".into());
+            cx.notify();
+            return;
+        };
+        match delete_space(&root, &name, &destination) {
+            Ok(touched) => self.after_space_change(
+                Some(space_rewrite_notice(
+                    &format!("Deleted {name:?} · records moved to {destination:?}"),
+                    &touched,
+                )),
+                None,
+                cx,
+            ),
+            Err(error) => self.after_space_change(None, Some(format!("{error:#}")), cx),
+        }
+    }
+
+    /// Refuse a catalog edit while any artifact draft is unsaved: renaming
+    /// or deleting rewrites the records drafts are based on and can strand
+    /// their stashed keys. Returns true when the caller must stop.
+    fn has_unsaved_artifact_draft(&mut self, cx: &mut Context<Self>) -> bool {
+        let blocked = self
+            .workspace
+            .clone()
+            .and_then(|workspace| {
+                workspace
+                    .update(cx, |this, cx| this.has_artifact_draft(cx))
+                    .ok()
+            })
+            .unwrap_or(false);
+        if blocked {
+            self.spaces_error = Some(
+                "Save or cancel the unsaved artifact draft first (Home → Artifacts or the repository Resources tab)."
+                    .into(),
+            );
+            cx.notify();
+        }
+        blocked
+    }
+
+    fn cancel_space_edit(&mut self, cx: &mut Context<Self>) {
+        self.space_edit = None;
+        self.spaces_error = None;
+        cx.notify();
+    }
+
+    /// Common tail for catalog edits: refresh the list, clear the inline
+    /// editor, and let the workspace re-project every space-filtered surface.
+    fn after_space_change(
+        &mut self,
+        notice: Option<String>,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.spaces = load_space_names(self.data_root.as_ref());
+        self.space_edit = None;
+        self.spaces_error = error;
+        self.spaces_notice = notice;
+        if let Some(workspace) = self.workspace.clone() {
+            workspace.update(cx, |this, cx| this.reload_spaces(cx)).ok();
+        }
+        cx.notify();
+    }
+
     /// Forward the command-bar toggles to the workspace, mirroring
     /// `TerminalPane::on_key_down` / `ReviewView::on_key_down`. Tab jumps and
     /// session creation are intentionally not forwarded: they live in
@@ -822,6 +1030,9 @@ impl SettingsView {
                                 SettingsSection::General => {
                                     self.render_general(cx).into_any_element()
                                 }
+                                SettingsSection::Spaces => {
+                                    self.render_spaces(cx).into_any_element()
+                                }
                                 SettingsSection::Sync => self.render_sync(cx).into_any_element(),
                                 SettingsSection::Agent => self.render_agent(cx).into_any_element(),
                                 SettingsSection::Keybindings => {
@@ -830,6 +1041,186 @@ impl SettingsView {
                             }),
                     ),
             )
+    }
+
+    /// Spaces: the portable isolation profiles. Switching happens from the
+    /// Home titlebar (or `s` in navigation mode); this section manages the
+    /// catalog itself.
+    fn render_spaces(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let last_space = self.spaces.len() <= 1;
+        v_flex()
+            .gap_4()
+            .child(
+                group(
+                    "Spaces",
+                    Some("Repositories, Home items, and artifacts are isolated per space; agent sessions follow their repository. Switch spaces from the Home titlebar, or press s in navigation mode."),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.space_input)))
+                        .child(
+                            Button::new("add-space")
+                                .primary()
+                                .label("Add space")
+                                .on_click(cx.listener(|this, _, window, cx| this.add_space(window, cx))),
+                        ),
+                )
+                .child({
+                    let rows: Vec<AnyElement> = self
+                        .spaces
+                        .iter()
+                        .map(|name| self.render_space_row(name, last_space, cx))
+                        .collect();
+                    v_flex().gap_2().children(rows)
+                }),
+            )
+            .when_some(self.spaces_error.clone(), |this, error| {
+                this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+            })
+            .when_some(self.spaces_notice.clone(), |this, notice| {
+                this.child(div().text_sm().text_color(rgb(0x858989)).child(notice))
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x737878))
+                    .child("Renaming rewrites every record that uses the space. Deleting moves its records to the destination you pick; at least one space must remain. Save or cancel unsaved artifact drafts before renaming or deleting a space."),
+            )
+    }
+
+    /// One space row: the name plus rename/delete actions, or the inline
+    /// editor for the pending action.
+    fn render_space_row(&self, name: &str, last_space: bool, cx: &mut Context<Self>) -> AnyElement {
+        match self.space_edit.clone() {
+            Some(SpaceEdit::Rename(target)) if space_eq(&target, name) => h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.space_rename_input)),
+                )
+                .child(
+                    Button::new("save-space-rename")
+                        .primary()
+                        .label("Rename")
+                        .on_click(cx.listener(|this, _, _, cx| this.save_space_rename(cx))),
+                )
+                .child(
+                    Button::new("cancel-space-rename")
+                        .ghost()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_space_edit(cx))),
+                )
+                .into_any_element(),
+            Some(SpaceEdit::Delete {
+                name: target,
+                destination,
+            }) if space_eq(&target, name) => {
+                let choices: Vec<String> = self
+                    .spaces
+                    .iter()
+                    .filter(|space| !space_eq(space, name))
+                    .cloned()
+                    .collect();
+                let row = cx.entity().downgrade();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(rgb(0xe7e7e7))
+                            .child(format!("Move everything in {name:?} to")),
+                    )
+                    .child(
+                        Button::new("delete-space-destination")
+                            .outline()
+                            .label(destination.clone())
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for choice in &choices {
+                                    let choice = choice.clone();
+                                    let row = row.clone();
+                                    let selected = choice == destination;
+                                    menu = menu.item(
+                                        PopupMenuItem::new(choice.clone())
+                                            .checked(selected)
+                                            .on_click(move |_, _, cx| {
+                                                let choice = choice.clone();
+                                                let _ = row.update(cx, |this, cx| {
+                                                    if let Some(SpaceEdit::Delete {
+                                                        destination,
+                                                        ..
+                                                    }) = &mut this.space_edit
+                                                    {
+                                                        *destination = choice.clone();
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    );
+                                }
+                                menu
+                            }),
+                    )
+                    .child(
+                        Button::new("confirm-space-delete")
+                            .danger()
+                            .label("Delete space")
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_space_delete(cx))),
+                    )
+                    .child(
+                        Button::new("cancel-space-delete")
+                            .ghost()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_space_edit(cx))),
+                    )
+                    .into_any_element()
+            }
+            _ => {
+                let rename_name = name.to_owned();
+                let delete_name = name.to_owned();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(rgb(0xe7e7e7))
+                            .child(name.to_owned()),
+                    )
+                    .child(
+                        Button::new(format!("rename-space-{name}"))
+                            .ghost()
+                            .label("Rename")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.begin_space_rename(&rename_name, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("delete-space-{name}"))
+                            .ghost()
+                            .label("Delete")
+                            .disabled(last_space)
+                            .tooltip(if last_space {
+                                "Keep at least one space"
+                            } else {
+                                "Move this space's records to another space and delete it"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_space_delete(&delete_name, cx)
+                            })),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1724,6 +2115,31 @@ fn checkout_notice(outcome: CheckoutOutcome, name: &str) -> String {
     }
 }
 
+/// Catalog names for the Spaces section (best effort; empty when the
+/// catalog cannot be read, with the section's own error line explaining).
+fn load_space_names(root: Option<&DataRoot>) -> Vec<String> {
+    root.and_then(|root| Spaces::load(root).ok())
+        .map(|catalog| catalog.names())
+        .unwrap_or_default()
+}
+
+/// Settings notice for a completed catalog rewrite, including records that
+/// could not be parsed: a rename must never look complete while some record
+/// still holds the old name.
+fn space_rewrite_notice(prefix: &str, touched: &SpaceRewrite) -> String {
+    let mut notice = format!(
+        "{prefix} · {} repositories and {} Home items updated",
+        touched.repositories, touched.items
+    );
+    if touched.skipped > 0 {
+        notice.push_str(&format!(
+            "; {} record(s) could not be read and may still reference the old name",
+            touched.skipped
+        ));
+    }
+    notice
+}
+
 fn group(title: &str, description: Option<&str>) -> gpui_kit::Div {
     v_flex().gap_3().child(
         v_flex()
@@ -1843,7 +2259,10 @@ mod tests {
             .into_iter()
             .map(|section| section.label())
             .collect();
-        assert_eq!(labels, vec!["General", "Sync", "Agent", "Keybindings"]);
+        assert_eq!(
+            labels,
+            vec!["General", "Spaces", "Sync", "Agent", "Keybindings"]
+        );
         for section in SettingsSection::ALL {
             assert!(
                 !section.description().is_empty(),

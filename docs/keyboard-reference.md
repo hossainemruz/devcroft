@@ -37,9 +37,10 @@ These three also work inside navigation mode: the palettes exit to normal mode a
 | Location | Keys |
 | --- | --- |
 | Everywhere in navigation mode | `Tab` Next focusable component, `Shift+Tab` Previous focusable component (mode stays open) |
-| Home dashboard | `a` Add repository, `r` Browse artifacts |
+| Home dashboard | `a` Add repository, `r` Browse artifacts, `s` Switch space |
+| Space switcher (open) | `↑`/`↓` Highlight a space, `Enter` switch to it, `Escape` close |
 | Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Git changes, `Space` Home, `n` New agent session |
-| Global Artifacts page | `Space` Home, `b` Back to origin, plus artifact actions below when available |
+| Global Artifacts page | `Space` Home, `b` Back to origin, `s` Switch space, plus artifact actions below when available |
 | Selected resource, no draft or save running | `m` Edit Markdown, `c` Add comment |
 | Resource draft, save not running | `w` Save draft, `q` Cancel draft |
 | Multiple visible panes | `h` Focus left pane, `l` Focus right pane |
@@ -59,7 +60,7 @@ The standalone preview window (`devcroft preview <path>`) and the Resources read
 
 ## Panes
 
-Pane movement follows the rendered left-to-right layout and only includes regions on screen. Agent covers the sessions sidebar and the terminal; Review covers files, diff, and comments when shown; Resources and Artifacts cover the list, the document or draft, and the comments and outline rails when shown. Editor and Terminal each have one pane. Home has one pane: `j`/`k` there walk every dashboard card (recent sessions, recent projects, then pull requests, todos, and reading items) instead of switching panes. On the Pull Requests board, `j`/`k` walk cards column by column within the selected All/Personal/Work filter and `Enter` edits the selected PR. On the Todos board, `j`/`k` walk cards column by column (Unscoped first, then projects) within the selected group filter and `Enter` toggles the selected todo. On the To Read page, `j`/`k` walk the list in order and `Enter` toggles the selected item read. Card menus also support moving PRs without dragging. The focused pane is named in the list and native panes show a focus ring; the `j`/`k` cursor shows as a ring around the highlighted sidebar row or card.
+Pane movement follows the rendered left-to-right layout and only includes regions on screen. Agent covers the sessions sidebar and the terminal; Review covers files, diff, and comments when shown; Resources and Artifacts cover the list, the document or draft, and the comments and outline rails when shown. Editor and Terminal each have one pane. Home has one pane: `j`/`k` there walk every dashboard card (recent sessions, recent projects, then pull requests, todos, and reading items) instead of switching panes. On the Pull Requests board, `j`/`k` walk cards column by column within the active space and `Enter` edits the selected PR. On the Todos board, `j`/`k` walk cards column by column (Unscoped first, then projects) within the active space and `Enter` toggles the selected todo. On the To Read page, `j`/`k` walk the list in order and `Enter` toggles the selected item read. Card menus also support moving PRs without dragging. The focused pane is named in the list and native panes show a focus ring; the `j`/`k` cursor shows as a ring around the highlighted sidebar row or card.
 
 ## Repository Relationships
 
@@ -76,6 +77,7 @@ Mouse: drag a node body to move it, background to pan, or an output handle to
 an input handle to create a connection. Select an edge, then drag its provider
 or consumer handle to rewire. Scroll zooms around the pointer. Finish editing
 with Save or Cancel; Auto arrange and Fit view are explicit toolbar actions.
-Group radio buttons switch between Personal, Work, custom groups, and Ungrouped
-when present. Connections outside the current group remain listed in the node
+The canvas shows the active space's repositories and each space keeps its own
+saved layout; switch spaces from the Home titlebar (or `s` in navigation mode).
+Connections to repositories in other spaces remain listed in the node
 inspector. The icon buttons provide tooltips and accessible names.

@@ -43,6 +43,12 @@ pub(crate) struct DeviceState {
     pub(crate) last_repository: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_tab: Option<String>,
+    /// Active space (see [`super::spaces`]): the isolation profile the app
+    /// resumes at startup. Absent or unknown falls back to the catalog's
+    /// first space, so a space renamed on another device never strands
+    /// startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_space: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sync_interval_minutes: Option<u64>,
     /// App-wide font size (General settings). Absent means the default;

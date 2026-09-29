@@ -10,7 +10,6 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::radio::Radio;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme as _, ColorName, Disableable as _, Sizable, Size, StyledExt as _, WindowExt as _,
@@ -28,7 +27,7 @@ fn item_id(prefix: &str, id: &str) -> SharedString {
     format!("{prefix}-{id}").into()
 }
 
-use crate::data::dashboard::{Category, Dashboard, Group, Item, Kind, safe_web_url};
+use crate::data::dashboard::{Category, Dashboard, Item, Kind, safe_web_url};
 use crate::data::{
     DataRoot, RecentRepository, RepositoryEntry, SyncStatus, SyncTracker, all_repositories,
     recent_repositories,
@@ -207,37 +206,6 @@ pub(crate) enum HomeEvent {
     RefreshSessions,
 }
 
-/// Session-local group filter for the Projects page.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-enum ProjectGroupFilter {
-    #[default]
-    All,
-    Group(String),
-    Ungrouped,
-}
-
-impl ProjectGroupFilter {
-    fn matches(&self, entry: &RepositoryEntry) -> bool {
-        match self {
-            Self::All => true,
-            Self::Group(group) => entry.group.as_deref() == Some(group.as_str()),
-            Self::Ungrouped => entry.group.is_none(),
-        }
-    }
-}
-
-/// Distinct non-empty groups present, sorted. Pure so the filter row stays
-/// unit-testable without a window.
-fn project_groups(entries: &[RepositoryEntry]) -> Vec<String> {
-    let mut groups: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| entry.group.clone())
-        .collect();
-    groups.sort();
-    groups.dedup();
-    groups
-}
-
 /// Session-local project filter for Todos. `All` shows everything, `Unscoped`
 /// shows todos with no project, and `Project(key)` shows one repository.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -315,9 +283,10 @@ pub(crate) struct HomeView {
     all_projects: Vec<RepositoryEntry>,
     project_errors: Vec<String>,
     project_refresh: crate::artifacts::Refresh,
-    /// Session-local group filter for the Projects page. Survives reloads;
-    /// reset only by picking another filter.
-    project_group_filter: ProjectGroupFilter,
+    /// Isolation profiles, in catalog order, and the active one. Every Home
+    /// list filters on the active space; the switcher lives in the titlebar.
+    spaces: Vec<String>,
+    active_space: String,
     sessions: Vec<(crate::agent_sessions::SessionSummary, String)>,
     session_errors: Vec<String>,
     sessions_loaded: bool,
@@ -328,19 +297,13 @@ pub(crate) struct HomeView {
     git_loading: bool,
     pr_status: crate::pull_requests::Cache,
     pr_loading: bool,
-    /// Session-local group filter for PRs (`None` shows Personal + Work).
-    /// Shared by the inbox list and the dedicated board.
-    group_filter: Option<Group>,
     /// Session-local category filter for the PR inbox (`None` shows all
     /// categories). The dedicated board keeps showing every column; only the
     /// inbox list applies this filter.
     pr_category_filter: Option<Category>,
-    /// Session-local group filter for Todos (`None` shows Personal + Work).
-    /// Shared by the inbox list and the dedicated board.
-    todo_group_filter: Option<Group>,
     /// Session-local project filter for the Todo inbox (`All` shows every
     /// project). The dedicated board shows every project as a column and
-    /// only applies the group filter.
+    /// only applies the space filter.
     todo_project_filter: TodoProjectFilter,
     project_focus: HashMap<String, FocusHandle>,
     add_project_focus: FocusHandle,
@@ -381,6 +344,34 @@ impl Render for DragTodo {
 }
 
 impl HomeView {
+    /// Whether the global artifact browser holds an unsaved draft.
+    pub(crate) fn has_artifact_draft(&self, cx: &gpui_kit::App) -> bool {
+        self.artifacts.read(cx).has_draft()
+    }
+
+    /// Follow the active space: the catalog powers the editors' Space
+    /// selector, and a real change re-projects every Home list.
+    pub(crate) fn set_space(
+        &mut self,
+        spaces: Vec<String>,
+        active: String,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = !crate::data::space_eq(&self.active_space, &active) || self.spaces != spaces;
+        self.spaces = spaces;
+        self.active_space = active.clone();
+        // A project filter naming another space's project would hide its own
+        // selection; the space itself is the filter now.
+        self.todo_project_filter = TodoProjectFilter::All;
+        self.navigation_cursor = None;
+        self.artifacts
+            .update(cx, |view, cx| view.set_space(active, cx));
+        if changed {
+            self.reload(cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn set_sessions(
         &mut self,
         sessions: Vec<(crate::agent_sessions::SessionSummary, String)>,
@@ -427,7 +418,8 @@ impl HomeView {
             all_projects: Vec::new(),
             project_errors: Vec::new(),
             project_refresh: crate::artifacts::Refresh::default(),
-            project_group_filter: ProjectGroupFilter::All,
+            spaces: Vec::new(),
+            active_space: crate::data::DEFAULT_SPACE.to_owned(),
             sessions: Vec::new(),
             session_errors: Vec::new(),
             sessions_loaded: false,
@@ -438,9 +430,7 @@ impl HomeView {
             git_loading: false,
             pr_status: crate::pull_requests::Cache::default(),
             pr_loading: false,
-            group_filter: None,
             pr_category_filter: None,
-            todo_group_filter: None,
             todo_project_filter: TodoProjectFilter::All,
             project_focus: HashMap::new(),
             add_project_focus: cx.focus_handle(),
@@ -520,12 +510,12 @@ impl HomeView {
         self.page == Some("Projects")
     }
 
-    /// Projects-page rows in render order: every portable record matching
-    /// the group filter, sorted by key.
+    /// Projects-page rows in render order: every portable record in the
+    /// active space, sorted by key.
     fn visible_projects(&self) -> Vec<RepositoryEntry> {
         self.all_projects
             .iter()
-            .filter(|entry| self.project_group_filter.matches(entry))
+            .filter(|entry| crate::data::space_eq(&entry.space, &self.active_space))
             .cloned()
             .collect()
     }
@@ -653,7 +643,7 @@ impl HomeView {
                 i.kind == Kind::PullRequest
                     && (self.show_completed || !i.completed)
                     && i.category == category
-                    && self.group_filter.is_none_or(|group| i.group == group)
+                    && self.in_active_space(i)
             }) {
                 targets.push(HomeNavTarget::Item(item.id.clone()));
             }
@@ -661,15 +651,16 @@ impl HomeView {
         for item in visible.iter().filter(|i| {
             i.kind == Kind::Todo
                 && (self.show_completed || !i.completed)
-                && self.todo_group_filter.is_none_or(|group| i.group == group)
+                && self.in_active_space(i)
                 && self.todo_project_filter.matches(i.project_key())
         }) {
             targets.push(HomeNavTarget::Item(item.id.clone()));
         }
-        for item in visible
-            .iter()
-            .filter(|i| i.kind == Kind::Reading && (self.show_completed || !i.completed))
-        {
+        for item in visible.iter().filter(|i| {
+            i.kind == Kind::Reading
+                && (self.show_completed || !i.completed)
+                && self.in_active_space(i)
+        }) {
             targets.push(HomeNavTarget::Item(item.id.clone()));
         }
         targets
@@ -854,10 +845,17 @@ impl HomeView {
         let Some(generation) = self.project_refresh.request() else {
             return;
         };
+        let space = self.active_space.clone();
         cx.spawn(async move |this, cx| {
             let (projects, result) = cx
                 .background_spawn(async move {
-                    (recent_repositories(&root, 4), all_repositories(&root))
+                    // The recents cap applies after the space filter, so the
+                    // dashboard shows up to four of this space's projects even
+                    // when another space holds the most recent opens.
+                    let mut projects = recent_repositories(&root, usize::MAX);
+                    projects.retain(|project| crate::data::space_eq(&project.space, &space));
+                    projects.truncate(4);
+                    (projects, all_repositories(&root))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -961,14 +959,32 @@ impl HomeView {
         let url = input(&item.url, "https://…", window, cx);
         let home = cx.entity().downgrade();
         let category = std::rc::Rc::new(std::cell::Cell::new(item.category));
-        let group = std::rc::Rc::new(std::cell::Cell::new(item.group));
+        // An item constructed without a space (a fresh `Item::new`) starts in
+        // the active space, like every quick-add path.
+        let item_space = if item.space.trim().is_empty() {
+            self.active_space.clone()
+        } else {
+            item.space.clone()
+        };
+        let space = std::rc::Rc::new(std::cell::RefCell::new(item_space.clone()));
+        // Space choices: the catalog plus the item's own value when it names
+        // a space the catalog does not know, so editing never reassigns it
+        // silently.
+        let mut space_options = self.spaces.clone();
+        if !space_options
+            .iter()
+            .any(|name| crate::data::space_eq(name, &item_space))
+        {
+            space_options.push(item_space);
+        }
+        let space_options = std::rc::Rc::new(space_options);
         let todo_project =
             std::rc::Rc::new(std::cell::RefCell::new(item.project.trim().to_owned()));
         // Project choices for the Todo editor: Unscoped plus every known
         // repository, plus the current value when it points at a removed
         // record so existing scope is never silently dropped.
         let mut project_options: Vec<(String, String)> = self
-            .all_projects
+            .visible_projects()
             .iter()
             .map(|entry| {
                 let title = entry
@@ -1001,27 +1017,39 @@ impl HomeView {
             } else {
                 form = form.child("URL").child(Input::new(&url));
             }
+            {
+                let space_choice = space.clone();
+                let space_options = space_options.clone();
+                form = form.child("Space").child(
+                    Button::new("item-space")
+                        .label(space.borrow().clone())
+                        .dropdown_caret(true)
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for name in space_options.iter() {
+                                let name = name.clone();
+                                let choice = space_choice.clone();
+                                let is_current = crate::data::space_eq(&choice.borrow(), &name);
+                                menu = menu.item(
+                                    PopupMenuItem::new(name.clone())
+                                        .checked(is_current)
+                                        .on_click(move |_, _, cx| {
+                                            *choice.borrow_mut() = name.clone();
+                                            cx.refresh_windows();
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
+                );
+            }
             if item.kind == Kind::PullRequest {
                 form = form.child("The title is fetched automatically from GitHub.").child("Category").child(h_flex().gap_2().flex_wrap().children(Category::ALL.into_iter().enumerate().map(|(index, choice)| {
                     let category = category.clone();
                     Button::new(("category", index)).label(if category.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
                         .on_click(move |_, _, cx| { category.set(choice); cx.refresh_windows(); })
-                })))
-                .child("Group")
-                .child(h_flex().gap_2().children(Group::ALL.into_iter().enumerate().map(|(index, choice)| {
-                    let group = group.clone();
-                    Button::new(("group", index))
-                        .label(if group.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
-                        .on_click(move |_, _, cx| { group.set(choice); cx.refresh_windows(); })
                 })));
             }
             if item.kind == Kind::Todo {
-                form = form.child("Group").child(h_flex().gap_2().children(Group::ALL.into_iter().enumerate().map(|(index, choice)| {
-                    let group = group.clone();
-                    Button::new(("todo-group", index))
-                        .label(if group.get() == choice { format!("✓ {}", choice.label()) } else { choice.label().to_owned() })
-                        .on_click(move |_, _, cx| { group.set(choice); cx.refresh_windows(); })
-                })));
                 let selected = todo_project.borrow().clone();
                 let selected_label = if selected.is_empty() {
                     "Unscoped".to_owned()
@@ -1060,7 +1088,7 @@ impl HomeView {
                         }),
                 );
             }
-            let group = group.clone();
+            let space = space.clone();
             let todo_project = todo_project.clone();
             let (title, description, url, home, category, item, original) = (title.clone(), description.clone(), url.clone(), home.clone(), category.clone(), item.clone(), original.clone());
             dialog.title("Edit Home item").w(px(560.)).child(form)
@@ -1077,7 +1105,7 @@ impl HomeView {
                 item.description = description.read(cx).value().to_string();
                 item.url = url.read(cx).value().to_string();
                 item.category = category.get();
-                item.group = group.get();
+                item.space = space.borrow().clone();
                 if item.kind == Kind::Todo {
                     item.project = todo_project.borrow().clone();
                 }
@@ -1142,37 +1170,6 @@ impl HomeView {
             })
     }
 
-    /// Group dropdown for the PR inbox: All, Personal, Work. Matches the
-    /// "Group" section of the PR editor.
-    fn group_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.group_filter;
-        let label = current.map_or("All", Group::label);
-        let home = cx.entity().downgrade();
-        Button::new("group-filter")
-            .ghost()
-            .label(format!("{label} ▾"))
-            .dropdown_menu(move |mut menu, _, _| {
-                for option in [None, Some(Group::Personal), Some(Group::Work)] {
-                    let option_label = option.map_or("All", Group::label);
-                    let home = home.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(option_label)
-                            .checked(current == option)
-                            .on_click(move |_, _, cx| {
-                                let _ = home.update(cx, |this, cx| {
-                                    if this.group_filter != option {
-                                        this.group_filter = option;
-                                        this.navigation_cursor = None;
-                                        cx.notify();
-                                    }
-                                });
-                            }),
-                    );
-                }
-                menu
-            })
-    }
-
     pub(crate) fn is_todos_page(&self) -> bool {
         self.page == Some("Todos")
     }
@@ -1196,7 +1193,17 @@ impl HomeView {
             .unwrap_or_else(|| format!("{key} (removed)"))
     }
 
-    /// Inbox todos in global order, filtered by completion, group, and
+    /// Whether a dashboard item belongs to the active space.
+    pub(super) fn in_active_space(&self, item: &Item) -> bool {
+        crate::data::space_eq(&item.space, &self.active_space)
+    }
+
+    /// Whether a repository entry belongs to the active space.
+    pub(super) fn in_active_space_entry(&self, entry: &RepositoryEntry) -> bool {
+        crate::data::space_eq(&entry.space, &self.active_space)
+    }
+
+    /// Inbox todos in global order, filtered by completion, space, and
     /// project. Pure ordering: the inbox stays a flat list; the board groups
     /// the same items into columns.
     fn visible_todos(&self) -> Vec<Item> {
@@ -1206,7 +1213,7 @@ impl HomeView {
             .filter(|i| {
                 i.kind == Kind::Todo
                     && (self.show_completed || !i.completed)
-                    && self.todo_group_filter.is_none_or(|group| i.group == group)
+                    && self.in_active_space(i)
                     && self.todo_project_filter.matches(i.project_key())
             })
             .cloned()
@@ -1217,11 +1224,11 @@ impl HomeView {
     /// order, then orphan keys from removed repositories so scoped todos are
     /// never hidden.
     fn todo_board_columns(&self) -> Vec<TodoColumn> {
-        todo_board_columns(&self.all_projects, &self.data.items)
+        todo_board_columns(&self.visible_projects(), &self.data.items)
     }
 
     /// Todos for one board column in global order, filtered by completion
-    /// and the shared group filter.
+    /// and the active space.
     fn column_todos(&self, project: Option<&str>) -> Vec<Item> {
         let normalized = project.unwrap_or_default().trim();
         self.data
@@ -1230,42 +1237,11 @@ impl HomeView {
             .filter(|i| {
                 i.kind == Kind::Todo
                     && (self.show_completed || !i.completed)
-                    && self.todo_group_filter.is_none_or(|group| i.group == group)
+                    && self.in_active_space(i)
                     && i.project.trim() == normalized
             })
             .cloned()
             .collect()
-    }
-
-    /// Group dropdown for the Todo inbox and board: All, Personal, Work.
-    /// Matches the "Group" section of the Todo editor.
-    fn todo_group_filter_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.todo_group_filter;
-        let label = current.map_or("All", Group::label);
-        let home = cx.entity().downgrade();
-        Button::new("todo-group-filter")
-            .ghost()
-            .label(format!("{label} ▾"))
-            .dropdown_menu(move |mut menu, _, _| {
-                for option in [None, Some(Group::Personal), Some(Group::Work)] {
-                    let option_label = option.map_or("All", Group::label);
-                    let home = home.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(option_label)
-                            .checked(current == option)
-                            .on_click(move |_, _, cx| {
-                                let _ = home.update(cx, |this, cx| {
-                                    if this.todo_group_filter != option {
-                                        this.todo_group_filter = option;
-                                        this.navigation_cursor = None;
-                                        cx.notify();
-                                    }
-                                });
-                            }),
-                    );
-                }
-                menu
-            })
     }
 
     /// Project dropdown for the Todo inbox: All, Unscoped, plus every known
@@ -1283,7 +1259,7 @@ impl HomeView {
             (TodoProjectFilter::All, "All".to_owned()),
             (TodoProjectFilter::Unscoped, "Unscoped".to_owned()),
         ];
-        for entry in &self.all_projects {
+        for entry in self.visible_projects() {
             let title = entry
                 .display_name
                 .clone()
@@ -1292,7 +1268,10 @@ impl HomeView {
             options.push((TodoProjectFilter::Project(entry.key.clone()), title));
         }
         if let TodoProjectFilter::Project(key) = &current
-            && !self.all_projects.iter().any(|entry| &entry.key == key)
+            && !self
+                .visible_projects()
+                .iter()
+                .any(|entry| &entry.key == key)
         {
             options.push((current.clone(), format!("{key} (removed)")));
         }
@@ -1328,22 +1307,34 @@ impl HomeView {
     /// options menu. Back navigation and the title live in the workspace
     /// titlebar, matching the Artifacts page.
     fn projects_page(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let linked = self.all_projects.iter().filter(|e| e.is_linked()).count();
-        let missing = self
-            .all_projects
-            .iter()
-            .filter(|e| e.checkout_missing)
-            .count();
-        let unlinked = self.all_projects.len() - linked - missing;
-        let card_width = recent_card_width(f32::from(window.viewport_size().width));
         let visible = self.visible_projects();
+        let linked = visible.iter().filter(|e| e.is_linked()).count();
+        let missing = visible.iter().filter(|e| e.checkout_missing).count();
+        let unlinked = visible.len() - linked - missing;
+        let card_width = recent_card_width(f32::from(window.viewport_size().width));
         let mut page = v_flex().gap_4().child(
             h_flex()
                 .w_full()
                 .items_center()
                 .justify_between()
                 .gap_3()
-                .child(self.group_filter_row(cx))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Space"),
+                        )
+                        .child(
+                            Tag::secondary()
+                                .with_size(Size::Small)
+                                .rounded_full()
+                                .child(self.active_space.clone()),
+                        ),
+                )
                 .child(
                     div()
                         .flex_none()
@@ -1366,30 +1357,21 @@ impl HomeView {
                         if no_projects {
                             "No repositories yet"
                         } else {
-                            "No repositories in this group"
+                            "No repositories in this space"
                         },
                         if no_projects {
                             "Add a repository to organize its resources and agent sessions."
                         } else {
-                            "Choose another group or show all repositories."
+                            "Add a repository to this space, or switch spaces from Home."
                         },
                     )
                     .content(
                         EmptyContent::new().child(
                             Button::new("empty-project-action")
-                                .label(if no_projects {
-                                    "Add repository"
-                                } else {
-                                    "Show all repositories"
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if no_projects {
-                                        cx.emit(HomeEvent::AddRepository)
-                                    } else {
-                                        this.project_group_filter = ProjectGroupFilter::All;
-                                        cx.notify();
-                                    }
-                                })),
+                                .label("Add repository")
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(HomeEvent::AddRepository)),
+                                ),
                         ),
                     ),
                 );
@@ -1426,53 +1408,7 @@ impl HomeView {
         })
     }
 
-    /// Group radios: All, each present group, and Ungrouped when relevant.
-    fn group_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let groups = project_groups(&self.all_projects);
-        let has_ungrouped = self.all_projects.iter().any(|entry| entry.group.is_none());
-        let mut row = h_flex()
-            .gap_2()
-            .flex_wrap()
-            .items_center()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Group:"),
-            )
-            .child(self.group_pill(ProjectGroupFilter::All, "All", cx));
-        for group in groups {
-            let label = group.clone();
-            row = row.child(self.group_pill(ProjectGroupFilter::Group(group), &label, cx));
-        }
-        if has_ungrouped {
-            row = row.child(self.group_pill(ProjectGroupFilter::Ungrouped, "Ungrouped", cx));
-        }
-        row
-    }
-
-    fn group_pill(
-        &self,
-        filter: ProjectGroupFilter,
-        label: &str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let active = self.project_group_filter == filter;
-        Radio::new(item_id("project-group", label))
-            .label(label.to_owned())
-            .checked(active)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                // Radios never toggle off: selecting the active one is a
-                // no-op, any other pick becomes the filter.
-                if this.project_group_filter != filter {
-                    this.project_group_filter = filter.clone();
-                    cx.notify();
-                }
-            }))
-    }
-
-    /// One Projects card mirroring the Recent-Projects card visuals: title
-    /// plus group pill plus `⋯` menu, git-state row, description, and an
+    /// plus `⋯` menu, git-state row, description, and an
     /// opened/footer row. Linked titles and footers open the workspace;
     /// unlinked cards act through their menu and footer link buttons, since
     /// a nested whole-card button would swallow the menu's clicks.
@@ -1486,7 +1422,6 @@ impl HomeView {
     ) -> impl IntoElement {
         let key = entry.key.clone();
         let title = entry.display_name.clone().unwrap_or_else(|| key.clone());
-        let group = entry.group.clone().filter(|value| !value.trim().is_empty());
         let description = entry
             .description
             .clone()
@@ -1572,18 +1507,6 @@ impl HomeView {
                             .font_semibold()
                             .child(title.clone()),
                     )
-                    .when_some(group, |this, tag| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .px_2()
-                                .rounded_full()
-                                .bg(cx.theme().secondary)
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(tag),
-                        )
-                    })
                     .child(
                         Button::new(item_id("repo-options", &key))
                             .ghost()
@@ -1849,7 +1772,7 @@ impl HomeView {
                     i.kind == Kind::Todo
                         && !i.completed
                         && i.project.trim() == project
-                        && self.todo_group_filter.is_none_or(|group| i.group == group)
+                        && self.in_active_space(i)
                 })
                 .collect();
             let index = pending.iter().position(|i| i.id == item.id).unwrap_or(0);
@@ -1976,7 +1899,7 @@ impl HomeView {
                 .child(
                     Tag::secondary()
                         .with_size(Size::Small)
-                        .child(item.group.label()),
+                        .child(item.space.clone()),
                 )
                 .when(!item.project.trim().is_empty(), |badges| {
                     badges.child(
@@ -2096,7 +2019,7 @@ impl HomeView {
                             || self
                                 .pr_category_filter
                                 .is_none_or(|category| i.category == category))
-                        && (!is_pr || self.group_filter.is_none_or(|group| i.group == group))
+                        && (!is_pr || self.in_active_space(i))
                 })
                 .cloned()
                 .collect()
@@ -2159,18 +2082,6 @@ impl HomeView {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("Group"),
-                            )
-                            .child(self.todo_group_filter_dropdown(cx)),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
                                     .child("Project"),
                             )
                             .child(self.todo_project_filter_dropdown(cx)),
@@ -2185,18 +2096,6 @@ impl HomeView {
                     .items_center()
                     .gap_2()
                     .flex_wrap()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Group"),
-                            )
-                            .child(self.group_filter_dropdown(cx)),
-                    )
                     .child(
                         h_flex()
                             .items_center()
@@ -2265,12 +2164,14 @@ impl HomeView {
                             .icon(gpui_kit::component::IconName::Plus)
                             .label(add_label)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.editor(Item::new(kind), window, cx)
+                                let mut item = Item::new(kind);
+                                item.space = this.active_space.clone();
+                                this.editor(item, window, cx)
                             })),
                     ),
             )
         } else if is_todo {
-            let group = self.todo_group_filter.unwrap_or_default();
+            let space = self.active_space.clone();
             let project = match &self.todo_project_filter {
                 TodoProjectFilter::All | TodoProjectFilter::Unscoped => String::new(),
                 TodoProjectFilter::Project(key) => key.clone(),
@@ -2289,7 +2190,7 @@ impl HomeView {
                             .label(add_label)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let mut item = Item::new(kind);
-                                item.group = group;
+                                item.space = space.clone();
                                 item.project = project.clone();
                                 this.editor(item, window, cx)
                             })),
@@ -2309,7 +2210,9 @@ impl HomeView {
                             .icon(gpui_kit::component::IconName::Plus)
                             .label(add_label)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.editor(Item::new(kind), window, cx)
+                                let mut item = Item::new(kind);
+                                item.space = this.active_space.clone();
+                                this.editor(item, window, cx)
                             })),
                     ),
             )
@@ -2599,13 +2502,13 @@ mod layout_tests {
         assert_eq!(project_opened_label(Some("broken"), now), None);
     }
 
-    fn group_entry(key: &str, group: Option<&str>) -> RepositoryEntry {
+    fn project_entry(key: &str, space: &str) -> RepositoryEntry {
         RepositoryEntry {
             revision: String::new(),
             key: key.to_owned(),
             display_name: None,
             description: None,
-            group: group.map(str::to_owned),
+            space: space.to_owned(),
             owner: None,
             name: None,
             checkout_path: None,
@@ -2616,31 +2519,15 @@ mod layout_tests {
     }
 
     #[test]
-    fn project_groups_lists_distinct_sorted_groups() {
-        let entries = vec![
-            group_entry("b", Some("work")),
-            group_entry("a", Some("personal")),
-            group_entry("c", Some("work")),
-            group_entry("d", None),
-        ];
-        assert_eq!(
-            project_groups(&entries),
-            vec!["personal".to_owned(), "work".to_owned()]
-        );
-        assert!(project_groups(&[]).is_empty());
-    }
+    fn space_matching_is_case_insensitive_for_records_and_items() {
+        let entry = project_entry("a", "Work");
+        assert!(crate::data::space_eq(&entry.space, "work"));
+        assert!(!crate::data::space_eq(&entry.space, "Personal"));
 
-    #[test]
-    fn project_group_filter_matches_all_group_and_ungrouped() {
-        let personal = group_entry("a", Some("personal"));
-        let ungrouped = group_entry("b", None);
-        assert!(ProjectGroupFilter::All.matches(&personal));
-        assert!(ProjectGroupFilter::All.matches(&ungrouped));
-        assert!(ProjectGroupFilter::Group("personal".to_owned()).matches(&personal));
-        assert!(!ProjectGroupFilter::Group("personal".to_owned()).matches(&ungrouped));
-        assert!(!ProjectGroupFilter::Group("work".to_owned()).matches(&personal));
-        assert!(!ProjectGroupFilter::Ungrouped.matches(&personal));
-        assert!(ProjectGroupFilter::Ungrouped.matches(&ungrouped));
+        let mut item = todo_item("t", "");
+        item.space = "work".to_owned();
+        assert!(crate::data::space_eq(&item.space, "Work"));
+        assert!(!crate::data::space_eq(&item.space, "Personal"));
     }
 
     fn todo_item(id: &str, project: &str) -> Item {
@@ -2664,7 +2551,10 @@ mod layout_tests {
 
     #[test]
     fn todo_board_columns_start_unscoped_then_projects_then_orphans() {
-        let projects = vec![group_entry("website", None), group_entry("api", None)];
+        let projects = vec![
+            project_entry("website", "Personal"),
+            project_entry("api", "Personal"),
+        ];
         let todos = vec![
             todo_item("a", ""),
             todo_item("b", "website"),

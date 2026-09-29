@@ -78,11 +78,11 @@ fn complete_headless_graph_lifecycle_and_repository_revision() {
     assert_eq!(query["dependencies"], json!(["api", "ui"]));
     assert_eq!(query["dependents"], json!(["cli", "ui"]));
     assert_eq!(query["relationships"].as_array().unwrap().len(), 6);
-    let group = read(
+    let space = read(
         root,
-        &["repository", "relationships", "--group", "work", "--json"],
+        &["repository", "relationships", "--space", "work", "--json"],
     );
-    assert_eq!(group["excludedRelationships"].as_array().unwrap().len(), 3);
+    assert_eq!(space["excludedRelationships"].as_array().unwrap().len(), 3);
     let old_revision = graph["revision"].as_str().unwrap();
     let changed = read(
         root,
@@ -148,7 +148,7 @@ fn complete_headless_graph_lifecycle_and_repository_revision() {
                 "repository",
                 "update",
                 "api",
-                "--group",
+                "--space",
                 "Personal",
                 "--revision",
                 metadata["revision"].as_str().unwrap()

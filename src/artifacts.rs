@@ -49,7 +49,7 @@ impl Refresh {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Scope {
     Global,
     Repository(Option<String>),
@@ -68,6 +68,24 @@ struct Draft {
     quote: Option<String>,
 }
 
+/// Identity a draft belongs to: a draft is only restored under the same
+/// scope *and* space, so switching isolation profiles never shows another
+/// space's editor — and switching back keeps the unsaved work.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DraftKey {
+    scope: Scope,
+    space: Option<String>,
+}
+
+impl DraftKey {
+    fn new(scope: &Scope, space: Option<&str>) -> Self {
+        Self {
+            scope: scope.clone(),
+            space: space.map(str::to_owned),
+        }
+    }
+}
+
 pub(crate) struct ArtifactBrowser {
     root: Option<DataRoot>,
     scope: Scope,
@@ -75,6 +93,12 @@ pub(crate) struct ArtifactBrowser {
     refresh: Refresh,
     include_archived: bool,
     kind_filter: Option<Kind>,
+    /// Active isolation profile. `None` (repository-scoped browsers) shows
+    /// every artifact in scope; the global browser follows the workspace's
+    /// active space. Artifacts whose space could not be resolved (their
+    /// repository record is gone) stay visible in every space rather than
+    /// being hidden silently.
+    space_filter: Option<String>,
     limit: usize,
     list: ArtifactList,
     selected_id: Option<String>,
@@ -87,7 +111,7 @@ pub(crate) struct ArtifactBrowser {
     active_comment: Option<String>,
     comments_scroll: gpui_kit::ScrollHandle,
     draft: Option<Draft>,
-    saved_drafts: std::collections::HashMap<Scope, Draft>,
+    saved_drafts: std::collections::HashMap<DraftKey, Draft>,
     saving: bool,
     opening: bool,
     open_generation: u64,
@@ -126,6 +150,7 @@ impl ArtifactBrowser {
             refresh: Refresh::default(),
             include_archived: false,
             kind_filter: None,
+            space_filter: None,
             limit: PAGE_SIZE,
             list: ArtifactList::default(),
             selected_id: None,
@@ -223,10 +248,15 @@ impl ArtifactBrowser {
             self.open_generation = self.open_generation.wrapping_add(1);
             self.opening = false;
             if let Some(draft) = self.draft.take() {
-                self.saved_drafts.insert(self.scope.clone(), draft);
+                self.saved_drafts.insert(
+                    DraftKey::new(&self.scope, self.space_filter.as_deref()),
+                    draft,
+                );
             }
             self.scope = scope;
-            self.draft = self.saved_drafts.remove(&self.scope);
+            self.draft = self
+                .saved_drafts
+                .remove(&DraftKey::new(&self.scope, self.space_filter.as_deref()));
             self.show_comments |= self.draft.as_ref().is_some_and(|d| !d.document);
             self.active_comment = None;
             self.selected_id = self.draft.as_ref().map(|d| d.snapshot.artifact.id.clone());
@@ -255,6 +285,50 @@ impl ArtifactBrowser {
         self.limit = PAGE_SIZE;
         self.refresh(cx);
     }
+    /// Whether any unsaved draft (active or stashed) exists. Settings blocks
+    /// catalog renames/deletes while one does: the rewrite replaces the
+    /// records a draft is based on, and a draft's restoration key can name
+    /// the space being edited.
+    pub(crate) fn has_draft(&self) -> bool {
+        self.draft.is_some() || !self.saved_drafts.is_empty()
+    }
+
+    /// Follow the active space. Repository-scoped browsers ignore this (the
+    /// open repository is an explicit context). Like a scope change, the
+    /// current draft is stashed under the old space and the new space's own
+    /// draft (if any) is restored, so isolation holds without discarding
+    /// unsaved work.
+    pub(crate) fn set_space(&mut self, space: String, cx: &mut Context<Self>) {
+        let next = (self.scope == Scope::Global).then_some(space);
+        if self.space_filter == next {
+            return;
+        }
+        self.open_generation = self.open_generation.wrapping_add(1);
+        self.opening = false;
+        if let Some(draft) = self.draft.take() {
+            self.saved_drafts.insert(
+                DraftKey::new(&self.scope, self.space_filter.as_deref()),
+                draft,
+            );
+        }
+        self.space_filter = next;
+        self.draft = self
+            .saved_drafts
+            .remove(&DraftKey::new(&self.scope, self.space_filter.as_deref()));
+        self.show_comments |= self.draft.as_ref().is_some_and(|d| !d.document);
+        self.active_comment = None;
+        self.selected_id = self.draft.as_ref().map(|d| d.snapshot.artifact.id.clone());
+        self.selected = None;
+        self.preview = None;
+        self.toc = Vec::new();
+        self.toc_active = 0;
+        self.error = None;
+        self.list = ArtifactList::default();
+        // Pagination is per space; the kind filter is a browsing preference.
+        self.limit = PAGE_SIZE;
+        self.refresh(cx);
+    }
+
     pub(crate) fn set_kind_filter(&mut self, filter: Option<Kind>, cx: &mut Context<Self>) {
         if self.kind_filter != filter {
             self.kind_filter = filter;
@@ -276,6 +350,16 @@ impl ArtifactBrowser {
         self.list.artifacts.iter().filter(|snapshot| {
             self.kind_filter
                 .is_none_or(|kind| snapshot.artifact.kind == kind)
+                && self.in_space(snapshot)
+        })
+    }
+
+    /// Whether an artifact belongs to the active space. Empty means its
+    /// repository is unknown: shown in every space instead of hidden.
+    fn in_space(&self, snapshot: &Snapshot) -> bool {
+        self.space_filter.as_deref().is_none_or(|space| {
+            snapshot.artifact.space.trim().is_empty()
+                || crate::data::space_eq(&snapshot.artifact.space, space)
         })
     }
 
@@ -329,6 +413,9 @@ impl ArtifactBrowser {
                 Scope::Repository(key) => key.clone(),
                 Scope::Global => None,
             },
+            // Space filtering happens in the store, before the page limit:
+            // another space's records must not consume the page.
+            space: self.space_filter.clone(),
             include_archived: self.include_archived,
             limit: Some(self.limit),
         };
@@ -356,6 +443,7 @@ impl ArtifactBrowser {
                                     if Some(&snapshot.artifact.id) == this.selected_id.as_ref()
                                         && (this.include_archived
                                             || !snapshot.artifact.archived)
+                                        && this.in_space(&snapshot)
                                         && match &this.scope {
                                             Scope::Global => true,
                                             Scope::Repository(key) => {
@@ -612,6 +700,7 @@ impl ArtifactBrowser {
         self.error = None;
         self.refresh.generation = self.refresh.generation.wrapping_add(1);
         let scope = self.scope.clone();
+        let space = self.space_filter.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -637,10 +726,12 @@ impl ArtifactBrowser {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.saving = false;
-                if this.scope != scope && result.is_ok() && close_draft {
-                    this.saved_drafts.remove(&scope);
+                let same_context = this.scope == scope && this.space_filter == space;
+                if !same_context && result.is_ok() && close_draft {
+                    this.saved_drafts
+                        .remove(&DraftKey::new(&scope, space.as_deref()));
                 }
-                if this.scope == scope {
+                if same_context {
                     match result {
                         Ok(snapshot) => {
                             if close_draft && this.draft.as_ref().is_some_and(|d| !d.document) {

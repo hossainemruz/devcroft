@@ -6,9 +6,9 @@ mod layout;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::radio::{Radio, RadioGroup};
+use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _, h_flex,
     v_flex,
 };
 use gpui_kit::{
@@ -23,13 +23,16 @@ use crate::data::{
     relationships::{self, Graph, Mutation, Node, Query},
 };
 use canvas::{Curve, Gesture};
-use layout::{GroupLayout, Layouts, NODE_HEIGHT, NODE_WIDTH, Point};
+use layout::{Layouts, NODE_HEIGHT, NODE_WIDTH, Point, SpaceLayout};
 
 #[derive(Clone, Debug)]
 enum Draft {
     Node {
         key: String,
         revision: String,
+        /// Selected space for this node, edited in the inspector and saved
+        /// with `patch_repository_purpose`.
+        space: String,
     },
     Edge {
         id: Option<String>,
@@ -37,6 +40,11 @@ enum Draft {
         anchor: Option<Point>,
     },
 }
+
+/// Borrowed-empty layout for a space that has never been arranged. Never
+/// mutated: `layout_mut` installs a real entry before writing.
+static EMPTY_LAYOUT: std::sync::LazyLock<SpaceLayout> =
+    std::sync::LazyLock::new(SpaceLayout::default);
 
 pub(crate) enum GraphEvent {
     AddRepository,
@@ -48,6 +56,11 @@ pub(crate) struct GraphPage {
     pub(crate) focus_handle: FocusHandle,
     root: Option<DataRoot>,
     active: bool,
+    /// Active isolation profile: the graph shows only this space's
+    /// repositories and keeps its canvas layout keyed by space name.
+    space: String,
+    /// Catalog names offered by the node inspector's Space selector.
+    space_names: Vec<String>,
     graph: Option<Graph>,
     layouts: Layouts,
     layouts_loaded: bool,
@@ -65,7 +78,6 @@ pub(crate) struct GraphPage {
     from: Entity<InputState>,
     to: Entity<InputState>,
     description: Entity<TextareaState>,
-    group: Entity<InputState>,
     bounds: Rc<Cell<Bounds<Pixels>>>,
     gesture: Option<Gesture>,
 }
@@ -81,8 +93,6 @@ impl GraphPage {
                 .rows(4)
                 .placeholder("Describe what the consumer uses from the provider")
         });
-        let group = cx
-            .new(|cx| InputState::new(window, cx).placeholder("Personal, Work, or a custom group"));
         for input in [&search, &from, &to] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
         }
@@ -113,14 +123,13 @@ impl GraphPage {
             }
         })
         .detach();
-        let mut layouts = Layouts::default();
-        layouts
-            .groups
-            .insert(layouts.last_group.clone(), GroupLayout::default());
+        let layouts = Layouts::default();
         Self {
             focus_handle,
             root,
             active: false,
+            space: crate::data::DEFAULT_SPACE.to_owned(),
+            space_names: Vec::new(),
             graph: None,
             layouts,
             layouts_loaded: false,
@@ -138,10 +147,26 @@ impl GraphPage {
             from,
             to,
             description,
-            group,
             bounds: Rc::new(Cell::new(Bounds::default())),
             gesture: None,
         }
+    }
+
+    /// Follow the active space: filter the canvas, swap to that space's
+    /// saved layout, and refresh the inspector's Space choices. Positions for
+    /// the new space are prepared in memory only; persistence waits for the
+    /// first load to finish (see [`Self::persist_layout`]) so switching before
+    /// the graph was ever opened cannot overwrite the saved layouts.
+    pub(crate) fn set_space(&mut self, space: String, names: Vec<String>, cx: &mut Context<Self>) {
+        let changed = !crate::data::space_eq(&self.space, &space);
+        self.space = space;
+        self.space_names = names;
+        if changed {
+            self.cancel_gesture(cx);
+            self.draft = None;
+            self.ensure_positions();
+        }
+        cx.notify();
     }
 
     pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -193,6 +218,11 @@ impl GraphPage {
                                 }
                             }
                             page.ensure_positions();
+                            // A pre-load change was held back; flush it now
+                            // that the saved layouts are in memory.
+                            if page.layout_dirty {
+                                page.persist_layout(cx);
+                            }
                         }
                         Err(error) => page.load_error = Some(error),
                     }
@@ -206,35 +236,16 @@ impl GraphPage {
         .detach();
     }
 
-    fn layout(&self) -> &GroupLayout {
-        &self.layouts.groups[&self.layouts.last_group]
-    }
-    fn layout_mut(&mut self) -> &mut GroupLayout {
+    fn layout(&self) -> &SpaceLayout {
         self.layouts
-            .groups
-            .entry(self.layouts.last_group.clone())
-            .or_default()
+            .spaces
+            .get(&self.space)
+            .unwrap_or(&EMPTY_LAYOUT)
+    }
+    fn layout_mut(&mut self) -> &mut SpaceLayout {
+        self.layouts.spaces.entry(self.space.clone()).or_default()
     }
     fn ensure_positions(&mut self) {
-        // Restore a specific group when upgrading an old All view, or when a
-        // custom group disappears after a metadata edit or portable sync.
-        let groups = self.groups();
-        if !groups.contains(&self.layouts.last_group) {
-            self.layouts.last_group = groups
-                .iter()
-                .find(|group| {
-                    self.graph.as_ref().is_some_and(|graph| {
-                        graph.nodes.iter().any(|node| {
-                            relationships::group_matches(
-                                node.repository.group.as_deref(),
-                                Some(group),
-                            )
-                        })
-                    })
-                })
-                .unwrap_or(&groups[0])
-                .clone();
-        }
         let keys: Vec<_> = self
             .graph
             .as_ref()
@@ -242,12 +253,7 @@ impl GraphPage {
                 graph
                     .nodes
                     .iter()
-                    .filter(|n| {
-                        relationships::group_matches(
-                            n.repository.group.as_deref(),
-                            Some(&self.layouts.last_group),
-                        )
-                    })
+                    .filter(|n| crate::data::space_eq(&n.repository.space, &self.space))
                     .map(|n| n.key().to_owned())
                     .collect()
             })
@@ -268,61 +274,21 @@ impl GraphPage {
                     .nodes
                     .iter()
                     .filter(|node| {
-                        relationships::group_matches(
-                            node.repository.group.as_deref(),
-                            Some(&self.layouts.last_group),
-                        ) && (search.is_empty()
-                            || format!(
-                                "{} {} {}",
-                                node.key(),
-                                node.label(),
-                                node.repository.description.as_deref().unwrap_or("")
-                            )
-                            .to_lowercase()
-                            .contains(&search))
+                        crate::data::space_eq(&node.repository.space, &self.space)
+                            && (search.is_empty()
+                                || format!(
+                                    "{} {} {}",
+                                    node.key(),
+                                    node.label(),
+                                    node.repository.description.as_deref().unwrap_or("")
+                                )
+                                .to_lowercase()
+                                .contains(&search))
                     })
                     .cloned()
                     .collect()
             })
             .unwrap_or_default()
-    }
-    fn set_group(&mut self, group: String, cx: &mut Context<Self>) {
-        if self.layouts.last_group == group {
-            return;
-        }
-        self.cancel_gesture(cx);
-        self.layouts.last_group = group;
-        self.ensure_positions();
-        self.persist_layout(cx);
-        cx.notify();
-    }
-    fn groups(&self) -> Vec<String> {
-        let mut groups = BTreeSet::new();
-        if let Some(graph) = &self.graph {
-            for node in &graph.nodes {
-                if let Some(group) = node.repository.group.as_deref().map(str::trim)
-                    && !group.is_empty()
-                    && !group.eq_ignore_ascii_case("Personal")
-                    && !group.eq_ignore_ascii_case("Work")
-                {
-                    groups.insert(group.to_owned());
-                }
-            }
-        }
-        let mut choices = vec!["Personal".into(), "Work".into()];
-        choices.extend(
-            groups
-                .into_iter()
-                .filter(|g| g != "All" && g != "Ungrouped"),
-        );
-        if self.graph.as_ref().is_some_and(|graph| {
-            graph.nodes.iter().any(|node| {
-                relationships::group_matches(node.repository.group.as_deref(), Some("Ungrouped"))
-            })
-        }) {
-            choices.push("Ungrouped".into());
-        }
-        choices
     }
     fn hidden_count(&self, key: &str, visible: &BTreeSet<String>) -> usize {
         self.graph
@@ -377,12 +343,7 @@ impl GraphPage {
             .as_ref()
             .into_iter()
             .flat_map(|g| &g.nodes)
-            .filter(|n| {
-                relationships::group_matches(
-                    n.repository.group.as_deref(),
-                    Some(&self.layouts.last_group),
-                )
-            })
+            .filter(|n| crate::data::space_eq(&n.repository.space, &self.space))
             .map(|n| n.key().to_owned())
             .collect();
         let edges = self
@@ -410,7 +371,10 @@ impl GraphPage {
         .detach();
     }
     fn persist_layout(&mut self, cx: &mut Context<Self>) {
-        if self.layout_saving || self.gesture.is_some() {
+        // Never save before the saved layouts are loaded: the in-memory map
+        // is still empty then, and writing it would erase every space's
+        // positions.
+        if !self.layouts_loaded || self.layout_saving || self.gesture.is_some() {
             self.layout_dirty = true;
             return;
         }
@@ -460,16 +424,10 @@ impl GraphPage {
                 cx,
             )
         });
-        self.group.update(cx, |input, cx| {
-            input.set_value(
-                node.repository.group.clone().unwrap_or_default(),
-                window,
-                cx,
-            )
-        });
         self.draft = Some(Draft::Node {
             key: key.into(),
             revision: node.repository.revision,
+            space: node.repository.space.clone(),
         });
         self.error = None;
         cx.notify();
@@ -557,7 +515,7 @@ impl GraphPage {
     fn reload_draft_revision(&mut self, cx: &mut Context<Self>) {
         if let Some(graph) = &self.graph {
             match &mut self.draft {
-                Some(Draft::Node { key, revision }) => {
+                Some(Draft::Node { key, revision, .. }) => {
                     if let Some(node) = graph.nodes.iter().find(|n| n.key() == key) {
                         *revision = node.repository.revision.clone();
                     }
@@ -578,7 +536,6 @@ impl GraphPage {
             return;
         };
         let description = self.description.read(cx).value().to_string();
-        let group = self.group.read(cx).value().to_string();
         let from = self.from.read(cx).value().trim().to_owned();
         let to = self.to.read(cx).value().trim().to_owned();
         let node_edit = matches!(draft, Draft::Node { .. });
@@ -590,12 +547,16 @@ impl GraphPage {
             let result = cx
                 .background_spawn(async move {
                     match draft {
-                        Draft::Node { key, revision } => {
+                        Draft::Node {
+                            key,
+                            revision,
+                            space,
+                        } => {
                             crate::data::patch_repository_purpose(
                                 &root,
                                 &key,
                                 description,
-                                group,
+                                space,
                                 &revision,
                             )?;
                         }
@@ -932,8 +893,8 @@ impl GraphPage {
                                 .id("graph-description")
                                 .child(Textarea::new(&self.description).h(px(125.))),
                         )
-                        .child("Group")
-                        .child(Input::new(&self.group))
+                        .child("Space")
+                        .child(self.space_selector(cx))
                         .child(
                             Button::new("save-node")
                                 .primary()
@@ -979,7 +940,7 @@ impl GraphPage {
                     }
                 }
                 panel = panel.child(div().text_xs().text_color(cx.theme().muted_foreground)
-                    .child("Connections to other groups are included here. Select a connection to inspect or edit it."));
+                    .child("Connections to other spaces are included here. Select a connection to inspect or edit it."));
             }
             Draft::Edge { id, .. } => {
                 panel = panel
@@ -1043,9 +1004,9 @@ impl GraphPage {
                     .and_then(|g| g.nodes.iter().find(|n| n.key() == key))
                     .map(|n| {
                         format!(
-                            "Current stored purpose: {}\nGroup: {}",
+                            "Current stored purpose: {}\nSpace: {}",
                             n.repository.description.as_deref().unwrap_or(""),
-                            n.repository.group.as_deref().unwrap_or("")
+                            n.repository.space
                         )
                     }),
                 Draft::Edge { id: Some(id), .. } => self
@@ -1065,6 +1026,54 @@ impl GraphPage {
             }
         }
         panel.into_any_element()
+    }
+    /// Space selector for the node inspector: every catalog space, plus the
+    /// node's current value when the catalog does not know it (a record from
+    /// a newer device), so editing never silently reassigns it.
+    fn space_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = match &self.draft {
+            Some(Draft::Node { space, .. }) => space.clone(),
+            _ => String::new(),
+        };
+        let label = if current.trim().is_empty() {
+            self.space.clone()
+        } else {
+            current.clone()
+        };
+        let mut choices = self.space_names.clone();
+        if !choices
+            .iter()
+            .any(|name| crate::data::space_eq(name, &label))
+        {
+            choices.push(label.clone());
+        }
+        let page = cx.entity().downgrade();
+        h_flex().gap_1().child(
+            Button::new("graph-node-space")
+                .outline()
+                .w_full()
+                .label(label)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for name in &choices {
+                        let name = name.clone();
+                        let selected = crate::data::space_eq(&current, &name);
+                        let page = page.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(
+                                move |_, _, cx| {
+                                    let name = name.clone();
+                                    let _ = page.update(cx, |page, cx| {
+                                        if let Some(Draft::Node { space, .. }) = &mut page.draft {
+                                            *space = name.clone();
+                                        }
+                                        cx.notify();
+                                    });
+                                },
+                            ));
+                    }
+                    menu
+                }),
+        )
     }
     fn endpoint_input(&self, provider: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.entity().downgrade();
@@ -1111,25 +1120,7 @@ impl GraphPage {
 
 impl Render for GraphPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let groups = self.groups();
         let count = self.visible_nodes(cx).len();
-        let selected_group = groups
-            .iter()
-            .position(|group| group == &self.layouts.last_group);
-        let radios = RadioGroup::horizontal("relationship-groups")
-            .flex_none()
-            .selected_index(selected_group)
-            .children(groups.iter().enumerate().map(|(index, group)| {
-                Radio::new(("relationship-group", index))
-                    .small()
-                    .label(group.clone())
-                    .py_1()
-            }))
-            .on_change(cx.listener(move |page, index: &usize, _, cx| {
-                if let Some(group) = groups.get(*index) {
-                    page.set_group(group.clone(), cx);
-                }
-            }));
         let toolbar = h_flex()
             .flex_none()
             .items_center()
@@ -1147,9 +1138,20 @@ impl Render for GraphPage {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Group"),
+                            .child("Space"),
                     )
-                    .child(radios),
+                    .child(
+                        Tag::secondary()
+                            .with_size(Size::Small)
+                            .rounded_full()
+                            .child(self.space.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Switch spaces from Home."),
+                    ),
             )
             .child(
                 Input::new(&self.search)
@@ -1322,10 +1324,10 @@ mod tests {
     use gpui_kit::{Focusable as _, point};
 
     #[gpui_kit::test]
-    fn group_migration_and_switching_preserve_saved_positions(cx: &mut gpui_kit::TestAppContext) {
+    fn space_switching_preserves_saved_positions(cx: &mut gpui_kit::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let root = DataRoot::new(dir.path().to_owned());
-        for (key, group) in [
+        for (key, space) in [
             ("api", "work"),
             ("ui", "Work"),
             ("tool", "Custom"),
@@ -1335,7 +1337,7 @@ mod tests {
                 &root
                     .portable_dir()
                     .join(format!("repositories/{key}/repository.json")),
-                &serde_json::json!({ "key": key, "group": group }),
+                &serde_json::json!({ "key": key, "group": space }),
             )
             .unwrap();
         }
@@ -1344,32 +1346,73 @@ mod tests {
         let (page, cx) = cx.add_window_view(|window, cx| GraphPage::new(None, window, cx));
         page.update(cx, |page, cx| {
             page.graph = Some(graph);
-            page.layouts.last_group = "All".into();
+            page.set_space(
+                "Work".into(),
+                vec!["Personal".into(), "Work".into(), "Custom".into()],
+                cx,
+            );
             page.layouts
-                .groups
+                .spaces
                 .entry("Work".into())
                 .or_default()
                 .positions
                 .insert("api".into(), Point::new(321., 123.));
             page.ensure_positions();
-            assert_eq!(page.groups(), ["Personal", "Work", "Custom", "Ungrouped"]);
-            assert_eq!(page.layouts.last_group, "Work");
+            // Legacy `group` values migrate: "work" resolves to the catalog
+            // spelling, and the space-less record lands in the default space.
             assert_eq!(page.visible_nodes(cx).len(), 2);
-            page.set_group("Custom".into(), cx);
+            page.set_space(
+                "Custom".into(),
+                vec!["Personal".into(), "Work".into(), "Custom".into()],
+                cx,
+            );
             assert_eq!(page.visible_nodes(cx)[0].key(), "tool");
-            page.set_group("Ungrouped".into(), cx);
+            page.set_space(
+                "Personal".into(),
+                vec!["Personal".into(), "Work".into(), "Custom".into()],
+                cx,
+            );
             assert_eq!(page.visible_nodes(cx)[0].key(), "other");
-            page.set_group("Work".into(), cx);
+            page.set_space(
+                "Work".into(),
+                vec!["Personal".into(), "Work".into(), "Custom".into()],
+                cx,
+            );
             assert_eq!(page.layout().positions["api"], Point::new(321., 123.));
-            page.graph
-                .as_mut()
-                .unwrap()
-                .nodes
-                .retain(|node| node.key() != "tool");
-            page.layouts.last_group = "Custom".into();
-            page.ensure_positions();
-            assert_eq!(page.layouts.last_group, "Work");
         });
+    }
+
+    #[gpui_kit::test]
+    fn switching_before_the_first_load_never_overwrites_saved_layouts(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().to_owned());
+        let mut layouts = Layouts::default();
+        layouts
+            .spaces
+            .entry("Work".into())
+            .or_default()
+            .positions
+            .insert("api".into(), Point::new(10., 20.));
+        layouts.save(&root).unwrap();
+        let path = root.root().join("repository-graph-layout.json");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        cx.update(gpui_kit::component::init);
+        let (page, cx) =
+            cx.add_window_view(|window, cx| GraphPage::new(Some(root.clone()), window, cx));
+        page.update(cx, |page, cx| {
+            page.set_space("Work".into(), vec!["Personal".into(), "Work".into()], cx);
+        });
+
+        // Startup (or a space switch) before the graph was opened must not
+        // write the still-empty in-memory map over the saved file.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            Layouts::load(&root).unwrap().spaces["Work"].positions["api"],
+            Point::new(10., 20.)
+        );
     }
 
     #[gpui_kit::test]

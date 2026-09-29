@@ -67,8 +67,9 @@ pub(crate) struct RepositoryUpdateArgs {
     pub(crate) name: Option<String>,
     #[arg(long)]
     pub(crate) description: Option<String>,
+    /// Isolation profile; an unknown name is added to the portable catalog.
     #[arg(long)]
-    pub(crate) group: Option<String>,
+    pub(crate) space: Option<String>,
     /// Comma-separated tags; empty string clears. Absent keeps stored tags.
     #[arg(long)]
     pub(crate) tags: Option<String>,
@@ -83,8 +84,9 @@ pub(crate) struct RelationshipQueryArgs {
     pub(crate) repository: Option<String>,
     #[arg(long, requires = "repository", value_parser = clap::value_parser!(u8).range(1..=8))]
     pub(crate) depth: Option<u8>,
+    /// Isolation profile filter; absent shows every space.
     #[arg(long)]
-    pub(crate) group: Option<String>,
+    pub(crate) space: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]
@@ -175,6 +177,9 @@ pub(crate) struct LimitArgs {
 pub(crate) struct ListArgs {
     #[arg(long)]
     pub(crate) repository: Option<String>,
+    /// Isolation profile filter; absent lists every space.
+    #[arg(long)]
+    pub(crate) space: Option<String>,
     #[command(flatten)]
     pub(crate) bounds: LimitArgs,
     /// Include archived records as well as active ones.

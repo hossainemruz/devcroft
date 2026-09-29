@@ -33,24 +33,6 @@ impl Category {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Group {
-    #[default]
-    Personal,
-    Work,
-}
-
-impl Group {
-    pub(crate) const ALL: [Self; 2] = [Self::Personal, Self::Work];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Personal => "Personal",
-            Self::Work => "Work",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Item {
     pub(crate) id: String,
@@ -66,10 +48,14 @@ pub(crate) struct Item {
     pub(crate) url: String,
     #[serde(default)]
     pub(crate) category: Category,
-    /// Personal/Work scope for pull requests and todos. Legacy records
-    /// stored this as `pr_group`; `Dashboard::load` migrates that key.
+    /// Isolation profile (see [`crate::data::spaces`]). Legacy records stored
+    /// a Personal/Work `group`, or an even earlier `pr_group`;
+    /// [`Dashboard::load`] migrates both keys onto `space`. Deserialization
+    /// alone leaves this empty: `load` resolves it through the catalog, so a
+    /// record with no stored space follows the catalog's first entry even
+    /// after that space is renamed.
     #[serde(default)]
-    pub(crate) group: Group,
+    pub(crate) space: String,
     /// Repository key this todo belongs to. Empty means unscoped (no
     /// project). Only meaningful for `Kind::Todo`; other kinds ignore it.
     #[serde(default)]
@@ -191,30 +177,46 @@ impl Dashboard {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).context("Reading dashboard.json"),
         };
-        // Migration: the Personal/Work scope used to serialize as `pr_group`.
-        // Prefer `group` when both keys are present (an older client may have
-        // round-tripped an unknown `group` through `extra` while writing its
-        // own `pr_group`), then drop the legacy key so saves stay clean.
+        // Migration: the Personal/Work scope used to serialize as `pr_group`
+        // and was later renamed to `group`. The shared precedence (non-blank
+        // `space`, else `group`, else `pr_group`) matches repository parsing
+        // and the catalog rewrite, so loading and rewriting can never
+        // disagree about an item's effective space.
         let mut value: Value = serde_json::from_slice(&bytes).context("Reading dashboard.json")?;
         if let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
             for item in items.iter_mut() {
                 if let Some(record) = item.as_object_mut() {
-                    if record.contains_key("group") {
-                        record.remove("pr_group");
-                    } else if let Some(legacy) = record.remove("pr_group") {
-                        record.insert("group".to_owned(), legacy);
-                    }
+                    crate::data::spaces::normalize_space_keys(record);
                 }
             }
         }
-        serde_json::from_value(value).context("Reading dashboard.json")
+        let mut dashboard: Self =
+            serde_json::from_value(value).context("Reading dashboard.json")?;
+        // Resolve every item's space through the catalog: legacy keys are
+        // already migrated, missing values follow the catalog's first space,
+        // and a case-only difference lands on the canonical spelling.
+        let catalog = crate::data::Spaces::load(root).unwrap_or_default();
+        for item in &mut dashboard.items {
+            item.space = catalog.resolve(Some(&item.space));
+        }
+        Ok(dashboard)
     }
 
     pub(crate) fn save(&self, root: &DataRoot, expected: &Self) -> Result<()> {
-        if Self::load(root)? != *expected {
+        // Mirror `load`'s resolution so the stale check compares like for
+        // like and an unresolved item is written with its concrete space.
+        let catalog = crate::data::Spaces::load(root).unwrap_or_default();
+        let resolved = |dashboard: &Self| {
+            let mut dashboard = dashboard.clone();
+            for item in &mut dashboard.items {
+                item.space = catalog.resolve(Some(&item.space));
+            }
+            dashboard
+        };
+        if Self::load(root)? != resolved(expected) {
             bail!("Home data changed on disk. Reload Home before saving again.");
         }
-        write_json_atomic(&root.portable_dir().join("dashboard.json"), self)
+        write_json_atomic(&root.portable_dir().join("dashboard.json"), &resolved(self))
     }
 
     pub(crate) fn upsert(&mut self, item: Item) -> Result<()> {
@@ -236,13 +238,15 @@ impl Dashboard {
         Ok(())
     }
 
-    pub(crate) fn pull_requests(&self, category: Category, group: Option<Group>) -> Vec<Item> {
+    /// PRs in one category, optionally restricted to one space (`None`
+    /// shows every space; Home always passes the active one).
+    pub(crate) fn pull_requests(&self, category: Category, space: Option<&str>) -> Vec<Item> {
         self.items
             .iter()
             .filter(|item| {
                 item.kind == Kind::PullRequest
                     && item.category == category
-                    && group.is_none_or(|group| item.group == group)
+                    && space.is_none_or(|space| crate::data::space_eq(&item.space, space))
             })
             .cloned()
             .collect()
@@ -322,33 +326,41 @@ impl Dashboard {
 mod tests {
     use super::*;
     #[test]
-    fn legacy_prs_keep_their_column_and_gain_personal_group() {
-        let mut doc: Dashboard = serde_json::from_value(serde_json::json!({"items":[{
-            "id":"legacy", "kind":"PullRequest", "title":"PR", "url":"https://github.com/a/b/pull/1",
-            "category":"WaitingForReview", "futureField":42
-        }]})).unwrap();
+    fn legacy_prs_keep_their_column_and_gain_the_default_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(temp.path().to_owned());
+        std::fs::create_dir_all(root.portable_dir()).unwrap();
+        std::fs::write(
+            root.portable_dir().join("dashboard.json"),
+            serde_json::json!({"items":[{
+                "id":"legacy", "kind":"PullRequest", "title":"PR", "url":"https://github.com/a/b/pull/1",
+                "category":"WaitingForReview", "futureField":42
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut doc = Dashboard::load(&root).unwrap();
         let original = doc.items[0].clone();
-        assert_eq!(original.group, Group::Personal);
+        assert_eq!(
+            original.space, "Personal",
+            "a record without a space follows the catalog's first entry"
+        );
         assert_eq!(original.category.label(), "Waiting for Approval");
         assert_eq!(
-            doc.pull_requests(Category::WaitingForReview, Some(Group::Personal))
+            doc.pull_requests(Category::WaitingForReview, Some("Personal"))
                 .len(),
             1
         );
         assert!(
-            doc.pull_requests(Category::WaitingForReview, Some(Group::Work))
+            doc.pull_requests(Category::WaitingForReview, Some("Work"))
                 .is_empty()
         );
         doc.move_pr(&original, Category::Watching).unwrap();
         assert!(doc.move_pr(&original, Category::ToReview).is_err());
         let mut moved = doc.items[0].clone();
-        moved.group = Group::Work;
+        moved.space = "Work".into();
         doc.upsert(moved).unwrap();
-        assert_eq!(
-            doc.pull_requests(Category::Watching, Some(Group::Work))
-                .len(),
-            1
-        );
+        assert_eq!(doc.pull_requests(Category::Watching, Some("work")).len(), 1);
         assert_eq!(doc.pull_requests(Category::Watching, None).len(), 1);
         assert!(
             doc.pull_requests(Category::WaitingForReview, None)
@@ -399,6 +411,7 @@ mod tests {
         let mut next = initial.clone();
         let mut item = Item::new(Kind::Todo);
         item.title = "Write tests".into();
+        item.space = "Personal".into();
         next.upsert(item).unwrap();
         next.save(&root, &initial).unwrap();
         assert_eq!(Dashboard::load(&root).unwrap(), next);
@@ -459,31 +472,55 @@ mod tests {
         assert_eq!(doc.items[1].id, "b");
     }
     #[test]
-    fn legacy_todos_gain_personal_group_and_unscoped_project() {
+    fn legacy_todos_gain_the_default_space_and_unscoped_project() {
         let mut doc: Dashboard = serde_json::from_value(serde_json::json!({"items":[{
             "id":"legacy", "kind":"Todo", "title":"Old", "futureField": 7
         }]}))
         .unwrap();
-        assert_eq!(doc.items[0].group, Group::Personal);
+        assert!(
+            doc.items[0].space.is_empty(),
+            "deserialization leaves resolution to `Dashboard::load`"
+        );
         assert_eq!(doc.items[0].project_key(), None);
         let mut scoped = doc.items[0].clone();
-        scoped.group = Group::Work;
+        scoped.space = "Work".into();
         scoped.project = "  website  ".into();
         doc.upsert(scoped).unwrap();
-        assert_eq!(doc.items[0].group, Group::Work);
+        assert_eq!(doc.items[0].space, "Work");
         assert_eq!(doc.items[0].project_key(), Some("website"));
         let json = serde_json::to_value(&doc).unwrap();
         assert_eq!(json["items"][0]["futureField"], 7);
-        assert_eq!(json["items"][0]["group"], "Work");
+        assert_eq!(json["items"][0]["space"], "Work");
         assert_eq!(json["items"][0]["project"], "website");
         assert_eq!(serde_json::from_value::<Dashboard>(json).unwrap(), doc);
     }
     #[test]
-    fn legacy_pr_group_key_migrates_to_group_on_load() {
+    fn items_without_a_space_follow_the_renamed_first_space() {
         let temp = tempfile::tempdir().unwrap();
         let root = DataRoot::new(temp.path().to_owned());
         std::fs::create_dir_all(root.portable_dir()).unwrap();
-        // Pre-rename record: `pr_group` with no `group`.
+        let mut catalog = crate::data::Spaces::default();
+        catalog.ensure_name("Home");
+        catalog.ensure_name("Work");
+        catalog
+            .save(&root, &crate::data::Spaces::default())
+            .unwrap();
+        std::fs::write(
+            root.portable_dir().join("dashboard.json"),
+            serde_json::json!({"items":[{"id": "legacy", "kind": "Todo", "title": "Old"}]})
+                .to_string(),
+        )
+        .unwrap();
+        let loaded = Dashboard::load(&root).unwrap();
+        assert_eq!(loaded.items[0].space, "Home");
+    }
+
+    #[test]
+    fn legacy_group_keys_migrate_to_space_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(temp.path().to_owned());
+        std::fs::create_dir_all(root.portable_dir()).unwrap();
+        // Pre-rename record: `pr_group` with no `group`/`space`.
         std::fs::write(
             root.portable_dir().join("dashboard.json"),
             serde_json::json!({"items":[{
@@ -494,19 +531,20 @@ mod tests {
         )
         .unwrap();
         let loaded = Dashboard::load(&root).unwrap();
-        assert_eq!(loaded.items[0].group, Group::Work);
+        assert_eq!(loaded.items[0].space, "Work");
         assert_eq!(loaded.items[0].project_key(), Some("website"));
-        // Saving drops the legacy key so synced files converge on `group`.
+        // Saving drops the legacy key so synced files converge on `space`.
         let snapshot = loaded.clone();
         loaded.save(&root, &snapshot).unwrap();
         let raw: Value = serde_json::from_slice(
             &std::fs::read(root.portable_dir().join("dashboard.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(raw["items"][0]["group"], "Work");
+        assert_eq!(raw["items"][0]["space"], "Work");
         assert!(raw["items"][0].get("pr_group").is_none());
-        // When both keys are present (an older client round-tripped an
-        // unknown `group` while writing its own `pr_group`), `group` wins.
+        assert!(raw["items"][0].get("group").is_none());
+        // When both the old group keys are present, `group` (the later
+        // legacy name) wins over `pr_group`.
         std::fs::write(
             root.portable_dir().join("dashboard.json"),
             serde_json::json!({"items":[{
@@ -516,7 +554,18 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        assert_eq!(Dashboard::load(&root).unwrap().items[0].group, Group::Work);
+        assert_eq!(Dashboard::load(&root).unwrap().items[0].space, "Work");
+        // `space` (the current name) wins over both legacy keys.
+        std::fs::write(
+            root.portable_dir().join("dashboard.json"),
+            serde_json::json!({"items":[{
+                "id": "current", "kind": "Todo", "title": "Current",
+                "space": "Personal", "group": "Work", "pr_group": "Work",
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(Dashboard::load(&root).unwrap().items[0].space, "Personal");
     }
     #[test]
     fn todo_project_moves_keep_column_order() {

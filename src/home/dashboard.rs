@@ -262,10 +262,6 @@ impl HomeView {
             let open_label = label.clone();
             let git_status = self.project_git.statuses.get(&project.checkout_path);
             let status = project_git_label(git_status);
-            let group = project
-                .group
-                .clone()
-                .filter(|value| !value.trim().is_empty());
             let description = project
                 .description
                 .clone()
@@ -336,21 +332,7 @@ impl HomeView {
                                     .whitespace_nowrap()
                                     .font_semibold()
                                     .child(label),
-                            )
-                            .when_some(group, |this, tag| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .max_w(px(96.))
-                                        .truncate()
-                                        .px_2()
-                                        .rounded_full()
-                                        .bg(cx.theme().secondary)
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(tag),
-                                )
-                            }),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -485,7 +467,7 @@ impl HomeView {
         let dangling = self
             .all_projects
             .iter()
-            .filter(|entry| !entry.is_linked())
+            .filter(|entry| !entry.is_linked() && self.in_active_space_entry(entry))
             .count();
         v_flex()
             .gap_3()

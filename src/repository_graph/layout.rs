@@ -88,23 +88,27 @@ impl Viewport {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct GroupLayout {
+pub(crate) struct SpaceLayout {
     pub positions: BTreeMap<String, Point>,
     pub viewport: Viewport,
 }
 
+/// Device-local canvas state, one entry per space. The active space comes
+/// from `device.json`, so no "last space" is stored here: the map keeps
+/// whatever each space's canvas last looked like.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Layouts {
     pub schema_version: u32,
-    pub groups: BTreeMap<String, GroupLayout>,
-    pub last_group: String,
+    /// `groups` is the pre-spaces name; aliased so existing local layouts
+    /// keep their positions instead of re-arranging once.
+    #[serde(alias = "groups")]
+    pub spaces: BTreeMap<String, SpaceLayout>,
 }
 impl Default for Layouts {
     fn default() -> Self {
         Self {
             schema_version: 1,
-            groups: BTreeMap::new(),
-            last_group: "Personal".into(),
+            spaces: BTreeMap::new(),
         }
     }
 }
@@ -134,7 +138,7 @@ impl Layouts {
         );
         ensure!(
             layouts
-                .groups
+                .spaces
                 .values()
                 .all(|g| g.positions.values().all(|p| p.finite())
                     && g.viewport.offset.finite()
@@ -273,7 +277,7 @@ pub(crate) fn arrange(keys: &[String], edges: &[Relationship]) -> BTreeMap<Strin
     result
 }
 
-impl GroupLayout {
+impl SpaceLayout {
     pub fn include_new(&mut self, keys: &[String], edges: &[Relationship]) {
         if self.positions.is_empty() {
             self.positions = arrange(keys, edges);
@@ -364,7 +368,7 @@ mod tests {
         assert!(positions["cli"].y > positions["backend"].y);
         edges.reverse();
         assert_eq!(positions, arrange(&keys, &edges));
-        let mut saved = GroupLayout {
+        let mut saved = SpaceLayout {
             positions: positions.clone(),
             ..Default::default()
         };

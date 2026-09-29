@@ -59,21 +59,30 @@ pub(crate) struct AgentActivity {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ActivitySnapshot {
     activities: HashMap<PathBuf, AgentActivity>,
-    launches: HashMap<u64, AgentActivity>,
+    launches: HashMap<u64, (PathBuf, AgentActivity)>,
 }
 
 impl ActivitySnapshot {
     pub(crate) fn for_launch(&self, launch: u64) -> Option<&AgentActivity> {
-        self.launches.get(&launch)
+        self.launches.get(&launch).map(|(_, activity)| activity)
     }
     pub(crate) fn for_checkout(&self, checkout: &Path) -> Option<&AgentActivity> {
         self.activities.get(checkout)
     }
 
+    /// One entry per managed agent pane with the checkout it runs in, for
+    /// space-filtered attention counts: several panes can share a checkout.
+    pub(crate) fn launches_by_checkout(&self) -> impl Iterator<Item = (&Path, &AgentActivity)> {
+        self.launches
+            .values()
+            .map(|(checkout, activity)| (checkout.as_path(), activity))
+    }
+
+    #[cfg(test)]
     pub(crate) fn attention_count(&self) -> usize {
         self.launches
             .values()
-            .filter(|activity| activity.state == ActivityState::NeedsAttention)
+            .filter(|(_, activity)| activity.state == ActivityState::NeedsAttention)
             .count()
     }
 
@@ -261,7 +270,7 @@ impl AgentActivityStore {
         let mut launches = HashMap::new();
         for ((checkout, generation), record) in &inner.records {
             let activity = record.projected();
-            launches.insert(*generation, activity.clone());
+            launches.insert(*generation, (checkout.clone(), activity.clone()));
             let priority = |state| match state {
                 ActivityState::NeedsAttention => 6,
                 ActivityState::Working => 5,

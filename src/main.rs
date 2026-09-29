@@ -138,6 +138,7 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
 /// Boot path for `devcroft app [--checkout <path>]`: the previous `main()`
 /// behavior verbatim, rooted at `--checkout` (or cwd when absent).
 fn run_app(args: crate::cli::AppArgs) -> Result<()> {
+    install_panic_log();
     // Resolve `--checkout` before touching the GUI so a bad path fails fast
     // with a runtime error instead of opening a window rooted elsewhere.
     let working_directory = crate::cli::resolve_working_directory(args.checkout)?;
@@ -185,6 +186,28 @@ fn run_app(args: crate::cli::AppArgs) -> Result<()> {
         .expect("failed to open Devcroft window");
     });
     Ok(())
+}
+
+/// Write a panic report to `<data root>/logs/panic.log` before the default
+/// hook runs. GPUI panics inside an AppKit event callback abort the process,
+/// so a window launched from Finder has no visible message: this file is the
+/// only way to read what happened. Best effort — never masks the panic.
+fn install_panic_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let report = format!(
+            "devcroft panic at {}\n{info}\n\nbacktrace:\n{}\n",
+            crate::relative_time::current_unix_secs(),
+            std::backtrace::Backtrace::force_capture()
+        );
+        if let Ok(root) = crate::data::resolve_data_root() {
+            let logs = root.root().join("logs");
+            if std::fs::create_dir_all(&logs).is_ok() {
+                let _ = std::fs::write(logs.join("panic.log"), report);
+            }
+        }
+        default(info);
+    }));
 }
 
 /// Persisted appearance (theme mode plus app font size) shared by every GUI

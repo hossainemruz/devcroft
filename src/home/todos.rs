@@ -4,25 +4,22 @@ use super::*;
 
 impl HomeView {
     pub(super) fn todos_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut filters = h_flex().gap_2().flex_wrap().items_center();
-        for group in [None, Some(Group::Personal), Some(Group::Work)] {
-            let label = group.map_or("All", Group::label);
-            let checked = self.todo_group_filter == group;
-            filters = filters.child(
-                Radio::new(item_id("filter-todo", label))
-                    .label(label.to_owned())
-                    .checked(checked)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        // Radios never toggle off: selecting the active one is
-                        // a no-op, any other pick becomes the filter.
-                        if this.todo_group_filter != group {
-                            this.todo_group_filter = group;
-                            this.navigation_cursor = None;
-                            cx.notify();
-                        }
-                    })),
+        let mut filters = h_flex()
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Space"),
+            )
+            .child(
+                Tag::secondary()
+                    .with_size(Size::Small)
+                    .rounded_full()
+                    .child(self.active_space.clone()),
             );
-        }
         let show_completed = self.show_completed;
         filters = filters.child(
             Checkbox::new("show-completed-todos-page")
@@ -36,7 +33,7 @@ impl HomeView {
         );
         let mut board = h_flex().items_stretch().gap_4().flex_wrap();
         // Only columns with visible todos stay on the board — projects
-        // without any (under the current group/completion filters) would
+        // without any (under the current space/completion filters) would
         // just be clutter.
         let mut visible_columns = 0;
         for (index, column) in self.todo_board_columns().into_iter().enumerate() {
@@ -75,7 +72,7 @@ impl HomeView {
             for item in items {
                 view = view.child(self.todo_card(&item, cx));
             }
-            let group = self.todo_group_filter.unwrap_or_default();
+            let space = self.active_space.clone();
             let project = column.key.clone().unwrap_or_default();
             view = view.child(
                 Button::new(("add-todo-column", index))
@@ -84,7 +81,7 @@ impl HomeView {
                     .label("+ Add todo")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let mut item = Item::new(Kind::Todo);
-                        item.group = group;
+                        item.space = space.clone();
                         item.project = project.clone();
                         this.editor(item, window, cx);
                     })),
@@ -94,7 +91,7 @@ impl HomeView {
         if visible_columns == 0 {
             // No column survived the filters: keep an entry point so the
             // board is never a dead end.
-            let group = self.todo_group_filter.unwrap_or_default();
+            let space = self.active_space.clone();
             board = board.child(
                 v_flex()
                     .gap_3()
@@ -115,7 +112,7 @@ impl HomeView {
                             .label("+ Add todo")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let mut item = Item::new(Kind::Todo);
-                                item.group = group;
+                                item.space = space.clone();
                                 this.editor(item, window, cx);
                             })),
                     ),

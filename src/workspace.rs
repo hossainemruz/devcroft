@@ -16,6 +16,8 @@ use gpui_kit::component::{
     WindowExt as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex,
+    menu::{PopupMenu, PopupMenuItem},
+    popover::Popover,
     spinner::Spinner,
     tab::{Tab, TabBar},
     tag::Tag,
@@ -23,7 +25,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _,
+    AnyElement, App, AppContext as _, Context, DismissEvent, Entity, FocusHandle, Focusable as _,
     InteractiveElement, IntoElement, KeyUpEvent, KeystrokeEvent, ModifiersChangedEvent,
     MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Window, deferred, div,
     px, rgb,
@@ -44,8 +46,9 @@ use crate::command_palette::{
     palette_mode_for_shortcut, palette_sections_for_mode,
 };
 use crate::data::{
-    DataRoot, DeviceStore, RecentRepository, SyncStatus, SyncTracker, checkout_for,
-    recent_repositories, record_repository_open, resolve_current_key, sync_portable_with_tracker,
+    DEFAULT_SPACE, DataRoot, DeviceStore, RecentRepository, Spaces, SyncStatus, SyncTracker,
+    checkout_for, ensure_spaces, recent_repositories, record_repository_open, resolve_current_key,
+    space_eq, sync_portable_with_tracker,
 };
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
@@ -199,6 +202,18 @@ pub(crate) struct Workspace {
     relationships_visible: bool,
     relationships_origin: Option<PageOrigin>,
     home_visible: bool,
+    /// Isolation profiles and the active one. `active_space` is machine-local
+    /// (`device.json`) and drives every space-filtered surface; the catalog
+    /// is portable and syncs with the records it scopes.
+    spaces: Spaces,
+    active_space: String,
+    /// The titlebar space switcher's controlled popover plus the menu it
+    /// shows, built per opening and owned here (never window-keyed state).
+    /// The focus handle is captured at build time: closing must not read the
+    /// menu entity, which is leased while its own click/dismiss handler runs.
+    space_menu_open: bool,
+    space_menu: Option<Entity<PopupMenu>>,
+    space_menu_focus: Option<FocusHandle>,
     portable_git_poll: GitPoll,
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
@@ -380,6 +395,26 @@ impl Workspace {
         let stored = data_root
             .as_ref()
             .and_then(|root| DeviceStore::new(root).load().ok());
+        // Isolation profiles: seed/reconcile the portable catalog (Personal
+        // and Work plus any legacy group names the records reference) and
+        // resume this device's last active space. A catalog that cannot be
+        // read falls back to the seeded pair so Home still filters sanely.
+        let spaces = data_root
+            .as_ref()
+            .and_then(|root| ensure_spaces(root).ok())
+            .unwrap_or_else(|| {
+                let mut catalog = Spaces::default();
+                for name in crate::data::spaces::DEFAULT_SEED {
+                    catalog.ensure_name(name);
+                }
+                catalog
+            });
+        let active_space = stored
+            .as_ref()
+            .and_then(|state| state.active_space.as_deref())
+            .and_then(|name| spaces.canonical(name))
+            .or_else(|| spaces.first().map(str::to_owned))
+            .unwrap_or_else(|| DEFAULT_SPACE.to_owned());
         let mut enabled_agents = stored
             .as_ref()
             .map(|state| state.enabled_agents_or_default())
@@ -567,6 +602,9 @@ impl Workspace {
         // Settings status line all read the same run state.
         let sync_tracker = SyncTracker::default();
         let home = cx.new(|cx| HomeView::new(data_root.clone(), sync_tracker.clone(), cx));
+        home.update(cx, |view, cx| {
+            view.set_space(spaces.names(), active_space.clone(), cx)
+        });
         home.read(cx).focus_handle.clone().focus(window, cx);
         cx.subscribe_in(&home, window, |this, _, event, window, cx| match event {
             HomeEvent::OpenReference(reference) => {
@@ -680,6 +718,9 @@ impl Workspace {
         .detach();
         let relationships =
             cx.new(|cx| crate::repository_graph::GraphPage::new(data_root.clone(), window, cx));
+        relationships.update(cx, |view, cx| {
+            view.set_space(active_space.clone(), spaces.names(), cx)
+        });
         cx.subscribe_in(
             &relationships,
             window,
@@ -706,6 +747,11 @@ impl Workspace {
             home,
             resources,
             home_visible: true,
+            spaces,
+            active_space,
+            space_menu_open: false,
+            space_menu: None,
+            space_menu_focus: None,
             portable_git_poll: GitPoll::default(),
             active_tab,
             tabs,
@@ -1091,7 +1137,9 @@ impl Workspace {
     /// open/close; the view is dropped with it.
     fn open_add_repository(&self, window: &mut Window, cx: &mut Context<Self>) {
         let data_root = self.data_root.clone();
-        let view = cx.new(|cx| AddRepositoryView::new(window, cx, data_root));
+        let spaces = self.spaces.names();
+        let active_space = self.active_space.clone();
+        let view = cx.new(|cx| AddRepositoryView::new(window, cx, data_root, spaces, active_space));
         cx.subscribe(
             &view,
             |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
@@ -1116,7 +1164,11 @@ impl Workspace {
     fn open_link_repository(&self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let data_root = self.data_root.clone();
         let key = key.to_owned();
-        let view = cx.new(|cx| AddRepositoryView::for_link(window, cx, data_root, key.clone()));
+        let spaces = self.spaces.names();
+        let active_space = self.active_space.clone();
+        let view = cx.new(|cx| {
+            AddRepositoryView::for_link(window, cx, data_root, key.clone(), spaces, active_space)
+        });
         cx.subscribe(
             &view,
             |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
@@ -1161,8 +1213,18 @@ impl Workspace {
                     }
                 };
                 let data_root = this.data_root.clone();
+                let spaces = this.spaces.names();
+                let active_space = this.active_space.clone();
                 let view = cx.new(|cx| {
-                    AddRepositoryView::for_edit(window, cx, data_root, key.clone(), &metadata)
+                    AddRepositoryView::for_edit(
+                        window,
+                        cx,
+                        data_root,
+                        key.clone(),
+                        &metadata,
+                        spaces,
+                        active_space,
+                    )
                 });
                 cx.subscribe(
                     &view,
@@ -1512,6 +1574,224 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Switch isolation profiles: persist the choice machine-locally and
+    /// re-project every space-filtered surface. The open repository workspace
+    /// stays open (an explicit context); its sidebar keeps its own sessions.
+    pub(crate) fn switch_space(
+        &mut self,
+        space: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(canonical) = self.spaces.canonical(&space) else {
+            return;
+        };
+        if space_eq(&canonical, &self.active_space) {
+            return;
+        }
+        self.active_space = canonical.clone();
+        self.close_space_menu(window, cx);
+        self.close_navigation(cx);
+        if let Some(root) = &self.data_root {
+            let _ = DeviceStore::new(root).update(|state| {
+                state.active_space = Some(canonical.clone());
+            });
+        }
+        self.refresh_spaces();
+        let names = self.spaces.names();
+        self.home.update(cx, |view, cx| {
+            view.set_space(names.clone(), self.active_space.clone(), cx);
+        });
+        self.relationships.update(cx, |view, cx| {
+            view.set_space(self.active_space.clone(), names, cx);
+        });
+        self.reload_recent_repositories();
+        self.publish_sessions(cx);
+        cx.notify();
+    }
+
+    /// Toggle the titlebar space switcher (the navigation-mode `s` entry
+    /// opens it). Reconciles the catalog first so a space added on another
+    /// device shows up without a restart.
+    fn toggle_space_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.space_menu_open {
+            self.close_space_menu(window, cx);
+        } else {
+            self.open_space_menu(window, cx);
+        }
+    }
+
+    /// Whether either artifact browser (the global Home one or the
+    /// repository Resources tab) holds an unsaved draft. Settings blocks
+    /// catalog renames/deletes then: the rewrite replaces the records a
+    /// draft is based on, and a stashed draft's key can name the space being
+    /// edited. Catalog edits are rare enough that a blanket guard is
+    /// cheaper than tracking every draft-to-space relationship.
+    pub(crate) fn has_artifact_draft(&self, cx: &App) -> bool {
+        self.home.read(cx).has_artifact_draft(cx) || self.resources.read(cx).has_draft()
+    }
+
+    /// Attention count for the active space: agent panes in registered
+    /// repositories count under their repository's space; unregistered
+    /// checkouts (explicitly opened ad-hoc) always count, matching the Home
+    /// session cards' rule.
+    fn attention_count(&self) -> usize {
+        self.agent_activity
+            .snapshot()
+            .launches_by_checkout()
+            .filter(|(checkout, agent)| {
+                agent.state == ActivityState::NeedsAttention
+                    && self
+                        .session_space(checkout)
+                        .is_none_or(|space| space_eq(&space, &self.active_space))
+            })
+            .count()
+    }
+
+    /// Re-read the portable catalog. Best effort: a read failure keeps the
+    /// in-memory catalog so the switcher still works.
+    fn refresh_spaces(&mut self) {
+        if let Some(root) = &self.data_root
+            && let Ok(catalog) = ensure_spaces(root)
+        {
+            self.spaces = catalog;
+        }
+    }
+
+    /// Re-read the catalog after Settings edits and re-project every
+    /// space-filtered surface. When the active name no longer exists (it was
+    /// renamed or deleted), follow the retargeted `device.json` value; a
+    /// value the catalog does not know falls back to the first space.
+    pub(crate) fn reload_spaces(&mut self, cx: &mut Context<Self>) {
+        self.refresh_spaces();
+        if !self.spaces.contains(&self.active_space) {
+            let stored = self
+                .data_root
+                .as_ref()
+                .and_then(|root| DeviceStore::new(root).load().ok())
+                .and_then(|state| state.active_space);
+            self.active_space = stored
+                .as_deref()
+                .and_then(|name| self.spaces.canonical(name))
+                .or_else(|| self.spaces.first().map(str::to_owned))
+                .unwrap_or_else(|| DEFAULT_SPACE.to_owned());
+            if let Some(root) = &self.data_root {
+                let active = self.active_space.clone();
+                let _ = DeviceStore::new(root).update(|state| {
+                    state.active_space = Some(active.clone());
+                });
+            }
+        }
+        let names = self.spaces.names();
+        self.home.update(cx, |view, cx| {
+            view.set_space(names.clone(), self.active_space.clone(), cx);
+        });
+        self.relationships.update(cx, |view, cx| {
+            view.set_space(self.active_space.clone(), names, cx);
+        });
+        self.reload_recent_repositories();
+        self.publish_sessions(cx);
+        cx.notify();
+    }
+
+    /// Titlebar space switcher: one controlled popover so the mouse and the
+    /// navigation-mode `s` entry open the same menu. The menu lists the
+    /// catalog in order with the active space checked; picking one switches
+    /// every space-filtered surface.
+    fn space_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.active_space.clone();
+        let menu = self.space_menu.clone();
+        // The popover focuses its tracked handle when it opens; pointing that
+        // at the menu is what makes the `s` entry keyboard-navigable (the
+        // menu is built before the popover's own open transition runs).
+        let menu_focus = menu.as_ref().map(|menu| menu.focus_handle(cx));
+        Popover::new("space-switcher")
+            .open(self.space_menu_open)
+            .appearance(false)
+            .when_some(menu_focus, |popover, focus| popover.track_focus(&focus))
+            .on_open_change(cx.listener(|this, open, window, cx| {
+                // The popover owns its trigger's toggling; this callback is
+                // the single place that opens and closes the menu.
+                if *open {
+                    this.open_space_menu(window, cx);
+                } else {
+                    this.close_space_menu(window, cx);
+                }
+            }))
+            .trigger(
+                Button::new("space-switcher-trigger")
+                    .ghost()
+                    .small()
+                    .dropdown_caret(true)
+                    .max_w(px(200.))
+                    .label(active.clone())
+                    .tooltip("Switch space · s in navigation mode"),
+            )
+            .content(move |_, _, _| match &menu {
+                Some(menu) => menu.clone().into_any_element(),
+                None => div().into_any_element(),
+            })
+    }
+
+    /// Build the switcher's menu for the current catalog and show it. The
+    /// menu is created per opening (catalog edits and space switches are
+    /// reflected immediately) and owned by the workspace, so no window-keyed
+    /// element state is involved.
+    fn open_space_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_spaces();
+        let names = self.spaces.names();
+        let active = self.active_space.clone();
+        let workspace = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let mut menu = menu.min_w(px(200.));
+            for name in names {
+                let selected = space_eq(&name, &active);
+                let workspace = workspace.clone();
+                menu = menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(
+                    move |_, window, cx| {
+                        let _ = workspace
+                            .update(cx, |this, cx| this.switch_space(name.clone(), window, cx));
+                    },
+                ));
+            }
+            menu
+        });
+        // Dismissing the menu (Escape, an item pick) closes the popover too.
+        let this = cx.entity().downgrade();
+        window
+            .subscribe(&menu, cx, move |_, _: &DismissEvent, window, cx| {
+                let _ = this.update(cx, |this, cx| this.close_space_menu(window, cx));
+            })
+            .detach();
+        // The popover focuses its own handle; the menu needs focus for its
+        // arrow keys and Enter to work, like the built-in dropdown.
+        self.space_menu_focus = Some(menu.focus_handle(cx));
+        menu.focus_handle(cx).focus(window, cx);
+        self.space_menu = Some(menu);
+        self.space_menu_open = true;
+        cx.notify();
+    }
+
+    /// Hide the switcher and drop its menu. When the menu itself holds
+    /// focus, focus moves back to Home first: leaving it on a dropped
+    /// handle would swallow every following keystroke.
+    fn close_space_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.space_menu_open && self.space_menu.is_none() {
+            return;
+        }
+        let menu_focused = self
+            .space_menu_focus
+            .as_ref()
+            .is_some_and(|handle| handle.contains_focused(window, cx));
+        self.space_menu = None;
+        self.space_menu_focus = None;
+        self.space_menu_open = false;
+        if menu_focused {
+            self.home.read(cx).focus_handle.clone().focus(window, cx);
+        }
+        cx.notify();
+    }
+
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.relationships_visible = false;
         self.relationships
@@ -1844,14 +2124,19 @@ impl Workspace {
             self.recent_repositories
                 .iter()
                 .filter(|repository| {
-                    activity
-                        .for_checkout(&repository.checkout_path)
-                        .is_some_and(|agent| agent.state == ActivityState::NeedsAttention)
+                    space_eq(&repository.space, &self.active_space)
+                        && activity
+                            .for_checkout(&repository.checkout_path)
+                            .is_some_and(|agent| agent.state == ActivityState::NeedsAttention)
                 })
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            self.recent_repositories.clone()
+            self.recent_repositories
+                .iter()
+                .filter(|repository| space_eq(&repository.space, &self.active_space))
+                .cloned()
+                .collect::<Vec<_>>()
         };
         let mut open_checkouts = activity
             .iter()
@@ -2381,6 +2666,7 @@ impl Workspace {
         match command {
             NavigationCommand::AddRepository => self.open_add_repository(window, cx),
             NavigationCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
+            NavigationCommand::SwitchSpace => self.toggle_space_menu(window, cx),
             NavigationCommand::Agent => self.select_tab(WorkspaceTab::Agent as usize, window, cx),
             NavigationCommand::Editor => self.select_tab(WorkspaceTab::Editor as usize, window, cx),
             NavigationCommand::Terminal => {
@@ -2909,7 +3195,7 @@ impl Render for Workspace {
             || is_pull_requests
             || is_todos
             || is_reading;
-        let attention_count = self.agent_activity.snapshot().attention_count();
+        let attention_count = self.attention_count();
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
         } else {
@@ -3025,6 +3311,9 @@ impl Render for Workspace {
                     .border_color(rgb(0x222525))
                     .when(self.home_visible && !is_home_page, |header| {
                         header.child(div().text_sm().font_semibold().child("Devcroft"))
+                    })
+                    .when(self.home_visible && !self.relationships_visible, |header| {
+                        header.child(self.space_switcher(cx))
                     })
                     .when(self.relationships_visible, |header| {
                         header.child(
@@ -3687,6 +3976,253 @@ mod tests {
             Some(home_focus.clone()),
             "Tab moves focus to the next component"
         );
+    }
+
+    /// Switching spaces through the real menu and rendering every surface
+    /// (Home, the global Artifacts page, a repository workspace) stays
+    /// stable. Regression coverage for the reported crash on a space pick.
+    #[gpui_kit::test]
+    fn switching_spaces_through_the_menu_stays_stable(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+        let holder_for_window = holder.clone();
+        let (_root, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            *holder_for_window.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        for _ in 0..3 {
+            test_cx.update(|window, cx| window.render_frame(cx));
+            test_cx.run_until_parked();
+        }
+        let (active, other) = view.update(test_cx, |view, _| {
+            let active = view.active_space.clone();
+            let other = view
+                .spaces
+                .names()
+                .into_iter()
+                .find(|name| !space_eq(name, &active));
+            (active, other)
+        });
+        let Some(other) = other else {
+            panic!("need two spaces for the switcher regression test");
+        };
+        // Switch to the other space through the titlebar menu. Escape first,
+        // then reopen: dismissal must leave no stale menu behind.
+        test_cx.update(|window, cx| window.click("space-switcher-trigger", cx));
+        test_cx.run_until_parked();
+        for _ in 0..3 {
+            test_cx.update(|window, cx| window.render_frame(cx));
+            test_cx.run_until_parked();
+        }
+        test_cx.simulate_keystrokes("escape");
+        test_cx.run_until_parked();
+        assert!(
+            !view.update(test_cx, |view, _| view.space_menu_open),
+            "Escape closes the switcher"
+        );
+        assert!(view.update(test_cx, |view, _| view.space_menu.is_none()));
+        test_cx.update(|window, cx| window.click("space-switcher-trigger", cx));
+        test_cx.run_until_parked();
+        for _ in 0..3 {
+            test_cx.update(|window, cx| window.render_frame(cx));
+            test_cx.run_until_parked();
+        }
+        let other_index = view.update(test_cx, |view, _| {
+            view.spaces
+                .names()
+                .iter()
+                .position(|name| space_eq(name, &other))
+                .unwrap()
+        });
+        test_cx.update(|window, cx| window.click(other_index, cx));
+        test_cx.run_until_parked();
+        for _ in 0..3 {
+            test_cx.update(|window, cx| window.render_frame(cx));
+            test_cx.run_until_parked();
+        }
+        assert_eq!(
+            view.update(test_cx, |view, _| view.active_space.clone()),
+            other
+        );
+        // Exercise the global Artifacts page in the new space before
+        // switching back. (A repository workspace would spawn PTY reader
+        // threads, which the test scheduler rejects as nondeterministic.)
+        test_cx.update(|window, cx| view.update(cx, |view, cx| view.browse_artifacts(window, cx)));
+        test_cx.run_until_parked();
+        for _ in 0..3 {
+            test_cx.update(|window, cx| window.render_frame(cx));
+            test_cx.run_until_parked();
+        }
+        // Switch back through the menu trigger and the first item.
+        test_cx.update(|window, cx| window.click("space-switcher-trigger", cx));
+        test_cx.run_until_parked();
+        for _ in 0..3 {
+            test_cx.update(|window, cx| window.render_frame(cx));
+            test_cx.run_until_parked();
+        }
+        let index = view.update(test_cx, |view, _| {
+            view.spaces
+                .names()
+                .iter()
+                .position(|name| space_eq(name, &active))
+                .unwrap()
+        });
+        test_cx.update(|window, cx| window.click(index, cx));
+        test_cx.run_until_parked();
+        for _ in 0..3 {
+            test_cx.update(|window, cx| window.render_frame(cx));
+            test_cx.run_until_parked();
+        }
+        assert_eq!(
+            view.update(test_cx, |view, _| view.active_space.clone()),
+            active
+        );
+    }
+
+    /// The switcher must be usable from the keyboard alone: `Cmd+J`, `s`,
+    /// arrow keys, Enter.
+    #[gpui_kit::test]
+    fn space_switcher_navigates_with_arrow_keys(cx: &mut gpui_kit::TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        const TRIGGER: &str = if cfg!(target_os = "macos") {
+            "cmd-j"
+        } else {
+            "ctrl-j"
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+        let holder_for_window = holder.clone();
+        let (_root, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            *holder_for_window.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        let release = |test_cx: &mut gpui_kit::VisualTestContext, key: &str| {
+            test_cx.simulate_event(gpui_kit::KeyUpEvent {
+                keystroke: gpui_kit::Keystroke::parse(key).unwrap(),
+            });
+        };
+
+        // Open the switcher through the navigation-mode entry.
+        test_cx.simulate_keystrokes(TRIGGER);
+        release(test_cx, "j");
+        test_cx.simulate_keystrokes("s");
+        release(test_cx, "s");
+        test_cx.run_until_parked();
+        let names = view.update(test_cx, |view, _| view.spaces.names());
+        let active = view.update(test_cx, |view, _| view.active_space.clone());
+        assert!(view.update(test_cx, |view, _| view.space_menu_open));
+        assert!(names.len() >= 2, "need two spaces for this test");
+        let target_index = names
+            .iter()
+            .position(|name| !space_eq(name, &active))
+            .unwrap();
+
+        // The menu must hold focus for its key bindings to fire.
+        let menu_focus = view.update(test_cx, |view, cx| {
+            view.space_menu.as_ref().map(|menu| menu.focus_handle(cx))
+        });
+        let focused = test_cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            focused, menu_focus,
+            "the space menu must hold focus for arrow keys and Enter"
+        );
+        // Nothing is selected on open: the first Down selects the first
+        // entry, each further Down moves one step.
+        for _ in 0..=target_index {
+            test_cx.simulate_keystrokes("down");
+        }
+        test_cx.simulate_keystrokes("enter");
+        test_cx.run_until_parked();
+        assert_eq!(
+            view.update(test_cx, |view, _| view.active_space.clone()),
+            names[target_index],
+            "arrow keys + Enter must pick the highlighted space"
+        );
+        assert!(!view.update(test_cx, |view, _| view.space_menu_open));
+        // Closing must not leave focus on the dropped menu handle.
+        let after = test_cx.update(|window, cx| window.focused(cx));
+        assert!(after.is_some(), "focus must land somewhere after closing");
+        assert_ne!(after, menu_focus, "focus must leave the dropped menu");
+    }
+
+    /// The navigation-mode `s` entry opens the titlebar space switcher and
+    /// leaves navigation mode; pressing it again (or the switcher's own
+    /// dismissal) closes it.
+    #[gpui_kit::test]
+    fn switch_space_entry_toggles_the_titlebar_switcher(cx: &mut gpui_kit::TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        const TRIGGER: &str = if cfg!(target_os = "macos") {
+            "cmd-j"
+        } else {
+            "ctrl-j"
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+        let holder_for_window = holder.clone();
+        let (_root, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            *holder_for_window.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        let state = |test_cx: &mut gpui_kit::VisualTestContext| {
+            view.update(test_cx, |view, _| {
+                (
+                    view.space_menu_open,
+                    view.navigation_open,
+                    view.active_space.clone(),
+                    view.spaces.names(),
+                )
+            })
+        };
+
+        // Start on Home in navigation mode.
+        assert!(test_cx.update(|_, cx| view.read(cx).home_visible));
+        test_cx.simulate_keystrokes(TRIGGER);
+        let (menu_open, navigation_open, active, spaces) = state(test_cx);
+        assert!(navigation_open);
+        assert!(!menu_open);
+        assert!(!spaces.is_empty(), "the catalog seeds at startup");
+        assert!(spaces.iter().any(|name| space_eq(name, &active)));
+        // Held-key bookkeeping swallows repeats until a key-up.
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("j").unwrap(),
+        });
+
+        // `s` opens the switcher and returns to normal mode.
+        test_cx.simulate_keystrokes("s");
+        let (menu_open, navigation_open, ..) = state(test_cx);
+        assert!(menu_open, "s opens the space switcher");
+        assert!(!navigation_open, "an action key leaves navigation mode");
+
+        // The same entry toggles it closed.
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("s").unwrap(),
+        });
+        test_cx.simulate_keystrokes(TRIGGER);
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("j").unwrap(),
+        });
+        test_cx.simulate_keystrokes("s");
+        let (menu_open, ..) = state(test_cx);
+        assert!(!menu_open, "s toggles the switcher closed");
     }
 
     /// Two focusable tab stops inside the workspace key context, with the

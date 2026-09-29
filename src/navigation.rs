@@ -23,6 +23,7 @@ pub(crate) struct ResourceState {
 pub(crate) enum Command {
     AddRepository,
     BrowseArtifacts,
+    SwitchSpace,
     Agent,
     Editor,
     Terminal,
@@ -57,7 +58,7 @@ impl Row {
     }
 }
 
-const HOME: [Row; 2] = [
+const HOME: [Row; 3] = [
     Row {
         key: 'a',
         label: "Add repository",
@@ -69,6 +70,12 @@ const HOME: [Row; 2] = [
         label: "Browse artifacts",
         group: "Home",
         command: Command::BrowseArtifacts,
+    },
+    Row {
+        key: 's',
+        label: "Switch space",
+        group: "Home",
+        command: Command::SwitchSpace,
     },
 ];
 
@@ -123,7 +130,7 @@ const WORKSPACE: [Row; 8] = [
     },
 ];
 
-const ARTIFACTS: [Row; 2] = [
+const ARTIFACTS: [Row; 3] = [
     Row {
         key: ' ',
         label: "Home",
@@ -136,7 +143,17 @@ const ARTIFACTS: [Row; 2] = [
         group: "Navigate",
         command: Command::Back,
     },
+    Row {
+        key: 's',
+        label: "Switch space",
+        group: "Navigate",
+        command: Command::SwitchSpace,
+    },
 ];
+
+/// The relationships canvas has no space switcher in its titlebar, so it
+/// shares the Home/Back rows without the `s` entry.
+const RELATIONSHIPS: [Row; 2] = [ARTIFACTS[0], ARTIFACTS[1]];
 
 const RESOURCE_EDIT: [Row; 2] = [
     Row {
@@ -172,7 +189,8 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
     let mut result = match context {
         Context::Home => HOME.to_vec(),
         Context::Workspace => WORKSPACE.to_vec(),
-        Context::Artifacts | Context::Relationships => ARTIFACTS.to_vec(),
+        Context::Artifacts => ARTIFACTS.to_vec(),
+        Context::Relationships => RELATIONSHIPS.to_vec(),
     };
     if resource.selected && !resource.saving {
         result.extend(if resource.drafting {
@@ -342,14 +360,15 @@ mod tests {
     #[test]
     fn shared_palette_keys_are_gone_everywhere() {
         // The Common section was removed: palettes stay reachable through
-        // their direct shortcuts, so p/s/o must offer nothing in any context.
+        // their direct shortcuts, so p/o must offer nothing in any context.
+        // `s` is Home's Switch space action and stays free elsewhere.
         for context in [
             Context::Home,
             Context::Workspace,
             Context::Artifacts,
             Context::Relationships,
         ] {
-            for key in ['p', 's', 'o'] {
+            for key in ['p', 'o'] {
                 assert_eq!(resolve(context, ResourceState::default(), key), None);
             }
             assert!(
@@ -357,6 +376,18 @@ mod tests {
                     .iter()
                     .all(|row| row.group != "Common")
             );
+        }
+        // `s` is the space switcher on the two Home destinations that render
+        // it (dashboard and the global Artifacts page), and stays free
+        // elsewhere.
+        for context in [Context::Home, Context::Artifacts] {
+            assert_eq!(
+                resolve(context, ResourceState::default(), 's'),
+                Some(Command::SwitchSpace)
+            );
+        }
+        for context in [Context::Workspace, Context::Relationships] {
+            assert_eq!(resolve(context, ResourceState::default(), 's'), None);
         }
     }
 

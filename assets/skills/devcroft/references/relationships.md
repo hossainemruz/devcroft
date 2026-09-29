@@ -14,19 +14,20 @@ valid (cycles are allowed). Self-connections and duplicate ordered pairs fail.
 devcroft repository relationships --json
 devcroft repository relationships backend --json
 devcroft repository relationships backend --depth 2 --json
-devcroft repository relationships --group Work --json
+devcroft repository relationships --space Work --json
 ```
 
 Whole-graph results include isolated and unlinked repositories, descriptions,
-groups, metadata `revision` tokens, checkout availability, and unresolved
+spaces, metadata `revision` tokens, checkout availability, and unresolved
 placeholders. Incoming/outgoing lists remain direct neighbors at every depth;
 expanded `nodes` carry shortest undirected neighborhood `distance` and `path`.
 `directions` classifies returned edges relative to the queried repository.
 Depth is bounded to 1–8, node results to 1000, and the store to 5000 edges.
-Always check `diagnostics`, `truncated`, and `excludedRelationships`. Group
-filters affect reads only; default queries include all groups, independently of
-the desktop filter. Personal/Work match case-insensitively; other groups retain
-stored spelling. All and Ungrouped are special filter choices.
+Always check `diagnostics`, `truncated`, and `excludedRelationships`. Space
+filters affect reads only; default queries include all spaces, independently of
+the desktop filter. Names match case-insensitively; `All` is a special filter
+choice. A repository with no stored space counts as the default space
+(`Personal` on a seeded catalog).
 
 Read first and use the top-level graph `revision` for each mutation:
 
@@ -42,12 +43,12 @@ On duplicate creation, edit the existing ID named in the error. On a stale
 revision, reread and recompute the intended change; do not blindly retry using a
 new token. Malformed/unsupported documents are never replaced with empty data.
 
-Node purposes and groups use the existing repository record. `repository get`
+Node purposes and spaces use the existing repository record. `repository get`
 returns its metadata revision, also available on graph nodes:
 
 ```sh
 devcroft repository get backend --json
-devcroft repository update backend --description 'Implements the shared services' --group Work --revision METADATA_REV --json
+devcroft repository update backend --description 'Implements the shared services' --space Work --revision METADATA_REV --json
 ```
 
 Unspecified metadata flags preserve stored fields; an explicit empty string
@@ -57,6 +58,6 @@ endpoints stay visible as unresolved connections and permit explicit cleanup.
 
 Definitions live in `portable/repository-relationships.json`; node metadata lives
 in `portable/repositories/<key>/repository.json`. Both participate in portable
-Git sync. Canvas positions, zoom, pan, and per-group preferences stay in the
+Git sync. Canvas positions, zoom, pan, and per-space preferences stay in the
 device-local `repository-graph-layout.json` outside portable data. Use the CLI
 for records rather than editing these files directly.

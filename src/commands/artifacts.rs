@@ -22,6 +22,7 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
             let list = store
                 .list(&artifacts::ListOptions {
                     repository: options.repository,
+                    space: options.space,
                     include_archived: options.include_archived,
                     limit: Some(options.bounds.limit.into()),
                 })

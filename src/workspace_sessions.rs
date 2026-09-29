@@ -301,9 +301,20 @@ impl Workspace {
         }
         let mut cards = Vec::new();
         for session in &self.session_snapshot.sessions {
-            if let Some(label) = self.session_repository_label(&session.checkout) {
-                cards.push((session.clone(), label));
+            let Some(label) = self.session_repository_label(&session.checkout) else {
+                continue;
+            };
+            // Registered repositories filter by the active space; an
+            // unregistered checkout (the current or a retained ad-hoc one)
+            // has no space to filter on and stays visible — the user opened
+            // it explicitly.
+            if self
+                .session_space(&session.checkout)
+                .is_some_and(|space| !space_eq(&space, &self.active_space))
+            {
+                continue;
             }
+            cards.push((session.clone(), label));
             if cards.len() == HOME_LIMIT {
                 break;
             }
@@ -317,6 +328,16 @@ impl Workspace {
             )
         });
         cx.notify();
+    }
+
+    /// Space of the registered repository whose checkout is `checkout`, when
+    /// one exists. Unregistered checkouts return `None`.
+    pub(super) fn session_space(&self, checkout: &Path) -> Option<String> {
+        self.session_projects
+            .iter()
+            .chain(self.recent_repositories.iter())
+            .find(|project| project.checkout_path == checkout)
+            .map(|project| project.space.clone())
     }
 
     /// Display label for one session checkout: a registered repository's

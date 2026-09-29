@@ -2,7 +2,7 @@
 //! see docs/resources.md for representation and interrupted-write behavior.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use super::DataRoot;
 use super::record::{MAX_BYTES, atomic_replace, nonblank, random_id, read_bounded, timestamp};
+use super::spaces::space_eq;
 use super::store_lock::{artifact_lock, ensure_directory, portable_gate, reject_symlink};
 
 pub(crate) mod anchors;
@@ -70,6 +71,13 @@ pub(crate) struct Artifact {
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) repository: Option<String>,
+    /// Isolation profile captured when the artifact was created. Reads
+    /// prefer the repository's current space (moving a repository moves its
+    /// artifacts) and fall back to this stored value for artifacts whose
+    /// repository is gone. Empty means "never captured" — pre-spaces records
+    /// resolve from their repository on every read.
+    #[serde(default)]
+    pub(crate) space: String,
     #[serde(default)]
     pub(crate) sessions: Vec<OriginSession>,
     #[serde(default)]
@@ -154,6 +162,10 @@ pub(crate) struct Snapshot {
 #[derive(Debug, Default)]
 pub(crate) struct ListOptions {
     pub(crate) repository: Option<String>,
+    /// Active isolation profile: only artifacts in this space are listed
+    /// (before the limit is applied, so another space's records cannot
+    /// consume the page). `None` lists every space.
+    pub(crate) space: Option<String>,
     pub(crate) include_archived: bool,
     pub(crate) limit: Option<usize>,
 }
@@ -191,6 +203,7 @@ impl ArtifactStore {
                 .as_deref()
                 .context("artifact repository is required")?,
         )?;
+        let spaces = self.repository_spaces();
         ensure_directory(&self.root.portable_dir())?;
         ensure_directory(&self.checked_path(None)?)?;
         for _ in 0..64 {
@@ -202,13 +215,14 @@ impl ArtifactStore {
                 continue;
             }
             let now = timestamp()?;
-            let artifact = Artifact {
+            let mut artifact = Artifact {
                 schema_version: SCHEMA_VERSION,
                 id,
                 title: input.title.trim().to_owned(),
                 kind: input.kind,
                 content: input.content.clone(),
                 repository: input.repository.clone(),
+                space: String::new(),
                 sessions: input.sessions.clone(),
                 comments: Vec::new(),
                 archived: false,
@@ -216,13 +230,14 @@ impl ArtifactStore {
                 updated_at: now,
                 extra: BTreeMap::new(),
             };
+            resolve_space(&spaces, &mut artifact);
             artifact.validate()?;
             match fs::create_dir(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e).context("creating artifact directory"),
             }
-            let result = self.write(&artifact, || Ok(()));
+            let result = self.write(&artifact, &spaces, || Ok(()));
             if result.is_err() {
                 let _ = fs::remove_dir(&dir);
             }
@@ -241,7 +256,22 @@ impl ArtifactStore {
     pub(super) fn get_under_gate(&self, id: &str) -> Result<Snapshot> {
         validate_id(id)?;
         let _record = artifact_lock(&self.root, id, false)?;
-        self.read(id)
+        let spaces = self.repository_spaces();
+        self.read(id, &spaces)
+    }
+
+    /// Space of every repository key, for resolving artifact spaces. Empty
+    /// when the catalog cannot be read: artifacts then keep their stored
+    /// space instead of failing the read.
+    fn repository_spaces(&self) -> HashMap<String, String> {
+        super::repositories::all_repositories_unlocked(&self.root)
+            .map(|(entries, _)| {
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.space))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn list(&self, options: &ListOptions) -> Result<ArtifactList> {
@@ -257,6 +287,7 @@ impl ArtifactStore {
             Err(e) => return Err(e).context("listing artifacts"),
         };
         let mut result = ArtifactList::default();
+        let spaces = self.repository_spaces();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -266,11 +297,18 @@ impl ArtifactStore {
                 }
             };
             let id = entry.file_name().to_string_lossy().into_owned();
-            match self.get_under_gate(&id) {
+            match self.read(&id, &spaces) {
                 Ok(snapshot)
                     if (options.include_archived || !snapshot.artifact.archived)
                         && options.repository.as_ref().is_none_or(|key| {
                             snapshot.artifact.repository.as_ref() == Some(key)
+                        })
+                        && options.space.as_deref().is_none_or(|space| {
+                            // An artifact whose repository is gone keeps its
+                            // captured space; one with neither is shown in
+                            // every space rather than hidden.
+                            snapshot.artifact.space.trim().is_empty()
+                                || space_eq(&snapshot.artifact.space, space)
                         }) =>
                 {
                     result.artifacts.push(snapshot)
@@ -332,7 +370,7 @@ impl ArtifactStore {
         validate_id(id)?;
         let _gate = portable_gate(&self.root, false)?;
         let _record = artifact_lock(&self.root, id, true)?;
-        let old = self.read(id)?;
+        let old = self.read(id, &self.repository_spaces())?;
         ensure!(
             old.revision == revision,
             "artifact_changed: {id} changed on disk; read the latest version and retry"
@@ -437,7 +475,8 @@ impl ArtifactStore {
         validate_id(id)?;
         let _gate = portable_gate(&self.root, false)?;
         let _record = artifact_lock(&self.root, id, true)?;
-        let old = self.read(id)?;
+        let spaces = self.repository_spaces();
+        let old = self.read(id, &spaces)?;
         ensure!(
             old.revision == revision,
             "artifact_changed: {id} changed on disk; read the latest version and retry"
@@ -451,6 +490,7 @@ impl ArtifactStore {
         {
             self.require_repository(key)?;
         }
+        resolve_space(&spaces, &mut artifact);
         artifact.updated_at = timestamp()?.max(
             artifact
                 .updated_at
@@ -458,7 +498,7 @@ impl ArtifactStore {
                 .context("artifact timestamp exhausted")?,
         );
         artifact.validate()?;
-        self.write(&artifact, || Ok(()))
+        self.write(&artifact, &spaces, || Ok(()))
     }
 
     fn require_repository(&self, key: &str) -> Result<()> {
@@ -470,7 +510,7 @@ impl ArtifactStore {
         reject_symlink(&dir)?;
         let bytes = read_bounded(&dir.join("repository.json"))
             .with_context(|| format!("unknown or unreadable repository {key}"))?;
-        serde_json::from_slice::<super::RepositoryMetadata>(&bytes)?;
+        super::repositories::parse_metadata(&bytes)?;
         Ok(())
     }
 
@@ -487,7 +527,7 @@ impl ArtifactStore {
         Ok(path)
     }
 
-    fn read(&self, id: &str) -> Result<Snapshot> {
+    fn read(&self, id: &str, spaces: &HashMap<String, String>) -> Result<Snapshot> {
         let dir = self.checked_path(Some(id))?;
         let path = dir.join("artifact.md");
         reject_symlink(&path)?;
@@ -528,33 +568,50 @@ impl ArtifactStore {
             "artifact ID does not match directory {id}"
         );
         artifact.relocate_comments();
+        resolve_space(spaces, &mut artifact);
         snapshot(artifact, &bytes)
     }
 
     fn write(
         &self,
         artifact: &Artifact,
+        spaces: &HashMap<String, String>,
         before_rename: impl FnOnce() -> Result<()>,
     ) -> Result<Snapshot> {
-        let mut metadata = serde_json::to_value(artifact)?;
+        let mut persisted = artifact.clone();
+        resolve_space(spaces, &mut persisted);
+        let mut metadata = serde_json::to_value(&persisted)?;
         metadata.as_object_mut().unwrap().remove("content");
         let bytes = format!(
             "---\n{}\n---\n{}",
             serde_json::to_string_pretty(&metadata)?,
-            artifact.content
+            persisted.content
         )
         .into_bytes();
         ensure!(
             bytes.len() as u64 <= MAX_BYTES,
             "artifact exceeds {MAX_BYTES} byte limit"
         );
-        let snapshot = snapshot(artifact.clone(), &bytes)?;
+        let snapshot = snapshot(persisted, &bytes)?;
         atomic_replace(
             &self.checked_path(Some(&artifact.id))?.join("artifact.md"),
             &bytes,
             before_rename,
         )?;
         Ok(snapshot)
+    }
+}
+
+/// Apply the repository's current space to `artifact`, falling back to the
+/// space captured at creation so a removed repository's artifacts keep their
+/// last home.
+fn resolve_space(spaces: &HashMap<String, String>, artifact: &mut Artifact) {
+    if let Some(space) = artifact
+        .repository
+        .as_deref()
+        .and_then(|key| spaces.get(key))
+    {
+        artifact.space = space.clone();
     }
 }
 

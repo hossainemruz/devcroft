@@ -9,6 +9,112 @@ fn fixture() -> (tempfile::TempDir, ArtifactStore) {
     }
     (dir, store)
 }
+
+/// Fixture whose repositories carry spaces: `repo` in Work, `other` in
+/// Personal, seeded through the portable catalog.
+fn spaced_fixture() -> (tempfile::TempDir, ArtifactStore) {
+    let (dir, store) = fixture();
+    for (key, space) in [("repo", "Work"), ("other", "Personal")] {
+        let path = store.root.portable_dir().join("repositories").join(key);
+        fs::write(
+            path.join("repository.json"),
+            serde_json::json!({ "key": key, "space": space }).to_string(),
+        )
+        .unwrap();
+    }
+    crate::data::ensure_spaces(&store.root).unwrap();
+    (dir, store)
+}
+
+#[test]
+fn artifact_space_follows_its_repository_and_survives_removal() {
+    let (_dir, store) = spaced_fixture();
+    let created = store.create(input("repo")).unwrap();
+    assert_eq!(created.artifact.space, "Work");
+    assert_eq!(
+        store.get(&created.artifact.id).unwrap().artifact.space,
+        "Work"
+    );
+
+    // Moving the repository moves its artifacts without touching the file.
+    let path = store
+        .root
+        .portable_dir()
+        .join("repositories/repo/repository.json");
+    fs::write(
+        &path,
+        serde_json::json!({ "key": "repo", "space": "Personal" }).to_string(),
+    )
+    .unwrap();
+    let moved = store.get(&created.artifact.id).unwrap();
+    assert_eq!(moved.artifact.space, "Personal");
+    assert_eq!(
+        moved.revision, created.revision,
+        "reads never rewrite the record"
+    );
+
+    // Removing the repository leaves the space captured when the artifact
+    // was written (Work) as the fallback: the later repository edit only
+    // ever lived in the repository record.
+    fs::remove_dir_all(store.root.portable_dir().join("repositories/repo")).unwrap();
+    assert_eq!(
+        store.get(&created.artifact.id).unwrap().artifact.space,
+        "Work"
+    );
+    let list = store.list(&ListOptions::default()).unwrap();
+    assert_eq!(list.artifacts.len(), 1);
+    assert_eq!(list.artifacts[0].artifact.space, "Work");
+}
+
+#[test]
+fn legacy_artifacts_without_a_space_resolve_from_their_repository() {
+    let (_dir, store) = spaced_fixture();
+    let created = store.create(input("repo")).unwrap();
+    // Rewrite the record the way a pre-spaces build would have: no `space`.
+    let path = store
+        .checked_path(Some(&created.artifact.id))
+        .unwrap()
+        .join("artifact.md");
+    let text = fs::read_to_string(&path).unwrap();
+    let (metadata, content) = text
+        .trim_start_matches("---\n")
+        .split_once("\n---\n")
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(metadata).unwrap();
+    value.as_object_mut().unwrap().remove("space");
+    fs::write(
+        &path,
+        format!(
+            "---\n{}\n---\n{content}",
+            serde_json::to_string_pretty(&value).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let resolved = store.get(&created.artifact.id).unwrap();
+    assert_eq!(resolved.artifact.space, "Work");
+}
+
+#[test]
+fn list_filters_by_space_before_the_page_limit() {
+    let (_dir, store) = spaced_fixture();
+    store.create(input("other")).unwrap();
+    store.create(input("repo")).unwrap();
+    let options = ListOptions {
+        space: Some("Work".into()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let list = store.list(&options).unwrap();
+    // The Personal artifact must not consume the one-slot page.
+    assert_eq!(list.artifacts.len(), 1);
+    assert_eq!(list.artifacts[0].artifact.space, "Work");
+    assert!(!list.truncated);
+
+    let all = store.list(&ListOptions::default()).unwrap();
+    assert_eq!(all.artifacts.len(), 2);
+}
+
 fn input(repository: &str) -> NewArtifact {
     NewArtifact {
         repository: Some(repository.into()),
@@ -194,7 +300,13 @@ fn failed_atomic_write_does_not_replace_document() {
     let first = store.create(input("repo")).unwrap();
     let mut artifact = first.artifact.clone();
     artifact.content = "changed".into();
-    assert!(store.write(&artifact, || bail!("interrupted")).is_err());
+    assert!(
+        store
+            .write(&artifact, &std::collections::HashMap::new(), || bail!(
+                "interrupted"
+            ))
+            .is_err()
+    );
     assert_eq!(store.get(&first.artifact.id).unwrap(), first);
 }
 #[cfg(unix)]

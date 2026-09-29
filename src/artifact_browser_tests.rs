@@ -178,6 +178,138 @@ fn block_comment_editor_keeps_reader_and_persists_anchor(cx: &mut gpui_kit::Test
 }
 
 #[gpui_kit::test]
+fn space_switching_stashes_drafts_and_never_shows_another_spaces_editor(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use crate::data::artifacts::NewArtifact;
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    for (key, space) in [("work", "Work"), ("home", "Personal")] {
+        crate::data::write_json_atomic(
+            &root
+                .portable_dir()
+                .join(format!("repositories/{key}/repository.json")),
+            &serde_json::json!({"key": key, "space": space}),
+        )
+        .unwrap();
+    }
+    crate::data::ensure_spaces(&root).unwrap();
+    let store = ArtifactStore::new(&root);
+    let new = |repository: &str, title: &str| {
+        store
+            .create(NewArtifact {
+                repository: Some(repository.into()),
+                sessions: vec![],
+                title: title.into(),
+                kind: Kind::Note,
+                content: format!("# {title}\n"),
+            })
+            .unwrap()
+    };
+    let work = new("work", "Work doc");
+    let home = new("home", "Home doc");
+
+    cx.update(gpui_kit::init);
+    let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
+    let view = browser.clone();
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+    browser.update(cx, |browser, cx| {
+        browser.set_space("Work".into(), cx);
+        browser.set_active(true, cx);
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, _| {
+        assert_eq!(browser.selected_id.as_ref(), Some(&work.artifact.id));
+    });
+    cx.update(|window, cx| {
+        browser.update(cx, |browser, cx| {
+            browser.begin_markdown_edit(window, cx);
+            assert!(browser.draft.is_some());
+            assert!(
+                browser.has_draft(),
+                "Settings must refuse catalog edits while a draft is unsaved"
+            );
+        })
+    });
+    cx.run_until_parked();
+
+    browser.update(cx, |browser, cx| browser.set_space("Personal".into(), cx));
+    cx.run_until_parked();
+    browser.update(cx, |browser, _| {
+        assert!(
+            browser.draft.is_none(),
+            "another space's draft must not be shown"
+        );
+        assert_eq!(browser.selected_id.as_ref(), Some(&home.artifact.id));
+        assert!(
+            browser.has_draft(),
+            "a stashed draft still blocks catalog edits"
+        );
+    });
+
+    browser.update(cx, |browser, cx| browser.set_space("Work".into(), cx));
+    cx.run_until_parked();
+    browser.update(cx, |browser, _| {
+        assert_eq!(
+            browser
+                .draft
+                .as_ref()
+                .map(|draft| draft.snapshot.artifact.id.clone()),
+            Some(work.artifact.id.clone()),
+            "the stashed draft comes back with its space"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn repository_scoped_drafts_report_their_resolved_space(cx: &mut gpui_kit::TestAppContext) {
+    use crate::data::artifacts::NewArtifact;
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    crate::data::write_json_atomic(
+        &root
+            .portable_dir()
+            .join("repositories/work/repository.json"),
+        &serde_json::json!({"key": "work", "space": "Work"}),
+    )
+    .unwrap();
+    crate::data::ensure_spaces(&root).unwrap();
+    let store = ArtifactStore::new(&root);
+    store
+        .create(NewArtifact {
+            repository: Some("work".into()),
+            sessions: vec![],
+            title: "Work doc".into(),
+            kind: Kind::Note,
+            content: "# Work\n".into(),
+        })
+        .unwrap();
+
+    cx.update(gpui_kit::init);
+    // The repository Resources browser has no space filter, so its drafts
+    // must resolve their space from the artifact snapshot instead.
+    let browser = cx.new(|cx| {
+        ArtifactBrowser::scoped(Some(root), Scope::Repository(Some("work".to_owned())), cx)
+    });
+    let view = browser.clone();
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+    browser.update(cx, |browser, cx| browser.set_active(true, cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        browser.update(cx, |browser, cx| {
+            browser.begin_markdown_edit(window, cx);
+            assert!(browser.draft.is_some());
+            assert!(
+                browser.has_draft(),
+                "repository-scoped drafts block catalog edits too"
+            );
+        })
+    });
+}
+
+#[gpui_kit::test]
 fn selected_text_draft_saves_selection_instead_of_containing_block(
     cx: &mut gpui_kit::TestAppContext,
 ) {

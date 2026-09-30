@@ -9,7 +9,7 @@ use crate::review::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
@@ -72,16 +72,16 @@ fn open_capture(
     let mut review = loaded
         .clone()
         .unwrap_or_else(|| Review::start(capture.clone()));
-    let before = (review.current, review.revisions.len());
+    let before = serde_json::to_vec(&review)?;
     review.add_capture(capture);
-    if loaded.is_none() || before != (review.current, review.revisions.len()) {
+    if loaded.is_none() || before != serde_json::to_vec(&review)? {
         store.save(&mut review)?;
     }
     if let Some(directory) = bundle {
         review.install(crate::review::session::Bundle::load(
             &directory,
             &review.active().capture,
-        )?);
+        )?)?;
         store.save(&mut review)?;
     }
     gpui_kit::open_window(
@@ -112,6 +112,9 @@ struct Workspace {
     ready: bool,
     preview: Option<pr::Preview>,
     publishing: bool,
+    refreshing: bool,
+    author_error: Option<String>,
+    source_recovery: bool,
 }
 impl Workspace {
     fn new(
@@ -123,6 +126,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let author_error = author::preflight(&cwd).err().map(|e| format!("{e:#}"));
         let mut this = Self {
             cwd,
             scope,
@@ -137,6 +141,9 @@ impl Workspace {
             ready: false,
             preview: None,
             publishing: false,
+            refreshing: false,
+            author_error,
+            source_recovery: false,
         };
         this.create(window, cx);
         this
@@ -193,7 +200,7 @@ impl Workspace {
         let r = self.review.active();
         let files=r.capture.files.iter().map(|f|json!({"path":f.path,"old_path":f.old_path,"status":f.status,"additions":f.additions,"deletions":f.deletions,"lines":f.lines,"unavailable":f.unavailable,"truncated":f.truncated})).collect::<Vec<_>>();
         let provider = crate::review::assistant::generation_options().provider;
-        json!({"version":self.review.version,"capture":{"id":r.capture.id,"label":r.capture.label,"base":r.capture.base,"head":r.capture.head,"branch":r.capture.branch,"files":files,"evidence":r.capture.evidence},"bundle":r.bundle,"bundleHash":r.bundle.as_ref().and_then(|b|serde_json::to_vec(b).ok()).map(digest),"examined":r.examined,"page":r.location.page,"chapter":r.location.chapter,"evidence":r.location.evidence,"findings":self.review.findings,"investigations":self.review.investigations,"drafts":self.review.drafts,"history":self.review.revisions.iter().map(|r|json!({"id":r.capture.id,"head":r.capture.head,"examined":r.examined.len()})).collect::<Vec<_>>(),"busy":self.job.is_some(),"provider":provider.label().to_lowercase(),"providers":[{"id":"codex","label":"Codex · confined authoring","eligible":true},{"id":"claude","label":"Claude · adapter not yet confined","eligible":false},{"id":"opencode","label":"OpenCode · adapter not yet confined","eligible":false},{"id":"omp","label":"Omp · adapter not yet confined","eligible":false}],"sharing":"Generation and questions send the captured source excerpts and your instructions to the selected agent provider. The live checkout and related repositories are excluded."})
+        json!({"version":self.review.version,"capture":{"id":r.capture.id,"label":r.capture.label,"base":r.capture.base,"head":r.capture.head,"branch":r.capture.branch,"pr":r.capture.pr,"files":files,"evidence":r.capture.evidence},"bundle":r.bundle,"bundleHash":r.bundle.as_ref().and_then(|b|serde_json::to_vec(b).ok()).map(digest),"examined":r.examined,"guideHistory":r.guide_history.iter().filter_map(|g|serde_json::to_vec(g).ok().map(|bytes|json!({"hash":digest(bytes),"title":g.bundle.manifest.title,"examined":g.examined.len()}))).collect::<Vec<_>>(),"page":if self.source_recovery {"changes"} else {r.location.page.as_str()},"chapter":r.location.chapter,"evidence":r.location.evidence,"findings":self.review.findings,"investigations":self.review.investigations,"drafts":self.review.drafts,"history":self.review.revisions.iter().map(|r|json!({"id":r.capture.id,"head":r.capture.head,"examined":r.examined.len()})).collect::<Vec<_>>(),"busy":self.job.is_some(),"capturing":self.refreshing,"publishing":self.publishing,"preview":self.preview,"submissions":self.review.submissions,"provider":provider.label().to_lowercase(),"providers":[{"id":"codex","label":"Codex · confined authoring","eligible":self.author_error.is_none(),"reason":self.author_error},{"id":"claude","label":"Claude · adapter not yet confined","eligible":false},{"id":"opencode","label":"OpenCode · adapter not yet confined","eligible":false},{"id":"omp","label":"Omp · adapter not yet confined","eligible":false}],"sharing":"Generation and questions send the captured source excerpts and your instructions to the selected agent provider. The live checkout and related repositories are excluded."})
     }
     fn send(&self, value: Value, cx: &mut Context<Self>) {
         if let Some(webview) = &self.webview {
@@ -255,17 +262,30 @@ impl Workspace {
     fn commit(&mut self, mut next: Review) -> Result<()> {
         self.store.save(&mut next)?;
         self.review = next;
+        self.preview = None;
         Ok(())
     }
     fn handle(&mut self, m: Message, cx: &mut Context<Self>) -> Result<Value> {
         if m.op == "ready" {
             self.ready = true;
+            if let Some(view) = &self.webview
+                && let Err(error) =
+                    view.update(cx, |view, _| super::accessibility::attach(view.raw()))
+            {
+                self.error = Some(format!(
+                    "Review accessibility setup needs attention: {error:#}"
+                ));
+            }
             return Ok(Value::Null);
         }
         ensure!(self.ready, "Review document has not initialized");
         ensure!(
             m.capture.as_deref() == Some(&self.review.active().capture.id),
             "Captured revision changed; reopen this review"
+        );
+        ensure!(
+            !self.publishing || ["source", "copy"].contains(&m.op.as_str()),
+            "Publication is running; wait for its saved status"
         );
         if m.op == "reload" {
             let active = self.review.active().capture.id.clone();
@@ -321,6 +341,81 @@ impl Workspace {
         );
         let mut next = self.review.clone();
         match m.op.as_str() {
+            "preview" => {
+                ensure!(
+                    !self.refreshing,
+                    "Wait for capture to finish before previewing"
+                );
+                ensure!(
+                    self.job.is_none(),
+                    "Finish or stop the agent request before previewing a review"
+                );
+                self.preview = Some(pr::preview(
+                    &self.review,
+                    text(&m.data, "event", 30)?,
+                    text_allow_empty(&m.data, "body", 12000)?,
+                )?);
+                return Ok(serde_json::to_value(&self.preview)?);
+            }
+            "publish" | "reconcile" | "discard" => {
+                ensure!(
+                    !self.refreshing,
+                    "Wait for capture to finish before publication"
+                );
+                let hash = text(&m.data, "hash", 100)?.to_owned();
+                ensure!(
+                    self.job.is_none(),
+                    "Finish or stop the agent request before publication"
+                );
+                let saved = self
+                    .review
+                    .submissions
+                    .iter()
+                    .find(|s| s.preview.hash == hash);
+                let create = if let Some(saved) = saved {
+                    ensure!(
+                        !matches!(saved.state.as_str(), "submitted" | "rejected" | "discarded"),
+                        "This publication is complete or was rejected; inspect a fresh preview"
+                    );
+                    false
+                } else {
+                    ensure!(m.op == "publish", "No saved publication to reconcile");
+                    ensure!(
+                        !next.submissions.iter().any(|s| !matches!(
+                            s.state.as_str(),
+                            "submitted" | "rejected" | "discarded"
+                        )),
+                        "A previous publication is unresolved. Inspect and reconcile its saved preview before creating another review"
+                    );
+                    let preview = self
+                        .preview
+                        .as_ref()
+                        .context("Create a fresh preview before publishing")?;
+                    ensure!(
+                        preview.hash == hash
+                            && preview.version == self.review.version
+                            && preview.capture == self.review.active().capture.id,
+                        "The preview is stale; inspect a new preview"
+                    );
+                    ensure!(
+                        next.submissions.len() < 100,
+                        "Publication history limit reached"
+                    );
+                    next.submissions.push(pr::Submission {
+                        preview: preview.clone(),
+                        remote_id: None,
+                        remote_author: None,
+                        event_sent: false,
+                        remote_url: None,
+                        state: "creating".into(),
+                        error: None,
+                    });
+                    // This intent is durable before the first external mutation.
+                    self.commit(next)?;
+                    true
+                };
+                self.publication(hash, create, m.op == "publish", m.op == "discard", cx);
+            }
             "revision" => {
                 self.cancel_job("Changed viewed revision")?;
                 next = self.review.clone();
@@ -333,6 +428,7 @@ impl Workspace {
                 self.commit(next)?;
             }
             "location" => {
+                self.source_recovery = false;
                 let page = text(&m.data, "page", 20)?;
                 ensure!(
                     ["overview", "walkthrough", "changes", "findings"].contains(&page),
@@ -400,6 +496,10 @@ impl Workspace {
                     range,
                 });
                 if let Some(key) = m.data.get("key").and_then(Value::as_str) {
+                    ensure!(
+                        key.starts_with(&format!("{}:", next.active().capture.id)),
+                        "Draft belongs to another capture"
+                    );
                     next.drafts.remove(key);
                 }
                 self.commit(next)?;
@@ -440,6 +540,22 @@ impl Workspace {
                 }
                 self.commit(next)?;
             }
+            "guide" => {
+                self.cancel_job("Changed viewed guide")?;
+                next = self.review.clone();
+                next.select_guide(text(&m.data, "hash", 100)?)?;
+                self.commit(next)?;
+            }
+            "repair" => {
+                ensure!(self.job.is_none(), "An agent request is already running");
+                ensure!(
+                    text(&m.data, "provider", 30)? == "codex",
+                    "This provider has no confined authoring adapter yet"
+                );
+                let chapter = text(&m.data, "chapter", 80)?.to_owned();
+                let problem = text_allow_empty(&m.data, "problem", 2000)?.to_owned();
+                self.run(author::Task::Repair { chapter, problem }, cx)?;
+            }
             "generate" => {
                 ensure!(self.job.is_none(), "An agent request is already running");
                 ensure!(
@@ -467,6 +583,13 @@ impl Workspace {
                     "Empty question or investigation limit reached"
                 );
                 let id = digest(rand::random::<[u8; 32]>());
+                let key = format!(
+                    "{}:question:{}:{}",
+                    next.active().capture.id,
+                    chapter.as_deref().unwrap_or("source"),
+                    evidence.as_deref().unwrap_or("none")
+                );
+                next.drafts.remove(&key);
                 next.investigations.push(Investigation {
                     id: id.clone(),
                     capture: next.active().capture.id.clone(),
@@ -501,9 +624,14 @@ impl Workspace {
         Ok(Value::Null)
     }
     fn run(&mut self, task: author::Task, cx: &mut Context<Self>) -> Result<()> {
+        ensure!(
+            !self.refreshing,
+            "Wait for capture to finish before requesting an explanation"
+        );
         let capture = self.review.active().capture.clone();
         let id = capture.id.clone();
         let (job, receiver) = author::start(
+            &self.cwd,
             capture,
             self.review.active().bundle.clone(),
             task,
@@ -526,12 +654,12 @@ impl Workspace {
                             let question = view.job.take().and_then(|job|job.question.clone());
                             let mut next=view.review.clone();
                             let result=match result {
-                                Ok(output) => {
-                                    match output { author::Output::Guide(bundle)=>next.install(bundle),author::Output::Answer{id,answer}=>if let Some(q)=next.investigations.iter_mut().find(|q|q.id==id){q.answer=Some(answer);q.error=None;} }
+                                Ok(output) => (|| -> Result<()> {
+                                    match output { author::Output::Guide(bundle)=>next.install(bundle)?,author::Output::Answer{id,answer}=>if let Some(q)=next.investigations.iter_mut().find(|q|q.id==id){q.answer=Some(answer);q.error=None;} }
                                     view.commit(next)
-                                }
+                                })(),
                                 Err(error) => {
-                                    if let Some(id)=question && let Some(q)=next.investigations.iter_mut().find(|q|q.id==id) {q.error=Some(format!("{error:#}"));view.commit(next).ok();}
+                                    if let Some(id)=question && let Some(q)=next.investigations.iter_mut().find(|q|q.id==id) {q.error=Some(format!("{error:#}"));if let Err(save_error)=view.commit(next) { view.error=Some(format!("Could not save the failed question: {save_error:#}")); }}
                                     Err(error)
                                 }
                             };
@@ -543,6 +671,31 @@ impl Workspace {
             }
         }).detach();
         Ok(())
+    }
+    fn publication(
+        &mut self,
+        hash: String,
+        create: bool,
+        submit: bool,
+        discard: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.publishing = true;
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move {
+                if discard { pr::discard_publication(&store, &hash) }
+                else { pr::complete_publication(&store, &hash, create, submit) }
+            }).await;
+            let _ = this.update(cx, |view, cx| {
+                view.publishing = false;
+                match result {
+                    Ok(review) => { view.review = review; view.send(json!({"state":view.snapshot(),"status":"GitHub review status saved. Inspect the publication record below."}), cx); },
+                    Err(e) => { if let Ok(Some(review)) = view.store.load() {view.review = review;} view.send(json!({"state":view.snapshot(),"error":format!("Publication status needs attention: {e:#}")}), cx); }
+                }
+                cx.notify();
+            });
+        }).detach();
     }
     fn cancel_job(&mut self, reason: &str) -> Result<()> {
         if let Some(job) = self.job.take()
@@ -557,6 +710,14 @@ impl Workspace {
         Ok(())
     }
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refreshing {
+            return;
+        }
+        if self.publishing {
+            self.error = Some("Wait for publication to finish before refreshing".into());
+            cx.notify();
+            return;
+        }
         if let Err(e) = self.cancel_job("New capture requested") {
             self.error = Some(format!("{e:#}"));
             return;
@@ -564,6 +725,7 @@ impl Workspace {
         let cwd = self.cwd.clone();
         let scope = self.scope.clone();
         let label = self.label.clone();
+        let original = self.review.active().capture.id.clone();
         let url = self
             .review
             .active()
@@ -571,7 +733,44 @@ impl Workspace {
             .pr
             .as_ref()
             .map(|p| p.url.clone());
-        cx.spawn(async move|this,cx|{let result=cx.background_spawn(async move{if let Some(url)=url {pr::acquire(&url)}else{Capture::stable_local(&cwd,&scope,&format!("Local working-tree snapshot · {label}"))}}).await;let _=this.update(cx,|view,cx|{match result{Ok(capture)=>{let mut next=view.review.clone();next.add_capture(capture);match view.commit(next){Ok(())=>view.send(json!({"state":view.snapshot(),"status":"Captured source refreshed. Previous decisions remain in revision history."}),cx),Err(e)=>view.error=Some(format!("{e:#}"))}},Err(e)=>view.error=Some(format!("{e:#}"))}cx.notify();});}).detach();
+        self.refreshing = true;
+        self.send(
+            json!({"state":self.snapshot(),"status":"Capturing a coherent source revision…"}),
+            cx,
+        );
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move {
+                if let Some(url) = url {
+                    pr::acquire(&url)
+                } else {
+                    Capture::stable_local(&cwd, &scope, &format!("Local working-tree snapshot · {label}"))
+                }
+            }).await;
+            let _ = this.update(cx, |view, cx| {
+                view.refreshing = false;
+                if view.review.active().capture.id != original {
+                    view.send(json!({"state":view.snapshot(),"status":"Capture selection changed while refreshing. Capture again when ready."}), cx);
+                    cx.notify();
+                    return;
+                }
+                let result = result.and_then(|capture| {
+                    let mut next = view.review.clone();
+                    next.add_capture(capture);
+                    view.commit(next)
+                });
+                match result {
+                    Ok(()) => view.send(json!({"state":view.snapshot(),"status":"Captured source refreshed. Previous decisions remain in revision history."}), cx),
+                    Err(error) => view.send(json!({"state":view.snapshot(),"error":format!("Capture failed: {error:#}")}), cx),
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+}
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = self.cancel_job("Review window closed before the answer was saved");
     }
 }
 impl Render for Workspace {
@@ -590,14 +789,15 @@ impl Render for Workspace {
                     .child(
                         Button::new("review-refresh")
                             .ghost()
-                            .label("Capture new revision")
+                            .label(if self.refreshing {"Capturing revision…"} else {"Capture new revision"})
+                            .disabled(self.refreshing)
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     )
                     .child(
                         Button::new("review-recover")
                             .ghost()
-                            .label("Recreate review view")
-                            .on_click(cx.listener(|this, _, window, cx| this.create(window, cx))),
+                            .label("Recover source view")
+                            .on_click(cx.listener(|this, _, window, cx| { this.source_recovery = true; this.create(window, cx); })),
                     )
                     .child(Button::new("review-reload").ghost().label("Reload saved state").on_click(cx.listener(|this,_,_,cx| {
                         match this.store.load() {Ok(Some(mut latest))=>{

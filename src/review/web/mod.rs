@@ -1,4 +1,6 @@
 #[cfg(target_os = "macos")]
+mod accessibility;
+#[cfg(target_os = "macos")]
 mod author;
 mod bridge;
 #[cfg(target_os = "macos")]

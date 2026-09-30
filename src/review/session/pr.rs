@@ -62,6 +62,7 @@ impl Identity {
 fn trusted_gh() -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?);
     let cwd = std::env::current_dir()?.canonicalize()?;
+    let checkout = cwd.join(".git").exists();
     for path in [
         home.join(".local/share/mise/installs/gh/latest/bin/gh"),
         home.join(".local/bin/gh"),
@@ -72,7 +73,7 @@ fn trusted_gh() -> Result<PathBuf> {
         if path.is_file() {
             let binary = path.canonicalize()?;
             ensure!(
-                !binary.starts_with(&cwd),
+                !checkout || !binary.starts_with(&cwd),
                 "GitHub CLI must be installed outside the active checkout"
             );
             return Ok(binary);
@@ -143,6 +144,12 @@ fn git_command(directory: &Path) -> Command {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_SSH")
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_ASKPASS")
         .env_remove("SSH_ASKPASS")
         .args([
@@ -252,6 +259,10 @@ pub(crate) struct Preview {
 pub(crate) struct Submission {
     pub preview: Preview,
     pub remote_id: Option<u64>,
+    #[serde(default)]
+    pub remote_author: Option<u64>,
+    #[serde(default)]
+    pub event_sent: bool,
     pub remote_url: Option<String>,
     pub state: String,
     pub error: Option<String>,
@@ -362,7 +373,10 @@ pub fn verify_head(capture: &Capture) -> Result<()> {
     let latest = gh(&identity.endpoint(), "GET", None, false)?;
     ensure!(
         bounded(&latest, "/head/sha", 64)? == capture.head
-            && bounded(&latest, "/base/sha", 64)? == capture.pr.as_ref().unwrap().target_tip,
+            && bounded(&latest, "/base/sha", 64)? == capture.pr.as_ref().unwrap().target_tip
+            && bounded(&latest, "/base/ref", 240)? == capture.pr.as_ref().unwrap().base_branch
+            && bounded(&latest, "/base/repo/full_name", 240)?
+                .eq_ignore_ascii_case(&identity.repository),
         "PR head or target changed. Capture a new revision and inspect it before publishing"
     );
     Ok(())
@@ -398,10 +412,31 @@ pub fn reconcile(capture: &Capture, submission: &Submission) -> Result<Option<Va
         matches.len() <= 1,
         "Multiple matching remote reviews; inspect GitHub before proceeding"
     );
-    Ok(matches.into_iter().next())
+    let Some(remote) = matches.into_iter().next() else {
+        return Ok(None);
+    };
+    let id = remote["id"].as_u64().context("Remote review ID missing")?;
+    let pages = gh(
+        &format!("{}/reviews/{id}/comments?per_page=100", identity.endpoint()),
+        "GET",
+        None,
+        true,
+    )?;
+    let comments = pages
+        .as_array()
+        .context("Invalid review comments")?
+        .iter()
+        .flat_map(|p| p.as_array().into_iter().flatten())
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        comments_match(&submission.preview, &comments)?,
+        "Remote inline comments differ from the approved preview. Inspect GitHub; this review will not be submitted"
+    );
+    Ok(Some(remote))
 }
 pub fn create_pending(capture: &Capture, preview: &Preview) -> Result<Value> {
-    verify_head(capture)?;
+    verify_head(capture).map_err(|e| CreationNotSent(format!("{e:#}")))?;
     gh(
         &format!("{}/reviews", identity_for(capture)?.endpoint()),
         "POST",
@@ -409,8 +444,83 @@ pub fn create_pending(capture: &Capture, preview: &Preview) -> Result<Value> {
         false,
     )
 }
+
+#[derive(Debug)]
+struct CreationNotSent(String);
+impl std::fmt::Display for CreationNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CreationNotSent {}
+
+trait Remote {
+    fn create(&self, capture: &Capture, preview: &Preview) -> Result<Value>;
+    fn reconcile(&self, capture: &Capture, submission: &Submission) -> Result<Option<Value>>;
+    fn submit(&self, capture: &Capture, submission: &Submission) -> Result<Value>;
+    fn discard(&self, capture: &Capture, submission: &Submission) -> Result<()>;
+    fn known_missing(&self, capture: &Capture, submission: &Submission) -> Result<bool>;
+}
+struct GitHub;
+impl Remote for GitHub {
+    fn create(&self, capture: &Capture, preview: &Preview) -> Result<Value> {
+        create_pending(capture, preview)
+    }
+    fn reconcile(&self, capture: &Capture, submission: &Submission) -> Result<Option<Value>> {
+        reconcile(capture, submission)
+    }
+    fn submit(&self, capture: &Capture, submission: &Submission) -> Result<Value> {
+        submit_pending(capture, submission)
+    }
+    fn discard(&self, capture: &Capture, submission: &Submission) -> Result<()> {
+        let id = submission.remote_id.context("Pending review ID missing")?;
+        let deleted = gh(
+            &format!("{}/reviews/{id}", identity_for(capture)?.endpoint()),
+            "DELETE",
+            None,
+            false,
+        )?;
+        ensure!(
+            deleted["id"].as_u64() == Some(id)
+                && deleted["body"] == submission.preview.payload["body"]
+                && deleted["commit_id"] == submission.preview.payload["commit_id"]
+                && deleted["user"]["id"].as_u64() == submission.remote_author,
+            "Unexpected deleted review response; reconcile its status"
+        );
+        Ok(())
+    }
+    fn known_missing(&self, capture: &Capture, submission: &Submission) -> Result<bool> {
+        let identity = identity_for(capture)?;
+        let id = submission.remote_id.context("Pending review ID missing")?;
+        match gh(
+            &format!("{}/reviews/{id}", identity.endpoint()),
+            "GET",
+            None,
+            false,
+        ) {
+            Ok(_) => Ok(false),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::pull_requests::GitHubRejection>()
+                    .is_some_and(|e| e.0 == 404) =>
+            {
+                // A hidden private resource or a different gh account is not
+                // proof that the old account's pending review was removed.
+                gh(&identity.endpoint(), "GET", None, false)?;
+                let user = gh("user", "GET", None, false)?;
+                ensure!(
+                    submission.remote_author.is_some()
+                        && user["id"].as_u64() == submission.remote_author,
+                    "Use the GitHub account that created this draft to confirm its removal"
+                );
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
 pub fn submit_pending(capture: &Capture, submission: &Submission) -> Result<Value> {
-    verify_head(capture)?;
+    verify_head(capture).map_err(|e| EventNotSent(format!("{e:#}")))?;
     let id = submission
         .remote_id
         .context("Remote review ID is unknown; reconcile before continuing")?;
@@ -420,4 +530,610 @@ pub fn submit_pending(capture: &Capture, submission: &Submission) -> Result<Valu
         Some(&json!({"event":submission.preview.event,"body":submission.preview.payload["body"]})),
         false,
     )
+}
+
+#[derive(Debug)]
+struct EventNotSent(String);
+impl std::fmt::Display for EventNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for EventNotSent {}
+
+fn comments_match(preview: &Preview, comments: &[Value]) -> Result<bool> {
+    fn canonical(c: &Value) -> Value {
+        json!({"path":c["path"],"body":c["body"],"line":c["line"],"side":c["side"],
+            "start_line":c.get("start_line").filter(|v| !v.is_null()),
+            "start_side":c.get("start_side").filter(|v| !v.is_null())})
+    }
+    let expected = preview.payload["comments"]
+        .as_array()
+        .context("Invalid preview comments")?;
+    if expected.len() != comments.len()
+        || comments
+            .iter()
+            .any(|c| c["commit_id"] != preview.payload["commit_id"])
+    {
+        return Ok(false);
+    }
+    let mut a = expected
+        .iter()
+        .map(|c| canonical(c).to_string())
+        .collect::<Vec<_>>();
+    let mut b = comments
+        .iter()
+        .map(|c| canonical(c).to_string())
+        .collect::<Vec<_>>();
+    a.sort();
+    b.sort();
+    Ok(a == b)
+}
+fn expected_state(event: &str) -> Result<&str> {
+    match event {
+        "APPROVE" => Ok("APPROVED"),
+        "COMMENT" => Ok("COMMENTED"),
+        "REQUEST_CHANGES" => Ok("CHANGES_REQUESTED"),
+        _ => anyhow::bail!("Invalid saved review event"),
+    }
+}
+fn record_remote(submission: &mut Submission, remote: &Value) -> Result<()> {
+    ensure!(
+        !matches!(
+            submission.state.as_str(),
+            "submitted" | "rejected" | "discarded"
+        ),
+        "Publication already completed in another operation"
+    );
+    ensure!(
+        remote["body"] == submission.preview.payload["body"]
+            && remote["commit_id"] == submission.preview.payload["commit_id"],
+        "Remote review differs from the approved preview"
+    );
+    let id = remote["id"].as_u64().context("Remote review ID missing")?;
+    let author = remote["user"]["id"]
+        .as_u64()
+        .context("Remote review author missing")?;
+    ensure!(
+        submission.remote_id.is_none_or(|old| old == id)
+            && submission.remote_author.is_none_or(|old| old == author),
+        "Remote review identity changed"
+    );
+    submission.remote_id = Some(id);
+    submission.remote_author = Some(author);
+    submission.remote_url = remote["html_url"].as_str().map(str::to_owned);
+    let state = remote["state"]
+        .as_str()
+        .context("Remote review state missing")?;
+    submission.state = if state == "PENDING" {
+        if submission.state == "discarding" {
+            "discarding"
+        } else if submission.event_sent {
+            "submitting"
+        } else {
+            "pending"
+        }
+    } else {
+        ensure!(
+            state == expected_state(&submission.preview.event)?,
+            "Remote review has a different decision; inspect GitHub before continuing"
+        );
+        "submitted"
+    }
+    .into();
+    submission.error = None;
+    Ok(())
+}
+fn update_submission(
+    store: &super::Store,
+    hash: &str,
+    update: impl Fn(&mut Submission) -> Result<()>,
+) -> Result<Review> {
+    // Preserve simultaneous reviewer edits; only this frozen intent is changed.
+    for _ in 0..3 {
+        let mut review = store.load()?.context("Saved review missing")?;
+        let submission = review
+            .submissions
+            .iter_mut()
+            .find(|s| s.preview.hash == hash)
+            .context("Saved publication missing")?;
+        update(submission)?;
+        match store.save(&mut review) {
+            Ok(()) => return Ok(review),
+            Err(_)
+                if store
+                    .load()?
+                    .is_some_and(|latest| latest.version != review.version) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    anyhow::bail!(
+        "Review changed repeatedly while recording publication. Reload and reconcile the saved intent"
+    )
+}
+/// The caller persists the intent before entering this operation. Only a new
+/// explicit publish creates a draft. Recovery always starts with a GET.
+pub fn complete_publication(
+    store: &super::Store,
+    hash: &str,
+    create: bool,
+    submit: bool,
+) -> Result<Review> {
+    complete_with_remote(store, hash, create, submit, &GitHub)
+}
+
+/// Only an explicit reviewer action can discard a known pending draft. An
+/// unknown creation result cannot be abandoned locally to permit another POST.
+pub fn discard_publication(store: &super::Store, hash: &str) -> Result<Review> {
+    discard_with_remote(store, hash, &GitHub)
+}
+fn discard_with_remote(store: &super::Store, hash: &str, remote: &impl Remote) -> Result<Review> {
+    let _operation = store.publication_lock()?;
+    let review = store.load()?.context("Saved review missing")?;
+    let submission = review
+        .submissions
+        .iter()
+        .find(|s| s.preview.hash == hash)
+        .context("Saved publication missing")?
+        .clone();
+    ensure!(
+        !matches!(
+            submission.state.as_str(),
+            "submitted" | "rejected" | "discarded"
+        ),
+        "This publication is already complete"
+    );
+    ensure!(
+        submission.remote_id.is_some(),
+        "The remote draft ID is unknown. Reconcile creation before discarding; another creation remains prohibited"
+    );
+    let capture = &review
+        .revisions
+        .iter()
+        .find(|r| r.capture.id == submission.preview.capture)
+        .context("Publication capture missing")?
+        .capture;
+    let result = (|| {
+        if let Some(found) = remote.reconcile(capture, &submission)? {
+            let mut verified = submission.clone();
+            record_remote(&mut verified, &found)?;
+            if verified.state == "submitted" {
+                return update_submission(store, hash, |s| record_remote(s, &found));
+            }
+            ensure!(
+                found["state"] == "PENDING",
+                "Only an exact pending review can be discarded"
+            );
+            // Save deletion intent before the mutation. A lost response is
+            // recovered by checking this exact ID, never by creating a review.
+            update_submission(store, hash, |s| {
+                ensure!(
+                    !matches!(s.state.as_str(), "submitted" | "rejected" | "discarded"),
+                    "Publication completed before discard"
+                );
+                record_remote(s, &found)?;
+                s.state = "discarding".into();
+                Ok(())
+            })?;
+            remote.discard(capture, &verified)?;
+        } else {
+            ensure!(
+                remote.known_missing(capture, &submission)?,
+                "The known draft still exists but differs from the saved preview. Inspect GitHub before discarding"
+            );
+        }
+        update_submission(store, hash, |s| {
+            ensure!(
+                !matches!(s.state.as_str(), "submitted" | "rejected"),
+                "Publication completed before discard"
+            );
+            s.state = "discarded".into();
+            s.error = None;
+            Ok(())
+        })
+    })();
+    if let Err(error) = &result {
+        update_submission(store, hash, |s| {
+            s.error = Some(format!("{error:#}"));
+            Ok(())
+        })?;
+    }
+    result
+}
+fn complete_with_remote(
+    store: &super::Store,
+    hash: &str,
+    create: bool,
+    submit: bool,
+    remote: &impl Remote,
+) -> Result<Review> {
+    let _operation = store.publication_lock()?;
+    let mut rejected = false;
+    let mut event_not_sent = false;
+    let result = (|| {
+        let mut review = store.load()?.context("Saved review missing")?;
+        let mut submission = review
+            .submissions
+            .iter()
+            .find(|s| s.preview.hash == hash)
+            .context("Saved publication missing")?
+            .clone();
+        ensure!(
+            !matches!(
+                submission.state.as_str(),
+                "submitted" | "rejected" | "discarded"
+            ),
+            "This publication is complete or was rejected; create a fresh preview"
+        );
+        let capture = review
+            .revisions
+            .iter()
+            .find(|r| r.capture.id == submission.preview.capture)
+            .context("Publication capture missing")?
+            .capture
+            .clone();
+        if submission.state == "discarding" {
+            if let Some(found) = remote.reconcile(&capture, &submission)? {
+                return update_submission(store, hash, |s| record_remote(s, &found));
+            }
+            ensure!(
+                remote.known_missing(&capture, &submission)?,
+                "Draft removal is unresolved; inspect and retry deleting this exact draft"
+            );
+            return update_submission(store, hash, |s| {
+                s.state = "discarded".into();
+                s.error = None;
+                Ok(())
+            });
+        }
+        if create {
+            ensure!(
+                submission.state == "creating" && submission.remote_id.is_none(),
+                "This intent must be reconciled; creating another review is prohibited"
+            );
+            let created = remote
+                .create(&capture, &submission.preview)
+                .inspect_err(|e| {
+                    rejected = e.downcast_ref::<CreationNotSent>().is_some()
+                        || e.downcast_ref::<crate::pull_requests::GitHubRejection>()
+                            .is_some();
+                })?;
+            review = update_submission(store, hash, |s| record_remote(s, &created))?;
+            submission = review
+                .submissions
+                .iter()
+                .find(|s| s.preview.hash == hash)
+                .unwrap()
+                .clone();
+        }
+        let reconciled = remote.reconcile(&capture, &submission)?.context("No matching remote review was found. Its creation may have failed or may still be processing. Inspect GitHub and reconcile again; no duplicate will be created")?;
+        review = update_submission(store, hash, |s| record_remote(s, &reconciled))?;
+        submission = review
+            .submissions
+            .iter()
+            .find(|s| s.preview.hash == hash)
+            .unwrap()
+            .clone();
+        if submission.state == "pending" && submit {
+            // A one-shot event intent is durable before POST. An ambiguous
+            // response permits GET reconciliation, never another event POST.
+            update_submission(store, hash, |s| {
+                ensure!(
+                    s.state == "pending" && !s.event_sent,
+                    "The final event is already in progress or unresolved"
+                );
+                s.event_sent = true;
+                s.state = "submitting".into();
+                Ok(())
+            })?;
+            let submitted = remote.submit(&capture, &submission).inspect_err(|e| {
+                event_not_sent = e.downcast_ref::<EventNotSent>().is_some()
+                    || e.downcast_ref::<crate::pull_requests::GitHubRejection>()
+                        .is_some();
+            })?;
+            review = update_submission(store, hash, |s| record_remote(s, &submitted))?;
+        }
+        Ok(review)
+    })();
+    if let Err(e) = &result {
+        let message = format!("{e:#}");
+        update_submission(store, hash, |s| {
+            if !matches!(
+                s.state.as_str(),
+                "submitted" | "rejected" | "discarded" | "discarding"
+            ) {
+                if event_not_sent {
+                    s.event_sent = false;
+                }
+                s.state = if rejected && s.remote_id.is_none() {
+                    "rejected"
+                } else {
+                    "uncertain"
+                }
+                .into();
+                s.error = Some(message.clone());
+            }
+            Ok(())
+        })
+        .with_context(|| {
+            format!("{message}; could not save the publication status. Reload and reconcile")
+        })?;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    struct FakeRemote {
+        create_count: Cell<usize>,
+        submit_count: Cell<usize>,
+        discard_count: Cell<usize>,
+        response: RefCell<Option<Value>>,
+        reject: bool,
+        lose_create_response: bool,
+        lose_submit_response: bool,
+        lose_discard_response: bool,
+        head_changed: Cell<bool>,
+        store: super::super::Store,
+    }
+    impl Remote for FakeRemote {
+        fn create(&self, _: &Capture, preview: &Preview) -> Result<Value> {
+            self.create_count.set(self.create_count.get() + 1);
+            if self.reject {
+                return Err(crate::pull_requests::GitHubRejection(422).into());
+            }
+            let response = json!({"id":42,"user":{"id":7},"body":preview.payload["body"],
+                "commit_id":preview.payload["commit_id"],"state":"PENDING"});
+            *self.response.borrow_mut() = Some(response.clone());
+            if self.lose_create_response {
+                anyhow::bail!("Synthetic lost response");
+            }
+            Ok(response)
+        }
+        fn reconcile(&self, _: &Capture, _: &Submission) -> Result<Option<Value>> {
+            Ok(self.response.borrow().clone())
+        }
+        fn submit(&self, _: &Capture, submission: &Submission) -> Result<Value> {
+            ensure!(!self.head_changed.get(), "Synthetic PR head changed");
+            // A crash at this point must still leave the remote ID recoverable.
+            assert_eq!(
+                self.store.load()?.unwrap().submissions[0].remote_id,
+                Some(42)
+            );
+            self.submit_count.set(self.submit_count.get() + 1);
+            let mut response = self.response.borrow().clone().unwrap();
+            response["state"] = json!(expected_state(&submission.preview.event)?);
+            *self.response.borrow_mut() = Some(response.clone());
+            if self.lose_submit_response {
+                anyhow::bail!("Synthetic lost event response");
+            }
+            Ok(response)
+        }
+        fn discard(&self, _: &Capture, submission: &Submission) -> Result<()> {
+            let saved = self.store.load()?.unwrap();
+            assert_eq!(saved.submissions[0].state, "discarding");
+            assert_eq!(submission.remote_id, Some(42));
+            self.discard_count.set(self.discard_count.get() + 1);
+            self.response.borrow_mut().take();
+            ensure!(
+                !self.lose_discard_response,
+                "Synthetic lost deletion response"
+            );
+            Ok(())
+        }
+        fn known_missing(&self, _: &Capture, submission: &Submission) -> Result<bool> {
+            Ok(submission.remote_id == Some(42)
+                && submission.remote_author == Some(7)
+                && self.response.borrow().is_none())
+        }
+    }
+    fn saved_intent() -> (tempfile::TempDir, super::super::Store, String) {
+        let cwd = tempfile::tempdir().unwrap();
+        let store = super::super::Store::at(cwd.path().join("review"));
+        let mut review = review();
+        let preview = preview(&review, "COMMENT", "Synthetic review").unwrap();
+        let hash = preview.hash.clone();
+        review.submissions.push(Submission {
+            preview,
+            remote_id: None,
+            remote_author: None,
+            event_sent: false,
+            remote_url: None,
+            state: "creating".into(),
+            error: None,
+        });
+        store.save(&mut review).unwrap();
+        (cwd, store, hash)
+    }
+    #[test]
+    fn lost_creation_response_recovers_without_duplicate_post() {
+        let (_cwd, store, hash) = saved_intent();
+        let remote = FakeRemote {
+            create_count: Cell::new(0),
+            submit_count: Cell::new(0),
+            discard_count: Cell::new(0),
+            response: RefCell::new(None),
+            reject: false,
+            lose_create_response: true,
+            lose_submit_response: false,
+            lose_discard_response: false,
+            head_changed: Cell::new(false),
+            store: store.clone(),
+        };
+        assert!(complete_with_remote(&store, &hash, true, true, &remote).is_err());
+        assert_eq!(
+            store.load().unwrap().unwrap().submissions[0].state,
+            "uncertain"
+        );
+        // Retrying a creation itself is prohibited; recovery only inspects.
+        assert!(complete_with_remote(&store, &hash, true, true, &remote).is_err());
+        let saved = complete_with_remote(&store, &hash, false, true, &remote).unwrap();
+        assert_eq!(saved.submissions[0].state, "submitted");
+        assert_eq!(remote.create_count.get(), 1);
+        assert_eq!(remote.submit_count.get(), 1);
+    }
+    #[test]
+    fn lost_event_response_reconciles_without_resubmission() {
+        let (_cwd, store, hash) = saved_intent();
+        let remote = FakeRemote {
+            create_count: Cell::new(0),
+            submit_count: Cell::new(0),
+            discard_count: Cell::new(0),
+            response: RefCell::new(None),
+            reject: false,
+            lose_create_response: false,
+            lose_submit_response: true,
+            lose_discard_response: false,
+            head_changed: Cell::new(false),
+            store: store.clone(),
+        };
+        assert!(complete_with_remote(&store, &hash, true, true, &remote).is_err());
+        let saved = complete_with_remote(&store, &hash, false, true, &remote).unwrap();
+        assert_eq!(saved.submissions[0].state, "submitted");
+        assert_eq!(remote.create_count.get(), 1);
+        assert_eq!(remote.submit_count.get(), 1);
+    }
+    #[test]
+    fn definite_creation_rejection_is_terminal_and_inspectable() {
+        let (_cwd, store, hash) = saved_intent();
+        let remote = FakeRemote {
+            create_count: Cell::new(0),
+            submit_count: Cell::new(0),
+            discard_count: Cell::new(0),
+            response: RefCell::new(None),
+            reject: true,
+            lose_create_response: false,
+            lose_submit_response: false,
+            lose_discard_response: false,
+            head_changed: Cell::new(false),
+            store: store.clone(),
+        };
+        assert!(complete_with_remote(&store, &hash, true, true, &remote).is_err());
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(saved.submissions[0].state, "rejected");
+        assert!(saved.submissions[0].error.as_ref().unwrap().contains("422"));
+        assert!(complete_with_remote(&store, &hash, false, true, &remote).is_err());
+        assert_eq!(
+            store.load().unwrap().unwrap().submissions[0].state,
+            "rejected"
+        );
+        assert_eq!(remote.submit_count.get(), 0);
+    }
+    fn review() -> Review {
+        let (hunks, _) = crate::review::model::diff_text("before\n", "after\n");
+        let files = vec![super::super::File {
+            path: "a.rs".into(),
+            old_path: None,
+            status: "Modified".into(),
+            additions: 1,
+            deletions: 1,
+            old: Some("before\n".into()),
+            new: Some("after\n".into()),
+            lines: hunks
+                .into_iter()
+                .flat_map(|h| h.lines)
+                .map(|l| super::super::SourceLine {
+                    old: l.old_no,
+                    new: l.new_no,
+                    tag: if l.new_no.is_some() {
+                        "addition"
+                    } else {
+                        "deletion"
+                    }
+                    .into(),
+                    text: l.text,
+                })
+                .collect(),
+            unavailable: None,
+            truncated: false,
+        }];
+        let capture = Capture::from_files("PR", &"b".repeat(40), &"a".repeat(40), None, files)
+            .unwrap()
+            .with_pr(Metadata {
+                url: "https://github.com/owner/repo/pull/1".into(),
+                repository: "owner/repo".into(),
+                number: 1,
+                title: "Retry".into(),
+                description: "data".into(),
+                author: "author".into(),
+                target_tip: "c".repeat(40),
+                base_branch: "main".into(),
+                head_branch: "fix".into(),
+                captured_at: 0,
+                checks: vec![],
+                checks_error: None,
+            })
+            .unwrap();
+        Review::start(capture)
+    }
+    #[test]
+    fn exact_preview_binds_event_version_ranges_and_revision() {
+        let mut r = review();
+        let e = r
+            .active()
+            .capture
+            .evidence
+            .iter()
+            .find(|e| e.side == super::super::Side::New)
+            .unwrap()
+            .id
+            .clone();
+        r.findings.push(super::super::Finding {
+            id: "f".into(),
+            capture: r.active().capture.id.clone(),
+            chapter: None,
+            evidence: Some(e),
+            range: Some(super::super::SourceRange { start: 1, end: 1 }),
+            body: "Concern".into(),
+            resolved: false,
+        });
+        let a = preview(&r, "COMMENT", "Review").unwrap();
+        assert_eq!(a.payload["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(a.payload["comments"][0]["line"], 1);
+        assert_ne!(a.hash, preview(&r, "APPROVE", "Review").unwrap().hash);
+        r.version += 1;
+        assert_ne!(a.hash, preview(&r, "COMMENT", "Review").unwrap().hash);
+        r.findings[0].range = None;
+        assert!(
+            preview(&r, "COMMENT", "Review").unwrap().payload["body"]
+                .as_str()
+                .unwrap()
+                .contains("Concern")
+        );
+        r.findings[0].capture = "old".into();
+        assert!(
+            !preview(&r, "COMMENT", "Review").unwrap().payload["body"]
+                .as_str()
+                .unwrap()
+                .contains("Concern")
+        );
+        assert!(preview(&r, "INVALID", "Review").is_err());
+    }
+    #[test]
+    fn reconciliation_requires_exact_comment_multiset() {
+        let mut p = preview(&review(), "COMMENT", "").unwrap();
+        p.payload["comments"] = json!([{"path":"a.rs","line":1,"side":"RIGHT","body":"Concern"}]);
+        let mut remote = p.payload["comments"][0].clone();
+        remote["commit_id"] = p.payload["commit_id"].clone();
+        assert!(comments_match(&p, &[remote.clone()]).unwrap());
+        remote["body"] = json!("Edited");
+        assert!(!comments_match(&p, &[remote]).unwrap());
+        assert!(!comments_match(&p, &[]).unwrap());
+        let mut s = Submission {
+            preview: p.clone(),
+            remote_id: None,
+            remote_author: None,
+            event_sent: false,
+            remote_url: None,
+            state: "creating".into(),
+            error: None,
+        };
+        let response = json!({"id":1,"user":{"id":7},"body":p.payload["body"],"commit_id":p.payload["commit_id"],"state":"APPROVED"});
+        assert!(record_remote(&mut s, &response).is_err());
+    }
 }

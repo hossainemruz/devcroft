@@ -536,17 +536,17 @@ impl ReviewView {
                     .small()
                     .tooltip("Open the visual review workspace")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if let ReviewState::Loaded(loaded) = &this.state {
-                            if let Err(error) = web::open(
+                        if let ReviewState::Loaded(loaded) = &this.state
+                            && let Err(error) = web::open(
                                 this.cwd.clone(),
                                 loaded.diff.as_ref().clone(),
                                 this.base_label(),
                                 this.scope(),
                                 cx,
-                            ) {
-                                this.state = ReviewState::Failed(format!("{error:#}").into());
-                                cx.notify();
-                            }
+                            )
+                        {
+                            this.state = ReviewState::Failed(format!("{error:#}").into());
+                            cx.notify();
                         }
                     }))
                     .child("Guided Review"),

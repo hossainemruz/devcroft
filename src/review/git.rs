@@ -275,6 +275,12 @@ enum BlobRead {
 }
 
 fn read_blob(repo: &gix::Repository, oid: gix::ObjectId) -> BlobRead {
+    let Ok(header) = repo.find_header(oid) else {
+        return BlobRead::Missing;
+    };
+    if header.size() > MAX_FILE_BYTES {
+        return BlobRead::TooLarge;
+    }
     let Ok(object) = repo.find_object(oid) else {
         return BlobRead::Missing;
     };
@@ -347,14 +353,13 @@ pub(crate) fn commit_files(
         };
         let old_source = source(a);
         let new_source = source(b);
-        let (hunks, truncated) = diff_text(
-            old_source.as_deref().unwrap_or(""),
-            new_source.as_deref().unwrap_or(""),
-        );
-        let (additions, deletions) = count_changes(
-            old_source.as_deref().unwrap_or(""),
-            new_source.as_deref().unwrap_or(""),
-        );
+        let ((hunks, truncated), (additions, deletions)) = if unavailable.is_none() {
+            let old = old_source.as_deref().unwrap_or("");
+            let new = new_source.as_deref().unwrap_or("");
+            (diff_text(old, new), count_changes(old, new))
+        } else {
+            ((vec![], false), (0, 0))
+        };
         let lines = if unavailable.is_none() {
             hunks
                 .into_iter()
@@ -405,6 +410,7 @@ enum WorkContent {
     Gone,
 }
 
+#[cfg(not(unix))]
 fn read_worktree(root: &Path, name: &str) -> WorkContent {
     // Never traverse a PR-controlled directory link while capturing local
     // source. A link at the leaf is captured as its target text, not followed.
@@ -442,6 +448,113 @@ fn read_worktree(root: &Path, name: &str) -> WorkContent {
         Ok(bytes) => WorkContent::Bytes(bytes),
         Err(_) => WorkContent::Gone,
     }
+}
+
+#[cfg(unix)]
+fn read_worktree(root: &Path, name: &str) -> WorkContent {
+    use std::io::Read as _;
+    let file = match open_worktree(root, name) {
+        WorkEntry::File(file) => file,
+        WorkEntry::Symlink(link) => return WorkContent::Symlink(link),
+        WorkEntry::Dir => return WorkContent::Dir,
+        WorkEntry::Gone => return WorkContent::Gone,
+    };
+    let Ok(metadata) = file.metadata() else {
+        return WorkContent::Gone;
+    };
+    if metadata.len() > MAX_FILE_BYTES {
+        return WorkContent::TooLarge;
+    }
+    let mut bytes = vec![];
+    if file
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return WorkContent::Gone;
+    }
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        WorkContent::TooLarge
+    } else {
+        WorkContent::Bytes(bytes)
+    }
+}
+
+#[cfg(unix)]
+enum WorkEntry {
+    File(std::fs::File),
+    Symlink(Vec<u8>),
+    Dir,
+    Gone,
+}
+
+#[cfg(unix)]
+fn open_worktree(root: &Path, name: &str) -> WorkEntry {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _};
+    // Directory descriptors pin each ancestor. O_NOFOLLOW closes the race
+    // between checking a directory link and opening the source beneath it.
+    let Ok(mut directory) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+    else {
+        return WorkEntry::Gone;
+    };
+    let mut parts = Path::new(name).components().peekable();
+    while let Some(part) = parts.next() {
+        let std::path::Component::Normal(part) = part else {
+            return WorkEntry::Dir;
+        };
+        let Ok(part) = CString::new(part.as_bytes()) else {
+            return WorkEntry::Gone;
+        };
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | if parts.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        // SAFETY: the directory FD is live and the name is NUL terminated.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0 {
+            if parts.peek().is_none() {
+                let mut link = vec![0u8; 4096];
+                // readlinkat reads the leaf itself, never the linked target.
+                let count = unsafe {
+                    libc::readlinkat(
+                        directory.as_raw_fd(),
+                        part.as_ptr(),
+                        link.as_mut_ptr().cast(),
+                        link.len(),
+                    )
+                };
+                if count >= 0 {
+                    link.truncate(count as usize);
+                    return WorkEntry::Symlink(link);
+                }
+            }
+            return WorkEntry::Gone;
+        }
+        // SAFETY: openat returned a newly owned file descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if parts.peek().is_some() {
+            directory = file;
+            continue;
+        }
+        let Ok(metadata) = file.metadata() else {
+            return WorkEntry::Gone;
+        };
+        if !metadata.is_file() {
+            return WorkEntry::Dir;
+        }
+        return WorkEntry::File(file);
+    }
+    WorkEntry::Dir
 }
 
 fn assemble(
@@ -630,13 +743,14 @@ fn classify_tracked(
 
 /// Compare oversized content independently of the diff rendering limit.
 /// Failed reads remain visible as unavailable changes.
+#[cfg(unix)]
 fn large_worktree_matches(repo: &gix::Repository, path: &str, oid: gix::ObjectId) -> bool {
     use std::io::Read as _;
 
     let Some(root) = repo.workdir() else {
         return false;
     };
-    let Ok(mut file) = std::fs::File::open(root.join(path)) else {
+    let WorkEntry::File(mut file) = open_worktree(root, path) else {
         return false;
     };
     let Ok(object) = repo.find_object(oid) else {
@@ -654,6 +768,12 @@ fn large_worktree_matches(repo: &gix::Repository, path: &str, oid: gix::ObjectId
     matches!(file.read(&mut buffer[..1]), Ok(0))
 }
 
+#[cfg(not(unix))]
+fn large_worktree_matches(_: &gix::Repository, _: &str, _: gix::ObjectId) -> bool {
+    // Do not infer equality by following an unchecked directory link.
+    false
+}
+
 /// Whether the worktree executable bit differs from the base tree mode.
 /// Symlinks have no executable bit; non-Unix platforms report no change.
 fn mode_changed(repo: &gix::Repository, path: &str, entry: &BaseEntry) -> bool {
@@ -663,8 +783,11 @@ fn mode_changed(repo: &gix::Repository, path: &str, entry: &BaseEntry) -> bool {
         let Some(workdir) = repo.workdir() else {
             return false;
         };
-        let Ok(meta) = std::fs::symlink_metadata(workdir.join(path)) else {
-            return false;
+        let WorkEntry::File(file) = open_worktree(workdir, path) else {
+            return !entry.mode.is_link();
+        };
+        let Ok(meta) = file.metadata() else {
+            return true;
         };
         let work_executable = meta.permissions().mode() & 0o111 != 0;
         let base_executable = entry.mode.is_executable();
@@ -1207,6 +1330,109 @@ mod tests {
         assert!(!diff.files.iter().any(|f| f.path == "main-only.txt"));
         let shared = find(&diff, "shared.txt");
         assert_eq!(shared.status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn commit_capture_excludes_dirty_checkout_and_uses_merge_base() {
+        let dir = init_repo();
+        write(dir.path(), "a.rs", b"before\n");
+        commit_all(dir.path(), "base");
+        let base = open(dir.path())
+            .unwrap()
+            .head_id()
+            .unwrap()
+            .detach()
+            .to_hex()
+            .to_string();
+        git(dir.path(), &["checkout", "-b", "feature"]);
+        write(dir.path(), "a.rs", b"after\n");
+        write(dir.path(), "binary", &[0, 1, 2]);
+        commit_all(dir.path(), "change");
+        let head = open(dir.path())
+            .unwrap()
+            .head_id()
+            .unwrap()
+            .detach()
+            .to_hex()
+            .to_string();
+        git(dir.path(), &["checkout", "main"]);
+        write(dir.path(), "main-only.rs", b"target advance\n");
+        commit_all(dir.path(), "target");
+        let target = open(dir.path())
+            .unwrap()
+            .head_id()
+            .unwrap()
+            .detach()
+            .to_hex()
+            .to_string();
+        write(dir.path(), "a.rs", b"unrelated dirty edit\n");
+        write(dir.path(), "untracked.rs", b"not a PR file\n");
+        let (merge_base, files) = commit_files(dir.path(), &target, &head).unwrap();
+        assert_eq!(merge_base, base);
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files
+                .iter()
+                .find(|f| f.path == "a.rs")
+                .unwrap()
+                .new
+                .as_deref(),
+            Some("after\n")
+        );
+        let binary = files.iter().find(|f| f.path == "binary").unwrap();
+        assert!(binary.unavailable.is_some());
+        assert_eq!((binary.additions, binary.deletions), (0, 0));
+        assert!(binary.lines.is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn local_capture_reads_leaf_links_without_traversing_parent_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "secret.txt", b"outside source");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("parent")).unwrap();
+        assert!(!matches!(
+            read_worktree(dir.path(), "parent/secret.txt"),
+            WorkContent::Bytes(_)
+        ));
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("leaf"))
+            .unwrap();
+        assert!(matches!(
+            read_worktree(dir.path(), "leaf"),
+            WorkContent::Symlink(_)
+        ));
+        assert!(!matches!(
+            read_worktree(dir.path(), "../secret.txt"),
+            WorkContent::Bytes(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_comparison_and_mode_checks_reject_replaced_ancestors() {
+        let dir = init_repo();
+        let outside = tempfile::tempdir().unwrap();
+        let bytes = vec![b'a'; MAX_FILE_BYTES as usize + 1];
+        write(dir.path(), "parent/large.txt", &bytes);
+        commit_all(dir.path(), "large tracked fixture");
+        let repo = gix::open(dir.path()).unwrap();
+        let tree = repo.head_commit().unwrap().tree_id().unwrap().detach();
+        let entries = list_tree(&repo, tree).unwrap();
+        let entry = &entries["parent/large.txt"];
+        assert!(matches!(
+            read_worktree(dir.path(), "parent/large.txt"),
+            WorkContent::TooLarge
+        ));
+        assert!(large_worktree_matches(&repo, "parent/large.txt", entry.oid));
+        write(outside.path(), "large.txt", &bytes);
+        fs::rename(dir.path().join("parent"), dir.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("parent")).unwrap();
+        assert!(!large_worktree_matches(
+            &repo,
+            "parent/large.txt",
+            entry.oid
+        ));
+        assert!(mode_changed(&repo, "parent/large.txt", entry));
     }
 
     #[test]

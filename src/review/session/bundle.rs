@@ -83,6 +83,10 @@ impl Bundle {
             !m.chapters.is_empty() && m.chapters.len() <= 16,
             "Guide must contain 1–16 behaviors"
         );
+        ensure!(
+            self.documents.len() == m.chapters.len(),
+            "Unexpected guide documents"
+        );
         let mut ids = HashSet::new();
         let mut total = 0;
         for c in &m.chapters {

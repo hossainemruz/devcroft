@@ -234,15 +234,14 @@ impl HomeView {
                             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
                                 let home = entity.clone();
                                 let url = review_url.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new("Review in Devcroft").on_click(
+                                menu =
+                                    menu.item(PopupMenuItem::new("Review in Devcroft").on_click(
                                         move |_, _, cx| {
                                             home.update(cx, |this, cx| {
                                                 this.review_pr(url.clone(), cx);
                                             });
                                         },
-                                    ),
-                                );
+                                    ));
                                 let home = entity.clone();
                                 let edit = edit_item.clone();
                                 menu = menu.item(PopupMenuItem::new("Edit").on_click(

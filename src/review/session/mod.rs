@@ -1,7 +1,7 @@
 //! Immutable evidence and durable, revision-checked reviewer state.
 mod bundle;
 pub(crate) mod pr;
-pub(crate) use bundle::Bundle;
+pub(crate) use bundle::{Bundle, Chapter, Claim, Manifest};
 
 use super::{
     comments::Side,
@@ -93,20 +93,20 @@ impl Capture {
                     .into(),
                 })
                 .collect();
+            let counts = if matches!(f.content, FileContent::Text { .. }) {
+                super::model::count_changes(
+                    old.as_deref().unwrap_or(""),
+                    new.as_deref().unwrap_or(""),
+                )
+            } else {
+                (0, 0)
+            };
             files.push(File {
                 path: f.path.clone(),
                 old_path: f.old_path.clone(),
                 status: f.status.label().into(),
-                additions: super::model::count_changes(
-                    old.as_deref().unwrap_or(""),
-                    new.as_deref().unwrap_or(""),
-                )
-                .0,
-                deletions: super::model::count_changes(
-                    old.as_deref().unwrap_or(""),
-                    new.as_deref().unwrap_or(""),
-                )
-                .1,
+                additions: counts.0,
+                deletions: counts.1,
                 old,
                 new,
                 lines,
@@ -132,8 +132,11 @@ impl Capture {
             let before = git::load_review(cwd, scope)?;
             let capture = Self::local(cwd, &before, label)?;
             let after = git::load_review(cwd, scope)?;
-            if format!("{before:?}") == format!("{after:?}") {
-                return Ok(capture);
+            if before == after {
+                let retained = Self::local(cwd, &after, label)?;
+                if capture.id == retained.id {
+                    return Ok(capture);
+                }
             }
         }
         bail!("Checkout changed while capturing. Retry after edits finish")
@@ -200,6 +203,11 @@ impl Capture {
             &metadata.repository,
             metadata.number,
             &metadata.target_tip,
+            &metadata.base_branch,
+            &metadata.head_branch,
+            &metadata.title,
+            &metadata.description,
+            &metadata.author,
         ))?);
         for e in &mut self.evidence {
             e.id = format!(
@@ -236,12 +244,86 @@ impl Capture {
         }
         .context("Source side unavailable")
     }
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.files.len() <= 10_000
+                && self.label.len() <= 1000
+                && self.base.len() <= 100
+                && self.head.len() <= 100,
+            "Invalid capture metadata"
+        );
+        for f in &self.files {
+            ensure!(
+                !f.path.is_empty()
+                    && f.path.len() <= 4096
+                    && Path::new(&f.path)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "Invalid captured path"
+            );
+            ensure!(
+                f.old
+                    .as_ref()
+                    .is_none_or(|s| s.len() <= git::MAX_FILE_BYTES as usize)
+                    && f.new
+                        .as_ref()
+                        .is_none_or(|s| s.len() <= git::MAX_FILE_BYTES as usize),
+                "Oversized captured source"
+            );
+        }
+        let mut rebuilt = Self::from_files(
+            &self.label,
+            &self.base,
+            &self.head,
+            self.branch.clone(),
+            self.files.clone(),
+        )?;
+        if let Some(pr) = &self.pr {
+            pr::Identity::parse(&pr.url)?;
+            rebuilt = rebuilt.with_pr(pr.clone())?;
+        }
+        ensure!(
+            rebuilt.id == self.id
+                && serde_json::to_vec(&rebuilt.evidence)? == serde_json::to_vec(&self.evidence)?,
+            "Captured source identity or evidence registry is inconsistent"
+        );
+        Ok(())
+    }
     pub fn prompt(&self) -> String {
         let mut out = format!(
             "Capture: {}\nScope: {}\nBase: {}\nHEAD: {}\n",
             self.id, self.label, self.base, self.head
         );
-        for e in &self.evidence {
+        if let Some(pr) = &self.pr {
+            out.push_str(&format!("PR {} #{}: {}\nAuthor: {}\nTarget tip: {}\nDescription (untrusted data):\n{}\nCI observations (not local execution): {}\n", pr.repository, pr.number, pr.title, pr.author, pr.target_tip, pr.description, serde_json::to_string(&pr.checks).unwrap_or_default()));
+        }
+        out.push_str("Complete changed-file inventory:\n");
+        for f in &self.files {
+            out.push_str(&format!(
+                "{} | {} | {}\n",
+                f.path,
+                f.status,
+                f.unavailable.as_deref().unwrap_or("text available")
+            ));
+        }
+        let mut ranges = self.evidence.iter().collect::<Vec<_>>();
+        ranges.sort_by_key(|e| {
+            let changed = self
+                .files
+                .iter()
+                .find(|f| f.path == e.path)
+                .is_some_and(|f| {
+                    f.lines.iter().any(|l| {
+                        let line = match e.side {
+                            Side::New => l.new,
+                            Side::Old => l.old,
+                        };
+                        l.tag != "context" && line.is_some_and(|n| n >= e.start && n <= e.end)
+                    })
+                });
+            (!changed, e.side == Side::Old)
+        });
+        for e in ranges {
             let source = self
                 .source(e)
                 .unwrap_or("")
@@ -270,6 +352,13 @@ pub(crate) struct Revision {
     pub bundle: Option<Bundle>,
     pub examined: Vec<String>,
     pub location: Location,
+    #[serde(default)]
+    pub guide_history: Vec<GuideRevision>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct GuideRevision {
+    pub bundle: Bundle,
+    pub examined: Vec<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Location {
@@ -330,6 +419,7 @@ impl Review {
             revisions: vec![Revision {
                 capture,
                 bundle: None,
+                guide_history: vec![],
                 examined: vec![],
                 location: Location {
                     page: "changes".into(),
@@ -349,6 +439,8 @@ impl Review {
             .position(|r| r.capture.id == capture.id)
         {
             self.current = i;
+            // Refresh observations without replacing immutable source or judgments.
+            self.revisions[i].capture.pr = capture.pr;
             return;
         }
         // Preserve old decisions as history; never infer approval from lines
@@ -357,6 +449,7 @@ impl Review {
         self.revisions.push(Revision {
             capture,
             bundle: None,
+            guide_history: vec![],
             examined: vec![],
             location: Location {
                 page: "changes".into(),
@@ -365,8 +458,21 @@ impl Review {
         });
         self.current = self.revisions.len() - 1;
     }
-    pub fn install(&mut self, bundle: Bundle) {
+    pub fn install(&mut self, bundle: Bundle) -> Result<()> {
+        bundle.validate(&self.active().capture)?;
         let revision = self.active_mut();
+        if revision
+            .bundle
+            .as_ref()
+            .is_some_and(|old| serde_json::to_vec(old).ok() == serde_json::to_vec(&bundle).ok())
+        {
+            return Ok(());
+        }
+        ensure!(
+            revision.guide_history.len() < 32,
+            "Guide history limit reached; earlier explanations are retained"
+        );
+        let old_examined = revision.examined.clone();
         // A changed claim or document requires another look. A presentation
         // retry with identical content retains the reviewer's decision.
         revision.examined.retain(|id| {
@@ -377,7 +483,33 @@ impl Review {
                 .zip(bundle.chapter(id))
                 .is_some_and(|(a, b)| a == b)
         });
-        revision.bundle = Some(bundle);
+        if let Some(old) = revision.bundle.replace(bundle) {
+            revision.guide_history.push(GuideRevision {
+                bundle: old,
+                examined: old_examined,
+            });
+        }
+        Ok(())
+    }
+    pub fn select_guide(&mut self, hash: &str) -> Result<()> {
+        let revision = self.active_mut();
+        let index = revision
+            .guide_history
+            .iter()
+            .position(|old| serde_json::to_vec(old).is_ok_and(|bytes| digest(bytes) == hash))
+            .context("Unknown saved guide")?;
+        let old = revision.guide_history.remove(index);
+        if let Some(current) = revision.bundle.replace(old.bundle) {
+            revision.guide_history.push(GuideRevision {
+                bundle: current,
+                examined: revision.examined.clone(),
+            });
+        }
+        revision.examined = old.examined;
+        revision.location.page = "overview".into();
+        revision.location.chapter = None;
+        revision.location.evidence = None;
+        Ok(())
     }
 }
 
@@ -395,6 +527,17 @@ impl Store {
     pub fn at(directory: PathBuf) -> Self {
         Self { directory }
     }
+    pub fn publication_lock(&self) -> Result<fs::File> {
+        fs::create_dir_all(&self.directory)?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.directory.join("publication.lock"))?;
+        lock.try_lock().map_err(|_| anyhow::anyhow!("Another window is checking or changing GitHub review status. Wait for it to finish, then reload"))?;
+        Ok(lock)
+    }
     pub fn load(&self) -> Result<Option<Review>> {
         let path = self.directory.join("review.json");
         if !path.try_exists()? {
@@ -410,6 +553,42 @@ impl Store {
             review.schema == 1 && review.current < review.revisions.len(),
             "Unsupported review record"
         );
+        for revision in &review.revisions {
+            revision.capture.validate()?;
+            if let Some(bundle) = &revision.bundle {
+                bundle.validate(&revision.capture)?;
+            }
+            ensure!(
+                revision.guide_history.len() <= 32,
+                "Oversized guide history"
+            );
+            for old in &revision.guide_history {
+                old.bundle.validate(&revision.capture)?;
+            }
+        }
+        for finding in &review.findings {
+            let capture = &review
+                .revisions
+                .iter()
+                .find(|r| r.capture.id == finding.capture)
+                .context("Finding revision missing")?
+                .capture;
+            ensure!(finding.body.len() <= 12000, "Oversized saved finding");
+            if let Some(evidence) = &finding.evidence {
+                let e = capture.evidence(evidence)?;
+                if let Some(range) = &finding.range {
+                    ensure!(
+                        range.start >= e.start && range.end <= e.end && range.start <= range.end,
+                        "Invalid saved finding range"
+                    );
+                }
+            } else {
+                ensure!(
+                    finding.range.is_none(),
+                    "Finding range lacks source evidence"
+                );
+            }
+        }
         Ok(Some(review))
     }
     pub fn save(&self, review: &mut Review) -> Result<()> {
@@ -467,6 +646,60 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+    #[test]
+    fn guide_revisions_preserve_old_decisions_and_restore_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().join("review"));
+        let mut review = Review::start(capture("after\n"));
+        let evidence = review.active().capture.evidence[0].id.clone();
+        let chapters = (0..2)
+            .map(|i| Chapter {
+                id: format!("behavior-{i}"),
+                title: format!("Behavior {i}"),
+                summary: "Static readable explanation".into(),
+                document: format!("chapters/{i}.html"),
+                evidence_ids: vec![evidence.clone()],
+                claims: vec![Claim {
+                    id: format!("claim-{i}"),
+                    text: "Inspect the captured source".into(),
+                    evidence_ids: vec![evidence.clone()],
+                }],
+                questions: vec![],
+            })
+            .collect();
+        let original = Bundle {
+            manifest: Manifest {
+                runtime: 1,
+                capture: review.active().capture.id.clone(),
+                title: "Guide".into(),
+                summary: "Summary".into(),
+                chapters,
+            },
+            documents: BTreeMap::from([
+                ("chapters/0.html".into(), "<p>First</p>".into()),
+                ("chapters/1.html".into(), "<p>Second</p>".into()),
+            ]),
+        };
+        review.install(original.clone()).unwrap();
+        review.active_mut().examined = vec!["behavior-0".into(), "behavior-1".into()];
+        let mut repaired = original.clone();
+        repaired
+            .documents
+            .insert("chapters/0.html".into(), "<p>Repaired visual</p>".into());
+        review.install(repaired).unwrap();
+        assert_eq!(review.active().examined, ["behavior-1"]);
+        assert_eq!(review.active().guide_history[0].examined.len(), 2);
+        let hash = digest(serde_json::to_vec(&review.active().guide_history[0]).unwrap());
+        store.save(&mut review).unwrap();
+        let mut restored = store.load().unwrap().unwrap();
+        restored.select_guide(&hash).unwrap();
+        assert_eq!(restored.active().examined.len(), 2);
+        assert_eq!(
+            restored.active().bundle.as_ref().unwrap().documents,
+            original.documents
+        );
+        assert_eq!(restored.active().guide_history.len(), 1);
     }
     #[test]
     fn evidence_tracks_bytes_and_survives_checkout_independently() {

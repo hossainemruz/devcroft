@@ -333,6 +333,29 @@ fn parse_command_v_output(bytes: &[u8]) -> Option<PathBuf> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct GitHubRejection(pub u16);
+impl std::fmt::Display for GitHubRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GitHub rejected the request (HTTP {}). Check gh authentication, repository permissions and the outgoing review",
+            self.0
+        )
+    }
+}
+impl std::error::Error for GitHubRejection {}
+fn rejection(message: &str) -> Option<GitHubRejection> {
+    // gh appends the transport status to its final diagnostic. Ignore fake
+    // status text earlier in a server-provided error message.
+    let line = message.trim_end().lines().last()?.strip_prefix("gh: ")?;
+    let tail = line.rsplit_once("(http ")?.1;
+    let status = tail.strip_suffix(')')?.parse().ok()?;
+    // A timeout or server error can be ambiguous. Only definite REST request
+    // rejections permit a new creation attempt after correcting the preview.
+    matches!(status, 400 | 401 | 403 | 404 | 405 | 409 | 410 | 422)
+        .then_some(GitHubRejection(status))
+}
 pub(crate) fn run(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     let mut child = command
         .stdin(Stdio::null())
@@ -347,13 +370,17 @@ pub(crate) fn run(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     // Drain both pipes concurrently so large responses cannot deadlock `gh`.
-    let read = |stream: Box<dyn Read + Send>| {
+    let read = |mut stream: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             stream
+                .by_ref()
                 .take(OUTPUT_LIMIT + 1)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes)
+                .read_to_end(&mut bytes)?;
+            // Keep draining after the retained prefix reaches the limit. A
+            // blocked writer must not turn a size error into a timeout.
+            std::io::copy(&mut stream, &mut std::io::sink())?;
+            Ok::<_, std::io::Error>(bytes)
         })
     };
     let out = read(Box::new(stdout));
@@ -382,6 +409,9 @@ pub(crate) fn run(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     if !exit.success() {
         let message = String::from_utf8_lossy(&stderr).to_lowercase();
         // Do not expose arbitrary CLI stderr (which may contain credentials).
+        if let Some(rejected) = rejection(&message) {
+            return Err(rejected.into());
+        }
         if exit.code() == Some(4)
             || message.contains("auth login")
             || message.contains("authentication")
@@ -406,6 +436,32 @@ pub(crate) fn run(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_command_output_is_drained_without_timing_out() {
+        let error = run(
+            Command::new("/bin/sh").args([
+                "-c",
+                "dd if=/dev/zero bs=1048576 count=6 2>/dev/null; dd if=/dev/zero bs=1048576 count=6 1>&2 2>/dev/null",
+            ]),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeded the size limit"));
+    }
+
+    #[test]
+    fn only_conclusive_final_gh_status_is_a_rejection() {
+        assert_eq!(
+            rejection("gh: validation failed (http 422)\n").unwrap().0,
+            422
+        );
+        assert!(rejection("malicious text (http 422)\ngh: server failed (http 500)").is_none());
+        assert!(rejection("gh: fake (http 422) actual (http 500)").is_none());
+        assert!(rejection("gh: timeout (http 408)").is_none());
+        assert!(rejection("other tool (http 422)").is_none());
+    }
 
     fn status(checks: serde_json::Value) -> Status {
         serde_json::from_value(json!({"title":"PR", "state":"OPEN", "isDraft":false,

@@ -35,8 +35,24 @@ impl Gate {
         );
         ensure!(
             [
-                "ready", "source", "location", "draft", "finding", "resolve", "examined",
-                "generate", "ask", "stop", "copy", "revision", "reload"
+                "ready",
+                "source",
+                "location",
+                "draft",
+                "finding",
+                "resolve",
+                "examined",
+                "generate",
+                "repair",
+                "guide",
+                "ask",
+                "stop",
+                "copy",
+                "revision",
+                "reload",
+                "preview",
+                "publish",
+                "reconcile"
             ]
             .contains(&m.op.as_str()),
             "Unsupported review operation"

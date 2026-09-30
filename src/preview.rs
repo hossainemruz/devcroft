@@ -1166,6 +1166,10 @@ mod tests {
         for (language, code) in [
             ("go", "// café\ntype Example struct { Name string }\n"),
             ("sql", "SELECT id FROM snapshots WHERE id = 1;\n"),
+            ("python", "def foo():\n    return 42\n"),
+            ("py", "def foo():\n    return 42\n"),
+            ("rust", "fn main() {}\n"),
+            ("rs", "fn main() {}\n"),
         ] {
             let dark = highlight_code(code, Some(language), true);
             let light = highlight_code(code, Some(language), false);

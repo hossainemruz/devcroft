@@ -294,6 +294,13 @@ mod tests {
     #[test]
     fn recognizes_extensions_and_special_file_names() {
         assert_eq!(syntax_for_path("src/lib.rs").unwrap().name, "Rust");
+        assert_eq!(syntax_for_path("scripts/foo.py").unwrap().name, "Python");
+        assert_eq!(syntax_for_path("src/foo.PY").unwrap().name, "Python");
+        assert_eq!(syntax_for_path("./foo.py").unwrap().name, "Python");
+        assert_eq!(syntax_for_path("/abs/path/foo.py").unwrap().name, "Python");
+        assert_eq!(syntax_for_path("foo.pyw").unwrap().name, "Python");
+        assert_eq!(syntax_for_path("foo.pyi").unwrap().name, "Python");
+        assert_eq!(syntax_for_path("foo.py3").unwrap().name, "Python");
         assert!(syntax_for_path("Makefile").is_some());
         assert!(syntax_for_path("notes.unknown-extension").is_none());
     }
@@ -309,6 +316,66 @@ mod tests {
                         .iter()
                         .any(|span| span.range.start == 0 && span.range.end >= 2),
                     "Rust's `fn` keyword should be highlighted"
+                );
+            }
+        }
+        assert_ne!(
+            highlights.line(false, 0, 0, 1)[0].rgba,
+            highlights.line(true, 0, 0, 1)[0].rgba,
+        );
+    }
+
+    fn python_diff() -> ReviewDiff {
+        ReviewDiff {
+            files: vec![ChangedFile {
+                path: "scripts/foo.py".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 1,
+                content: FileContent::Text {
+                    hunks: vec![Hunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        collapsed_before: 0,
+                        lines: vec![
+                            HunkLine {
+                                tag: LineTag::Deletion,
+                                old_no: Some(1),
+                                new_no: None,
+                                text: "def old():".into(),
+                            },
+                            HunkLine {
+                                tag: LineTag::Addition,
+                                old_no: None,
+                                new_no: Some(1),
+                                text: "def new():".into(),
+                            },
+                        ],
+                    }],
+                    truncated: false,
+                },
+            }],
+            base_commit: String::new(),
+            head_commit: String::new(),
+            base_ref: None,
+            head_branch: None,
+        }
+    }
+
+    #[test]
+    fn python_files_highlight_in_both_appearance_variants() {
+        let highlights = highlight(&python_diff());
+        for dark in [false, true] {
+            for line in [0, 1] {
+                let spans = highlights.line(dark, 0, 0, line);
+                assert!(
+                    spans
+                        .iter()
+                        .any(|span| span.range.start == 0 && span.range.end >= 3),
+                    "Python's `def` keyword should be highlighted"
                 );
             }
         }

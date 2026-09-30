@@ -130,6 +130,11 @@ impl TerminalPane {
         self.error.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_terminal_session(&self) -> bool {
+        self.session.is_some()
+    }
+
     pub(crate) fn agent_running(&self) -> bool {
         self.session.is_some()
             && self

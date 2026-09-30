@@ -229,7 +229,9 @@ impl AssistantView {
     }
 
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
-        if (self.loading || self.awaiting_configuration)
+        // Comparison loading has no new agent yet. Its cancellation must
+        // leave the previous guide's session available for follow-ups.
+        if (self.request_kind.is_some() || self.awaiting_configuration)
             && let Some(agent) = &self.agent
         {
             agent.update(cx, |pane, cx| pane.close(cx));
@@ -2193,6 +2195,81 @@ mod tests {
             base_ref: None,
             head_branch: None,
         })
+    }
+
+    #[test]
+    fn stopping_comparison_preparation_keeps_the_previous_session() {
+        let mut app = TestApp::new();
+        app.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let (activity, _) = crate::agent_activity::AgentActivityStore::new();
+        let mut reader = None;
+        let window = app.open_window(|window, cx| {
+            // An ordinary shell supplies a real PTY without launching a
+            // provider or changing the user's agent session history.
+            let pane = cx.new(|cx| {
+                TerminalPane::new(
+                    crate::workspace::WorkspaceTab::Terminal,
+                    directory.path(),
+                    AgentKind::Codex,
+                    &activity,
+                    cx,
+                )
+            });
+            assert!(pane.read(cx).has_terminal_session());
+            let view = cx.new(|cx| {
+                let mut view = AssistantView::new(
+                    directory.path().to_owned(),
+                    sample_diff(),
+                    "changes".into(),
+                    ReviewScope::UncommittedChanges,
+                    window,
+                    cx,
+                );
+                let snapshot = Snapshot::new(&view.diff);
+                view.install(
+                    Tutorial::sample(&snapshot, false),
+                    Pending {
+                        snapshot,
+                        options: Options::default(),
+                        agent: Some(pane.clone()),
+                    },
+                    true,
+                    cx,
+                );
+                view.agent = Some(pane);
+                view.loading = true;
+                view
+            });
+            reader = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        app.update(|cx| {
+            reader.as_ref().unwrap().update(cx, |view, cx| {
+                let id = view.request_id;
+                view.stop(cx);
+                assert!(!view.loading);
+                assert!(view.request_id > id);
+                assert!(
+                    view.guide
+                        .as_ref()
+                        .unwrap()
+                        .agent
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .has_terminal_session(),
+                    "cancelled comparison closed the old agent"
+                );
+                view.awaiting_configuration = true;
+                view.stop(cx);
+                assert!(
+                    !view.agent.as_ref().unwrap().read(cx).has_terminal_session(),
+                    "configuration cancellation kept its agent open"
+                );
+            });
+        });
+        drop(window);
     }
 
     #[test]

@@ -121,7 +121,10 @@ pub(crate) fn anchor_source(
     let repo = open(cwd)?;
     let bytes = match side {
         super::comments::Side::New => {
-            let root = repo.workdir().context("review requires a worktree")?;
+            let root = repo
+                .workdir()
+                .context("review requires a worktree")?
+                .canonicalize()?;
             if Path::new(path).is_absolute()
                 || Path::new(path)
                     .components()
@@ -129,7 +132,7 @@ pub(crate) fn anchor_source(
             {
                 bail!("Invalid anchor path");
             }
-            match read_worktree(&root.join(path)) {
+            match read_worktree(&root, path) {
                 WorkContent::Bytes(bytes) | WorkContent::Symlink(bytes) => Some(bytes),
                 _ => None,
             }
@@ -285,6 +288,114 @@ fn read_blob(repo: &gix::Repository, oid: gix::ObjectId) -> BlobRead {
     }
 }
 
+/// Read a PR from verified commit objects. This deliberately never consults
+/// the worktree, index, hooks, submodule tooling or checkout configuration.
+pub(crate) fn commit_files(
+    path: &Path,
+    target_tip: &str,
+    head: &str,
+) -> Result<(String, Vec<super::session::File>)> {
+    let repo = open(path)?;
+    let target = gix::ObjectId::from_hex(target_tip.as_bytes())?;
+    let head = gix::ObjectId::from_hex(head.as_bytes())?;
+    let base = repo
+        .merge_base(target, head)
+        .context("PR revisions have no available merge base")?
+        .detach();
+    let old = list_tree(&repo, commit_tree_id(&repo, base)?)?;
+    let new = list_tree(&repo, commit_tree_id(&repo, head)?)?;
+    let mut paths = old.keys().chain(new.keys()).cloned().collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    let mut files = vec![];
+    for path in paths {
+        let a = old.get(&path);
+        let b = new.get(&path);
+        if a.zip(b)
+            .is_some_and(|(a, b)| a.oid == b.oid && a.mode == b.mode)
+        {
+            continue;
+        }
+        let mut unavailable = None;
+        let mut source = |entry: Option<&BaseEntry>| -> Option<String> {
+            let entry = entry?;
+            if entry.mode.is_commit() {
+                unavailable = Some("Submodule commit · contents not captured".into());
+                return None;
+            }
+            match read_blob(&repo, entry.oid) {
+                BlobRead::Hit(bytes) if !bytes.contains(&0) => match String::from_utf8(bytes) {
+                    Ok(text) => Some(text),
+                    Err(_) => {
+                        unavailable = Some("Non-UTF-8 source".into());
+                        None
+                    }
+                },
+                BlobRead::Hit(_) => {
+                    unavailable = Some("Binary content".into());
+                    None
+                }
+                BlobRead::TooLarge => {
+                    unavailable = Some("Source exceeds 4 MiB".into());
+                    None
+                }
+                BlobRead::Missing => {
+                    unavailable = Some("Git blob unavailable".into());
+                    None
+                }
+            }
+        };
+        let old_source = source(a);
+        let new_source = source(b);
+        let (hunks, truncated) = diff_text(
+            old_source.as_deref().unwrap_or(""),
+            new_source.as_deref().unwrap_or(""),
+        );
+        let (additions, deletions) = count_changes(
+            old_source.as_deref().unwrap_or(""),
+            new_source.as_deref().unwrap_or(""),
+        );
+        let lines = if unavailable.is_none() {
+            hunks
+                .into_iter()
+                .flat_map(|h| h.lines)
+                .map(|l| super::session::SourceLine {
+                    old: l.old_no,
+                    new: l.new_no,
+                    text: l.text,
+                    tag: match l.tag {
+                        super::model::LineTag::Context => "context",
+                        super::model::LineTag::Addition => "addition",
+                        super::model::LineTag::Deletion => "deletion",
+                    }
+                    .into(),
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        files.push(super::session::File {
+            path,
+            old_path: None,
+            status: match (a, b) {
+                (None, _) => "Added",
+                (_, None) => "Deleted",
+                (Some(a), Some(b)) if a.mode != b.mode => "Mode/type changed",
+                _ => "Modified",
+            }
+            .into(),
+            additions,
+            deletions,
+            old: old_source,
+            new: new_source,
+            lines,
+            unavailable,
+            truncated,
+        });
+    }
+    Ok((base.to_hex().to_string(), files))
+}
+
 /// Raw worktree content at one path.
 enum WorkContent {
     Bytes(Vec<u8>),
@@ -294,7 +405,23 @@ enum WorkContent {
     Gone,
 }
 
-fn read_worktree(path: &Path) -> WorkContent {
+fn read_worktree(root: &Path, name: &str) -> WorkContent {
+    // Never traverse a PR-controlled directory link while capturing local
+    // source. A link at the leaf is captured as its target text, not followed.
+    let mut path = root.to_path_buf();
+    let mut components = Path::new(name).components().peekable();
+    while let Some(component) = components.next() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return WorkContent::Dir;
+        }
+        path.push(component);
+        if components.peek().is_some()
+            && std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return WorkContent::Dir;
+        }
+    }
+    let path = path.as_path();
     let meta = match std::fs::symlink_metadata(path) {
         Err(_) => return WorkContent::Gone,
         Ok(meta) => meta,
@@ -328,7 +455,7 @@ fn assemble(
     let workdir = repo
         .workdir()
         .context("review requires a working tree (bare repositories are not supported)")
-        .map(Path::to_owned)?;
+        .and_then(|p| p.canonicalize().map_err(Into::into))?;
     let base_entries = list_tree(repo, base_tree)?;
     let untracked = discover_untracked(&workdir, &base_entries);
 
@@ -338,11 +465,11 @@ fn assemble(
     let mut added: Vec<(String, Vec<u8>)> = Vec::new();
 
     for (path, entry) in &base_entries {
-        let work = read_worktree(&workdir.join(path));
+        let work = read_worktree(&workdir, path);
         classify_tracked(repo, path, entry, work, &mut files, &mut deleted);
     }
     for path in untracked {
-        match read_worktree(&workdir.join(&path)) {
+        match read_worktree(&workdir, &path) {
             WorkContent::Bytes(bytes) | WorkContent::Symlink(bytes) => {
                 added.push((path, bytes));
             }

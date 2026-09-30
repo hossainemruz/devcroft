@@ -51,6 +51,13 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 similar = "3.2.0"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig"] }
 tempfile = "3.27.0"
+sha2 = "0.10"
+rand = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui-wry = "=0.7.0"
+wry = { version = "=0.53.3", package = "lb-wry" }
+raw-window-handle = { version = "0.6", features = ["std"] }
 
 [dev-dependencies]
 gpui-kit = { version = "0.7.0", features = ["test-support"] }

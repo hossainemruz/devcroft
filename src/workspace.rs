@@ -848,11 +848,6 @@ impl Workspace {
                 WorkspaceTab::Agent => self.tabs[WorkspaceTab::Agent as usize]
                     .as_ref()
                     .and_then(|pane| pane.read(cx).launch_id()),
-                WorkspaceTab::Review => self
-                    .review
-                    .read(cx)
-                    .visible_agent(cx)
-                    .and_then(|pane| pane.read(cx).launch_id()),
                 _ => None,
             }
         } else {

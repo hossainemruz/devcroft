@@ -130,39 +130,6 @@ impl TerminalPane {
         self.error.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_terminal_session(&self) -> bool {
-        self.session.is_some()
-    }
-
-    pub(crate) fn agent_running(&self) -> bool {
-        self.session.is_some()
-            && self
-                .agent_activity
-                .as_ref()
-                .is_some_and(|launch| !launch.has_exited())
-    }
-
-    /// Paste a single-line task into the same input the user configures.
-    /// The leading shell comment also makes an exit race harmless if the
-    /// harness returns to its login shell before the PTY reports the exit.
-    pub(crate) fn paste_agent_task(&mut self, task: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.agent_running(),
-            "The agent session has closed. Generate a new guide to start another session."
-        );
-        anyhow::ensure!(
-            task.starts_with("# ") && !task.contains(['\n', '\r', '\x1b']),
-            "Invalid terminal task"
-        );
-        self.session.as_mut().unwrap().paste(task)
-    }
-
-    pub(crate) fn submit_agent_task(&mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.agent_running(), "The agent session has closed.");
-        self.session.as_ref().unwrap().write_input(b"\r")
-    }
-
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.session = None;
         if let Some(activity) = &self.agent_activity {

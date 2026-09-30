@@ -134,23 +134,7 @@ impl ListDelegate for AgentPicker {
 
 impl Workspace {
     pub(super) fn new_review(cwd: &Path, cx: &mut Context<Self>) -> Entity<ReviewView> {
-        let review = cx.new(|cx| ReviewView::new(cwd, cx));
-        cx.subscribe(
-            &review,
-            |this, _, request: &crate::review::ReviewAgentRequested, cx| {
-                if !request.assistant.read(cx).accepts_agent(request.request_id) {
-                    return;
-                }
-                let pane =
-                    this.create_agent_session(request.agent, &request.cwd, "Review tutorial", cx);
-                request.assistant.update(cx, |assistant, cx| {
-                    assistant.attach_agent(pane, request.request_id, cx);
-                });
-                this.refresh_sessions(cx);
-            },
-        )
-        .detach();
-        review
+        cx.new(|cx| ReviewView::new(cwd, cx))
     }
 
     fn create_agent_session(

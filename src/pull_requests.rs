@@ -194,7 +194,7 @@ pub(crate) fn fetch(url: &str) -> Result<Status> {
 /// terminal tabs launch a login shell that sources all of that. Without
 /// this, macOS users with a working terminal `gh` still see "Could not
 /// start GitHub CLI".
-fn resolve_gh() -> Result<PathBuf> {
+pub(crate) fn resolve_gh() -> Result<PathBuf> {
     resolve_gh_from(
         env::var_os("PATH").as_deref(),
         env::var_os("HOME").as_deref(),
@@ -333,7 +333,7 @@ fn parse_command_v_output(bytes: &[u8]) -> Option<PathBuf> {
     }
 }
 
-fn run(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
+pub(crate) fn run(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

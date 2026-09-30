@@ -1,0 +1,496 @@
+//! Immutable evidence and durable, revision-checked reviewer state.
+mod bundle;
+pub(crate) mod pr;
+pub(crate) use bundle::Bundle;
+
+use super::{
+    comments::Side,
+    git,
+    model::{FileContent, LineTag, ReviewDiff},
+};
+use anyhow::{Context as _, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+pub(crate) fn digest(bytes: impl AsRef<[u8]>) -> String {
+    format!("{:x}", Sha256::digest(bytes.as_ref()))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct SourceLine {
+    pub old: Option<u32>,
+    pub new: Option<u32>,
+    pub tag: String,
+    pub text: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct File {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub old: Option<String>,
+    pub new: Option<String>,
+    pub lines: Vec<SourceLine>,
+    pub unavailable: Option<String>,
+    pub truncated: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Evidence {
+    pub id: String,
+    pub path: String,
+    pub side: Side,
+    pub start: u32,
+    pub end: u32,
+    pub source_hash: String,
+    pub kind: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Capture {
+    pub id: String,
+    pub label: String,
+    pub base: String,
+    pub head: String,
+    pub branch: Option<String>,
+    pub files: Vec<File>,
+    pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub pr: Option<pr::Metadata>,
+}
+impl Capture {
+    pub fn local(cwd: &Path, diff: &ReviewDiff, label: &str) -> Result<Self> {
+        // Rebuild hunks from the exact bytes retained here. A checkout edit
+        // during capture cannot leave the inspector showing a different diff.
+        let mut files = Vec::new();
+        for f in &diff.files {
+            let old = git::anchor_source(cwd, diff, &f.path, Side::Old)?;
+            let new = git::anchor_source(cwd, diff, &f.path, Side::New)?;
+            let (hunks, truncated) = match &f.content {
+                FileContent::Text { .. } => super::model::diff_text(
+                    old.as_deref().unwrap_or(""),
+                    new.as_deref().unwrap_or(""),
+                ),
+                _ => (vec![], false),
+            };
+            let lines = hunks
+                .into_iter()
+                .flat_map(|h| h.lines)
+                .map(|l| SourceLine {
+                    old: l.old_no,
+                    new: l.new_no,
+                    text: l.text,
+                    tag: match l.tag {
+                        LineTag::Context => "context",
+                        LineTag::Addition => "addition",
+                        LineTag::Deletion => "deletion",
+                    }
+                    .into(),
+                })
+                .collect();
+            files.push(File {
+                path: f.path.clone(),
+                old_path: f.old_path.clone(),
+                status: f.status.label().into(),
+                additions: super::model::count_changes(
+                    old.as_deref().unwrap_or(""),
+                    new.as_deref().unwrap_or(""),
+                )
+                .0,
+                deletions: super::model::count_changes(
+                    old.as_deref().unwrap_or(""),
+                    new.as_deref().unwrap_or(""),
+                )
+                .1,
+                old,
+                new,
+                lines,
+                truncated,
+                unavailable: match &f.content {
+                    FileContent::Unavailable(reason) => Some(reason.label().into()),
+                    _ => None,
+                },
+            });
+        }
+        Self::from_files(
+            label,
+            &diff.base_commit,
+            &diff.head_commit,
+            diff.head_branch.clone(),
+            files,
+        )
+    }
+    pub fn stable_local(cwd: &Path, scope: &git::ReviewScope, label: &str) -> Result<Self> {
+        // A local worktree is mutable. Require a stable complete scan around
+        // retained bytes rather than silently omitting a concurrently added file.
+        for _ in 0..3 {
+            let before = git::load_review(cwd, scope)?;
+            let capture = Self::local(cwd, &before, label)?;
+            let after = git::load_review(cwd, scope)?;
+            if format!("{before:?}") == format!("{after:?}") {
+                return Ok(capture);
+            }
+        }
+        bail!("Checkout changed while capturing. Retry after edits finish")
+    }
+    pub fn from_files(
+        label: &str,
+        base: &str,
+        head: &str,
+        branch: Option<String>,
+        files: Vec<File>,
+    ) -> Result<Self> {
+        ensure!(
+            serde_json::to_vec(&files)?.len() <= 64 * 1024 * 1024,
+            "Captured source exceeds 64 MiB; narrow the comparison"
+        );
+        let id = digest(serde_json::to_vec(&(label, base, head, &files))?);
+        let mut evidence = vec![];
+        for file in &files {
+            for (side, source) in [(Side::Old, &file.old), (Side::New, &file.new)] {
+                if let Some(source) = source {
+                    let source_hash = digest(source);
+                    // Every source range is registered, including unchanged
+                    // context. Authors never supply authoritative source text.
+                    for (i, chunk) in source.lines().collect::<Vec<_>>().chunks(48).enumerate() {
+                        let start = (i * 48 + 1) as u32;
+                        let end = start + chunk.len() as u32 - 1;
+                        let evidence_id = digest(serde_json::to_vec(&(
+                            &id,
+                            &file.path,
+                            side,
+                            start,
+                            end,
+                            &source_hash,
+                        ))?);
+                        evidence.push(Evidence {
+                            id: format!("e-{}", &evidence_id[..20]),
+                            path: file.path.clone(),
+                            side,
+                            start,
+                            end,
+                            source_hash: source_hash.clone(),
+                            kind: "cited_source".into(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            id,
+            label: label.into(),
+            base: base.into(),
+            head: head.into(),
+            branch,
+            files,
+            evidence,
+            pr: None,
+        })
+    }
+    pub fn with_pr(mut self, metadata: pr::Metadata) -> Result<Self> {
+        // CI and timestamps are observations, not source identity. The target
+        // tip is part of identity even when its merge base did not change.
+        let bound = digest(serde_json::to_vec(&(
+            &self.id,
+            &metadata.repository,
+            metadata.number,
+            &metadata.target_tip,
+        ))?);
+        for e in &mut self.evidence {
+            e.id = format!(
+                "e-{}",
+                &digest(serde_json::to_vec(&(
+                    &bound,
+                    &e.path,
+                    e.side,
+                    e.start,
+                    e.end,
+                    &e.source_hash
+                ))?)[..20]
+            );
+        }
+        self.id = bound;
+        self.pr = Some(metadata);
+        Ok(self)
+    }
+    pub fn evidence(&self, id: &str) -> Result<&Evidence> {
+        self.evidence
+            .iter()
+            .find(|e| e.id == id)
+            .context("Unknown captured evidence")
+    }
+    pub fn source(&self, e: &Evidence) -> Result<&str> {
+        let f = self
+            .files
+            .iter()
+            .find(|f| f.path == e.path)
+            .context("Evidence file missing")?;
+        match e.side {
+            Side::Old => f.old.as_deref(),
+            Side::New => f.new.as_deref(),
+        }
+        .context("Source side unavailable")
+    }
+    pub fn prompt(&self) -> String {
+        let mut out = format!(
+            "Capture: {}\nScope: {}\nBase: {}\nHEAD: {}\n",
+            self.id, self.label, self.base, self.head
+        );
+        for e in &self.evidence {
+            let source = self
+                .source(e)
+                .unwrap_or("")
+                .lines()
+                .skip(e.start as usize - 1)
+                .take((e.end - e.start + 1) as usize)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let entry = format!(
+                "\nEVIDENCE {} | {} | {:?} lines {}–{} | cited source, execution not recorded\n{}\n",
+                e.id, e.path, e.side, e.start, e.end, source
+            );
+            if out.len() + entry.len() > 220_000 {
+                out.push_str("\nInput limit reached; do not claim complete coverage.\n");
+                break;
+            }
+            out.push_str(&entry);
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Revision {
+    pub capture: Capture,
+    pub bundle: Option<Bundle>,
+    pub examined: Vec<String>,
+    pub location: Location,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Location {
+    pub page: String,
+    pub chapter: Option<String>,
+    pub evidence: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Finding {
+    pub id: String,
+    pub capture: String,
+    pub chapter: Option<String>,
+    pub evidence: Option<String>,
+    pub body: String,
+    pub resolved: bool,
+    #[serde(default)]
+    pub range: Option<SourceRange>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct SourceRange {
+    pub start: u32,
+    pub end: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Investigation {
+    pub id: String,
+    pub capture: String,
+    pub chapter: Option<String>,
+    pub evidence: Option<String>,
+    pub question: String,
+    pub answer: Option<String>,
+    pub error: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Review {
+    pub schema: u32,
+    pub version: u64,
+    pub current: usize,
+    pub revisions: Vec<Revision>,
+    pub findings: Vec<Finding>,
+    pub investigations: Vec<Investigation>,
+    pub drafts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub submissions: Vec<pr::Submission>,
+}
+impl Review {
+    pub fn active(&self) -> &Revision {
+        &self.revisions[self.current]
+    }
+    pub fn active_mut(&mut self) -> &mut Revision {
+        &mut self.revisions[self.current]
+    }
+    pub fn start(capture: Capture) -> Self {
+        Self {
+            schema: 1,
+            version: 0,
+            current: 0,
+            revisions: vec![Revision {
+                capture,
+                bundle: None,
+                examined: vec![],
+                location: Location {
+                    page: "changes".into(),
+                    ..Default::default()
+                },
+            }],
+            findings: vec![],
+            investigations: vec![],
+            drafts: BTreeMap::new(),
+            submissions: vec![],
+        }
+    }
+    pub fn add_capture(&mut self, capture: Capture) {
+        if let Some(i) = self
+            .revisions
+            .iter()
+            .position(|r| r.capture.id == capture.id)
+        {
+            self.current = i;
+            return;
+        }
+        // Preserve old decisions as history; never infer approval from lines
+        // that happen to remain unchanged. Regeneration within one revision
+        // is handled separately from a source update.
+        self.revisions.push(Revision {
+            capture,
+            bundle: None,
+            examined: vec![],
+            location: Location {
+                page: "changes".into(),
+                ..Default::default()
+            },
+        });
+        self.current = self.revisions.len() - 1;
+    }
+    pub fn install(&mut self, bundle: Bundle) {
+        let revision = self.active_mut();
+        // A changed claim or document requires another look. A presentation
+        // retry with identical content retains the reviewer's decision.
+        revision.examined.retain(|id| {
+            revision
+                .bundle
+                .as_ref()
+                .and_then(|old| old.chapter(id))
+                .zip(bundle.chapter(id))
+                .is_some_and(|(a, b)| a == b)
+        });
+        revision.bundle = Some(bundle);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Store {
+    directory: PathBuf,
+}
+impl Store {
+    pub fn open(cwd: &Path, label: &str) -> Result<Self> {
+        let root = crate::data::resolve_data_root()?;
+        Ok(Self::at(root.root().join("reviews").join(digest(
+            serde_json::to_vec(&(cwd.canonicalize()?, label))?,
+        ))))
+    }
+    pub fn at(directory: PathBuf) -> Self {
+        Self { directory }
+    }
+    pub fn load(&self) -> Result<Option<Review>> {
+        let path = self.directory.join("review.json");
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= 128 * 1024 * 1024,
+            "Invalid or oversized review record"
+        );
+        let review: Review = serde_json::from_slice(&fs::read(path)?)?;
+        ensure!(
+            review.schema == 1 && review.current < review.revisions.len(),
+            "Unsupported review record"
+        );
+        Ok(Some(review))
+    }
+    pub fn save(&self, review: &mut Review) -> Result<()> {
+        fs::create_dir_all(&self.directory)?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.directory.join("store.lock"))?;
+        lock.lock()?;
+        let current = self.load()?;
+        if current.as_ref().map_or(0, |r| r.version) != review.version {
+            bail!(
+                "Review changed in another window. Reopen it to load the latest state; your draft remains in this window."
+            );
+        }
+        let mut next = review.clone();
+        next.version += 1;
+        let bytes = serde_json::to_vec(&next)?;
+        ensure!(
+            bytes.len() <= 128 * 1024 * 1024,
+            "Review history exceeds 128 MiB"
+        );
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.directory)?;
+        tmp.write_all(&bytes)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(self.directory.join("review.json"))?;
+        *review = next;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn capture(source: &str) -> Capture {
+        Capture::from_files(
+            "Local snapshot",
+            "base",
+            "head",
+            None,
+            vec![File {
+                path: "a.rs".into(),
+                old_path: None,
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                old: Some("before\n".into()),
+                new: Some(source.into()),
+                lines: vec![],
+                unavailable: None,
+                truncated: false,
+            }],
+        )
+        .unwrap()
+    }
+    #[test]
+    fn evidence_tracks_bytes_and_survives_checkout_independently() {
+        let a = capture("after\ncontext\n");
+        let b = capture("later\n");
+        assert_ne!(a.id, b.id);
+        let e = a.evidence.iter().find(|e| e.side == Side::New).unwrap();
+        assert_eq!(a.source(e).unwrap(), "after\ncontext\n");
+        assert!(b.evidence(&e.id).is_err());
+    }
+    #[test]
+    fn restart_conflicts_and_new_revisions_preserve_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().into());
+        let mut review = Review::start(capture("one\n"));
+        review.drafts.insert("finding".into(), "keep me".into());
+        store.save(&mut review).unwrap();
+        let mut stale = review.clone();
+        review.add_capture(capture("two\n"));
+        store.save(&mut review).unwrap();
+        assert!(store.save(&mut stale).is_err());
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.revisions.len(), 2);
+        assert_eq!(loaded.drafts["finding"], "keep me");
+        assert!(loaded.active().examined.is_empty());
+    }
+}

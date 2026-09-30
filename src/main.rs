@@ -72,6 +72,72 @@ fn main() -> Result<()> {
     }
 }
 
+pub(crate) fn run_visual_review(
+    cwd: std::path::PathBuf,
+    diff: review::model::ReviewDiff,
+    label: String,
+    scope: review::git::ReviewScope,
+    bundle: Option<std::path::PathBuf>,
+) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    anyhow::bail!("Visual review native hosting is currently enabled on macOS only");
+    #[cfg(target_os = "macos")]
+    {
+        let (theme, font_size) = resolve_appearance();
+        crate::metrics::set_app_font_size(font_size);
+        gpui_kit::application()
+            .with_assets(app_assets::AppAssets)
+            .run(move |cx| {
+                gpui_kit::init(cx);
+                load_bundled_fonts(cx).expect("loading fonts");
+                Theme::change(theme, None, cx);
+                apply_focus_theme(cx);
+                cx.on_action(|_: &Quit, cx| cx.quit());
+                if let Err(e) = review::open_visual_workspace(cwd, diff, label, scope, bundle, cx) {
+                    eprintln!("Opening visual review: {e:#}");
+                    cx.quit();
+                }
+            });
+        Ok(())
+    }
+}
+
+pub(crate) fn run_pr_review(
+    capture: review::ReviewCapture,
+    bundle: Option<std::path::PathBuf>,
+) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (capture, bundle);
+        anyhow::bail!("Visual PR review native hosting is currently enabled on macOS only");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (theme, font_size) = resolve_appearance();
+        crate::metrics::set_app_font_size(font_size);
+        let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let result = failure.clone();
+        gpui_kit::application()
+            .with_assets(app_assets::AppAssets)
+            .run(move |cx| {
+                gpui_kit::init(cx);
+                load_bundled_fonts(cx).expect("loading fonts");
+                Theme::change(theme, None, cx);
+                apply_focus_theme(cx);
+                cx.on_action(|_: &Quit, cx| cx.quit());
+                cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+                if let Err(e) = review::web::open_pr(capture, bundle, cx) {
+                    *failure.borrow_mut() = Some(e);
+                    cx.quit();
+                }
+            });
+        if let Some(error) = result.borrow_mut().take() {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 /// Direct shortcuts and the workspace Tab unbind, shared by the app and its
 /// tests so the keymap under test is the shipped one.
 pub(crate) fn bind_app_keys(cx: &mut App) {

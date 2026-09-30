@@ -187,11 +187,11 @@ impl HomeView {
         } else {
             None
         };
-        let review_url = item.url.clone();
         let menu_item = item.clone();
         let menu_title = title.clone();
         let entity = cx.entity();
         let edit_item = item.clone();
+        let review_url = item.url.clone();
         let mut card = v_flex()
             .id(item_id("pr", &item.id))
             .w_full()
@@ -233,6 +233,17 @@ impl HomeView {
                             .accessibility_label(format!("Options for {menu_title}"))
                             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
                                 let home = entity.clone();
+                                let url = review_url.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new("Review in Devcroft").on_click(
+                                        move |_, _, cx| {
+                                            home.update(cx, |this, cx| {
+                                                this.review_pr(url.clone(), cx);
+                                            });
+                                        },
+                                    ),
+                                );
+                                let home = entity.clone();
                                 let edit = edit_item.clone();
                                 menu = menu.item(PopupMenuItem::new("Edit").on_click(
                                     move |_, window, cx| {
@@ -271,14 +282,6 @@ impl HomeView {
                                     ),
                                 )
                             }),
-                    ),
-            )
-            .child(
-                Button::new(item_id("pr-review", &item.id))
-                    .ghost()
-                    .label("Review in Devcroft")
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.review_pr(review_url.clone(), cx)),
                     ),
             )
             .child(

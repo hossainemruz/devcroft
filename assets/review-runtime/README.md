@@ -42,7 +42,7 @@ source mode, without mounting a potentially hung chapter. Saved findings,
 drafts and guide history remain available.
 
 Native hosting is currently enabled on macOS. Confined generation is verified
-against installed Codex 0.159.2 with existing CLI authentication; other providers
+against installed Codex 0.159.2 and 0.159.3 with existing CLI authentication; other providers
 and unverified versions remain disabled. Windows and Linux hosting require their
 own native integration checks before enablement.
 

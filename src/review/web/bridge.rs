@@ -52,7 +52,8 @@ impl Gate {
                 "reload",
                 "preview",
                 "publish",
-                "reconcile"
+                "reconcile",
+                "discard"
             ]
             .contains(&m.op.as_str()),
             "Unsupported review operation"
@@ -82,6 +83,23 @@ mod tests {
         assert!(g.accept(&valid).is_err());
         let mut replacement = Gate::new();
         assert!(replacement.accept(&valid).is_err());
+    }
+    #[test]
+    fn pending_draft_discard_passes_the_trusted_bridge() {
+        let mut gate = Gate::new();
+        let message = serde_json::json!({
+            "token": gate.token(),
+            "seq": 1,
+            "op": "discard",
+            "capture": "captured-head",
+            "version": 4,
+            "data": {"hash": "saved-preview"}
+        })
+        .to_string();
+        let accepted = gate.accept(&message).unwrap();
+        assert_eq!(accepted.op, "discard");
+        assert_eq!(accepted.capture.as_deref(), Some("captured-head"));
+        assert!(gate.accept(&message).is_err());
     }
     #[test]
     fn data_never_terminates_shell_script() {

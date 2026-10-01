@@ -469,8 +469,8 @@ pub(super) fn preflight(checkout: &Path) -> Result<PathBuf> {
     version.arg("--version").env_clear();
     let version = crate::pull_requests::run(&mut version, Duration::from_secs(3))?;
     ensure!(
-        String::from_utf8_lossy(&version).trim() == "codex-cli 0.159.2",
-        "This confined adapter is verified with Codex 0.159.2; the installed version is unsupported"
+        verified_version(String::from_utf8_lossy(&version).trim()),
+        "This confined adapter is verified with Codex 0.159.2 and 0.159.3; the installed version is unsupported"
     );
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?);
     let auth = std::env::var_os("CODEX_HOME")
@@ -489,6 +489,9 @@ pub(super) fn preflight(checkout: &Path) -> Result<PathBuf> {
         );
     }
     Ok(binary)
+}
+fn verified_version(version: &str) -> bool {
+    matches!(version, "codex-cli 0.159.2" | "codex-cli 0.159.3")
 }
 fn find_codex(checkout: &Path) -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?);
@@ -557,6 +560,15 @@ fn profile(binary: &Path, root: &Path, candidate: &Path, runtime: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unverified_cli_versions_remain_ineligible() {
+        assert!(verified_version("codex-cli 0.159.2"));
+        assert!(verified_version("codex-cli 0.159.3"));
+        assert!(!verified_version("codex-cli 0.160.0"));
+        assert!(!verified_version("codex-cli 0.159.3-custom"));
+        assert!(!verified_version("0.159.3"));
+    }
 
     #[test]
     fn repair_replaces_only_the_selected_visual_and_checks_its_target() {

@@ -3,7 +3,7 @@
 use objc2::{
     ffi::object_setClass,
     msg_send,
-    runtime::{AnyClass, AnyObject, ClassBuilder, Imp, Sel},
+    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Imp, Sel},
     sel,
 };
 use objc2_foundation::NSPoint;
@@ -23,6 +23,18 @@ struct Methods {
     children: Imp,
     focus: Imp,
     hit: Imp,
+    key: Imp,
+}
+unsafe extern "C" fn key(view: &AnyObject, cmd: Sel, event: &AnyObject) -> Bool {
+    if let Some(handled) = unsafe { super::input::key_equivalent(view, event) } {
+        return handled;
+    }
+    let Some(methods) = methods(view) else {
+        return Bool::NO;
+    };
+    let original: unsafe extern "C" fn(&AnyObject, Sel, &AnyObject) -> Bool =
+        unsafe { std::mem::transmute(methods.key) };
+    unsafe { original(view, cmd, event) }
 }
 static METHODS: OnceLock<Mutex<HashMap<String, Methods>>> = OnceLock::new();
 fn methods(view: &AnyObject) -> Option<Methods> {
@@ -160,6 +172,7 @@ pub(super) fn attach(webview: &wry::WebView) -> anyhow::Result<()> {
                 children: get(sel!(accessibilityChildren))?,
                 focus: get(sel!(accessibilityFocusedUIElement))?,
                 hit: get(sel!(accessibilityHitTest:))?,
+                key: get(sel!(performKeyEquivalent:))?,
             },
         );
         let mut class = ClassBuilder::new(&name_c, previous)
@@ -177,6 +190,10 @@ pub(super) fn attach(webview: &wry::WebView) -> anyhow::Result<()> {
             class.add_method(
                 sel!(accessibilityHitTest:),
                 hit as unsafe extern "C" fn(_, _, _) -> _,
+            );
+            class.add_method(
+                sel!(performKeyEquivalent:),
+                key as unsafe extern "C" fn(_, _, _) -> _,
             );
         }
         class.register()

@@ -517,6 +517,16 @@ impl Review {
 pub(crate) struct Store {
     directory: PathBuf,
 }
+pub(crate) struct PublicationLock {
+    file: fs::File,
+}
+impl Drop for PublicationLock {
+    fn drop(&mut self) {
+        // Closing only this descriptor can leave the lock alive in a child
+        // forked concurrently by another thread. End the operation explicitly.
+        let _ = self.file.unlock();
+    }
+}
 impl Store {
     pub fn open(cwd: &Path, label: &str) -> Result<Self> {
         let root = crate::data::resolve_data_root()?;
@@ -527,7 +537,7 @@ impl Store {
     pub fn at(directory: PathBuf) -> Self {
         Self { directory }
     }
-    pub fn publication_lock(&self) -> Result<fs::File> {
+    pub fn publication_lock(&self) -> Result<PublicationLock> {
         fs::create_dir_all(&self.directory)?;
         let lock = fs::OpenOptions::new()
             .read(true)
@@ -535,8 +545,22 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(self.directory.join("publication.lock"))?;
-        lock.try_lock().map_err(|_| anyhow::anyhow!("Another window is checking or changing GitHub review status. Wait for it to finish, then reload"))?;
-        Ok(lock)
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return Ok(PublicationLock { file: lock }),
+                Err(fs::TryLockError::Error(error))
+                    if error.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                Err(fs::TryLockError::WouldBlock) => anyhow::bail!(
+                    "Another window is checking or changing GitHub review status. Wait for it to finish, then reload"
+                ),
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error).context("Locking review publication");
+                }
+            }
+        }
     }
     pub fn load(&self) -> Result<Option<Review>> {
         let path = self.directory.join("review.json");
@@ -646,6 +670,18 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+    #[test]
+    fn publication_lock_releases_even_with_an_inherited_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().join("review"));
+        let guard = store.publication_lock().unwrap();
+        let inherited = guard.file.try_clone().unwrap();
+        assert!(store.publication_lock().is_err());
+        drop(guard);
+        let next = store.publication_lock().unwrap();
+        drop(next);
+        drop(inherited);
     }
     #[test]
     fn guide_revisions_preserve_old_decisions_and_restore_after_restart() {

@@ -878,6 +878,7 @@ mod tests {
         lose_create_response: bool,
         lose_submit_response: bool,
         lose_discard_response: bool,
+        leave_pending_on_loss: bool,
         head_changed: Cell<bool>,
         store: super::super::Store,
     }
@@ -899,13 +900,20 @@ mod tests {
             Ok(self.response.borrow().clone())
         }
         fn submit(&self, _: &Capture, submission: &Submission) -> Result<Value> {
-            ensure!(!self.head_changed.get(), "Synthetic PR head changed");
+            if self.head_changed.get() {
+                return Err(EventNotSent("Synthetic PR head changed".into()).into());
+            }
             // A crash at this point must still leave the remote ID recoverable.
             assert_eq!(
                 self.store.load()?.unwrap().submissions[0].remote_id,
                 Some(42)
             );
+            assert!(self.store.load()?.unwrap().submissions[0].event_sent);
             self.submit_count.set(self.submit_count.get() + 1);
+            ensure!(
+                !(self.lose_submit_response && self.leave_pending_on_loss),
+                "Synthetic lost event response with stale pending GET"
+            );
             let mut response = self.response.borrow().clone().unwrap();
             response["state"] = json!(expected_state(&submission.preview.event)?);
             *self.response.borrow_mut() = Some(response.clone());
@@ -950,6 +958,98 @@ mod tests {
         store.save(&mut review).unwrap();
         (cwd, store, hash)
     }
+    fn fake(store: &super::super::Store) -> FakeRemote {
+        FakeRemote {
+            create_count: Cell::new(0),
+            submit_count: Cell::new(0),
+            discard_count: Cell::new(0),
+            response: RefCell::new(None),
+            reject: false,
+            lose_create_response: false,
+            lose_submit_response: false,
+            lose_discard_response: false,
+            leave_pending_on_loss: false,
+            head_changed: Cell::new(false),
+            store: store.clone(),
+        }
+    }
+    #[test]
+    fn stale_known_pending_draft_can_be_deliberately_discarded() {
+        let (_cwd, store, hash) = saved_intent();
+        let remote = fake(&store);
+        remote.head_changed.set(true);
+        assert!(complete_with_remote(&store, &hash, true, true, &remote).is_err());
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(saved.submissions[0].remote_id, Some(42));
+        assert!(!saved.submissions[0].event_sent);
+        let saved = discard_with_remote(&store, &hash, &remote).unwrap();
+        assert_eq!(saved.submissions[0].state, "discarded");
+        assert_eq!(remote.discard_count.get(), 1);
+        assert_eq!(remote.submit_count.get(), 0);
+    }
+    #[test]
+    fn lost_deletion_response_reconciles_exact_id_without_another_delete() {
+        let (_cwd, store, hash) = saved_intent();
+        let mut remote = fake(&store);
+        complete_with_remote(&store, &hash, true, false, &remote).unwrap();
+        remote.lose_discard_response = true;
+        assert!(discard_with_remote(&store, &hash, &remote).is_err());
+        assert_eq!(
+            store.load().unwrap().unwrap().submissions[0].state,
+            "discarding"
+        );
+        let saved = complete_with_remote(&store, &hash, false, true, &remote).unwrap();
+        assert_eq!(saved.submissions[0].state, "discarded");
+        assert_eq!(remote.discard_count.get(), 1);
+        assert_eq!(remote.create_count.get(), 1);
+        assert_eq!(remote.submit_count.get(), 0);
+    }
+    #[test]
+    fn discard_rejects_unknown_identity_and_changed_remote_payload() {
+        let (_cwd, store, hash) = saved_intent();
+        let remote = fake(&store);
+        assert!(discard_with_remote(&store, &hash, &remote).is_err());
+        complete_with_remote(&store, &hash, true, false, &remote).unwrap();
+        remote.response.borrow_mut().as_mut().unwrap()["body"] = json!("Edited elsewhere");
+        assert!(discard_with_remote(&store, &hash, &remote).is_err());
+        assert_eq!(remote.discard_count.get(), 0);
+        remote.response.borrow_mut().as_mut().unwrap()["body"] =
+            store.load().unwrap().unwrap().submissions[0]
+                .preview
+                .payload["body"]
+                .clone();
+        remote.response.borrow_mut().as_mut().unwrap()["state"] = json!("COMMENTED");
+        let saved = discard_with_remote(&store, &hash, &remote).unwrap();
+        assert_eq!(saved.submissions[0].state, "submitted");
+        assert_eq!(remote.discard_count.get(), 0);
+    }
+    #[test]
+    fn stale_pending_get_after_lost_event_never_repeats_the_post() {
+        let (_cwd, store, hash) = saved_intent();
+        let mut remote = fake(&store);
+        remote.lose_submit_response = true;
+        remote.leave_pending_on_loss = true;
+        assert!(complete_with_remote(&store, &hash, true, true, &remote).is_err());
+        for _ in 0..2 {
+            let saved = complete_with_remote(&store, &hash, false, true, &remote).unwrap();
+            assert_eq!(saved.submissions[0].state, "submitting");
+        }
+        assert_eq!(remote.submit_count.get(), 1);
+        assert_eq!(remote.create_count.get(), 1);
+    }
+    #[test]
+    fn publication_operations_are_serialized_across_windows() {
+        let (_cwd, store, hash) = saved_intent();
+        let remote = fake(&store);
+        let guard = store.publication_lock().unwrap();
+        assert!(complete_with_remote(&store, &hash, true, true, &remote).is_err());
+        assert!(discard_with_remote(&store, &hash, &remote).is_err());
+        assert_eq!(remote.create_count.get(), 0);
+        drop(guard);
+        complete_with_remote(&store, &hash, true, true, &remote).unwrap();
+        assert_eq!(remote.create_count.get(), 1);
+        assert_eq!(remote.submit_count.get(), 1);
+    }
     #[test]
     fn lost_creation_response_recovers_without_duplicate_post() {
         let (_cwd, store, hash) = saved_intent();
@@ -962,6 +1062,7 @@ mod tests {
             lose_create_response: true,
             lose_submit_response: false,
             lose_discard_response: false,
+            leave_pending_on_loss: false,
             head_changed: Cell::new(false),
             store: store.clone(),
         };
@@ -989,6 +1090,7 @@ mod tests {
             lose_create_response: false,
             lose_submit_response: true,
             lose_discard_response: false,
+            leave_pending_on_loss: false,
             head_changed: Cell::new(false),
             store: store.clone(),
         };
@@ -1010,6 +1112,7 @@ mod tests {
             lose_create_response: false,
             lose_submit_response: false,
             lose_discard_response: false,
+            leave_pending_on_loss: false,
             head_changed: Cell::new(false),
             store: store.clone(),
         };

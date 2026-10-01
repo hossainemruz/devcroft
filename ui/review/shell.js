@@ -6,7 +6,7 @@
   const $=id=>document.getElementById(id);
   const pending=new Map();let sequence=0,queue=Promise.resolve(),state=null;
   let chapter=null,evidence=null,file=null,pinned=false,whole=false,textMode=false,automaticTextFallback=false,frame=null;
-  let findingAnchor=null,questionAnchor=null,draftTimer=null,sourceRequest=0,localPage=null,publicationPreview=null,publicationDirty=false;const visualFailures=new Map();
+  let findingAnchor=null,draftTimer=null,sourceRequest=0,localPage=null,publicationPreview=null,publicationDirty=false;const visualFailures=new Map();
   const stamps=new Map();
   function changed(key,value){const next=JSON.stringify(value);if(stamps.get(key)===next)return false;stamps.set(key,next);return true;}
   const make=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
@@ -21,7 +21,7 @@
   function error(e){$('status').textContent=e.message||String(e);}
   window.__dcReceive=message=>{
     if(message.state){
-      if(state&&state.capture.id!==message.state.capture.id){chapter=null;evidence=null;file=null;pinned=false;whole=false;localPage=null;frame=null;stamps.clear();publicationPreview=null;if($('composer').open||$('question-dialog').open)error('Viewed revision changed. Composer text belongs to the earlier capture; reopen that capture to save it.');}
+      if(state&&state.capture.id!==message.state.capture.id){chapter=null;evidence=null;file=null;pinned=false;whole=false;localPage=null;frame=null;stamps.clear();publicationPreview=null;if($('composer').open)error('Viewed revision changed. Composer text belongs to the earlier capture; reopen that capture to save it.');}
       if(state&&state.bundleHash!==message.state.bundleHash){
         const chapters=message.state.bundle?.manifest.chapters||[];
         chapter=chapters.some(c=>c.id===message.state.chapter)?message.state.chapter:chapters.some(c=>c.id===chapter)?chapter:chapters[0]?.id||null;
@@ -34,7 +34,6 @@
       state=message.state;render();
     }
     if(message.status!==undefined)$('status').textContent=message.status;
-    if(message.log!==undefined)$('log').textContent=message.log;
     const request=pending.get(message.seq);
     if(request){pending.delete(message.seq);message.error?request.reject(new Error(message.error)):request.resolve(message.result);}
     if(message.error)error(message.error);
@@ -77,12 +76,6 @@
     if(!$('review-body').dataset.capture||$('review-body').dataset.capture!==state.capture.id){$('review-body').value=state.drafts[draftKey({},'publication')]||'';$('review-body').dataset.capture=state.capture.id;}
     $('overview-summary').textContent=state.bundle?.manifest.summary||'Inspect all captured changes now. Guide generation is optional and never blocks source review.';
     $('summary-button').textContent=`Review findings${state.findings.length?' ('+state.findings.length+')':''}`;
-    const preferred=$('provider').value||state.provider;
-    const selected=state.providers.find(p=>p.id===preferred&&p.eligible)?.id||state.providers.find(p=>p.eligible)?.id||state.providers.find(p=>p.reason)?.id||preferred;
-    if(changed('providers',state.providers)){$('provider').replaceChildren();state.providers.forEach(p=>{const option=make('option',p.label);option.value=p.id;option.disabled=!p.eligible;$('provider').append(option);});$('provider').value=selected;}
-    $('sharing').textContent=state.sharing;
-    $('question-sharing').textContent=state.sharing;
-    $('stop').hidden=!state.busy;
     if(!chapter||!active())chapter=state.chapter||state.bundle?.manifest.chapters[0]?.id||null;
     if(!evidence)evidence=state.evidence||active()?.evidence_ids[0]||null;
     providerState();
@@ -99,9 +92,9 @@
     let current=localPage||state.page||'changes';if(current==='walkthrough'&&!c)current='changes';
     for(const p of ['overview','walkthrough','findings','changes'])$(p).hidden=p!==current;
     document.querySelectorAll('.tabs [data-page]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.page===current)));
-    if($('question-dialog').open)renderThread();
   }
   function renderChapter(){
+    $('agent-context-request').replaceChildren();
     const c=active();if(!c){const canvas=$('chapter-canvas');canvas.replaceChildren();delete canvas.dataset.chapter;delete canvas.dataset.bundle;delete canvas.dataset.page;frame=null;return;}
     $('chapter-label').textContent='Behavior · captured interpretation';$('chapter-title').textContent=c.title;$('chapter-summary').textContent=c.summary;
     const canvas=$('chapter-canvas');canvas.replaceChildren();frame=null;canvas.dataset.chapter=c.id;canvas.dataset.bundle=state.bundleHash;canvas.dataset.page=localPage||state.page;
@@ -120,7 +113,7 @@
     $('examined').textContent=state.examined.includes(c.id)?'Reopen behavior':'Mark examined';$('decision').textContent=state.examined.includes(c.id)?'Examined by you':'Waiting for your judgment';
     if(evidence)showEvidence(evidence);
   }
-  function providerState(){const chosen=state.providers.find(p=>p.id===$('provider').value);if($('author-status'))$('author-status').textContent=chosen?.reason||(!chosen?.eligible?'This provider’s confined authoring adapter is unavailable.':'');const eligible=state.providers.some(p=>p.id===$('provider').value&&p.eligible);$('generate').disabled=state.busy||state.publishing||state.capturing||!eligible;$('repair-visual').disabled=state.busy||state.publishing||state.capturing||!eligible||!active();$('send-question').disabled=state.busy||state.publishing||state.capturing||!eligible;}
+  function providerState(){$('repair-visual').disabled=state.publishing||state.capturing||!active();}
   function evidenceLabel(id){const e=state.capture.evidence.find(e=>e.id===id);return e?`${e.path} · ${e.side} ${e.start}–${e.end}`:'Unavailable reference';}
   function code(lines,selected=null,path=null){
     const out=make('div',undefined,'code');let offset=0;
@@ -180,12 +173,7 @@
     $('finding-body').value=state.drafts[draftKey(a,'finding')]||'';$('composer-status').textContent='';$('composer').showModal();$('finding-body').focus();
   }
   function saveDraft(kind,a,value){clearTimeout(draftTimer);draftTimer=setTimeout(()=>call('draft',{key:draftKey(a,kind),body:value}).catch(e=>{if(kind==='finding')$('composer-status').textContent=e.message;error(e);}),300);}
-  function openQuestion(question='',a=anchor()){
-    questionAnchor={...a,capture:state.capture.id};$('question-anchor').textContent=a.evidence?evidenceLabel(a.evidence):'Captured behavior';$('question-body').value=question||state.drafts[draftKey(a,'question')]||'';renderThread();$('question-dialog').showModal();$('question-body').focus();
-  }
-  function renderThread(){
-    $('thread').replaceChildren();state.investigations.filter(q=>q.capture===state.capture.id&&q.chapter===questionAnchor?.chapter&&q.evidence===questionAnchor?.evidence).forEach(q=>{$('thread').append(make('h3',q.question),make('p',q.answer||q.error||(state.busy?'Working on the captured source…':'No answer was saved. Ask again to continue this investigation.')));});
-  }
+  function openQuestion(question='',a=anchor()){call('ask',{...a,question}).catch(error);}
   // Authored frames can select registered evidence or open trusted UI. They
   // cannot submit a question, save a finding, or change a review decision.
   let lastFrameRequest=0;
@@ -197,37 +185,38 @@
     const now=performance.now();if(now-lastFrameRequest<120)return;lastFrameRequest=now;
     if(m.type==='evidence'&&c.evidence_ids.includes(m.id)){if(!pinned)showEvidence(m.id);}
     if(m.type==='claim'){const claim=c.claims.find(x=>x.id===m.id);if(claim&&!pinned)showEvidence(claim.evidence_ids[0]);}
-    if(m.type==='question'&&c.claims.some(x=>x.id===m.id))openQuestion(c.claims.find(x=>x.id===m.id).text);
+    if(m.type==='question'&&c.claims.some(x=>x.id===m.id)){
+      // A frame may suggest context, but cannot take native focus or replace
+      // a draft. Only a deliberate click in this trusted shell opens it.
+      const target=$('agent-context-request');if(target.childElementCount)return;
+      const claim=c.claims.find(x=>x.id===m.id),a=anchor();
+      target.append(make('span',claim.text),button('Discuss with agent',()=>{target.replaceChildren();openQuestion(claim.text,a);}),button('Dismiss',()=>target.replaceChildren()));
+    }
     if(m.type==='finding'&&c.evidence_ids.includes(m.id))openFinding({chapter:c.id,evidence:m.id});
   });
   document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>page(b.dataset.page)));
   $('summary-button').onclick=()=>page('findings');$('unassigned').onclick=()=>page('changes');
-  $('repair-visual').onclick=()=>call('repair',{provider:$('provider').value,chapter,problem:visualFailures.get(chapter)||'Improve readability and accessible interaction while keeping the existing explanation and evidence.'}).catch(error);
+  $('repair-visual').onclick=()=>call('repair',{chapter,problem:visualFailures.get(chapter)||'Improve readability and accessible interaction while keeping the existing explanation and evidence.'}).catch(error);
   $('text-mode').onclick=()=>{textMode=!textMode;automaticTextFallback=false;renderChapter();};$('follow').onclick=()=>{pinned=false;showEvidence(active()?.evidence_ids[0]);};
   $('context').onclick=()=>{whole=!whole;pinned=true;showEvidence(evidence);};
   $('concern').onclick=()=>openFinding();$('add-finding').onclick=()=>openFinding();
   $('challenge').onclick=()=>openQuestion('What assumptions could make this behavior incorrect?');$('ask-evidence').onclick=()=>openQuestion();
   $('examined').onclick=()=>call('examined',{chapter,examined:!state.examined.includes(chapter)}).catch(error);
-  $('provider').onchange=providerState;
-  $('generate').onclick=()=>call('generate',{provider:$('provider').value,priorities:$('priorities').value}).catch(error);
-  $('stop').onclick=()=>call('stop').catch(error);$('diagnostics').onclick=()=>$('log').hidden=!$('log').hidden;
   $('finding-body').oninput=()=>saveDraft('finding',findingAnchor,$('finding-body').value);
-  $('question-body').oninput=()=>saveDraft('question',questionAnchor,$('question-body').value);
   async function closeComposer(kind){
     clearTimeout(draftTimer);
-    const a=kind==='finding'?findingAnchor:questionAnchor;
+    const a=findingAnchor;
     if(a.capture!==state.capture.id){error('Reopen the composer’s captured revision before saving its draft.');return;}
-    const dialog=kind==='finding'?$('composer'):$('question-dialog');
-    const input=kind==='finding'?$('finding-body'):$('question-body');
+    const dialog=$('composer');
+    const input=$('finding-body');
     try{await call('draft',{key:draftKey(a,kind),body:input.value});dialog.close();}
     catch(e){if(kind==='finding')$('composer-status').textContent=e.message+' Use Reload saved state, then retry.';error(e);}
   }
-  for(const [id,kind] of [['composer','finding'],['question-dialog','question']]){
+  for(const [id,kind] of [['composer','finding']]){
     $(id).addEventListener('cancel',event=>{event.preventDefault();closeComposer(kind);});
     $(id).querySelectorAll('button[value="cancel"]').forEach(b=>b.onclick=event=>{event.preventDefault();closeComposer(kind);});
   }
   $('save-finding').onclick=async()=>{const body=$('finding-body').value.trim();if(!body){$('composer-status').textContent='Describe your concern before saving.';return;}clearTimeout(draftTimer);try{if(findingAnchor.capture!==state.capture.id)throw new Error('Reopen the finding’s captured revision before saving.');const range=$('attach-lines').checked?{start:Number($('range-start').value),end:Number($('range-end').value)}:null;await call('finding',{...findingAnchor,range,body,key:draftKey(findingAnchor,'finding')});$('finding-body').value='';$('composer').close();}catch(e){$('composer-status').textContent=e.message;}};
-  $('send-question').onclick=async()=>{const question=$('question-body').value.trim();if(!question)return;clearTimeout(draftTimer);try{if(questionAnchor.capture!==state.capture.id)throw new Error('Reopen the question’s captured revision before sending.');await call('ask',{...questionAnchor,question,provider:$('provider').value});$('question-body').value='';renderThread();}catch(e){error(e);}};
   function renderPr(){
     const p=state.capture.pr,target=$('pr-context');target.replaceChildren();target.hidden=!p;if(!p)return;
     target.append(make('h3',`${p.repository} #${p.number} · ${p.title}`),make('p',p.description||'No PR description supplied.'),make('p',`Author ${p.author} · ${p.head_branch} → ${p.base_branch} · target tip ${p.target_tip.slice(0,12)} · captured ${new Date(p.captured_at*1000).toLocaleString()}`,'muted'),make('h3','CI observations'));

@@ -6,7 +6,7 @@
 //! owns loading, scope selection, the tree/stream layout, viewed-file state,
 //! and refresh.
 
-mod assistant;
+mod authoring;
 pub(crate) mod session;
 pub(crate) mod web;
 pub(crate) use session::Capture as ReviewCapture;

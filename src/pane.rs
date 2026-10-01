@@ -146,8 +146,20 @@ impl TerminalPane {
         target: Option<&crate::agent_sessions::SessionSummary>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_prompt(tab, cwd, agent, activity_store, target, None, cx)
+    }
+
+    pub(crate) fn with_prompt(
+        tab: WorkspaceTab,
+        cwd: &Path,
+        agent: AgentKind,
+        activity_store: &AgentActivityStore,
+        target: Option<&crate::agent_sessions::SessionSummary>,
+        prompt: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let agent_activity = (tab == WorkspaceTab::Agent)
-            .then(|| activity_store.start_with_session(cwd, agent, target));
+            .then(|| activity_store.start_with_prompt(cwd, agent, target, prompt));
         let mut pane = Self {
             focus_handle: cx.focus_handle(),
             tab,

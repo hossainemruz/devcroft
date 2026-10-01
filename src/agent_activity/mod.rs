@@ -193,11 +193,22 @@ impl AgentActivityStore {
         self.start_with_session(checkout, agent, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_with_session(
         &self,
         checkout: &Path,
         agent: AgentKind,
         session: Option<&crate::agent_sessions::SessionSummary>,
+    ) -> PreparedAgentLaunch {
+        self.start_with_prompt(checkout, agent, session, None)
+    }
+
+    pub(crate) fn start_with_prompt(
+        &self,
+        checkout: &Path,
+        agent: AgentKind,
+        session: Option<&crate::agent_sessions::SessionSummary>,
+        prompt: Option<&str>,
     ) -> PreparedAgentLaunch {
         let checkout = checkout
             .canonicalize()
@@ -246,6 +257,9 @@ impl AgentActivityStore {
         if let Some(session) = session {
             provider.arguments.splice(0..0, session.arguments());
             provider.environment.extend(session.environment());
+        }
+        if let Some(prompt) = prompt {
+            provider.arguments.extend(agent.prompt_arguments(prompt));
         }
         let exit_marker = format!("devcroft-agent-exit-{generation}-");
         let command_line = shell_command(agent, generation, &provider);
@@ -809,6 +823,48 @@ pub(crate) fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interactive_guide_prompts_preserve_provider_flags_and_shell_argument_boundaries() {
+        use super::*;
+        for agent in AgentKind::ALL {
+            let prompt = "Read the guide's instructions at /a path/guide.md; $(printf injected)\nContinue chatting.";
+            let mut provider = providers::ProviderLaunch {
+                arguments: vec!["--existing-setting".into(), "normal profile".into()],
+                ..Default::default()
+            };
+            provider.arguments.extend(agent.prompt_arguments(prompt));
+            let command = format!(
+                "{}() {{ printf '%s\\0' \"$@\"; }}; {}",
+                agent.command(),
+                shell_command(agent, 7, &provider)
+            );
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let mut expected = Vec::new();
+            for argument in &provider.arguments {
+                expected.extend_from_slice(argument.as_bytes());
+                expected.push(0);
+            }
+            assert!(
+                output.stdout.starts_with(&expected),
+                "{} lost interactive prompt arguments",
+                agent.id()
+            );
+            assert!(!provider.arguments.iter().any(|a| {
+                [
+                    "--print",
+                    "exec",
+                    "--ignore-user-config",
+                    "--ephemeral",
+                    "--auto",
+                ]
+                .contains(&a.as_str())
+            }));
+        }
+    }
     use super::*;
 
     fn store() -> (AgentActivityStore, PathBuf) {

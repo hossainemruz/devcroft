@@ -25,7 +25,7 @@ pub(crate) struct Chapter {
     pub claims: Vec<Claim>,
     pub questions: Vec<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
     pub runtime: u32,
@@ -34,12 +34,66 @@ pub(crate) struct Manifest {
     pub summary: String,
     pub chapters: Vec<Chapter>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Bundle {
     pub manifest: Manifest,
     pub documents: BTreeMap<String, String>,
 }
 impl Bundle {
+    /// Read a complete author commit into memory once. Matching every byte
+    /// against the final marker prevents partial edits or racing writes from
+    /// replacing the last usable guide.
+    pub fn load_committed(directory: &Path, capture: &Capture) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Commit {
+            capture: String,
+            files: BTreeMap<String, String>,
+        }
+        let marker = read_file(directory, "ready.json", 16 * 1024)?;
+        let commit: Commit =
+            serde_json::from_str(&marker).context("Invalid guide commit marker")?;
+        ensure!(
+            commit.capture == capture.id,
+            "Guide update targets an earlier capture"
+        );
+        let manifest = read_file(directory, "manifest.json", 128 * 1024)?;
+        ensure!(
+            commit.files.get("manifest.json") == Some(&super::digest(&manifest)),
+            "Manifest is still being edited; waiting for a complete commit"
+        );
+        let manifest: Manifest =
+            serde_json::from_str(&manifest).context("Invalid guide manifest")?;
+        ensure!(
+            manifest.chapters.len() <= 16 && commit.files.len() == manifest.chapters.len() + 1,
+            "Guide commit must name exactly the manifest and chapter files"
+        );
+        let mut documents = BTreeMap::new();
+        for chapter in &manifest.chapters {
+            ensure!(
+                !documents.contains_key(&chapter.document)
+                    && chapter.document != "manifest.json"
+                    && chapter.document != "ready.json",
+                "Duplicate or reserved chapter document"
+            );
+            let html = read_file(directory, &chapter.document, 512 * 1024)?;
+            ensure!(
+                commit.files.get(&chapter.document) == Some(&super::digest(&html)),
+                "Chapter is still being edited; waiting for a complete commit"
+            );
+            documents.insert(chapter.document.clone(), html);
+        }
+        ensure!(
+            read_file(directory, "ready.json", 16 * 1024)? == marker,
+            "Guide commit changed during validation; retry"
+        );
+        let bundle = Self {
+            manifest,
+            documents,
+        };
+        bundle.validate(capture)?;
+        Ok(bundle)
+    }
     pub fn chapter(&self, id: &str) -> Option<(&Chapter, &str)> {
         let c = self.manifest.chapters.iter().find(|c| c.id == id)?;
         Some((c, self.documents.get(&c.document)?.as_str()))
@@ -90,6 +144,17 @@ impl Bundle {
         let mut ids = HashSet::new();
         let mut total = 0;
         for c in &m.chapters {
+            let document = Path::new(&c.document);
+            ensure!(
+                !document.is_absolute()
+                    && document
+                        .components()
+                        .all(|part| matches!(part, Component::Normal(_)))
+                    && !c.document.is_empty()
+                    && c.document != "manifest.json"
+                    && c.document != "ready.json",
+                "Invalid chapter document path"
+            );
             ensure!(
                 valid_id(&c.id) && ids.insert(c.id.clone()),
                 "Invalid or duplicate chapter ID"
@@ -157,6 +222,11 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 fn read_file(root: &Path, name: &str, limit: u64) -> Result<String> {
+    let root_meta = fs::symlink_metadata(root)?;
+    ensure!(
+        root_meta.is_dir() && !root_meta.file_type().is_symlink(),
+        "Guide directory must be a real directory"
+    );
     let path = Path::new(name);
     ensure!(
         !path.is_absolute() && path.components().all(|c| matches!(c, Component::Normal(_))),

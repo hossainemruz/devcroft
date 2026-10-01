@@ -20,6 +20,14 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
+    /// Interactive startup only: keep the ordinary configuration, tools and
+    /// permission prompts, and leave the conversation open for follow-ups.
+    pub(crate) fn prompt_arguments(self, prompt: &str) -> Vec<String> {
+        match self {
+            Self::Opencode => vec!["--prompt".into(), prompt.into()],
+            Self::Claude | Self::Codex | Self::Omp => vec![prompt.into()],
+        }
+    }
     /// The fallback harness: fresh installs and unset or unknown stored
     /// preferences resolve here. It is also the first entry in the
     /// new-session picker.

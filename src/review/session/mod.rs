@@ -1,7 +1,9 @@
 //! Immutable evidence and durable, revision-checked reviewer state.
 mod bundle;
 pub(crate) mod pr;
-pub(crate) use bundle::{Bundle, Chapter, Claim, Manifest};
+pub(crate) use bundle::Bundle;
+#[cfg(test)]
+use bundle::{Chapter, Claim, Manifest};
 
 use super::{
     comments::Side,
@@ -517,10 +519,10 @@ impl Review {
 pub(crate) struct Store {
     directory: PathBuf,
 }
-pub(crate) struct PublicationLock {
+pub(crate) struct ReviewLock {
     file: fs::File,
 }
-impl Drop for PublicationLock {
+impl Drop for ReviewLock {
     fn drop(&mut self) {
         // Closing only this descriptor can leave the lock alive in a child
         // forked concurrently by another thread. End the operation explicitly.
@@ -537,27 +539,34 @@ impl Store {
     pub fn at(directory: PathBuf) -> Self {
         Self { directory }
     }
-    pub fn publication_lock(&self) -> Result<PublicationLock> {
+    pub fn authoring_directory(&self, capture: &Capture) -> PathBuf {
+        self.directory.join("authoring").join(&capture.id)
+    }
+    pub fn authoring_lock(&self, capture: &Capture) -> Result<ReviewLock> {
+        self.operation_lock(&format!("authoring-{}.lock", capture.id), "Another review window has an agent editing this guide. Close that agent before starting another")
+    }
+    pub fn publication_lock(&self) -> Result<ReviewLock> {
+        self.operation_lock("publication.lock", "Another window is checking or changing GitHub review status. Wait for it to finish, then reload")
+    }
+    fn operation_lock(&self, name: &str, busy: &str) -> Result<ReviewLock> {
         fs::create_dir_all(&self.directory)?;
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.directory.join("publication.lock"))?;
+            .open(self.directory.join(name))?;
         loop {
             match lock.try_lock() {
-                Ok(()) => return Ok(PublicationLock { file: lock }),
+                Ok(()) => return Ok(ReviewLock { file: lock }),
                 Err(fs::TryLockError::Error(error))
                     if error.kind() == std::io::ErrorKind::Interrupted =>
                 {
                     continue;
                 }
-                Err(fs::TryLockError::WouldBlock) => anyhow::bail!(
-                    "Another window is checking or changing GitHub review status. Wait for it to finish, then reload"
-                ),
+                Err(fs::TryLockError::WouldBlock) => anyhow::bail!("{busy}"),
                 Err(fs::TryLockError::Error(error)) => {
-                    return Err(error).context("Locking review publication");
+                    return Err(error).context("Locking review operation");
                 }
             }
         }
@@ -681,6 +690,24 @@ mod tests {
         drop(guard);
         let next = store.publication_lock().unwrap();
         drop(next);
+        drop(inherited);
+    }
+    #[test]
+    fn authoring_is_single_writer_per_capture_and_releases_for_replacement_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().join("review"));
+        let first = capture("first\n");
+        let guard = store.authoring_lock(&first).unwrap();
+        assert!(store.authoring_lock(&first).is_err());
+        assert!(
+            store
+                .authoring_lock(&capture("different capture\n"))
+                .is_ok()
+        );
+        assert!(store.publication_lock().is_ok());
+        let inherited = guard.file.try_clone().unwrap();
+        drop(guard);
+        assert!(store.authoring_lock(&first).is_ok());
         drop(inherited);
     }
     #[test]

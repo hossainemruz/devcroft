@@ -166,6 +166,113 @@ fn git_command(directory: &Path) -> Command {
         .arg(directory);
     command
 }
+
+/// Give the normal interactive agent a real checkout, never the bare object
+/// database. Prefer the repository's linked checkout without changing it.
+pub(crate) fn authoring_checkout(capture: &Capture) -> Result<PathBuf> {
+    let metadata = capture
+        .pr
+        .as_ref()
+        .context("Missing PR authoring identity")?;
+    let root = crate::data::resolve_data_root()?;
+    let (repositories, _) = crate::data::all_repositories(&root)?;
+    for repository in repositories {
+        let identity = match (&repository.owner, &repository.name) {
+            (Some(owner), Some(name)) => format!("{owner}/{name}"),
+            _ => continue,
+        };
+        if identity.eq_ignore_ascii_case(&metadata.repository)
+            && let Some(checkout) = crate::data::checkout_for(&root, &repository.key)
+            && linked_checkout_matches(&checkout, &metadata.repository)
+        {
+            return checkout
+                .canonicalize()
+                .context("Opening linked PR agent checkout");
+        }
+    }
+    let identity = Identity::parse(&metadata.url)?;
+    let objects = identity.directory()?;
+    // Different captured heads have separate working directories. Reopening
+    // never resets an existing checkout or discards agent/user edits.
+    let checkout = root
+        .root()
+        .join("review-checkouts")
+        .join(digest(&metadata.url))
+        .join(sha(&capture.head)?);
+    ensure_authoring_checkout(&objects, &checkout, &capture.head)?;
+    Ok(checkout)
+}
+fn linked_checkout_matches(checkout: &Path, repository: &str) -> bool {
+    let result = (|| -> Result<bool> {
+        let top = crate::pull_requests::run(
+            git_command(checkout).args(["rev-parse", "--show-toplevel"]),
+            Duration::from_secs(5),
+        )?;
+        let top = PathBuf::from(String::from_utf8(top)?.trim());
+        ensure!(
+            top.canonicalize()? == checkout.canonicalize()?,
+            "Linked path is not a repository root"
+        );
+        let remotes = crate::pull_requests::run(
+            git_command(checkout).args(["config", "--get-regexp", "^remote\\..*\\.url$"]),
+            Duration::from_secs(5),
+        )?;
+        Ok(String::from_utf8(remotes)?.lines().any(|line| {
+            let Some((_, url)) = line.split_once(' ') else {
+                return false;
+            };
+            let path = [
+                "https://github.com/",
+                "http://github.com/",
+                "git@github.com:",
+                "ssh://git@github.com/",
+                "ssh://github.com/",
+            ]
+            .iter()
+            .find_map(|prefix| url.strip_prefix(prefix));
+            path.is_some_and(|path| {
+                path.trim_end_matches('/')
+                    .trim_end_matches(".git")
+                    .eq_ignore_ascii_case(repository)
+            })
+        }))
+    })();
+    result.unwrap_or(false)
+}
+pub(crate) fn checkout_head(checkout: &Path) -> Option<String> {
+    let bytes = crate::pull_requests::run(
+        git_command(checkout).args(["rev-parse", "HEAD"]),
+        Duration::from_secs(5),
+    )
+    .ok()?;
+    let head = String::from_utf8(bytes).ok()?.trim().to_owned();
+    sha(&head).ok()?;
+    Some(head)
+}
+fn ensure_authoring_checkout(objects: &Path, checkout: &Path, head: &str) -> Result<()> {
+    if checkout.exists() {
+        let common = crate::pull_requests::run(
+            git_command(checkout).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+            Duration::from_secs(5),
+        ).with_context(|| format!("Managed PR checkout is incomplete or unavailable at {}. Link an existing checkout in repository settings, then try generation again", checkout.display()))?;
+        ensure!(
+            PathBuf::from(String::from_utf8(common)?.trim()).canonicalize()?
+                == objects.canonicalize()?,
+            "Managed PR checkout belongs to another repository"
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(
+        checkout
+            .parent()
+            .context("Missing review checkout parent")?,
+    )?;
+    crate::pull_requests::run(
+        git_command(objects).args(["worktree", "add", "--detach", "--"]).arg(checkout).arg(sha(head)?),
+        Duration::from_secs(30),
+    ).context("Could not create the captured PR's agent checkout. Link a checkout in repository settings or refresh unavailable Git objects")?;
+    Ok(())
+}
 fn fetch_objects(identity: &Identity, target: &str, head: &str) -> Result<PathBuf> {
     let directory = identity.directory()?;
     std::fs::create_dir_all(&directory)?;
@@ -867,6 +974,87 @@ fn complete_with_remote(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn linked_agent_checkout_must_be_a_git_root_with_matching_github_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!linked_checkout_matches(tmp.path(), "owner/repo"));
+        let run = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/unrelated/repo.git",
+        ]);
+        assert!(!linked_checkout_matches(tmp.path(), "owner/repo"));
+        run(&["remote", "add", "upstream", "git@github.com:owner/repo.git"]);
+        assert!(linked_checkout_matches(tmp.path(), "owner/repo"));
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert!(!linked_checkout_matches(&nested, "owner/repo"));
+    }
+    #[test]
+    fn managed_agent_checkout_uses_exact_head_without_resetting_follow_up_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let run = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .arg("-C")
+                .arg(&source)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        run(&["init", "-q"]);
+        std::fs::write(source.join("retry.rs"), "captured source").unwrap();
+        run(&["add", "retry.rs"]);
+        run(&[
+            "-c",
+            "user.name=QA",
+            "-c",
+            "user.email=qa@example.test",
+            "commit",
+            "-qm",
+            "synthetic capture",
+        ]);
+        let head = checkout_head(&source).unwrap();
+        let objects = tmp.path().join("objects.git");
+        let output = Command::new("git")
+            .args(["clone", "--bare", "--quiet"])
+            .arg(&source)
+            .arg(&objects)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let checkout = tmp.path().join("managed");
+        ensure_authoring_checkout(&objects, &checkout, &head).unwrap();
+        assert_eq!(checkout_head(&checkout).as_deref(), Some(head.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("retry.rs")).unwrap(),
+            "captured source"
+        );
+        std::fs::write(checkout.join("retry.rs"), "ongoing agent edit").unwrap();
+        ensure_authoring_checkout(&objects, &checkout, &head).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("retry.rs")).unwrap(),
+            "ongoing agent edit"
+        );
+        assert!(ensure_authoring_checkout(&source.join(".git"), &checkout, &head).is_err());
+    }
     use super::*;
     use std::cell::{Cell, RefCell};
     struct FakeRemote {

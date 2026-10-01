@@ -267,6 +267,8 @@ pub(crate) struct Submission {
     pub state: String,
     pub error: Option<String>,
 }
+// Consumed by the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn preview(review: &Review, event: &str, body: &str) -> Result<Preview> {
     ensure!(
         ["COMMENT", "REQUEST_CHANGES", "APPROVE"].contains(&event),
@@ -365,9 +367,13 @@ pub fn preview(review: &Review, event: &str, body: &str) -> Result<Preview> {
         payload,
     })
 }
+// Consumed by the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn identity_for(capture: &Capture) -> Result<Identity> {
     Identity::parse(&capture.pr.as_ref().context("Not a GitHub PR")?.url)
 }
+// Consumed by the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn verify_head(capture: &Capture) -> Result<()> {
     let identity = identity_for(capture)?;
     let latest = gh(&identity.endpoint(), "GET", None, false)?;
@@ -381,6 +387,8 @@ pub fn verify_head(capture: &Capture) -> Result<()> {
     );
     Ok(())
 }
+// Consumed by the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Reconcile ambiguous requests by their exact commit/body and remote ID. A
 /// timeout during creation is never retried with another POST, avoiding duplicates.
 pub fn reconcile(capture: &Capture, submission: &Submission) -> Result<Option<Value>> {
@@ -435,6 +443,8 @@ pub fn reconcile(capture: &Capture, submission: &Submission) -> Result<Option<Va
     );
     Ok(Some(remote))
 }
+// Consumed by the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn create_pending(capture: &Capture, preview: &Preview) -> Result<Value> {
     verify_head(capture).map_err(|e| CreationNotSent(format!("{e:#}")))?;
     gh(
@@ -454,6 +464,8 @@ impl std::fmt::Display for CreationNotSent {
 }
 impl std::error::Error for CreationNotSent {}
 
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 trait Remote {
     fn create(&self, capture: &Capture, preview: &Preview) -> Result<Value>;
     fn reconcile(&self, capture: &Capture, submission: &Submission) -> Result<Option<Value>>;
@@ -461,6 +473,8 @@ trait Remote {
     fn discard(&self, capture: &Capture, submission: &Submission) -> Result<()>;
     fn known_missing(&self, capture: &Capture, submission: &Submission) -> Result<bool>;
 }
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct GitHub;
 impl Remote for GitHub {
     fn create(&self, capture: &Capture, preview: &Preview) -> Result<Value> {
@@ -519,6 +533,8 @@ impl Remote for GitHub {
         }
     }
 }
+// Consumed by the macOS-only visual workspace (via `GitHub impl Remote`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn submit_pending(capture: &Capture, submission: &Submission) -> Result<Value> {
     verify_head(capture).map_err(|e| EventNotSent(format!("{e:#}")))?;
     let id = submission
@@ -569,6 +585,8 @@ fn comments_match(preview: &Preview, comments: &[Value]) -> Result<bool> {
     b.sort();
     Ok(a == b)
 }
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn expected_state(event: &str) -> Result<&str> {
     match event {
         "APPROVE" => Ok("APPROVED"),
@@ -577,6 +595,8 @@ fn expected_state(event: &str) -> Result<&str> {
         _ => anyhow::bail!("Invalid saved review event"),
     }
 }
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn record_remote(submission: &mut Submission, remote: &Value) -> Result<()> {
     ensure!(
         !matches!(
@@ -624,6 +644,8 @@ fn record_remote(submission: &mut Submission, remote: &Value) -> Result<()> {
     submission.error = None;
     Ok(())
 }
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn update_submission(
     store: &super::Store,
     hash: &str,
@@ -656,6 +678,8 @@ fn update_submission(
 }
 /// The caller persists the intent before entering this operation. Only a new
 /// explicit publish creates a draft. Recovery always starts with a GET.
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn complete_publication(
     store: &super::Store,
     hash: &str,
@@ -667,9 +691,13 @@ pub fn complete_publication(
 
 /// Only an explicit reviewer action can discard a known pending draft. An
 /// unknown creation result cannot be abandoned locally to permit another POST.
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn discard_publication(store: &super::Store, hash: &str) -> Result<Review> {
     discard_with_remote(store, hash, &GitHub)
 }
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn discard_with_remote(store: &super::Store, hash: &str, remote: &impl Remote) -> Result<Review> {
     let _operation = store.publication_lock()?;
     let review = store.load()?.context("Saved review missing")?;
@@ -743,6 +771,8 @@ fn discard_with_remote(store: &super::Store, hash: &str, remote: &impl Remote) -
     }
     result
 }
+// Drives GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn complete_with_remote(
     store: &super::Store,
     hash: &str,

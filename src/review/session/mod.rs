@@ -1,7 +1,10 @@
 //! Immutable evidence and durable, revision-checked reviewer state.
 mod bundle;
 pub(crate) mod pr;
-pub(crate) use bundle::{Bundle, Chapter, Claim, Manifest};
+pub(crate) use bundle::Bundle;
+// Re-exported for the macOS-only visual workspace (`web::author`).
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+pub(crate) use bundle::{Chapter, Claim, Manifest};
 
 use super::{
     comments::Side,
@@ -226,12 +229,16 @@ impl Capture {
         self.pr = Some(metadata);
         Ok(self)
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn evidence(&self, id: &str) -> Result<&Evidence> {
         self.evidence
             .iter()
             .find(|e| e.id == id)
             .context("Unknown captured evidence")
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn source(&self, e: &Evidence) -> Result<&str> {
         let f = self
             .files
@@ -289,6 +296,8 @@ impl Capture {
         );
         Ok(())
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn prompt(&self) -> String {
         let mut out = format!(
             "Capture: {}\nScope: {}\nBase: {}\nHEAD: {}\n",
@@ -408,9 +417,13 @@ impl Review {
     pub fn active(&self) -> &Revision {
         &self.revisions[self.current]
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn active_mut(&mut self) -> &mut Revision {
         &mut self.revisions[self.current]
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn start(capture: Capture) -> Self {
         Self {
             schema: 1,
@@ -432,6 +445,8 @@ impl Review {
             submissions: vec![],
         }
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn add_capture(&mut self, capture: Capture) {
         if let Some(i) = self
             .revisions
@@ -458,6 +473,8 @@ impl Review {
         });
         self.current = self.revisions.len() - 1;
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn install(&mut self, bundle: Bundle) -> Result<()> {
         bundle.validate(&self.active().capture)?;
         let revision = self.active_mut();
@@ -491,6 +508,8 @@ impl Review {
         }
         Ok(())
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn select_guide(&mut self, hash: &str) -> Result<()> {
         let revision = self.active_mut();
         let index = revision
@@ -517,6 +536,8 @@ impl Review {
 pub(crate) struct Store {
     directory: PathBuf,
 }
+// Guards GitHub publication from the macOS-only visual workspace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct PublicationLock {
     file: fs::File,
 }
@@ -537,6 +558,8 @@ impl Store {
     pub fn at(directory: PathBuf) -> Self {
         Self { directory }
     }
+    // Guards GitHub publication from the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn publication_lock(&self) -> Result<PublicationLock> {
         fs::create_dir_all(&self.directory)?;
         let lock = fs::OpenOptions::new()
@@ -615,6 +638,8 @@ impl Store {
         }
         Ok(Some(review))
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn save(&self, review: &mut Review) -> Result<()> {
         fs::create_dir_all(&self.directory)?;
         let lock = fs::OpenOptions::new()

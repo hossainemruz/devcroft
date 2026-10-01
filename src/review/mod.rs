@@ -10,6 +10,10 @@ mod assistant;
 pub(crate) mod session;
 pub(crate) mod web;
 pub(crate) use session::Capture as ReviewCapture;
+// Only the macOS entry point (`run_visual_review`) opens the bundled visual
+// workspace; gating the re-export keeps Linux/Windows builds warning-free
+// instead of silencing an unused import.
+#[cfg(target_os = "macos")]
 pub(crate) use web::open_with_bundle as open_visual_workspace;
 pub(crate) mod comments;
 mod feedback;

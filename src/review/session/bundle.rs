@@ -40,10 +40,14 @@ pub(crate) struct Bundle {
     pub documents: BTreeMap<String, String>,
 }
 impl Bundle {
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn chapter(&self, id: &str) -> Option<(&Chapter, &str)> {
         let c = self.manifest.chapters.iter().find(|c| c.id == id)?;
         Some((c, self.documents.get(&c.document)?.as_str()))
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn load(directory: &Path, capture: &Capture) -> Result<Self> {
         let manifest = read_file(directory, "manifest.json", 128 * 1024)?;
         let manifest: Manifest =
@@ -66,6 +70,8 @@ impl Bundle {
         result.validate(capture)?;
         Ok(result)
     }
+    // Consumed by the macOS-only visual workspace.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn validate(&self, capture: &Capture) -> Result<()> {
         let m = &self.manifest;
         ensure!(
@@ -149,6 +155,8 @@ impl Bundle {
         Ok(())
     }
 }
+// Consumed by the macOS-only visual workspace (via `Bundle::validate`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 80
@@ -156,6 +164,8 @@ fn valid_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+// Consumed by the macOS-only visual workspace (via `Bundle::load`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn read_file(root: &Path, name: &str, limit: u64) -> Result<String> {
     let path = Path::new(name);
     ensure!(

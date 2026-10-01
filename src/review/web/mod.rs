@@ -23,6 +23,9 @@ pub(crate) fn open(
         "The visual review webview is currently enabled on macOS. Source review remains available; Windows/Linux native hosting must pass integration checks before it is enabled."
     )
 }
+// Linux/Windows stub until native hosting passes integration checks. Only
+// reachable via the macOS-gated re-export, so it is dead on other platforms.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn open_with_bundle(
     cwd: std::path::PathBuf,

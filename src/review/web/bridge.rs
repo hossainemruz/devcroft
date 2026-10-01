@@ -1,3 +1,6 @@
+// Only consumed by the macOS-only workspace (`native.rs`); keep compiling on
+// other platforms for test coverage without dead-code noise.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;

@@ -1,4 +1,8 @@
 //! User-visible author provider preferences.
+//!
+//! Only consumed by the macOS-only workspace (`web::native`/`web::author`);
+//! keep compiling elsewhere for configuration reuse without dead-code noise.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum GenerationProvider {

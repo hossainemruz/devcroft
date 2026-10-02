@@ -15,8 +15,9 @@ use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
-    Styled as _, Window, WindowBounds, WindowOptions, div, px, size,
+    App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
+    WindowOptions, div, px, size,
 };
 use raw_window_handle::HasWindowHandle as _;
 use serde_json::{Value, json};
@@ -87,9 +88,17 @@ fn open_capture(
         )?)?;
         store.save(&mut review)?;
     }
+    let bounds = cx
+        .active_window()
+        .and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| window.window_bounds())
+                .ok()
+        })
+        .unwrap_or_else(|| WindowBounds::centered(size(px(1520.), px(940.)), cx));
     gpui_kit::open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(1520.), px(940.)), cx)),
+            window_bounds: Some(bounds),
             titlebar: Some(gpui_kit::TitlebarOptions {
                 title: Some("Devcroft · Guided review".into()),
                 ..Default::default()
@@ -119,6 +128,8 @@ struct Workspace {
     authoring: Option<authoring::Workspace>,
     focus: Entity<TextareaState>,
     show_agent: bool,
+    show_details: bool,
+    show_recovery: bool,
     preparing: bool,
     applying: bool,
     auto_apply: bool,
@@ -164,8 +175,9 @@ impl Workspace {
         let focus = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(3)
-                .placeholder("Review focus, a question, or a change to the guide…")
+                .placeholder("What should this guide help you understand? Leave blank for a complete walkthrough.")
         });
+        let show_agent = review.active().bundle.is_none();
         let mut this = Self {
             cwd,
             scope,
@@ -182,12 +194,14 @@ impl Workspace {
             activity,
             authoring: None,
             focus,
-            show_agent: true,
+            show_agent,
+            show_details: false,
+            show_recovery: false,
             preparing: false,
             applying: false,
             auto_apply: false,
             author_epoch: 0,
-            author_status: "Choose your agent and generate a guide. Continue the conversation in the native Agent pane.".into(),
+            author_status: "Ready when you are. Your guide will appear here after the agent completes its first revision.".into(),
             context_capture: None,
             ready: false,
             preview: None,
@@ -792,7 +806,27 @@ impl Workspace {
         self.author_status = "Agent session closed. Guide files and saved revisions remain; start another agent to continue.".into();
         cx.notify();
     }
-    fn author_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn show_reader(&mut self, cx: &mut Context<Self>) {
+        self.show_agent = false;
+        self.source_recovery = false;
+        // The explicit Read guide action should open the explanation, even
+        // when generation began from a source-only capture.
+        if self.review.active().bundle.is_some()
+            && matches!(
+                self.review.active().location.page.as_str(),
+                "changes" | "findings"
+            )
+        {
+            let mut next = self.review.clone();
+            next.active_mut().location.page = "overview".into();
+            if let Err(error) = self.commit(next) {
+                self.error = Some(format!("Could not open guide: {error:#}"));
+            }
+        }
+        self.send(json!({"state":self.snapshot()}), cx);
+        cx.notify();
+    }
+    fn author_panel(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let mut providers = h_flex().gap_1();
         for kind in &self.enabled_agents {
             let kind = *kind;
@@ -840,8 +874,8 @@ impl Workspace {
             .as_ref()
             .and_then(|p| p.read(cx).launch_id())
             .and_then(|id| self.activity.snapshot().for_launch(id).cloned());
-        let start = h_flex().gap_2()
-            .child(Button::new("review-generate-native").label(if self.preparing {"Preparing…"} else if self.agent.is_some() {"Agent session open"} else if self.review.active().bundle.is_some() {"Continue with agent"} else {"Generate guide"})
+        let start = h_flex().flex_wrap().gap_2()
+            .child(Button::new("review-generate-native").primary().label(if self.preparing {"Preparing…"} else if self.agent.is_some() {"Agent session open"} else if self.review.active().bundle.is_some() {"Continue with agent"} else {"Generate guide"})
                 .disabled(self.preparing || self.refreshing || self.agent.is_some())
                 .on_click(cx.listener(|this, _, window, cx| this.start_agent(window, cx))))
             .child(Button::new("review-copy-context").ghost().label("Copy context").on_click(cx.listener(|this, _, _, cx| {
@@ -855,6 +889,7 @@ impl Workspace {
                 this.author_status = "Context copied. Paste it into your agent conversation to discuss or update the guide.".into(); cx.notify();
             })));
         let tools = h_flex()
+            .flex_wrap()
             .gap_1()
             .child(
                 Button::new("review-apply-guide")
@@ -903,56 +938,109 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, _, cx| this.close_agent(cx))),
                 )
             });
+        let capture = &self.review.active().capture;
+        let additions: u64 = capture
+            .files
+            .iter()
+            .map(|file| u64::from(file.additions))
+            .sum();
+        let deletions: u64 = capture
+            .files
+            .iter()
+            .map(|file| u64::from(file.deletions))
+            .sum();
+        let mut presets = h_flex().flex_wrap().gap_2();
+        for (id, label, prompt) in [
+            (
+                "architecture",
+                "Architecture",
+                "Explain the architecture and how data flows through this change.",
+            ),
+            (
+                "risks",
+                "Risks & edge cases",
+                "Focus on correctness risks, edge cases, and failure handling.",
+            ),
+            (
+                "tests",
+                "Test coverage",
+                "Explain the test coverage, missing cases, and how to verify this change.",
+            ),
+        ] {
+            presets = presets.child(Button::new(id).ghost().label(label).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    let current = this.focus.read(cx).value().to_string();
+                    let value = if current.trim().is_empty() {
+                        prompt.to_owned()
+                    } else {
+                        format!("{current}\n{prompt}")
+                    };
+                    this.focus
+                        .update(cx, |input, cx| input.set_value(value, window, cx));
+                    cx.notify();
+                },
+            )));
+        }
         let header = div()
-            .p_3()
+            .id("guide-setup")
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_6()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child("Guide agent"),
-            )
+            .gap_4()
+            .w_full()
+            .max_w(px(720.))
+            .when(self.agent.is_some() && !compact, |d| d.w(px(440.)).flex_shrink_0())
+            .when(self.agent.is_some() && compact, |d| d.max_w_full().h(px(240.)).flex_shrink_0())
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("GUIDED REVIEW"))
+            .child(div().text_2xl().font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .child(if self.agent.is_some() { "Build your understanding" } else if self.review.active().bundle.is_some() { "Refine your guide" } else { "Turn changes into a walkthrough" }))
+            .child(div().text_color(cx.theme().muted_foreground)
+                .child("Explore the reasoning behind a change, follow its source, and capture the questions that matter."))
+            .child(div().p_4().rounded_lg().bg(cx.theme().muted)
+                .child(div().font_weight(gpui_kit::FontWeight::SEMIBOLD).child(capture.label.clone()))
+                .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child(format!("{} files  ·  +{additions}  −{deletions}  ·  captured {}", capture.files.len(), &capture.head[..12.min(capture.head.len())]))))
+            .child(div().text_sm().font_weight(gpui_kit::FontWeight::SEMIBOLD).child("1  Choose your agent"))
             .child(providers)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(scope),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Your regular agent’s configuration, tools, integrations and permissions.",
-                    ),
-            )
-            .when_some(session, |d, s| d.child(div().text_sm().child(s)))
-            .child(Textarea::new(&self.focus).h(px(84.)))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Uses your existing agent settings, tools, and permissions."))
+            .child(div().text_sm().font_weight(gpui_kit::FontWeight::SEMIBOLD).child("2  Set a focus · optional"))
+            .child(Textarea::new(&self.focus).h(px(112.)))
+            .child(presets)
             .child(start)
-            .child(tools)
-            .child(div().text_sm().child(self.author_status.clone()))
-            .when_some(activity, |d, a| {
-                d.child(div().text_sm().child(format!(
-                    "{} · {}",
-                    self.agent_kind.label(),
-                    a.detail.as_deref().unwrap_or(a.state.label())
-                )))
-            });
-        div()
-            .w(px(520.))
-            .flex_shrink_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .border_r_1()
-            .border_color(cx.theme().border)
+            .child(div().p_3().rounded_lg().bg(cx.theme().muted).text_sm().child(self.author_status.clone()))
+            .when_some(activity, |d, a| d.child(div().text_sm().child(format!("{} · {}", self.agent_kind.label(), a.detail.as_deref().unwrap_or(a.state.label())))))
+            .when(self.review.active().bundle.is_some(), |d| d.child(
+                Button::new("read-saved-guide").primary().label("Read guide →")
+                    .on_click(cx.listener(|this, _, _, cx| { this.show_reader(cx); }))))
+            .child(Button::new("author-details").ghost().label(if self.show_details { "Hide session details" } else { "Session details & tools" })
+                .on_click(cx.listener(|this, _, _, cx| { this.show_details = !this.show_details; cx.notify(); })))
+            .when(self.show_details, |d| d
+                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(scope))
+                .when_some(session, |d, s| d.child(div().text_sm().child(s)))
+                .child(tools));
+        h_flex()
+            .size_full()
+            .min_h_0()
+            .items_stretch()
+            .justify_center()
+            .when(compact, |d| d.flex_col())
             .child(header)
             .when_some(self.agent.clone(), |d, pane| {
-                d.child(div().flex_1().min_h_0().child(pane))
+                d.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .when(!compact, |d| d.h_full())
+                        .border_l_1()
+                        .border_color(cx.theme().border)
+                        .child(pane),
+                )
             })
     }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.refreshing {
             return;
@@ -1015,7 +1103,7 @@ impl Workspace {
     }
 }
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // AccessKit can install its native subclass after the first ready
         // event. Keep the web area's accessibility tree joined after native
         // input/terminal updates as well as at document initialization.
@@ -1024,7 +1112,22 @@ impl Render for Workspace {
         {
             let _ = super::accessibility::attach(webview.read(cx).raw());
         }
-        let webview = self.webview.clone();
+        // Native child views do not follow GPUI layout visibility automatically.
+        // Hide explicitly, retaining the DOM and terminal session across mode switches.
+        if let Some(webview) = &self.webview {
+            let visible = !self.show_agent;
+            webview.update(cx, |view, cx| {
+                if visible != view.visible() {
+                    if visible {
+                        view.show();
+                    } else {
+                        view.hide();
+                    }
+                    cx.notify();
+                }
+            });
+        }
+        let webview = self.webview.clone().filter(|_| !self.show_agent);
         div()
             .flex()
             .flex_col()
@@ -1032,30 +1135,14 @@ impl Render for Workspace {
             .bg(cx.theme().background)
             .child(
                 h_flex()
-                    .h(px(38.))
+                    .min_h(px(46.)).flex_shrink_0().flex_wrap().border_b_1().border_color(cx.theme().border)
                     .gap_3()
                     .px_3()
-                    .child(
-                        Button::new("review-refresh")
-                            .ghost()
-                            .label(if self.refreshing {"Capturing revision…"} else {"Capture new revision"})
-                            .disabled(self.refreshing)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    )
-                    .child(
-                        Button::new("review-recover")
-                            .ghost()
-                            .label("Recover source view")
-                            .on_click(cx.listener(|this, _, window, cx| { this.source_recovery = true; this.create(window, cx); })),
-                    )
-                    .child(Button::new("review-reload").ghost().label("Reload saved state").on_click(cx.listener(|this,_,_,cx| {
-                        match this.store.load() {Ok(Some(mut latest))=>{
-                            let id=&this.review.active().capture.id;
-                            if let Some(index)=latest.revisions.iter().position(|r|&r.capture.id==id){latest.current=index;}
-                            if let Err(error) = this.replace_review(latest) {this.author_status = format!("{error:#}");} this.send(json!({"state":this.snapshot(),"status":"Loaded saved review. Unsaved composer text is retained; retry saving."}),cx);
-                        },Ok(None)=>{},Err(e)=>this.error=Some(format!("{e:#}"))}cx.notify();
-                    })))
-                    .child(Button::new("review-agent-toggle").ghost().label(if self.show_agent {"Hide agent"} else {"Show agent"}).on_click(cx.listener(|this, _, _, cx| {this.show_agent = !this.show_agent; cx.notify();})))
+                    .child(div().font_weight(gpui_kit::FontWeight::SEMIBOLD).child("Guided review"))
+                    .child(div().flex_1())
+                    .child(Button::new("review-more").ghost().label(if self.show_recovery { "Less" } else { "More" })
+                        .on_click(cx.listener(|this, _, _, cx| { this.show_recovery = !this.show_recovery; cx.notify(); })))
+                    .child(Button::new("review-agent-toggle").ghost().label(if self.show_agent { if self.review.active().bundle.is_some() { "Read guide" } else { "Inspect source" } } else { "Edit guide" }).on_click(cx.listener(|this, _, _, cx| {if this.show_agent { this.show_reader(cx); } else { this.show_agent = true; cx.notify(); }})))
                     .child(
                         Button::new("review-close")
                             .ghost()
@@ -1067,11 +1154,33 @@ impl Render for Workspace {
                             })),
                     ),
             )
+            .when(self.show_recovery, |d| d.child(h_flex().flex_wrap().px_3().py_2().gap_2()
+                    .child(
+                        Button::new("review-refresh")
+                            .ghost()
+                            .label(if self.refreshing {"Capturing revision…"} else {"Capture new revision"})
+                            .disabled(self.refreshing)
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    )
+                    .child(
+                        Button::new("review-recover")
+                            .ghost()
+                            .label("Recover view")
+                            .on_click(cx.listener(|this, _, window, cx| { this.source_recovery = true; this.show_agent = false; this.create(window, cx); })),
+                    )
+                    .child(Button::new("review-reload").ghost().label("Reload saved state").on_click(cx.listener(|this,_,_,cx| {
+                        match this.store.load() {Ok(Some(mut latest))=>{
+                            let id=&this.review.active().capture.id;
+                            if let Some(index)=latest.revisions.iter().position(|r|&r.capture.id==id){latest.current=index;}
+                            if let Err(error) = this.replace_review(latest) {this.author_status = format!("{error:#}");} this.send(json!({"state":this.snapshot(),"status":"Loaded saved review. Unsaved composer text is retained; retry saving."}),cx);
+                        },Ok(None)=>{},Err(e)=>this.error=Some(format!("{e:#}"))}cx.notify();
+                    })))
+            ))
             .when_some(self.error.clone(), |d, error| {
                 d.child(div().p_4().child(error))
             })
             .child(h_flex().flex_1().min_h_0().items_stretch()
-                .when(self.show_agent, |d| d.child(self.author_panel(cx)))
+                .when(self.show_agent, |d| d.child(self.author_panel(window.viewport_size().width < px(900.), cx)))
                 .when_some(webview, |d, webview| d.child(div().flex_1().min_w_0().min_h_0().child(webview))))
     }
 }

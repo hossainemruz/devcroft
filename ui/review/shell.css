@@ -7,3 +7,27 @@ input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--lin
 #agent-context-request>span{flex:1 1 18rem;min-width:0;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
 #agent-context-request>button{flex-shrink:0}
 @media(max-width:640px){#agent-context-request:not(:empty){padding:12px 18px}}
+
+/* Reading workspace: quiet chrome, generous canvas, source on demand. */
+:root{--bg:light-dark(#fcfcfa,#1b1e1d);--soft:light-dark(#f2f4f0,#232825);--line:light-dark(#dfe5dc,#39433c);--accent:light-dark(#32654b,#a8d6b8);--tint:light-dark(#e9f1e6,#2d4032)}
+#review{height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{padding:16px 28px;flex-shrink:0}header>div{min-width:0}header h1{font-size:21px}header .eyebrow{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70vw}
+.tabs{flex-shrink:0}.workspace{flex:1;min-height:0;grid-template-columns:232px minmax(0,1fr)}
+aside{padding:24px 16px;overflow:auto}aside .eyebrow{margin-top:0}main{overflow:auto;scroll-behavior:auto}
+#outline .chapter-button{border-color:transparent;background:transparent;padding:12px;line-height:1.45;margin:4px 0;border-radius:9px;font-size:13px}
+#outline .chapter-button:hover{background:var(--bg)}#outline .chapter-button[aria-pressed=true]{background:var(--tint);border-color:var(--line);box-shadow:inset 3px 0 var(--accent)}
+#review-progress{display:block;appearance:none;width:100%;height:5px;border:0;border-radius:8px;overflow:hidden;margin:28px 0 10px;accent-color:var(--accent)}
+#review-progress::-webkit-progress-bar{background:var(--line)}#review-progress::-webkit-progress-value{background:var(--accent)}#review-progress::-moz-progress-bar{background:var(--accent)}
+main>section:not(.panels){padding:40px;max-width:1280px;margin:0 auto}h2{font-size:30px;letter-spacing:-.8px}.lead{font-size:15px;line-height:1.7;max-width:80ch}
+.metrics{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0}.metric{padding:6px 12px;border:1px solid var(--line);border-radius:20px;font-size:12px;color:var(--muted)}
+#overview-chapters{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:16px;margin:28px 0}
+.chapter-card{display:flex;flex-direction:column;gap:12px;text-align:left;padding:22px;border-radius:12px;background:var(--bg);min-width:0;overflow-wrap:anywhere}
+.chapter-card:hover{border-color:var(--accent);background:var(--soft)}.chapter-card strong{font-size:17px;line-height:1.4}.chapter-description{font-size:13px;line-height:1.65;color:var(--muted);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.card-footer{font-size:12px;color:var(--accent);margin-top:auto;padding-top:8px}
+.panels{min-height:100%;grid-template-columns:minmax(0,1.6fr) minmax(310px,1fr)}.panels.evidence-hidden{grid-template-columns:minmax(0,1fr)}
+article{padding:32px;min-width:0}.evidence{padding:26px 22px}.chapter-top{flex-wrap:wrap;gap:8px 16px;margin-bottom:18px;align-items:center}.chapter-top .eyebrow{flex:1 1 100%;margin:0}
+#chapter-canvas{margin:24px 0}#chapter-canvas iframe{height:clamp(420px,58vh,850px);border:1px solid var(--line);border-radius:12px}
+.evidence-hidden article{width:100%;max-width:1400px;margin:0 auto}.evidence-hidden #chapter-canvas iframe{height:clamp(480px,66vh,1000px)}
+.chapter-navigation{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid var(--line);padding-top:22px;margin-top:28px}.chapter-navigation button{white-space:nowrap}
+#examined{background:var(--accent);color:var(--bg);border-color:var(--accent)}.citation{max-width:100%;overflow-wrap:anywhere;text-align:left}.panel-title{align-items:center}
+@media(max-width:1100px){.workspace{grid-template-columns:190px minmax(0,1fr)}.panels{grid-template-columns:minmax(0,1fr)}.evidence{border-left:0;border-top:1px solid var(--line)}article,main>section:not(.panels){padding:28px}}
+@media(max-width:700px){#review{height:auto;min-height:100vh;overflow:visible}.workspace{display:block}main,aside{overflow:visible}header{padding:16px 18px}header h1{font-size:18px}header .eyebrow{max-width:60vw}aside{padding:16px 18px;border-right:0;border-bottom:1px solid var(--line)}#outline{display:flex;flex-wrap:nowrap;overflow:auto}#outline .chapter-button{flex:0 0 180px}#review-progress{margin-top:16px}.tabs{gap:18px;padding:0 18px}main>section:not(.panels),article,.evidence{padding:24px 18px}h2{font-size:25px}.chapter-navigation{gap:6px}.chapter-navigation button{padding:7px}#chapter-canvas iframe,.evidence-hidden #chapter-canvas iframe{height:480px}}

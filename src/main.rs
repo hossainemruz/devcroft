@@ -36,6 +36,8 @@ mod settings;
 mod terminal_graphics;
 mod terminal_preferences;
 mod tools;
+mod tutorial_view;
+mod webview;
 mod workspace;
 
 use anyhow::{Context as _, Result, anyhow};

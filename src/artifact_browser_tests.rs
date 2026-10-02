@@ -24,6 +24,72 @@ fn kind_labels_cover_every_filter_option() {
     assert_eq!(Kind::Tutorial.label(), "Tutorial");
 }
 
+#[gpui_kit::test]
+fn tutorial_selection_swaps_the_markdown_reader_for_the_sandboxed_viewer(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use crate::data::artifacts::NewArtifact;
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    crate::data::write_json_atomic(
+        &root
+            .portable_dir()
+            .join("repositories/repo/repository.json"),
+        &serde_json::json!({"key": "repo"}),
+    )
+    .unwrap();
+    let store = ArtifactStore::new(&root);
+    let tutorial = store
+        .create(NewArtifact {
+            repository: Some("repo".into()),
+            sessions: vec![],
+            title: "Two records".into(),
+            kind: Kind::Tutorial,
+            content: "<!doctype html><html><body><p>Two records</p></body></html>".into(),
+        })
+        .unwrap();
+    let note = store
+        .create(NewArtifact {
+            repository: Some("repo".into()),
+            sessions: vec![],
+            title: "Note".into(),
+            kind: Kind::Note,
+            content: "# Note".into(),
+        })
+        .unwrap();
+    cx.update(gpui_kit::init);
+    let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
+    browser.update(cx, |browser, cx| {
+        browser.select(Some(tutorial.clone()), cx);
+        assert!(
+            browser.tutorial.is_some(),
+            "tutorial uses the sandboxed viewer"
+        );
+        assert!(
+            browser.preview.is_none(),
+            "tutorial never builds a Markdown reader"
+        );
+        assert!(browser.toc.is_empty(), "tutorials do not feed the outline");
+
+        // A new revision refreshes the existing viewer instead of rebuilding it.
+        let mut updated = tutorial.clone();
+        updated.artifact.content = "<!doctype html><p>Updated</p>".into();
+        browser.select(Some(updated), cx);
+        assert!(browser.tutorial.is_some());
+        assert!(browser.preview.is_none());
+
+        browser.select(Some(note), cx);
+        assert!(
+            browser.tutorial.is_none(),
+            "Markdown selection drops the tutorial viewer"
+        );
+        assert!(
+            browser.preview.is_some(),
+            "Markdown selection uses the reader"
+        );
+    });
+}
+
 #[test]
 fn updated_label_buckets_like_relative_durations() {
     let now_secs = 1_700_000_000;

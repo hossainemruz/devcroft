@@ -7,6 +7,7 @@ use crate::data::artifacts::{
 };
 use crate::preview::{PreviewView, TocActive, TocEntry};
 use crate::relative_time::{current_unix_secs, relative_duration_label};
+use crate::tutorial_view::TutorialView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
@@ -105,6 +106,9 @@ pub(crate) struct ArtifactBrowser {
     selected: Option<Snapshot>,
     error: Option<String>,
     preview: Option<Entity<PreviewView>>,
+    /// Sandboxed HTML viewer for the selected tutorial artifact. Exactly one
+    /// of `preview`/`tutorial` is populated for a selection.
+    tutorial: Option<Entity<TutorialView>>,
     toc: Vec<TocEntry>,
     toc_active: usize,
     show_comments: bool,
@@ -157,6 +161,7 @@ impl ArtifactBrowser {
             selected: None,
             error: None,
             preview: None,
+            tutorial: None,
             toc: Vec::new(),
             toc_active: 0,
             show_comments: false,
@@ -190,6 +195,8 @@ impl ArtifactBrowser {
         }
         if let Some(draft) = self.draft.as_ref().filter(|d| d.document) {
             panes.push(("Draft", draft.input.read(cx).focus_handle(cx)));
+        } else if let Some(tutorial) = &self.tutorial {
+            panes.push(("Document", tutorial.read(cx).focus_handle()));
         } else {
             panes.push(("Document", self.detail_focus.clone()));
             if self.show_comments {
@@ -262,6 +269,7 @@ impl ArtifactBrowser {
             self.selected_id = self.draft.as_ref().map(|d| d.snapshot.artifact.id.clone());
             self.selected = None;
             self.preview = None;
+            self.tutorial = None;
             self.toc = Vec::new();
             self.toc_active = 0;
             self.error = None;
@@ -320,6 +328,7 @@ impl ArtifactBrowser {
         self.selected_id = self.draft.as_ref().map(|d| d.snapshot.artifact.id.clone());
         self.selected = None;
         self.preview = None;
+        self.tutorial = None;
         self.toc = Vec::new();
         self.toc_active = 0;
         self.error = None;
@@ -556,42 +565,89 @@ impl ArtifactBrowser {
     fn select(&mut self, snapshot: Option<Snapshot>, cx: &mut Context<Self>) {
         self.open_generation = self.open_generation.wrapping_add(1);
         self.opening = false;
-        if self.selected_id != snapshot.as_ref().map(|s| s.artifact.id.clone()) {
+        let selected_id = snapshot.as_ref().map(|s| s.artifact.id.clone());
+        let content_changed = self.selected.as_ref().map(|s| &s.artifact.content)
+            != snapshot.as_ref().map(|s| &s.artifact.content);
+        if self.selected_id != selected_id {
             self.active_comment = None;
         }
-        if self.selected_id != snapshot.as_ref().map(|s| s.artifact.id.clone())
-            || self.selected.as_ref().map(|s| &s.artifact.content)
-                != snapshot.as_ref().map(|s| &s.artifact.content)
-            || self.preview.is_none()
+        if snapshot
+            .as_ref()
+            .is_some_and(|s| s.artifact.kind == Kind::Tutorial)
         {
-            match (self.preview.as_ref(), snapshot.as_ref()) {
-                (Some(preview), Some(s)) if self.selected_id.as_ref() == Some(&s.artifact.id) => {
-                    preview.update(cx, |view, cx| {
-                        view.set_content(s.artifact.content.clone().into(), cx)
-                    })
+            // Tutorials render as one sandboxed HTML document: no Markdown
+            // preview, outline, or comment plumbing applies.
+            self.preview = None;
+            if self.selected_id != selected_id || content_changed || self.tutorial.is_none() {
+                match (self.tutorial.as_ref(), snapshot.as_ref()) {
+                    (Some(tutorial), Some(s))
+                        if self.selected_id.as_ref() == Some(&s.artifact.id) =>
+                    {
+                        let root = self.root.clone();
+                        tutorial.update(cx, |view, cx| {
+                            view.show(
+                                root,
+                                &s.artifact.id,
+                                &s.artifact.title,
+                                s.artifact.content.clone(),
+                                cx,
+                            )
+                        });
+                    }
+                    (_, Some(s)) => {
+                        let root = self.root.clone();
+                        let tutorial = cx.new(TutorialView::new);
+                        tutorial.update(cx, |view, cx| {
+                            view.show(
+                                root,
+                                &s.artifact.id,
+                                &s.artifact.title,
+                                s.artifact.content.clone(),
+                                cx,
+                            )
+                        });
+                        self.tutorial = Some(tutorial);
+                    }
+                    _ => self.tutorial = None,
                 }
-                (_, Some(s)) => {
-                    let preview = cx.new(|cx| {
-                        let mut view = PreviewView::embedded(s.artifact.content.clone().into(), cx);
-                        view.set_reference_root(self.root.clone(), cx);
-                        view
-                    });
-                    cx.subscribe(
-                        &preview,
-                        |_, _, event: &crate::preview::OpenReference, cx| cx.emit(event.clone()),
-                    )
-                    .detach();
-                    cx.subscribe(&preview, |this, _, event: &TocActive, cx| {
-                        this.toc_active = event.0;
-                        cx.notify();
-                    })
-                    .detach();
-                    self.preview = Some(preview);
+            }
+        } else {
+            self.tutorial = None;
+            if self.selected_id != selected_id || content_changed || self.preview.is_none() {
+                match (self.preview.as_ref(), snapshot.as_ref()) {
+                    (Some(preview), Some(s))
+                        if self.selected_id.as_ref() == Some(&s.artifact.id) =>
+                    {
+                        preview.update(cx, |view, cx| {
+                            view.set_content(s.artifact.content.clone().into(), cx)
+                        })
+                    }
+                    (_, Some(s)) => {
+                        let preview = cx.new(|cx| {
+                            let mut view =
+                                PreviewView::embedded(s.artifact.content.clone().into(), cx);
+                            view.set_reference_root(self.root.clone(), cx);
+                            view
+                        });
+                        cx.subscribe(
+                            &preview,
+                            |_, _, event: &crate::preview::OpenReference, cx| {
+                                cx.emit(event.clone())
+                            },
+                        )
+                        .detach();
+                        cx.subscribe(&preview, |this, _, event: &TocActive, cx| {
+                            this.toc_active = event.0;
+                            cx.notify();
+                        })
+                        .detach();
+                        self.preview = Some(preview);
+                    }
+                    _ => self.preview = None,
                 }
-                _ => self.preview = None,
             }
         }
-        self.selected_id = snapshot.as_ref().map(|s| s.artifact.id.clone());
+        self.selected_id = selected_id;
         self.selected = snapshot;
         self.sync_preview_comments(cx);
         if let Some(preview) = self.preview.as_ref() {
@@ -1290,6 +1346,13 @@ impl Render for ArtifactBrowser {
                                     })),
                             ),
                     );
+                detail = detail.child(main);
+            } else if let Some(tutorial) = self
+                .tutorial
+                .as_ref()
+                .filter(|_| artifact.kind == Kind::Tutorial)
+            {
+                main = main.child(div().flex_1().min_h_0().child(tutorial.clone()));
                 detail = detail.child(main);
             } else {
                 if let Some(preview) = &self.preview {

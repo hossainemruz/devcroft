@@ -134,7 +134,7 @@ unsafe extern "C" fn hit(view: &AnyObject, cmd: Sel, point: NSPoint) -> *mut Any
         unsafe { std::mem::transmute(methods.hit) };
     unsafe { original(view, cmd, point) }
 }
-pub(super) fn attach(webview: &wry::WebView) -> anyhow::Result<()> {
+pub(crate) fn attach(webview: &wry::WebView) -> anyhow::Result<()> {
     let native = webview.webview();
     let window: *mut AnyObject = unsafe { msg_send![&*native, window] };
     anyhow::ensure!(!window.is_null(), "Webview has no native window");
@@ -147,11 +147,11 @@ pub(super) fn attach(webview: &wry::WebView) -> anyhow::Result<()> {
     if previous
         .name()
         .to_string_lossy()
-        .starts_with("DevcroftReviewAX_")
+        .starts_with("DevcroftWebViewAX_")
     {
         return Ok(());
     }
-    let name = format!("DevcroftReviewAX_{}", previous.name().to_string_lossy());
+    let name = format!("DevcroftWebViewAX_{}", previous.name().to_string_lossy());
     let mut registry = METHODS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()

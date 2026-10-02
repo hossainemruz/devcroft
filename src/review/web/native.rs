@@ -19,7 +19,6 @@ use gpui_kit::{
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
     WindowOptions, div, px, size,
 };
-use raw_window_handle::HasWindowHandle as _;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -257,13 +256,8 @@ impl Workspace {
                 }
             })
             .detach();
-            let native = wry::WebViewBuilder::new()
-                .with_html(html)
-                .with_incognito(true)
-                .with_navigation_handler(|url| url == "about:blank" || url == "about:srcdoc")
-                .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
-                .with_download_started_handler(|_, _| false)
-                .with_ipc_handler(move |request| {
+            crate::webview::create(window, cx, move |builder| {
+                builder.with_html(html).with_ipc_handler(move |request| {
                     if request.body().len() <= 64 * 1024
                         && let Ok(message) = serde_json::from_str::<Message>(request.body())
                         && message.token == capability
@@ -271,8 +265,7 @@ impl Workspace {
                         let _ = sender.try_send(request.into_body());
                     }
                 })
-                .build_as_child(&window.window_handle()?)?;
-            Ok(cx.new(|cx| gpui_wry::WebView::new(native, window, cx)))
+            })
         })();
         match result {
             Ok(webview) => {
@@ -374,8 +367,9 @@ impl Workspace {
         if m.op == "ready" {
             self.ready = true;
             if let Some(view) = &self.webview
-                && let Err(error) =
-                    view.update(cx, |view, _| super::accessibility::attach(view.raw()))
+                && let Err(error) = view.update(cx, |view, _| {
+                    crate::webview::accessibility::attach(view.raw())
+                })
             {
                 self.error = Some(format!(
                     "Review accessibility setup needs attention: {error:#}"
@@ -1110,7 +1104,7 @@ impl Render for Workspace {
         if self.ready
             && let Some(webview) = &self.webview
         {
-            let _ = super::accessibility::attach(webview.read(cx).raw());
+            let _ = crate::webview::accessibility::attach(webview.read(cx).raw());
         }
         // Native child views do not follow GPUI layout visibility automatically.
         // Hide explicitly, retaining the DOM and terminal session across mode switches.

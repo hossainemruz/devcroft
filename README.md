@@ -85,32 +85,10 @@ Comments persist locally per branch pair and scope; changed code is re-anchored
 when possible, with removed or ambiguous ranges marked outdated. See the
 [review workflow and CLI](docs/review-comments.md).
 
-**Review assistant** generates a chapter guide alongside the captured diff. Choose
-an enabled agent and optionally add a design-document reference or instructions,
-then click **Generate guide**. Its managed session opens in the right sidebar;
-choose the model and effort in the terminal, finish any startup prompts, then
-click **Next** to send the tutorial task. **Hide agent** keeps the session running,
-and it is also available in the Agent tab. Follow-up questions and guide repairs
-use that same session. These sessions use the agent's normal interactive
-permissions; tutorial instructions ask it to leave repository files unchanged and
-save its response in a temporary handoff directory. **Stop** closes the current
-generation session while preserving the previous guide and notes.
-
-Guides open with an **Overview**, followed by behavior chapters and a **Review
-summary**. Chapters connect before/after behavior to captured diff evidence,
-assumptions to investigate, and identified tests or evidence gaps. An identified
-test does not mean it ran or passed. Concepts and coaching are optional; you can
-jump directly to any behavior.
-
-Choose **Investigate** or **Inspect evidence** to examine a question, optionally
-ask the agent to explain or challenge it, then **Save conclusion** with your own
-outcome: needs follow-up, concern, or satisfied. Conclusions and their captured
-evidence persist locally under Git's `devcroft-review/guided-notes.json`, isolated
-by checkout, branch, and review scope. The summary includes saved conclusions,
-unresolved questions, and changes outside the guide. Earlier comparisons are
-labelled for rechecking; regenerate the guide after editing code. Preview
-conclusions are temporary. Generated guides and unsaved drafts are not restored
-after closing the review.
+To understand a change before reviewing it, ask your agent for a visual tutorial
+and open it from Resources (see [Repository resources](#repository-resources)).
+Tutorials are agent-generated, self-contained HTML pages; review judgments stay in
+the Review tab and its comments.
 
 ## Tools
 

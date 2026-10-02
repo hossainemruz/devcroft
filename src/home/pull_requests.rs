@@ -92,33 +92,6 @@ impl HomeView {
         self.change(window, cx, |data| data.move_pr(original, category));
     }
 
-    fn review_pr(&mut self, url: String, cx: &mut Context<Self>) {
-        self.error = Some("Capturing PR source…".into());
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let identity = crate::review::session::pr::Identity::parse(&url)?;
-                    if let Some(review) = identity.store()?.load()? {
-                        Ok(review.active().capture.clone())
-                    } else {
-                        crate::review::session::pr::acquire(&url)
-                    }
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.error = match result {
-                    Ok(capture) => crate::review::web::open_pr(capture, None, cx)
-                        .err()
-                        .map(|e| format!("{e:#}")),
-                    Err(e) => Some(format!("{e:#}")),
-                };
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     pub(super) fn pr_card(
         &self,
         item: &Item,
@@ -191,7 +164,6 @@ impl HomeView {
         let menu_title = title.clone();
         let entity = cx.entity();
         let edit_item = item.clone();
-        let review_url = item.url.clone();
         let mut card = v_flex()
             .id(item_id("pr", &item.id))
             .w_full()
@@ -232,16 +204,6 @@ impl HomeView {
                             .label("⋯")
                             .accessibility_label(format!("Options for {menu_title}"))
                             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
-                                let home = entity.clone();
-                                let url = review_url.clone();
-                                menu =
-                                    menu.item(PopupMenuItem::new("Review in Devcroft").on_click(
-                                        move |_, _, cx| {
-                                            home.update(cx, |this, cx| {
-                                                this.review_pr(url.clone(), cx);
-                                            });
-                                        },
-                                    ));
                                 let home = entity.clone();
                                 let edit = edit_item.clone();
                                 menu = menu.item(PopupMenuItem::new("Edit").on_click(

@@ -664,7 +664,7 @@ impl Workspace {
     fn remove_agent_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = self.open_sessions.remove(&id) {
             // Other views can retain the pane, so dropping the sidebar row is
-            // insufficient to stop a terminal shared with a review assistant.
+            // insufficient to stop a terminal shared with an open agent session.
             session.pane.update(cx, |pane, cx| pane.close(cx));
         }
         let agent_index = WorkspaceTab::Agent as usize;

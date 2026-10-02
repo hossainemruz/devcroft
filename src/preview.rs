@@ -1078,7 +1078,7 @@ mod tests {
         use gpui_kit::component::Root;
         use gpui_kit::{Bounds, Pixels, TestApp, WindowBounds, WindowOptions, point, size};
 
-        const CONTENT: &str = "# Review Assistant: guided change review and impact investigation\n\nStatus: revised design proposal.\n";
+        const CONTENT: &str = "# Release checklist: verify document rendering and comment layout before shipping\n\nStatus: revised design proposal.\n";
 
         let mut app = TestApp::new();
         app.update(gpui_kit::init);

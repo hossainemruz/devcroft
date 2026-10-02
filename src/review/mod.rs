@@ -6,16 +6,6 @@
 //! owns loading, scope selection, the tree/stream layout, viewed-file state,
 //! and refresh.
 
-#[cfg(any(target_os = "macos", test))]
-mod authoring;
-pub(crate) mod session;
-pub(crate) mod web;
-pub(crate) use session::Capture as ReviewCapture;
-// Only the macOS entry point (`run_visual_review`) opens the bundled visual
-// workspace; gating the re-export keeps Linux/Windows builds warning-free
-// instead of silencing an unused import.
-#[cfg(target_os = "macos")]
-pub(crate) use web::open_with_bundle as open_visual_workspace;
 pub(crate) mod comments;
 mod feedback;
 pub(crate) mod git;
@@ -33,9 +23,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
-    button::{Button, ButtonVariants as _},
-    h_flex,
+    ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex,
     list::ListItem,
     tab::{Tab, TabBar},
     tree::{TreeState, tree},
@@ -535,27 +523,6 @@ impl ReviewView {
             .items_center()
             .border_b_1()
             .border_color(rgb(0x292b2b))
-            .child(
-                Button::new("guided-review")
-                    .ghost()
-                    .small()
-                    .tooltip("Open the visual review workspace")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let ReviewState::Loaded(loaded) = &this.state
-                            && let Err(error) = web::open(
-                                this.cwd.clone(),
-                                loaded.diff.as_ref().clone(),
-                                this.base_label(),
-                                this.scope(),
-                                cx,
-                            )
-                        {
-                            this.state = ReviewState::Failed(format!("{error:#}").into());
-                            cx.notify();
-                        }
-                    }))
-                    .child("Guided Review"),
-            )
             .child(
                 TabBar::new("review-scope")
                     .segmented()

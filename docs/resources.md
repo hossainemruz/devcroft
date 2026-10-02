@@ -1,6 +1,6 @@
 # Repository resources
 
-The Resources tab replaces task tracking. Its sidebar lists the current repository's artifacts by most recent update, selects the first by default, and renders Markdown. Selection remains stable across refreshes. Browse artifacts in the command palette provides a global view, including legacy artifacts that do not yet have a repository.
+The Resources tab replaces task tracking. Its sidebar lists the current repository's artifacts by most recent update, selects the first by default, and renders Markdown. Tutorial artifacts hold a complete, self-contained HTML document instead of Markdown, and comments are rejected for them. Selection remains stable across refreshes. Browse artifacts in the command palette provides a global view, including legacy artifacts that do not yet have a repository.
 
 Use Edit Markdown to change a document and Save or Cancel. The right sidebar has **On this page** and **Comments** tabs. Right-click a rendered block and choose **Comment on this block**, or use its **+** button. A block is a paragraph, heading, list, table, blockquote, or code block. Select words within that block first and choose **Comment on selected text** to attach feedback to that exact source range. The editor opens in the Comments tab while the document stays visible. Selection comments store the original Markdown byte offsets, source lines, and selected quote. Without a mapped selection, comments attach to the whole block. The gutter and background indicate comments on the containing block; selecting across separate blocks is not supported.
 
@@ -53,7 +53,7 @@ and optional math rendering.
 
 ## Storage and concurrency
 
-`portable/artifacts/<art-id>/artifact.md` is the atomic record. Schema version 4 metadata is JSON (a YAML subset), enclosed by `---` lines. The Markdown body follows the closing delimiter. Metadata includes ID, title, kind, repository key, originating sessions, comments, archive state, and creation/update timestamps. Comments may have a tagged `anchor` with `kind: "block"`; older comments without an anchor remain document-level feedback. Comment metadata does not insert markers into the Markdown body. Unknown metadata round-trips unchanged.
+`portable/artifacts/<art-id>/artifact.md` is the atomic record. Schema version 4 metadata is JSON (a YAML subset), enclosed by `---` lines. The body follows the closing delimiter: Markdown for RFC, Plan, Note, and Review artifacts, or one complete self-contained HTML document for Tutorial artifacts. Tutorial content must not be empty, and records cannot change kind between the tutorial and Markdown formats. Metadata includes ID, title, kind, repository key, originating sessions, comments, archive state, and creation/update timestamps. Comments may have a tagged `anchor` with `kind: "block"`; older comments without an anchor remain document-level feedback. Comment metadata does not insert markers into the Markdown body. Unknown metadata round-trips unchanged.
 
 App and CLI mutations share a portable gate and per-artifact lock. A hash of the complete file is the revision. Saves check the revision, write and sync a temporary file, then atomically rename it. Conflicts leave editor drafts intact. Files must be regular UTF-8 files, no symlinks, at most 4 MiB including metadata.
 

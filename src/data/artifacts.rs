@@ -1,5 +1,7 @@
-//! Repository Markdown artifacts. One Markdown file is the atomic commit unit;
-//! see docs/resources.md for representation and interrupted-write behavior.
+//! Repository artifacts: Markdown for RFC/Plan/Note/Review and one complete
+//! self-contained HTML document for Tutorial. One content file is the atomic
+//! commit unit; see docs/resources.md for representation and interrupted-write
+//! behavior.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
@@ -27,10 +29,17 @@ pub(crate) enum Kind {
     Plan,
     Note,
     Review,
+    Tutorial,
 }
 
 impl Kind {
-    pub(crate) const ALL: [Self; 4] = [Self::Rfc, Self::Plan, Self::Note, Self::Review];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Rfc,
+        Self::Plan,
+        Self::Note,
+        Self::Review,
+        Self::Tutorial,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -38,6 +47,7 @@ impl Kind {
             Self::Plan => "Plan",
             Self::Note => "Note",
             Self::Review => "Review",
+            Self::Tutorial => "Tutorial",
         }
     }
 }
@@ -110,6 +120,16 @@ impl Artifact {
         );
         validate_id(&self.id)?;
         nonblank(&self.title, "artifact title")?;
+        if self.kind == Kind::Tutorial {
+            ensure!(
+                !self.content.trim().is_empty(),
+                "tutorial artifact content must be an HTML document"
+            );
+            ensure!(
+                self.comments.is_empty(),
+                "tutorial artifacts do not support comments"
+            );
+        }
         if let Some(key) = &self.repository {
             super::require_repository_key(key)?;
         }
@@ -338,7 +358,7 @@ impl ArtifactStore {
         revision: &str,
         patch: ArtifactPatch,
     ) -> Result<Snapshot> {
-        self.mutate(id, revision, |artifact| {
+        self.mutate_result(id, revision, |artifact| {
             if let Some(v) = patch.repository {
                 artifact.repository = Some(v);
             }
@@ -349,11 +369,16 @@ impl ArtifactStore {
                 artifact.title = v.trim().to_owned();
             }
             if let Some(v) = patch.kind {
+                ensure!(
+                    (artifact.kind == Kind::Tutorial) == (v == Kind::Tutorial),
+                    "artifact kind cannot change between tutorial and Markdown formats"
+                );
                 artifact.kind = v;
             }
             if let Some(v) = patch.content {
                 artifact.content = v;
             }
+            Ok(())
         })
     }
 
@@ -398,6 +423,12 @@ impl ArtifactStore {
             nonblank(body, "comment body")?;
         }
         self.mutate_result(id, revision, |artifact| {
+            // Checked under the artifact lock after the revision check so a
+            // tutorial can never gain an anchor the reader cannot maintain.
+            ensure!(
+                artifact.kind != Kind::Tutorial,
+                "tutorial artifacts do not support comments"
+            );
             match change {
                 CommentChange::Create(body) => artifact.comments.push(Comment {
                     id: random_id().replacen("art-", "comment-", 1),

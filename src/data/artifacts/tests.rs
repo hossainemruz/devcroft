@@ -149,6 +149,135 @@ fn markdown_roundtrip_and_external_edit_conflict() {
     let edited = store.get(&first.artifact.id).unwrap();
     assert!(edited.artifact.content.contains('β'));
 }
+
+fn tutorial(repository: &str, html: &str) -> NewArtifact {
+    NewArtifact {
+        repository: Some(repository.into()),
+        sessions: vec![],
+        title: "Change tutorial".into(),
+        kind: Kind::Tutorial,
+        content: html.into(),
+    }
+}
+
+#[test]
+fn tutorial_roundtrip_keeps_html_and_rejects_comments_and_format_changes() {
+    let (_dir, store) = fixture();
+    // A body line that is exactly the metadata delimiter must survive the
+    // front-matter envelope, and script text is stored verbatim.
+    let html = "<!doctype html>\n<html><body>\n<h1>Two records</h1>\n---\n<script>const tag = \"</script>\";</script>\n</body></html>\n";
+    let first = store.create(tutorial("repo", html)).unwrap();
+    assert_eq!(first.artifact.kind, Kind::Tutorial);
+    assert_eq!(first.artifact.content, html);
+    assert_eq!(store.get(&first.artifact.id).unwrap(), first);
+
+    // Comments are rejected without changing the record.
+    assert!(
+        store
+            .comment(
+                &first.artifact.id,
+                &first.revision,
+                CommentChange::Create("Feedback".into()),
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .comment(
+                &first.artifact.id,
+                &first.revision,
+                CommentChange::CreateBlock {
+                    body: "Feedback".into(),
+                    block: 0,
+                    quote: None,
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(store.get(&first.artifact.id).unwrap(), first);
+
+    // Cross-format kind changes are rejected in both directions.
+    assert!(
+        store
+            .update(
+                &first.artifact.id,
+                &first.revision,
+                ArtifactPatch {
+                    kind: Some(Kind::Plan),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+    );
+    let plan = store.create(input("repo")).unwrap();
+    assert!(
+        store
+            .update(
+                &plan.artifact.id,
+                &plan.revision,
+                ArtifactPatch {
+                    kind: Some(Kind::Tutorial),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+    );
+
+    // Markdown-to-Markdown renames remain allowed.
+    let renamed = store
+        .update(
+            &plan.artifact.id,
+            &plan.revision,
+            ArtifactPatch {
+                kind: Some(Kind::Note),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(renamed.artifact.kind, Kind::Note);
+
+    // Updates keep the revision check and replace the HTML body.
+    let updated = store
+        .update(
+            &first.artifact.id,
+            &first.revision,
+            ArtifactPatch {
+                content: Some("<p>Updated</p>".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(updated.revision, first.revision);
+    assert_eq!(updated.artifact.content, "<p>Updated</p>");
+    assert_eq!(store.get(&first.artifact.id).unwrap(), updated);
+}
+
+#[test]
+fn tutorial_content_must_be_a_nonempty_document_while_markdown_may_be_empty() {
+    let (_dir, store) = fixture();
+    assert!(store.create(tutorial("repo", "  \n")).is_err());
+    let html = store.create(tutorial("repo", "<p>Hello</p>")).unwrap();
+    assert!(
+        store
+            .update(
+                &html.artifact.id,
+                &html.revision,
+                ArtifactPatch {
+                    content: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+    );
+    let empty = store
+        .create(NewArtifact {
+            content: String::new(),
+            ..input("repo")
+        })
+        .unwrap();
+    assert_eq!(empty.artifact.content, "");
+}
+
 #[test]
 fn repository_filter_order_archive_and_partial_errors() {
     let (_dir, store) = fixture();

@@ -208,6 +208,7 @@ pub(crate) enum KindArg {
     Plan,
     Note,
     Review,
+    Tutorial,
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]
@@ -222,7 +223,8 @@ pub(crate) struct ArtifactCreateArgs {
     pub(crate) title: String,
     #[arg(long, value_enum)]
     pub(crate) kind: KindArg,
-    /// UTF-8 Markdown file, or - for stdin (maximum 4 MiB; empty input is valid).
+    /// UTF-8 Markdown for rfc/plan/note/review, or a self-contained HTML
+    /// document for tutorial; - for stdin (maximum 4 MiB; empty Markdown is valid).
     #[arg(long, value_name = "PATH|-")]
     pub(crate) content_file: PathBuf,
 }
@@ -240,10 +242,11 @@ pub(crate) struct ArtifactUpdateArgs {
     pub(crate) title: Option<String>,
     #[arg(long, value_enum)]
     pub(crate) kind: Option<KindArg>,
-    /// UTF-8 Markdown file, or - for stdin (maximum 4 MiB).
+    /// UTF-8 Markdown for rfc/plan/note/review, or a self-contained HTML
+    /// document for tutorial; - for stdin (maximum 4 MiB).
     #[arg(long, value_name = "PATH|-")]
     pub(crate) content_file: Option<PathBuf>,
-    /// Explicitly replace Markdown content with an empty string.
+    /// Explicitly replace content with an empty string (Markdown kinds only).
     #[arg(long, conflicts_with = "content_file")]
     pub(crate) clear_content: bool,
 }
@@ -252,9 +255,41 @@ pub(crate) struct ArtifactUpdateArgs {
 mod tests {
     use clap::CommandFactory as _;
 
+    use super::{ArtifactCommand, KindArg};
+
     #[test]
     fn command_tree_is_consistent() {
         crate::cli::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn tutorial_kind_parses_for_artifact_create() {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from([
+            "devcroft",
+            "artifact",
+            "create",
+            "--repository",
+            "repo",
+            "--title",
+            "Change tutorial",
+            "--kind",
+            "tutorial",
+            "--content-file",
+            "/tmp/tutorial.html",
+        ])
+        .unwrap();
+        let crate::cli::Command::Artifact(args) = cli.command else {
+            panic!("expected artifact command");
+        };
+        let ArtifactCommand::Create(create) = args.command else {
+            panic!("expected artifact create");
+        };
+        assert_eq!(create.kind, KindArg::Tutorial);
+        assert_eq!(
+            create.content_file,
+            std::path::PathBuf::from("/tmp/tutorial.html")
+        );
     }
 }
 

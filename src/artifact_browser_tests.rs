@@ -16,11 +16,12 @@ fn refresh_coalesces_requests_and_discards_superseded_results() {
 
 #[test]
 fn kind_labels_cover_every_filter_option() {
-    assert_eq!(Kind::ALL.len(), 4);
+    assert_eq!(Kind::ALL.len(), 5);
     assert_eq!(Kind::Rfc.label(), "RFC");
     assert_eq!(Kind::Plan.label(), "Plan");
     assert_eq!(Kind::Note.label(), "Note");
     assert_eq!(Kind::Review.label(), "Review");
+    assert_eq!(Kind::Tutorial.label(), "Tutorial");
 }
 
 #[test]

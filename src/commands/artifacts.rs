@@ -12,6 +12,7 @@ fn kind(value: KindArg) -> artifacts::Kind {
         KindArg::Plan => artifacts::Kind::Plan,
         KindArg::Note => artifacts::Kind::Note,
         KindArg::Review => artifacts::Kind::Review,
+        KindArg::Tutorial => artifacts::Kind::Tutorial,
     }
 }
 
@@ -82,7 +83,7 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
                 sessions: sessions(input_args.sessions_file)?.unwrap_or_default(),
                 title: input_args.title,
                 kind: kind(input_args.kind),
-                content: input::markdown(&input_args.content_file)?,
+                content: input::content(&input_args.content_file)?,
             })
             .context("creating artifact")?,
         ArtifactCommand::Update(patch) => store
@@ -121,6 +122,6 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
 }
 
 fn sessions(path: Option<std::path::PathBuf>) -> Result<Option<Vec<artifacts::OriginSession>>> {
-    path.map(|path| Ok(serde_json::from_str(&input::markdown(&path)?)?))
+    path.map(|path| Ok(serde_json::from_str(&input::content(&path)?)?))
         .transpose()
 }

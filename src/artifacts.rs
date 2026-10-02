@@ -974,14 +974,15 @@ enum Mutation {
 /// without reading. Hues are type-neutral on purpose: green/red are reserved
 /// elsewhere for status (open/pass/clean vs closed/fail), so `Plan` uses sky
 /// instead of green and `RFC` uses violet for proposal-like content.
-/// `Review` uses teal to stay distinct from sky/violet/amber while avoiding
-/// status hues.
+/// `Review` uses teal and `Tutorial` uses rose to stay distinct from
+/// sky/violet/amber while avoiding status hues.
 fn kind_tag_color(kind: Kind) -> ColorName {
     match kind {
         Kind::Rfc => ColorName::Violet,
         Kind::Plan => ColorName::Sky,
         Kind::Note => ColorName::Amber,
         Kind::Review => ColorName::Teal,
+        Kind::Tutorial => ColorName::Rose,
     }
 }
 

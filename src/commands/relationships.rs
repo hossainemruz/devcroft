@@ -60,7 +60,7 @@ pub(super) fn query(root: &DataRoot, args: RelationshipQueryArgs, json: bool) ->
 
 fn description(args: RelationshipDescriptionArgs) -> Result<Option<String>> {
     let text = match args.description_file {
-        Some(path) => Some(super::input::markdown(&path)?),
+        Some(path) => Some(super::input::content(&path)?),
         None => args.description,
     };
     ensure!(

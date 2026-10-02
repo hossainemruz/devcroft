@@ -51,6 +51,27 @@ impl TutorialView {
         self.focus_handle.clone()
     }
 
+    /// Native child views do not follow GPUI layout visibility, so the host
+    /// tab must hide the webview when its pane stops rendering. Rendering the
+    /// view again shows it on the next frame.
+    pub(crate) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if let Some(webview) = &self.webview {
+            webview.update(cx, |view, cx| {
+                if visible != view.visible() {
+                    if visible {
+                        view.show();
+                    } else {
+                        view.hide();
+                    }
+                    cx.notify();
+                }
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (visible, cx);
+    }
+
     /// Point the viewer at one tutorial revision. The native document is
     /// rebuilt on the next frame; the previous webview is dropped first so a
     /// stale document never lingers behind a new revision.
@@ -144,6 +165,11 @@ impl Render for TutorialView {
             }
             let webview = self.webview.clone().filter(|_| self.error.is_none());
             if let Some(webview) = &webview {
+                webview.update(cx, |view, _| {
+                    if !view.visible() {
+                        view.show();
+                    }
+                });
                 let _ = crate::webview::accessibility::attach(webview.read(cx).raw());
             }
             webview.map(|webview| {

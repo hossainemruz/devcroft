@@ -298,6 +298,11 @@ impl ArtifactBrowser {
         self.active = active;
         if active {
             self.refresh(cx);
+        } else if let Some(tutorial) = self.tutorial.clone() {
+            // The native tutorial webview sits above GPUI content, so hide it
+            // when the Resources tab leaves the screen instead of leaving it
+            // painted over the next tab.
+            tutorial.update(cx, |view, cx| view.set_visible(false, cx));
         }
     }
     pub(crate) fn include_archived(&self) -> bool {

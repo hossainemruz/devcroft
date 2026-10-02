@@ -75,6 +75,12 @@ fn tutorial_selection_swaps_the_markdown_reader_for_the_sandboxed_viewer(
             "tutorials expose no edit or comment rows"
         );
 
+        // Leaving the tab hides the native view but keeps it for re-entry.
+        browser.set_active(false, cx);
+        assert!(browser.tutorial.is_some());
+        browser.set_active(true, cx);
+        assert!(browser.tutorial.is_some());
+
         // A new revision refreshes the existing viewer instead of rebuilding it.
         let mut updated = tutorial.clone();
         updated.artifact.content = "<!doctype html><p>Updated</p>".into();

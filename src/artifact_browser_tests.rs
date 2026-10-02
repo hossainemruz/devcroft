@@ -70,6 +70,10 @@ fn tutorial_selection_swaps_the_markdown_reader_for_the_sandboxed_viewer(
             "tutorial never builds a Markdown reader"
         );
         assert!(browser.toc.is_empty(), "tutorials do not feed the outline");
+        assert!(
+            !browser.navigation_state().editable,
+            "tutorials expose no edit or comment rows"
+        );
 
         // A new revision refreshes the existing viewer instead of rebuilding it.
         let mut updated = tutorial.clone();
@@ -87,6 +91,50 @@ fn tutorial_selection_swaps_the_markdown_reader_for_the_sandboxed_viewer(
             browser.preview.is_some(),
             "Markdown selection uses the reader"
         );
+        assert!(
+            browser.navigation_state().editable,
+            "Markdown resources keep edit and comment rows"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn tutorials_reject_edit_and_comment_commands(cx: &mut gpui_kit::TestAppContext) {
+    use crate::data::artifacts::NewArtifact;
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    crate::data::write_json_atomic(
+        &root
+            .portable_dir()
+            .join("repositories/repo/repository.json"),
+        &serde_json::json!({"key": "repo"}),
+    )
+    .unwrap();
+    let store = ArtifactStore::new(&root);
+    let tutorial = store
+        .create(NewArtifact {
+            repository: Some("repo".into()),
+            sessions: vec![],
+            title: "Two records".into(),
+            kind: Kind::Tutorial,
+            content: "<!doctype html><html><body><p>Two records</p></body></html>".into(),
+        })
+        .unwrap();
+    cx.update(gpui_kit::init);
+    let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
+    let view = browser.clone();
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+    browser.update(cx, |browser, cx| browser.select(Some(tutorial), cx));
+    cx.update(|window, cx| {
+        browser.update(cx, |browser, cx| {
+            browser.begin_markdown_edit(window, cx);
+            browser.begin_comment(window, cx);
+            assert!(
+                browser.draft.is_none(),
+                "tutorials never open a draft editor"
+            );
+        });
     });
 }
 

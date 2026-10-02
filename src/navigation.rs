@@ -17,6 +17,9 @@ pub(crate) struct ResourceState {
     pub selected: bool,
     pub drafting: bool,
     pub saving: bool,
+    /// Whether the selection supports Markdown editing and comments. Tutorial
+    /// resources are view-only HTML, so their resource rows are omitted.
+    pub editable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -192,7 +195,7 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
         Context::Artifacts => ARTIFACTS.to_vec(),
         Context::Relationships => RELATIONSHIPS.to_vec(),
     };
-    if resource.selected && !resource.saving {
+    if resource.selected && resource.editable && !resource.saving {
         result.extend(if resource.drafting {
             RESOURCE_DRAFT
         } else {
@@ -405,16 +408,19 @@ mod tests {
                     selected: true,
                     drafting: false,
                     saving: false,
+                    editable: true,
                 },
                 ResourceState {
                     selected: true,
                     drafting: true,
                     saving: false,
+                    editable: true,
                 },
                 ResourceState {
                     selected: true,
                     drafting: true,
                     saving: true,
+                    editable: true,
                 },
             ] {
                 let available = rows(context, resource);
@@ -430,6 +436,7 @@ mod tests {
     fn resource_rows_follow_draft_and_save_state() {
         let selected = ResourceState {
             selected: true,
+            editable: true,
             ..Default::default()
         };
         assert_eq!(
@@ -451,6 +458,15 @@ mod tests {
             ..draft
         };
         assert_eq!(resolve(Context::Workspace, saving, 'w'), None);
+
+        // View-only resources keep selection but expose no edit/comment rows.
+        let view_only = ResourceState {
+            selected: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve(Context::Workspace, view_only, 'm'), None);
+        assert_eq!(resolve(Context::Workspace, view_only, 'c'), None);
+        assert_eq!(resolve(Context::Workspace, view_only, 'w'), None);
     }
 
     #[test]

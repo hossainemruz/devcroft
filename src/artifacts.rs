@@ -185,6 +185,10 @@ impl ArtifactBrowser {
             selected: self.selected.is_some(),
             drafting: self.draft.is_some(),
             saving: self.saving,
+            editable: self
+                .selected
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.artifact.kind != Kind::Tutorial),
         }
     }
 
@@ -231,6 +235,17 @@ impl ArtifactBrowser {
         if let Some(draft) = &self.draft {
             draft.input.read(cx).focus_handle(cx).focus(window, cx);
         }
+    }
+
+    /// Open the selected tutorial in the platform browser. Shares the cache
+    /// and launch path with the viewer's own button.
+    fn open_tutorial_in_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(tutorial) = self.tutorial.clone() else {
+            return;
+        };
+        tutorial.update(cx, |view, cx| {
+            let _ = view.open_in_browser(cx);
+        });
     }
 
     pub(crate) fn save_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -672,6 +687,10 @@ impl ArtifactBrowser {
         let Some(snapshot) = self.selected.clone() else {
             return;
         };
+        // Tutorials are view-only HTML: no Markdown draft and no comments.
+        if snapshot.artifact.kind == Kind::Tutorial {
+            return;
+        }
         let value = if document {
             snapshot.artifact.content.clone()
         } else {
@@ -882,30 +901,58 @@ impl ArtifactBrowser {
             .accessibility_label("Artifact options")
             .disabled(self.draft.is_some() || self.saving)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-                menu.item({
-                    let content = menu_snapshot.artifact.content.clone();
-                    PopupMenuItem::new("Copy Markdown").on_click(move |_, window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
-                        window.push_notification("Copied Markdown", cx);
-                    })
-                })
-                .item({
-                    let id = menu_snapshot.artifact.id.clone();
-                    PopupMenuItem::new("Copy ID").on_click(move |_, window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
-                        window.push_notification("Copied artifact ID", cx);
-                    })
-                })
-                .item({
+                let mut menu = menu;
+                if menu_snapshot.artifact.kind == Kind::Tutorial {
                     let view = view.clone();
-                    PopupMenuItem::new("Edit Markdown")
-                        .on_click(move |_, window, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.edit(true, None, window, cx);
-                            });
+                    menu = menu
+                        .item({
+                            PopupMenuItem::new("Open in browser").on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.open_tutorial_in_browser(cx);
+                                });
+                            })
                         })
-                })
-                .item({
+                        .item({
+                            let content = menu_snapshot.artifact.content.clone();
+                            PopupMenuItem::new("Copy HTML").on_click(move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
+                                window.push_notification("Copied HTML", cx);
+                            })
+                        })
+                        .item({
+                            let id = menu_snapshot.artifact.id.clone();
+                            PopupMenuItem::new("Copy ID").on_click(move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                                window.push_notification("Copied artifact ID", cx);
+                            })
+                        });
+                } else {
+                    menu = menu
+                        .item({
+                            let content = menu_snapshot.artifact.content.clone();
+                            PopupMenuItem::new("Copy Markdown").on_click(move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
+                                window.push_notification("Copied Markdown", cx);
+                            })
+                        })
+                        .item({
+                            let id = menu_snapshot.artifact.id.clone();
+                            PopupMenuItem::new("Copy ID").on_click(move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                                window.push_notification("Copied artifact ID", cx);
+                            })
+                        })
+                        .item({
+                            let view = view.clone();
+                            PopupMenuItem::new("Edit Markdown")
+                                .on_click(move |_, window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.edit(true, None, window, cx);
+                                    });
+                                })
+                        });
+                }
+                menu.item({
                     let view = view.clone();
                     let snapshot = menu_snapshot.clone();
                     let label = if archived { "Unarchive" } else { "Archive" };
@@ -1310,14 +1357,19 @@ impl Render for ArtifactBrowser {
                         );
                 }
             }
-            main = main.child(
-                h_flex().w_full().justify_center().child(
-                    meta.flex_wrap()
-                        .w_full()
-                        .max_w(px(crate::preview::READING_WIDTH))
-                        .pr(px(16.)),
-                ),
+            let is_tutorial = artifact.kind == Kind::Tutorial;
+            let mut meta_row = h_flex().w_full().justify_center().child(
+                meta.flex_wrap()
+                    .w_full()
+                    .max_w(px(crate::preview::READING_WIDTH))
+                    .pr(px(16.)),
             );
+            if is_tutorial {
+                // Tutorials omit the reader rail, which normally hosts the
+                // artifact options menu, so their actions live in the meta row.
+                meta_row = meta_row.child(self.render_options_menu(snapshot.clone(), archived, cx));
+            }
+            main = main.child(meta_row);
             if let Some(draft) = self.draft.as_ref().filter(|draft| draft.document) {
                 main = main
                     .child(
@@ -1347,11 +1399,7 @@ impl Render for ArtifactBrowser {
                             ),
                     );
                 detail = detail.child(main);
-            } else if let Some(tutorial) = self
-                .tutorial
-                .as_ref()
-                .filter(|_| artifact.kind == Kind::Tutorial)
-            {
+            } else if let Some(tutorial) = self.tutorial.as_ref().filter(|_| is_tutorial) {
                 main = main.child(div().flex_1().min_h_0().child(tutorial.clone()));
                 detail = detail.child(main);
             } else {
@@ -1463,7 +1511,7 @@ impl Render for ArtifactBrowser {
             } else {
                 detail = detail.child(crate::empty_state::empty_state(
                     gpui_kit::component::IconName::FileText, "No resources yet",
-                    "Ask your agent to save a plan, RFC, note, or review here. It will appear automatically.",
+                    "Ask your agent to save a plan, RFC, note, review, or tutorial here. It will appear automatically.",
                 ));
             }
         }

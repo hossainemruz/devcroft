@@ -144,4 +144,18 @@ mod tests {
         assert!(host.contains("connect-src 'none'"));
         assert_eq!(host.matches("connect-src 'none'").count(), 2);
     }
+
+    /// Tutorial webviews are built without an IPC handler. The host shell
+    /// must not install any bridge of its own: the only script is the srcdoc
+    /// setter, and the authored markup stays an escaped string.
+    #[test]
+    fn the_host_shell_adds_no_capability_bridge() {
+        let host = sandboxed_document("<script>parent.postMessage('x', '*')</script>");
+        assert_eq!(host.matches("<script").count(), 1);
+        assert!(!host.contains("__dc"));
+        assert!(!host.contains("messageHandlers"));
+        assert!(!host.contains("addEventListener"));
+        assert!(host.contains("sandbox=\"allow-scripts\""));
+        assert!(host.contains("\\u003cscript"), "authored script stays text");
+    }
 }

@@ -20,6 +20,7 @@ use gpui_kit::{
     SharedString, Styled as _, Window, div,
 };
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub(crate) struct TutorialView {
     root: Option<crate::data::DataRoot>,
@@ -105,6 +106,7 @@ impl TutorialView {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         std::fs::write(&path, body.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
+        prune_browser_cache(dir, SystemTime::now());
         Ok(path)
     }
 
@@ -225,6 +227,32 @@ fn browser_cache_path(root: &crate::data::DataRoot, id: &str) -> PathBuf {
         .join(format!("{id}.html"))
 }
 
+/// Browser copies are disposable: entries untouched for this long are removed
+/// best-effort the next time a tutorial is opened. The current revision is
+/// written first, so its fresh timestamp always spares it.
+const BROWSER_CACHE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+fn prune_browser_cache(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("html") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > BROWSER_CACHE_TTL)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn launch_browser(path: &Path) -> Result<()> {
     spawn_browser(std::process::Command::new("open"), path)
@@ -258,7 +286,6 @@ fn spawn_browser(mut command: std::process::Command, path: &Path) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
     use gpui_kit::AppContext as _;
 
     #[test]
@@ -270,6 +297,56 @@ mod tests {
             PathBuf::from("/data/cache/tutorials/art-23456789.html")
         );
         assert!(!path.starts_with(root.portable_dir()));
+    }
+
+    #[gpui_kit::test]
+    fn browser_copy_writes_the_current_revision_to_the_cache(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::data::DataRoot::new(dir.path().to_owned());
+        let view = cx.new(TutorialView::new);
+        view.update(cx, |view, cx| {
+            view.show(
+                Some(root.clone()),
+                "art-23456789",
+                "Two records",
+                "<!doctype html><p>hello</p>".into(),
+                cx,
+            );
+            let path = view.write_browser_copy().unwrap();
+            assert_eq!(
+                path,
+                root.root()
+                    .join("cache")
+                    .join("tutorials")
+                    .join("art-23456789.html")
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "<!doctype html><p>hello</p>"
+            );
+        });
+    }
+
+    #[test]
+    fn browser_cache_prunes_stale_entries_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.html");
+        let stale = dir.path().join("stale.html");
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&fresh, "fresh").unwrap();
+        std::fs::write(&stale, "stale").unwrap();
+        std::fs::write(&other, "keep").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        prune_browser_cache(dir.path(), SystemTime::now());
+        assert!(fresh.exists());
+        assert!(!stale.exists(), "entries older than the TTL are removed");
+        assert!(other.exists(), "non-tutorial files are left alone");
     }
 
     /// Rendering a shown tutorial must either host the document or surface a

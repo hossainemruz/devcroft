@@ -57,6 +57,8 @@ and optional math rendering.
 
 App and CLI mutations share a portable gate and per-artifact lock. A hash of the complete file is the revision. Saves check the revision, write and sync a temporary file, then atomically rename it. Conflicts leave editor drafts intact. Files must be regular UTF-8 files, no symlinks, at most 4 MiB including metadata.
 
+Opening a tutorial in the browser rewrites a disposable device-local copy under `cache/tutorials/` in the data root; copies untouched for 30 days are pruned the next time a tutorial is opened, and the cache never syncs. Tutorial records use a kind value older Devcroft builds cannot parse: once a data root contains tutorials, use a current build for that root.
+
 Existing schema 3 JSON artifacts are read without modification. The first explicit edit writes Markdown; old JSON is retained as a recovery copy, and Markdown takes precedence afterward. Unassociated artifacts remain available through Browse artifacts and can be assigned with `artifact update --repository KEY`. Old task records are left on disk but are no longer read or exposed by the application.
 
 ## CLI

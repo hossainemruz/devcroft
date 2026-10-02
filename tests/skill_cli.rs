@@ -30,6 +30,8 @@ fn install_both_idempotently_and_remove_without_touching_other_skills() {
         fs::read(claude.join("SKILL.md")).unwrap()
     );
     assert!(shared.join("references/review.md").exists());
+    assert!(shared.join("references/tutorials.md").exists());
+    assert!(shared.join("templates/tutorial.html").exists());
     fs::create_dir_all(home.join(".agents/skills/other")).unwrap();
     assert!(run(home, &["uninstall"]).status.success());
     assert!(!shared.exists());

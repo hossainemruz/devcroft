@@ -26,6 +26,14 @@ const FILES: &[(&str, &str)] = &[
         "references/relationships.md",
         include_str!("../assets/skills/devcroft/references/relationships.md"),
     ),
+    (
+        "references/tutorials.md",
+        include_str!("../assets/skills/devcroft/references/tutorials.md"),
+    ),
+    (
+        "templates/tutorial.html",
+        include_str!("../assets/skills/devcroft/templates/tutorial.html"),
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -405,6 +413,13 @@ mod tests {
         operate(h, target, Action::Uninstall).unwrap();
         assert!(!path.exists());
     }
+    #[test]
+    fn bundle_delivers_the_tutorial_contract_and_template() {
+        let files = bundle();
+        assert!(files.contains_key("references/tutorials.md"));
+        assert!(files.contains_key("templates/tutorial.html"));
+    }
+
     #[test]
     fn unmanaged_and_extra_files_are_preserved() {
         let tmp = tempfile::tempdir().unwrap();

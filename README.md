@@ -32,7 +32,7 @@ Press **Cmd+J** on macOS (**Ctrl+J** on Linux/Windows) anywhere in the workspace
 
 ## Repository resources
 
-Use the Resources tab to browse plans, RFCs, notes, and reviews for the current repository. Edit Markdown, comment on documents, and reopen originating agent sessions. Plans can track implementation phases using checkboxes. Reviews record agent review findings.
+Use the Resources tab to browse plans, RFCs, notes, reviews, and visual tutorials for the current repository. Edit Markdown, comment on documents, and reopen originating agent sessions. Plans can track implementation phases using checkboxes. Reviews record agent review findings. Tutorials are self-contained HTML pages: they render in a sandboxed embedded view on macOS, open in the default browser elsewhere, and have no editor or comment UI.
 
 ```sh
 devcroft repository list --json
@@ -156,8 +156,9 @@ The initial terminal renderer supports ANSI color, keyboard input, bracketed pas
 
 In **Settings → Agent → Devcroft skill**, install or update the bundled CLI
 skill for Claude Code and/or Codex/shared agents. OpenCode also discovers these
-locations. The skill explains repository artifacts and artifact/review
-comments, with examples; all operations use the existing CLI.
+locations. The skill explains repository artifacts, visual tutorial
+generation, and artifact/review comments, with examples; all operations use the
+existing CLI.
 
 The same installer works without the desktop:
 

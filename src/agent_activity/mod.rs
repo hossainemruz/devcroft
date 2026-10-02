@@ -110,6 +110,8 @@ enum BaseState {
     Starting,
     Idle,
     Working,
+    /// A working turn ended while its result was outside the live viewport.
+    Ready,
 }
 
 struct ActivityRecord {
@@ -164,7 +166,7 @@ impl ActivityRecord {
         } else {
             match self.base {
                 BaseState::Starting => ActivityState::Starting,
-                BaseState::Idle => ActivityState::Idle,
+                BaseState::Idle | BaseState::Ready => ActivityState::Idle,
                 BaseState::Working => ActivityState::Working,
             }
         };
@@ -690,6 +692,7 @@ impl ActivityEmitter {
     }
 
     fn terminal_evidence(&self, evidence: TerminalEvidence) {
+        let completion_confirmed = matches!(&evidence, TerminalEvidence::Idle(_));
         self.store
             .update(&self.checkout, self.generation, |record| {
                 if record.exited {
@@ -715,7 +718,7 @@ impl ActivityEmitter {
                         record.unseen_completion = false;
                         record.detail = detail;
                     }
-                    TerminalEvidence::Idle(detail) => {
+                    TerminalEvidence::Idle(detail) | TerminalEvidence::Ready(detail) => {
                         if record.agent == AgentKind::Opencode && record.structured_status_available
                         {
                             record.terminal_blocked = false;
@@ -726,9 +729,16 @@ impl ActivityEmitter {
                         }
                         record.resolve_all_pending();
                         record.working_sessions.clear();
-                        let completed = record.observed_work && record.base == BaseState::Working;
+                        let awaiting_result =
+                            matches!(record.base, BaseState::Working | BaseState::Ready);
+                        let completed =
+                            completion_confirmed && record.observed_work && awaiting_result;
                         record.terminal_blocked = false;
-                        record.base = BaseState::Idle;
+                        record.base = if !completion_confirmed && awaiting_result {
+                            BaseState::Ready
+                        } else {
+                            BaseState::Idle
+                        };
                         record.unseen_completion |= completed && !record.visible;
                         record.detail = detail;
                     }
@@ -1147,6 +1157,73 @@ mod tests {
             store.snapshot().for_launch(launch.id()).unwrap().state,
             ActivityState::Unavailable
         );
+    }
+
+    #[test]
+    fn opencode_v2_terminal_lifecycle_and_completion_acknowledgement() {
+        let (store, checkout) = store();
+        // Avoid binding a v1 status port: exercise the same v2 launch marker
+        // and frame observations the pane feeds to a managed OpenCode launch.
+        let launch = store.start(&checkout, AgentKind::Codex);
+        store.update(&checkout, launch.id(), |record| {
+            record.agent = AgentKind::Opencode
+        });
+        launch.observe_output(
+            format!("\u{1b}]0;devcroft-opencode-v2-{}\u{7}", launch.id()).as_bytes(),
+        );
+        let observe = |screen: &str, expected| {
+            launch.observe(TerminalObservation {
+                title: "OpenCode".into(),
+                screen: screen.into(),
+            });
+            assert_eq!(
+                store.snapshot().for_launch(launch.id()).unwrap().state,
+                expected
+            );
+        };
+        let idle = "  ┃\n  ┃\n  ┃  General · Model\n  ╹▀▀▀▀\n  /repo";
+        let busy = idle.replace("/repo", "[⋯] esc interrupt");
+        observe(idle, ActivityState::Idle);
+        observe(&busy, ActivityState::Working);
+        observe(
+            "  △ Permission required\n  ⇆ select enter confirm",
+            ActivityState::NeedsAttention,
+        );
+        observe(
+            "  ┃ enter done esc close\n\n",
+            ActivityState::NeedsAttention,
+        );
+        observe(&busy, ActivityState::Working);
+        observe(idle, ActivityState::Finished);
+        // Repainting the settled frame preserves the unseen notification.
+        observe(idle, ActivityState::Finished);
+        let scrolled = format!("  General · Model · interrupted\n  Jump to latest ↓\n{idle}");
+        observe(&scrolled, ActivityState::Finished);
+        store.set_visible_launch(Some(launch.id()));
+        observe(&scrolled, ActivityState::Idle);
+        observe(idle, ActivityState::Idle);
+        observe(&busy, ActivityState::Working);
+        observe(idle, ActivityState::Idle);
+        observe(&busy, ActivityState::Working);
+        let transparent_draft = "  ┃\n  ┃  draft\n  ┃  General · Model\n\n  /repo";
+        observe(transparent_draft, ActivityState::Idle);
+        store.set_visible_launch(None);
+        observe(&busy, ActivityState::Working);
+        observe(
+            &format!("  General · Model · 1s · interrupted\n\n  Jump to latest ↓\n{idle}"),
+            ActivityState::Idle,
+        );
+        observe(
+            &format!("  General · Model · 1s · interrupted\n\n{idle}"),
+            ActivityState::Idle,
+        );
+        observe(&busy, ActivityState::Working);
+        // An older interrupted turn in a scrolled viewport is not the result
+        // of the current turn. Returning to the latest summary confirms it.
+        observe(&scrolled, ActivityState::Idle);
+        observe(idle, ActivityState::Finished);
+        observe(&busy, ActivityState::Working);
+        observe(idle, ActivityState::Finished);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use serde_json::Value;
 use super::{DataRoot, write_json_atomic};
 use crate::agent::AgentKind;
 use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, snap_sidebar_limit};
+use crate::editor::{EditorChoice, ExternalEditorKind};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
 /// Selectable automatic portable-sync intervals, in minutes.
@@ -74,6 +75,14 @@ pub(crate) struct DeviceState {
     /// `default_agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) enabled_agents: Option<Vec<String>>,
+    /// Editor used for newly created Editor tabs. Missing or unknown values
+    /// preserve the historical Neovim behavior for existing installations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) editor_choice: Option<String>,
+    /// Launcher overrides keyed by editor id, so switching choices never
+    /// runs a different editor through a stale custom executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) editor_executables: Option<HashMap<String, String>>,
     /// Machine-local checkout bindings by repository key: the linked local
     /// checkout plus remote alias. Portable metadata lives in
     /// `portable/repositories/<key>/repository.json`; only the binding that
@@ -102,6 +111,18 @@ pub(crate) struct DeviceRepositoryBinding {
 }
 
 impl DeviceState {
+    pub(crate) fn editor_choice_or_default(&self) -> EditorChoice {
+        self.editor_choice
+            .as_deref()
+            .and_then(EditorChoice::parse)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn editor_executable_for(&self, kind: ExternalEditorKind) -> Option<String> {
+        self.editor_executables
+            .as_ref()
+            .and_then(|executables| executables.get(kind.id()).cloned())
+    }
     /// Effective app-wide font size: the stored value clamped to the
     /// settable range, or the default when unset.
     pub(crate) fn app_font_size_or_default(&self) -> f32 {
@@ -256,6 +277,35 @@ mod tests {
         assert_eq!(encoded["terminal_copy_on_select"], false);
         assert_eq!(encoded["future_setting"], 123);
         assert_eq!(DeviceState::default().terminal_copy_on_select, None);
+    }
+
+    #[test]
+    fn editor_choice_migrates_without_changing_neovim_default() {
+        let old: DeviceState = serde_json::from_str(r#"{"future_setting":123}"#).unwrap();
+        assert_eq!(old.editor_choice_or_default(), EditorChoice::Neovim);
+        let future: DeviceState = serde_json::from_str(r#"{"editor_choice":"future"}"#).unwrap();
+        assert_eq!(future.editor_choice_or_default(), EditorChoice::Neovim);
+        let built_in: DeviceState = serde_json::from_str(
+            r#"{"editor_choice":"built_in","editor_executables":{"vscode":"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code","zed":"/opt/zed"}}"#,
+        )
+        .unwrap();
+        assert_eq!(built_in.editor_choice_or_default(), EditorChoice::BuiltIn);
+        assert_eq!(
+            built_in
+                .editor_executable_for(ExternalEditorKind::VsCode)
+                .as_deref(),
+            Some("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
+        );
+        assert_eq!(
+            built_in
+                .editor_executable_for(ExternalEditorKind::Zed)
+                .as_deref(),
+            Some("/opt/zed")
+        );
+        assert_eq!(
+            serde_json::to_value(built_in).unwrap()["editor_choice"],
+            "built_in"
+        );
     }
 
     #[test]

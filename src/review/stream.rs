@@ -150,6 +150,13 @@ pub(crate) fn status_color(status: FileStatus) -> u32 {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RowRenderOptions {
+    pub(crate) selected: bool,
+    pub(crate) dark: bool,
+    pub(crate) editor_open_available: bool,
+}
+
 /// Render one flattened row. Pure over the loaded diff except the file
 /// header's viewed/collapsed toggles, which update the view through its entity.
 pub(crate) fn render_row(
@@ -158,8 +165,7 @@ pub(crate) fn render_row(
     viewed: &HashSet<String>,
     collapsed: &HashSet<String>,
     view: &Entity<ReviewView>,
-    selected: bool,
-    dark: bool,
+    options: RowRenderOptions,
 ) -> AnyElement {
     let file = &loaded.diff.files[row.file()];
     match row {
@@ -168,6 +174,7 @@ pub(crate) fn render_row(
             viewed.contains(&file.path),
             collapsed.contains(&file.path),
             view,
+            options.editor_open_available,
         ),
         StreamRow::HunkHeader { hunk, .. } => match &file.content {
             super::model::FileContent::Text { hunks, .. } => hunk_header_row(&hunks[hunk]),
@@ -176,8 +183,11 @@ pub(crate) fn render_row(
         StreamRow::Line { hunk, line, .. } => match &file.content {
             super::model::FileContent::Text { hunks, .. } => line_row(
                 &hunks[hunk].lines[line],
-                loaded.syntax.line(dark, row.file(), hunk, line),
-                selected,
+                loaded.syntax.line(options.dark, row.file(), hunk, line),
+                options.selected,
+                &file.path,
+                view,
+                options.editor_open_available,
             ),
             super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
         },
@@ -198,11 +208,14 @@ pub(crate) fn file_header_row(
     is_viewed: bool,
     is_collapsed: bool,
     view: &Entity<ReviewView>,
+    editor_open_available: bool,
 ) -> AnyElement {
     let path = file.path.clone();
     let collapse_path = file.path.clone();
     let toggle_view = view.clone();
     let toggle_collapse = view.clone();
+    let open_view = view.clone();
+    let open_path = file.path.clone();
     let stats = if file.additions > 0 || file.deletions > 0 {
         format!("+{} −{}", file.additions, file.deletions)
     } else {
@@ -262,6 +275,22 @@ pub(crate) fn file_header_row(
                 .text_color(rgb(0x858989))
                 .child(stats),
         )
+        .when(editor_open_available, |this| {
+            this.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(0x7dd3fc))
+                    .child("Open in Editor")
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
+                        cx.update_entity(&open_view, |view, cx| {
+                            view.open_file(&open_path, None, cx);
+                        });
+                        cx.stop_propagation();
+                    }),
+            )
+        })
         .child(
             div()
                 .flex_none()
@@ -282,7 +311,14 @@ pub(crate) fn file_header_row(
         .into_any_element()
 }
 
-fn line_row(line: &HunkLine, spans: &[super::syntax::SyntaxSpan], selected: bool) -> AnyElement {
+fn line_row(
+    line: &HunkLine,
+    spans: &[super::syntax::SyntaxSpan],
+    selected: bool,
+    path: &str,
+    view: &Entity<ReviewView>,
+    editor_open_available: bool,
+) -> AnyElement {
     let (background, sign, sign_color) = match line.tag {
         LineTag::Context => (None, " ", 0x555a5a),
         LineTag::Deletion => (Some(DELETION_BG), "-", 0xf87171),
@@ -296,6 +332,9 @@ fn line_row(line: &HunkLine, spans: &[super::syntax::SyntaxSpan], selected: bool
         Some(number) => format!("{number:>5}"),
         None => "     ".to_owned(),
     };
+    let open_path = path.to_owned();
+    let open_line = line.new_no;
+    let open_view = view.clone();
     div()
         .h(px(ROW_H))
         .flex_none()
@@ -321,6 +360,19 @@ fn line_row(line: &HunkLine, spans: &[super::syntax::SyntaxSpan], selected: bool
                 .w(px(44.))
                 .flex_none()
                 .text_color(rgb(0x555a5a))
+                .when(editor_open_available && line.new_no.is_some(), |this| {
+                    this.cursor_pointer().on_mouse_down(
+                        MouseButton::Left,
+                        move |_, _, cx: &mut App| {
+                            if let Some(number) = open_line {
+                                cx.update_entity(&open_view, |view, cx| {
+                                    view.open_file(&open_path, Some(number as usize), cx);
+                                });
+                                cx.stop_propagation();
+                            }
+                        },
+                    )
+                })
                 .child(new_no),
         )
         .child(

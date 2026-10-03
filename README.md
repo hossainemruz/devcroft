@@ -1,12 +1,14 @@
 # Devcroft
 
-Devcroft is a small GPUI desktop workspace with three persistent, Ghostty-powered terminal tabs:
+Devcroft is a small GPUI desktop workspace with Agent, Editor, Terminal, Review, and Resources tabs:
 
 - **Agent** resumes the checkout's most recent session when history exists, otherwise it launches your default agent (`opencode` unless changed in Settings → Agent) in your default shell. Use **New session…** in the Agent sidebar to pick a harness (`opencode`, `claude`, `codex`, or `omp`) explicitly for a new session.
-- **Editor** launches `nvim .` in your default shell.
+- **Editor** offers Neovim or Devcroft's built-in editor in **Settings → General → Editor**. Existing installations keep Neovim. The built-in editor opens one UTF-8 checkout file at a time and saves explicitly; it is intended for small edits, not a full IDE.
 - **Terminal** launches your default login shell.
 
-Each tab owns an independent PTY session. Switching tabs keeps the underlying process alive. Devcroft starts the default shell as an interactive login shell in every tab, then enters the Agent or Editor command through that shell. This matches a normal terminal launch and makes shell startup files, environment changes, aliases, functions, and tool-manager activation available to the agent harness and `nvim`.
+Terminal-backed tabs own independent PTY sessions. Switching tabs keeps the underlying process alive. Devcroft starts the default shell as an interactive login shell, then enters the Agent or Neovim command through that shell. This makes shell startup files, environment changes, aliases, functions, and tool-manager activation available to those commands.
+
+You can select the built-in editor from Settings on Home before opening your first project; Neovim is not required. Use **Open file…** and **Save** in the Editor tab. A changed file on disk blocks saving and leaves your draft open; save or discard a draft before opening a different file. Binary, non-UTF-8, and files over 2 MiB need an external editor. In Review, **Open ↗** and new-file line numbers open the current checkout file in the built-in editor. The built-in editor's **Open in** menu (Zed, VS Code) launches the checkout separately from the editor preference. Install their CLI launchers or set executable overrides in Settings. Paths are passed as process arguments. Changing editor choice keeps existing Neovim sessions and built-in drafts alive.
 
 The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, italic, and bold italic), so Nerd Font symbols work without a separate system font installation. Attribution and license files are in [`assets/`](assets/).
 
@@ -104,7 +106,7 @@ Tool inputs and the diff tool's language choice are machine-local: they autosave
 
 ## Requirements
 
-[mise](https://mise.jdx.dev/) manages the required Rust and Zig toolchains. The application expects `nvim` and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) to already be available in the environment inherited by your default shell.
+[mise](https://mise.jdx.dev/) manages the required Rust and Zig toolchains. The application expects at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) in the environment inherited by your default shell. Neovim is needed only when selected as the editor.
 
 ```sh
 mise install

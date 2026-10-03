@@ -29,7 +29,7 @@ use gpui_kit::{
     WeakEntity, Window, div, px, rgb,
 };
 
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use crate::agent::AgentKind;
 use crate::agent_icons::{self, AgentIconTiles};
@@ -46,6 +46,7 @@ use crate::data::{
     delete_space, get_origin, is_supported_sync_interval, list_local_branches, rename_space,
     set_origin, space_eq,
 };
+use crate::editor::{EditorChoice, ExternalEditorKind};
 use crate::fonts::TERMINAL_FONT_FAMILY;
 use crate::metrics::{
     DEFAULT_APP_FONT_SIZE, MAX_APP_FONT_SIZE, MIN_APP_FONT_SIZE, clamp_app_font_size,
@@ -105,6 +106,12 @@ pub(crate) struct SettingsView {
     active_section: SettingsSection,
     font_size: f32,
     terminal_preferences_error: Option<String>,
+    editor_choice: EditorChoice,
+    external_launcher: ExternalEditorKind,
+    editor_executables: HashMap<String, String>,
+    editor_executable: Option<String>,
+    editor_executable_input: Entity<InputState>,
+    editor_error: Option<String>,
     data_root: Option<DataRoot>,
     sync_tracker: SyncTracker,
     sync_interval: Option<u64>,
@@ -179,6 +186,24 @@ impl SettingsView {
         let stored = data_root
             .as_ref()
             .and_then(|root| DeviceStore::new(root).load().ok());
+        let editor_choice = stored
+            .as_ref()
+            .map(|state| state.editor_choice_or_default())
+            .unwrap_or_default();
+        let editor_executables = stored
+            .as_ref()
+            .and_then(|state| state.editor_executables.clone())
+            .unwrap_or_default();
+        let external_launcher = ExternalEditorKind::Zed;
+        let editor_executable = editor_executables.get(external_launcher.id()).cloned();
+        let editor_executable_input = cx.new(|cx| {
+            let mut input =
+                InputState::new(window, cx).placeholder("Command name or absolute executable path");
+            if let Some(value) = editor_executable.as_ref() {
+                input.set_value(value.clone(), window, cx);
+            }
+            input
+        });
         let session_limit = stored
             .as_ref()
             .map(|state| state.recent_sessions_limit_or_default())
@@ -235,6 +260,12 @@ impl SettingsView {
             active_section: SettingsSection::General,
             font_size: clamp_app_font_size(initial_font_size),
             terminal_preferences_error: None,
+            editor_choice,
+            external_launcher,
+            editor_executables,
+            editor_executable,
+            editor_executable_input,
+            editor_error: None,
             data_root,
             sync_tracker,
             sync_interval,
@@ -284,6 +315,22 @@ impl SettingsView {
     pub(crate) fn refresh_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(root) = self.data_root.clone() {
             let stored = DeviceStore::new(&root).load().ok();
+            self.editor_choice = stored
+                .as_ref()
+                .map(|state| state.editor_choice_or_default())
+                .unwrap_or_default();
+            self.editor_executables = stored
+                .as_ref()
+                .and_then(|state| state.editor_executables.clone())
+                .unwrap_or_default();
+            self.editor_executable = self
+                .editor_executables
+                .get(self.external_launcher.id())
+                .cloned();
+            let executable = self.editor_executable.clone().unwrap_or_default();
+            self.editor_executable_input.update(cx, |input, cx| {
+                input.set_value(executable, window, cx);
+            });
             self.sync_interval = stored
                 .as_ref()
                 .and_then(|state| state.sync_interval_minutes);
@@ -762,6 +809,83 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_editor_choice(
+        &mut self,
+        choice: EditorChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor_choice == choice {
+            return;
+        }
+        self.editor_choice = choice;
+        self.editor_error = None;
+        if let Some(root) = self.data_root.as_ref()
+            && let Err(error) = DeviceStore::new(root).update(|state| {
+                state.editor_choice = Some(choice.id().to_owned());
+            })
+        {
+            self.editor_error = Some(format!("Could not save editor choice: {error:#}"));
+        }
+        if let Some(workspace) = self.workspace.as_ref() {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.set_editor_choice(choice, window, cx)
+                })
+                .ok();
+        }
+        cx.notify();
+    }
+
+    fn set_external_launcher(
+        &mut self,
+        kind: ExternalEditorKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_launcher = kind;
+        self.editor_executable = self.editor_executables.get(kind.id()).cloned();
+        let executable = self.editor_executable.clone().unwrap_or_default();
+        self.editor_executable_input
+            .update(cx, |input, cx| input.set_value(executable, window, cx));
+        self.editor_error = None;
+        cx.notify();
+    }
+
+    fn save_editor_executable(&mut self, cx: &mut Context<Self>) {
+        let value = self
+            .editor_executable_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        let value = (!value.is_empty()).then_some(value);
+        self.editor_executable = value.clone();
+        if let Some(value) = value.as_ref() {
+            self.editor_executables
+                .insert(self.external_launcher.id().to_owned(), value.clone());
+        } else {
+            self.editor_executables.remove(self.external_launcher.id());
+        }
+        self.editor_error = None;
+        if let Some(root) = self.data_root.as_ref()
+            && let Err(error) = DeviceStore::new(root).update(|state| {
+                state.editor_executables = Some(self.editor_executables.clone());
+            })
+        {
+            self.editor_error = Some(format!("Could not save editor executable: {error:#}"));
+        }
+        if let Some(workspace) = self.workspace.as_ref() {
+            let kind = self.external_launcher;
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.set_external_executable(kind, value, cx)
+                })
+                .ok();
+        }
+        cx.notify();
+    }
+
     fn select_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         if self.active_section != section {
             self.active_section = section;
@@ -1225,6 +1349,10 @@ impl SettingsView {
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
+        let editor_view = view.clone();
+        let launcher_view = view.clone();
+        let editor_choice = self.editor_choice;
+        let external_launcher = self.external_launcher;
         let size = self.font_size;
         let is_default = (size - DEFAULT_APP_FONT_SIZE).abs() < f32::EPSILON;
         v_flex()
@@ -1241,6 +1369,87 @@ impl SettingsView {
             .when_some(self.terminal_preferences_error.clone(), |this, error| {
                 this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
             })
+            .child(
+                group(
+                    "Editor",
+                    Some("Choose Neovim or Devcroft's built-in editor. New Editor tabs use this choice; existing sessions and drafts stay open."),
+                )
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            Button::new("editor-choice")
+                                .accessibility_label(format!("Editor: {}", editor_choice.label()))
+                                .outline()
+                                .dropdown_caret(true)
+                                .label(editor_choice.label())
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for choice in EditorChoice::ALL {
+                                        let option_view = launcher_view.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(choice.label())
+                                                .checked(choice == editor_choice)
+                                                .on_click(move |_, window, cx| {
+                                                    option_view
+                                                        .update(cx, |this, cx| {
+                                                            this.set_editor_choice(choice, window, cx)
+                                                        })
+                                                        .ok();
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x858989))
+                                .child("Open the checkout in Zed or VS Code from the Editor tab. Install its CLI launcher or set an override below."),
+                        )
+                        .child(
+                            Button::new("external-launcher-choice")
+                                .accessibility_label(format!("External launcher: {}", external_launcher.label()))
+                                .outline()
+                                .dropdown_caret(true)
+                                .label(format!("{} launcher", external_launcher.label()))
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for kind in ExternalEditorKind::ALL {
+                                        let option_view = editor_view.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(kind.label())
+                                                .checked(kind == external_launcher)
+                                                .on_click(move |_, window, cx| {
+                                                    option_view.update(cx, |this, cx| {
+                                                        this.set_external_launcher(kind, window, cx)
+                                                    }).ok();
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                }),
+                        )
+                        .child(
+                            div()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                )
+                                .child(Input::new(&self.editor_executable_input)),
+                        )
+                        .child(
+                            Button::new("save-editor-executable")
+                                .label("Save executable")
+                                .outline()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.save_editor_executable(cx)
+                                })),
+                        ),
+                )
+                .when_some(self.editor_error.clone(), |this, error| {
+                    this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                }),
+            )
             .child(
                 group("Appearance", None).child(live_row(
                     "App font size",

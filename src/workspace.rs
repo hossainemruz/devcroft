@@ -50,6 +50,7 @@ use crate::data::{
     checkout_for, ensure_spaces, recent_repositories, record_repository_open, resolve_current_key,
     space_eq, sync_portable_with_tracker,
 };
+use crate::editor::{EditorChoice, ExternalEditorKind, native::NativeEditor};
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
@@ -217,6 +218,10 @@ pub(crate) struct Workspace {
     portable_git_poll: GitPoll,
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
+    editor_instance: Option<EditorChoice>,
+    editor_preference: EditorChoice,
+    editor_executables: HashMap<String, String>,
+    native_editor: Option<Entity<NativeEditor>>,
     review: Entity<ReviewView>,
     /// Harness the visible Agent pane was spawned with. Preserved across
     /// repository switches with its tabs; selecting a historical session
@@ -337,6 +342,8 @@ struct OpenAgentSession {
 struct RepositoryTabs {
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
+    editor_instance: Option<EditorChoice>,
+    native_editor: Option<Entity<NativeEditor>>,
     review: Entity<ReviewView>,
     /// Harness its Agent pane was spawned with, kept so a switch back
     /// restores the running session instead of respawning.
@@ -348,20 +355,26 @@ impl RepositoryTabs {
         working_directory: &Path,
         agent: AgentKind,
         activity: &AgentActivityStore,
+        editor: EditorChoice,
         cx: &mut Context<Workspace>,
     ) -> Self {
         let tabs = WorkspaceTab::ALL
             .into_iter()
             .map(|tab| {
-                (tab.has_terminal() && tab != WorkspaceTab::Agent).then(|| {
-                    cx.new(|cx| TerminalPane::new(tab, working_directory, agent, activity, cx))
-                })
+                (tab.has_terminal()
+                    && tab != WorkspaceTab::Agent
+                    && (tab != WorkspaceTab::Editor || editor == EditorChoice::Neovim))
+                    .then(|| {
+                        cx.new(|cx| TerminalPane::new(tab, working_directory, agent, activity, cx))
+                    })
             })
             .collect();
         let review = Workspace::new_review(working_directory, cx);
         Self {
             active_tab: WorkspaceTab::Agent,
             tabs,
+            editor_instance: Some(editor),
+            native_editor: None,
             review,
             agent,
         }
@@ -395,6 +408,14 @@ impl Workspace {
         let stored = data_root
             .as_ref()
             .and_then(|root| DeviceStore::new(root).load().ok());
+        let editor_preference = stored
+            .as_ref()
+            .map(|state| state.editor_choice_or_default())
+            .unwrap_or_default();
+        let editor_executables = stored
+            .as_ref()
+            .and_then(|state| state.editor_executables.clone())
+            .unwrap_or_default();
         // Isolation profiles: seed/reconcile the portable catalog (Personal
         // and Work plus any legacy group names the records reference) and
         // resume this device's last active space. A catalog that cannot be
@@ -755,6 +776,10 @@ impl Workspace {
             portable_git_poll: GitPoll::default(),
             active_tab,
             tabs,
+            editor_instance: None,
+            editor_preference,
+            editor_executables,
+            native_editor: None,
             review,
             session_agent,
             default_agent,
@@ -836,6 +861,14 @@ impl Workspace {
                 .focus(window, cx);
             return;
         }
+        if self.active_tab == WorkspaceTab::Editor
+            && self.editor_instance == Some(EditorChoice::BuiltIn)
+        {
+            if let Some(editor) = self.native_editor.as_ref() {
+                editor.read(cx).editor_focus(cx).focus(window, cx);
+            }
+            return;
+        }
         if let Some(Some(pane)) = self.tabs.get(self.active_tab as usize) {
             let focus_handle = pane.read(cx).focus_handle.clone();
             focus_handle.focus(window, cx);
@@ -874,6 +907,69 @@ impl Workspace {
         if self.command_open {
             self.close_command_palette(window, cx);
         }
+    }
+
+    pub(crate) fn set_editor_choice(
+        &mut self,
+        choice: EditorChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_preference = choice;
+        if !self.home_visible {
+            self.editor_instance = Some(choice);
+            if choice == EditorChoice::BuiltIn && self.native_editor.is_none() {
+                let executables = self.editor_executables.clone();
+                self.native_editor =
+                    Some(cx.new(|cx| {
+                        NativeEditor::new(&self.working_directory, executables, window, cx)
+                    }));
+            }
+            if choice == EditorChoice::Neovim && self.tabs[WorkspaceTab::Editor as usize].is_none()
+            {
+                self.tabs[WorkspaceTab::Editor as usize] = Some(cx.new(|cx| {
+                    TerminalPane::new(
+                        WorkspaceTab::Editor,
+                        &self.working_directory,
+                        self.default_agent,
+                        &self.agent_activity,
+                        cx,
+                    )
+                }));
+            }
+        }
+        self.refresh_review_editor_action(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_external_executable(
+        &mut self,
+        kind: ExternalEditorKind,
+        executable: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(executable) = executable {
+            self.editor_executables
+                .insert(kind.id().to_owned(), executable);
+        } else {
+            self.editor_executables.remove(kind.id());
+        }
+        let executables = self.editor_executables.clone();
+        if let Some(editor) = self.native_editor.as_ref() {
+            editor.update(cx, |view, cx| view.set_executables(executables.clone(), cx));
+        }
+        for tabs in self.inactive_repositories.values() {
+            if let Some(editor) = tabs.native_editor.as_ref() {
+                editor.update(cx, |view, cx| view.set_executables(executables.clone(), cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh_review_editor_action(&mut self, cx: &mut Context<Self>) {
+        let available = self.editor_instance == Some(EditorChoice::BuiltIn);
+        self.review
+            .update(cx, |view, cx| view.set_editor_open_available(available, cx));
     }
 
     /// Jump straight to the Terminal tab. An open command bar
@@ -1493,11 +1589,19 @@ impl Workspace {
             .inactive_repositories
             .remove(checkout)
             .unwrap_or_else(|| {
-                RepositoryTabs::new(checkout, self.default_agent, &self.agent_activity, cx)
+                RepositoryTabs::new(
+                    checkout,
+                    self.default_agent,
+                    &self.agent_activity,
+                    self.editor_preference,
+                    cx,
+                )
             });
         let previous = RepositoryTabs {
             active_tab: std::mem::replace(&mut self.active_tab, next.active_tab),
             tabs: std::mem::replace(&mut self.tabs, next.tabs),
+            editor_instance: std::mem::replace(&mut self.editor_instance, next.editor_instance),
+            native_editor: std::mem::replace(&mut self.native_editor, next.native_editor),
             review: std::mem::replace(&mut self.review, next.review),
             // Swap the session agents alongside their tab sets: the active
             // panes keep the harness they were spawned with, and the hidden
@@ -1523,8 +1627,22 @@ impl Workspace {
         });
         self.home_visible = false;
         self.home.update(cx, |view, cx| view.deactivate(cx));
+        if self.editor_instance.is_none() {
+            self.editor_instance = Some(self.editor_preference);
+        }
+        if self.editor_instance == Some(EditorChoice::BuiltIn) && self.native_editor.is_none() {
+            let executables = self.editor_executables.clone();
+            self.native_editor = Some(
+                cx.new(|cx| NativeEditor::new(&self.working_directory, executables, window, cx)),
+            );
+        }
+        self.refresh_review_editor_action(cx);
         for tab in WorkspaceTab::ALL {
-            if tab.has_terminal() && self.tabs[tab as usize].is_none() {
+            if tab.has_terminal()
+                && self.tabs[tab as usize].is_none()
+                && (tab != WorkspaceTab::Editor
+                    || self.editor_instance == Some(EditorChoice::Neovim))
+            {
                 if tab == WorkspaceTab::Agent
                     && self.agent_autostart.insert(self.working_directory.clone())
                     && let Some(last) = self
@@ -2415,6 +2533,15 @@ impl Workspace {
         if self.active_tab == WorkspaceTab::Agent {
             return self.render_agent_sessions(cx);
         }
+        if self.active_tab == WorkspaceTab::Editor
+            && self.editor_instance == Some(EditorChoice::BuiltIn)
+        {
+            return self
+                .native_editor
+                .as_ref()
+                .map(|editor| editor.clone().into_any_element())
+                .unwrap_or_else(|| div().size_full().into_any_element());
+        }
         match self
             .tabs
             .get(self.active_tab as usize)
@@ -2477,6 +2604,11 @@ impl Workspace {
             }
             WorkspaceTab::Resources => self.resources.read(cx).navigation_panes(cx),
             WorkspaceTab::Review => self.review.read(cx).navigation_panes(cx),
+            WorkspaceTab::Editor if self.editor_instance == Some(EditorChoice::BuiltIn) => self
+                .native_editor
+                .as_ref()
+                .map(|editor| vec![("Editor", editor.read(cx).editor_focus(cx))])
+                .unwrap_or_default(),
             WorkspaceTab::Editor | WorkspaceTab::Terminal => self
                 .tabs
                 .get(self.active_tab as usize)

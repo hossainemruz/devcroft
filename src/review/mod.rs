@@ -31,10 +31,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, ParentElement,
-    Render, ScrollStrategy, SharedString, Styled, Subscription, Window, div, img, list, px, rgb,
-    svg,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState,
+    MouseButton, ParentElement, Render, ScrollStrategy, SharedString, Styled, Subscription, Window,
+    div, img, list, px, rgb, svg,
 };
 
 use crate::command_palette::{
@@ -44,7 +44,7 @@ use crate::command_palette::{
 use self::git::{ReviewScope, load_review, suggest_base_branch};
 use self::icons::{FALLBACK, ICON_PX, IconTiles, ensure_tiles, icon_key};
 use self::model::ReviewDiff;
-use self::stream::{file_header_row, flatten, render_row, status_color};
+use self::stream::{RowRenderOptions, file_header_row, flatten, render_row, status_color};
 use self::tree::{TreeRowMeta, build_file_tree, file_item_id, file_path_from_id};
 
 /// Lucide `message-square` outline, inlined because `gpui-kit-assets`
@@ -121,9 +121,38 @@ pub(crate) struct ReviewView {
     generation: u64,
     feedback: feedback::Feedback,
     show_comments: bool,
+    open_error: Option<String>,
+    editor_open_available: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OpenReviewFile {
+    pub(crate) path: String,
+    pub(crate) line: Option<usize>,
+}
+
+impl EventEmitter<OpenReviewFile> for ReviewView {}
+
 impl ReviewView {
+    pub(crate) fn open_file(&self, path: &str, line: Option<usize>, cx: &mut Context<Self>) {
+        cx.emit(OpenReviewFile {
+            path: path.to_owned(),
+            line,
+        });
+    }
+
+    pub(crate) fn set_open_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        self.open_error = error;
+        cx.notify();
+    }
+
+    pub(crate) fn set_editor_open_available(&mut self, available: bool, cx: &mut Context<Self>) {
+        if self.editor_open_available != available {
+            self.editor_open_available = available;
+            self.open_error = None;
+            cx.notify();
+        }
+    }
     pub(crate) fn new(cwd: &Path, cx: &mut Context<Self>) -> Self {
         let base_branch = suggest_base_branch(cwd, "origin").unwrap_or_else(|| "main".to_owned());
         let mut view = Self {
@@ -152,6 +181,8 @@ impl ReviewView {
             generation: 0,
             feedback: feedback::Feedback::default(),
             show_comments: true,
+            open_error: None,
+            editor_open_available: false,
         };
         view.reload(cx);
         view
@@ -768,6 +799,7 @@ impl ReviewView {
                     self.viewed.borrow().contains(&file.path),
                     self.collapsed.borrow().contains(&file.path),
                     &view,
+                    self.editor_open_available,
                 ))
                 .into_any_element(),
         )
@@ -801,6 +833,7 @@ impl ReviewView {
         }
         let loaded = loaded.clone();
         let dark = cx.theme().is_dark();
+        let editor_open_available = self.editor_open_available;
         let viewed = self.viewed.clone();
         let collapsed = self.collapsed.clone();
         let thread_groups = self.inline_thread_groups();
@@ -860,8 +893,11 @@ impl ReviewView {
                     &viewed.borrow(),
                     &collapsed.borrow(),
                     &view,
-                    selected,
-                    dark,
+                    RowRenderOptions {
+                        selected,
+                        dark,
+                        editor_open_available,
+                    },
                 )))
                 .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     if matches!(row, stream::StreamRow::Line { .. }) {
@@ -1040,6 +1076,16 @@ impl Render for ReviewView {
             )
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_toolbar(cx))
+            .when_some(self.open_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .text_color(rgb(0xf87171))
+                        .child(error),
+                )
+            })
             .child(
                 h_flex()
                     .flex_1()

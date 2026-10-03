@@ -134,7 +134,32 @@ impl ListDelegate for AgentPicker {
 
 impl Workspace {
     pub(super) fn new_review(cwd: &Path, cx: &mut Context<Self>) -> Entity<ReviewView> {
-        cx.new(|cx| ReviewView::new(cwd, cx))
+        let review = cx.new(|cx| ReviewView::new(cwd, cx));
+        let checkout = cwd.to_owned();
+        cx.subscribe(
+            &review,
+            move |this, review, event: &crate::review::OpenReviewFile, cx| {
+                let file = checkout.join(&event.path);
+                let error = if !file.is_file() {
+                    Some(format!(
+                        "{} is unavailable in the current checkout.",
+                        event.path
+                    ))
+                } else if this.editor_instance != Some(EditorChoice::BuiltIn) {
+                    Some("Choose Devcroft editor in Settings to open Review files here.".into())
+                } else if let Some(editor) = this.native_editor.as_ref() {
+                    editor.update(cx, |view, cx| view.request_open(file, event.line, cx));
+                    this.active_tab = WorkspaceTab::Editor;
+                    cx.notify();
+                    None
+                } else {
+                    Some("The built-in editor is not ready yet.".into())
+                };
+                review.update(cx, |view, cx| view.set_open_error(error, cx));
+            },
+        )
+        .detach();
+        review
     }
 
     fn create_agent_session(

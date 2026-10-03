@@ -948,6 +948,7 @@ impl Workspace {
         self.command_open = true;
         self.attention_only = false;
         self.palette_mode = mode;
+        self.sync_tutorial_palette(cx);
         // A few small JSON reads per opening — not per render — so the
         // switcher always reflects recent adds and switches.
         self.reload_recent_repositories();
@@ -983,8 +984,29 @@ impl Workspace {
             return;
         }
         self.command_open = false;
+        self.sync_tutorial_palette(cx);
         self.focus_active_pane(window, cx);
         cx.notify();
+    }
+
+    /// Keep tutorial webviews behind the palette: native children paint over
+    /// GPUI popups, so both artifact browsers hide while the bar is open and
+    /// re-show on the next render once it closes.
+    fn sync_tutorial_palette(&mut self, cx: &mut Context<Self>) {
+        let open = self.command_open;
+        self.home
+            .update(cx, |view, cx| view.set_palette_open(open, cx));
+        self.resources
+            .update(cx, |view, cx| view.set_palette_open(open, cx));
+    }
+
+    /// Same cover rule for the navigation HUD.
+    fn sync_tutorial_navigation(&mut self, cx: &mut Context<Self>) {
+        let open = self.navigation_open;
+        self.home
+            .update(cx, |view, cx| view.set_navigation_open(open, cx));
+        self.resources
+            .update(cx, |view, cx| view.set_navigation_open(open, cx));
     }
 
     /// Open Settings as a modal dialog (fixed height, scrollable body — see
@@ -1090,6 +1112,7 @@ impl Workspace {
         // Every path below leaves the bar closed; `select_tab` focuses and
         // notifies itself, the other arms do it explicitly.
         self.command_open = false;
+        self.sync_tutorial_palette(cx);
         let focus_attention_target = self.attention_only;
         match item {
             PaletteItem::SwitchRepository { key, label } => {
@@ -1549,6 +1572,7 @@ impl Workspace {
         self.relationships_visible = true;
         self.home_visible = true;
         self.command_open = false;
+        self.sync_tutorial_palette(cx);
         self.relationships
             .update(cx, |view, cx| view.set_active(true, cx));
         self.focus_active_pane(window, cx);
@@ -1797,6 +1821,7 @@ impl Workspace {
             .update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
+        self.sync_tutorial_palette(cx);
         self.home.update(cx, |view, cx| view.activate(cx));
         self.refresh_sessions(cx);
         self.focus_active_pane(window, cx);
@@ -1826,6 +1851,7 @@ impl Workspace {
             .update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
         self.command_open = false;
+        self.sync_tutorial_palette(cx);
         self.home
             .update(cx, |view, cx| view.show_artifacts_page(cx));
         self.focus_active_pane(window, cx);
@@ -2479,6 +2505,7 @@ impl Workspace {
             .rposition(|(_, focus)| focus.contains_focused(window, cx))
             .unwrap_or(0);
         self.navigation_open = true;
+        self.sync_tutorial_navigation(cx);
         // Start item cursors where `j`/`k` should repeat from: the active
         // session in the sidebar, the first Home card on the dashboard.
         // Artifact and review lists reuse their existing selection.
@@ -2515,6 +2542,7 @@ impl Workspace {
         let was_open = self.navigation_open;
         if was_open {
             self.navigation_open = false;
+            self.sync_tutorial_navigation(cx);
         }
         if self.session_cursor.is_some() {
             self.session_cursor = None;

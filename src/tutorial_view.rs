@@ -28,6 +28,8 @@ pub(crate) struct TutorialView {
     error: Option<SharedString>,
     focus_handle: FocusHandle,
     menu_open: bool,
+    palette_open: bool,
+    navigation_open: bool,
     #[cfg(target_os = "macos")]
     webview: Option<Entity<gpui_wry::WebView>>,
     #[cfg(target_os = "macos")]
@@ -44,6 +46,8 @@ impl TutorialView {
             error: None,
             focus_handle: cx.focus_handle(),
             menu_open: false,
+            palette_open: false,
+            navigation_open: false,
             #[cfg(target_os = "macos")]
             webview: None,
             #[cfg(target_os = "macos")]
@@ -58,6 +62,27 @@ impl TutorialView {
     /// Native child views otherwise cover GPUI popup rows and intercept clicks.
     pub(crate) fn set_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.menu_open = open;
+        if open {
+            self.set_visible(false, cx);
+        }
+        cx.notify();
+    }
+
+    /// The workspace command palette is GPUI content, not a dialog or sheet,
+    /// so the render-time dialog/sheet gate does not cover it. While open the
+    /// native webview must hide or it paints over the palette list.
+    pub(crate) fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.palette_open = open;
+        if open {
+            self.set_visible(false, cx);
+        }
+        cx.notify();
+    }
+
+    /// The navigation HUD is GPUI content anchored to the viewport corner, so
+    /// the same native-cover rule applies as the palette.
+    pub(crate) fn set_navigation_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.navigation_open = open;
         if open {
             self.set_visible(false, cx);
         }
@@ -187,8 +212,11 @@ impl Render for TutorialView {
                 });
             }
             let webview = self.webview.clone().filter(|_| self.error.is_none());
-            let visible =
-                !self.menu_open && !window.has_active_dialog(cx) && !window.has_active_sheet(cx);
+            let visible = !self.menu_open
+                && !self.palette_open
+                && !self.navigation_open
+                && !window.has_active_dialog(cx)
+                && !window.has_active_sheet(cx);
             if let Some(webview) = &webview {
                 webview.update(cx, |view, _| {
                     if visible && !view.visible() {

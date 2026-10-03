@@ -305,6 +305,21 @@ impl ArtifactBrowser {
             tutorial.update(cx, |view, cx| view.set_visible(false, cx));
         }
     }
+
+    /// Forward the workspace palette state: the palette is GPUI content, so a
+    /// visible tutorial webview would paint over its list.
+    pub(crate) fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if let Some(tutorial) = self.tutorial.clone() {
+            tutorial.update(cx, |view, cx| view.set_palette_open(open, cx));
+        }
+    }
+
+    /// Forward navigation-HUD state for the same native-cover reason.
+    pub(crate) fn set_navigation_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if let Some(tutorial) = self.tutorial.clone() {
+            tutorial.update(cx, |view, cx| view.set_navigation_open(open, cx));
+        }
+    }
     pub(crate) fn include_archived(&self) -> bool {
         self.include_archived
     }

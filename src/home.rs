@@ -547,6 +547,16 @@ impl HomeView {
             .update(cx, |view, cx| view.set_include_archived(include, cx));
     }
 
+    pub(crate) fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.artifacts
+            .update(cx, |view, cx| view.set_palette_open(open, cx));
+    }
+
+    pub(crate) fn set_navigation_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.artifacts
+            .update(cx, |view, cx| view.set_navigation_open(open, cx));
+    }
+
     pub(crate) fn artifacts_navigation_state(
         &self,
         cx: &gpui_kit::App,

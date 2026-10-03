@@ -1,5 +1,6 @@
 //! Editor preference and argument-safe optional external editor launches.
 
+pub(crate) mod lsp;
 pub(crate) mod native;
 
 use std::ffi::OsString;
@@ -140,7 +141,7 @@ impl ExternalEditor {
     }
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
     let path = Path::new(name);
     if path.components().count() > 1 || path.is_absolute() {
         return is_executable(path).then(|| path.to_owned());

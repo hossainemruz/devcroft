@@ -127,6 +127,7 @@ pub(crate) enum PaletteCommand {
     GoReview,
     GoResources,
     GoHome,
+    EditorGoBack,
     BrowseArtifacts,
     RepositoryRelationships,
     AddRepository,
@@ -145,13 +146,14 @@ impl PaletteCommand {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::GoAgent,
         Self::GoEditor,
         Self::GoTerminal,
         Self::GoReview,
         Self::GoResources,
         Self::GoHome,
+        Self::EditorGoBack,
         Self::BrowseArtifacts,
         Self::RepositoryRelationships,
         Self::AddRepository,
@@ -167,6 +169,7 @@ impl PaletteCommand {
             Self::GoReview => "Go to Review",
             Self::GoResources => "Go to Resources",
             Self::GoHome => "Go to Home",
+            Self::EditorGoBack => "Editor: Go Back",
             Self::BrowseArtifacts => "Browse artifacts",
             Self::RepositoryRelationships => "Repository relationships",
             Self::AddRepository => "Add repository…",
@@ -186,6 +189,7 @@ impl PaletteCommand {
             Self::GoReview => &["tab", "review", "diff"],
             Self::GoResources => &["tab", "resources", "artifacts"],
             Self::GoHome => &["tab", "home", "dashboard"],
+            Self::EditorGoBack => &["editor", "back", "definition", "jump"],
             Self::RepositoryRelationships => {
                 &["graph", "canvas", "dependencies", "dependents", "map"]
             }
@@ -352,6 +356,7 @@ pub(crate) fn palette_sections_for_mode(
             if home_visible {
                 go_to.retain(|item| {
                     !matches!(item, PaletteItem::Command(command) if command.is_workspace_tab())
+                        && !matches!(item, PaletteItem::Command(PaletteCommand::EditorGoBack))
                 });
             }
             vec![
@@ -409,13 +414,14 @@ pub(crate) fn item_at(
     sections.get(section)?.items.get(row).cloned()
 }
 
-const GO_TO_COMMANDS: [PaletteCommand; 8] = [
+const GO_TO_COMMANDS: [PaletteCommand; 9] = [
     PaletteCommand::GoAgent,
     PaletteCommand::GoEditor,
     PaletteCommand::GoTerminal,
     PaletteCommand::GoReview,
     PaletteCommand::GoResources,
     PaletteCommand::GoHome,
+    PaletteCommand::EditorGoBack,
     PaletteCommand::BrowseArtifacts,
     PaletteCommand::RepositoryRelationships,
 ];
@@ -772,10 +778,14 @@ mod tests {
         );
         assert_eq!(
             item_at(&sections, 0, 6),
-            Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+            Some(PaletteItem::Command(PaletteCommand::EditorGoBack))
         );
         assert_eq!(
             item_at(&sections, 0, 7),
+            Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+        );
+        assert_eq!(
+            item_at(&sections, 0, 8),
             Some(PaletteItem::Command(
                 PaletteCommand::RepositoryRelationships
             ))
@@ -807,7 +817,7 @@ mod tests {
             item_at(&sections, 4, 0),
             Some(PaletteItem::Command(PaletteCommand::SyncPortable))
         );
-        assert_eq!(item_at(&sections, 0, 8), None);
+        assert_eq!(item_at(&sections, 0, 9), None);
         assert_eq!(item_at(&sections, 1, ToolKind::ALL.len()), None);
         assert_eq!(item_at(&sections, 5, 0), None);
     }
@@ -816,8 +826,8 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 8 go-to + all tools + 2 switch + 1 add + 1 settings + 1 sync.
-        let expected = 13 + ToolKind::ALL.len();
+        // 9 go-to + all tools + 2 switch + 1 add + 1 settings + 1 sync.
+        let expected = 14 + ToolKind::ALL.len();
         assert_eq!(all.len(), expected);
         assert_eq!(filter_items(&sections, "   ").len(), expected);
     }

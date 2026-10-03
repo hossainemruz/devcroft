@@ -51,6 +51,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 similar = "3.2.0"
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig"] }
 libc = "0.2"
+lsp-types = "0.97"
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]

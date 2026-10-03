@@ -2,12 +2,16 @@
 //! protection against overwriting a file changed by an agent on disk.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs,
     io::Write as _,
     path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
 };
 
+use super::lsp::{Client, DiagnosticEvent, LspProviders, discover_rust_analyzer, file_uri};
 use crate::editor::{ExternalEditor, ExternalEditorKind};
 use anyhow::{Context as _, Result, bail};
 use gpui_kit::component::{
@@ -35,6 +39,18 @@ pub(crate) struct NativeEditor {
     error: Option<String>,
     pending_open: Option<(PathBuf, Option<usize>)>,
     executables: HashMap<String, String>,
+    lsp: Option<LspSession>,
+    /// Origins of follow-definition jumps (engine positions), newest last.
+    /// Pushed by the `show_document` hook before the engine jumps.
+    jump_back: Rc<RefCell<Vec<Position>>>,
+}
+
+/// One live language session: exactly the document currently open, at the
+/// URI the server knows. Replaced on every successful open; dropped (and
+/// the server killed) when the editor moves to another file.
+struct LspSession {
+    client: Arc<Client>,
+    uri: String,
 }
 
 impl NativeEditor {
@@ -51,6 +67,7 @@ impl NativeEditor {
                     .saved
                     .as_ref()
                     .is_some_and(|saved| editor.read(cx).value().as_ref() != saved.as_str());
+                this.push_text_to_server(cx);
                 cx.notify();
             }
         })
@@ -64,11 +81,17 @@ impl NativeEditor {
             error: None,
             pending_open: None,
             executables,
+            lsp: None,
+            jump_back: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
     pub(crate) fn editor_focus(&self, cx: &App) -> FocusHandle {
         self.editor.read(cx).focus_handle(cx)
+    }
+
+    pub(crate) fn has_jump_history(&self) -> bool {
+        !self.jump_back.borrow().is_empty()
     }
 
     /// A Review event has no Window handle. Apply it on the next render, when
@@ -157,9 +180,15 @@ impl NativeEditor {
                 "This file's text format cannot be preserved by the built-in editor. Open it in Zed or VS Code."
             );
         }
-        self.path = Some(canonical);
-        self.saved = Some(contents);
+        if self.path.as_deref() != Some(canonical.as_path()) {
+            // A different file: origins recorded in the previous document
+            // would jump to meaningless offsets here.
+            self.jump_back.borrow_mut().clear();
+        }
+        self.path = Some(canonical.clone());
+        self.saved = Some(contents.clone());
         self.dirty = false;
+        self.restart_lsp(&canonical, language, &contents, window, cx);
         Ok(())
     }
 
@@ -240,6 +269,139 @@ impl NativeEditor {
         cx: &mut Context<Self>,
     ) {
         self.executables = executables;
+        cx.notify();
+    }
+
+    /// Push the current buffer to the server after an edit. Silent on
+    /// failure: the client records the failure and the next edit retries,
+    /// so a struggling server never interrupts typing.
+    fn push_text_to_server(&self, cx: &mut Context<Self>) {
+        let Some(session) = self.lsp.as_ref() else {
+            return;
+        };
+        let text = self.editor.read(cx).value().to_string();
+        let _ = session.client.did_change(&text);
+    }
+
+    /// Restart the language session for a newly opened file. Any failure
+    /// (no server binary, failed handshake) leaves `lsp` empty and the file
+    /// perfectly editable without language features.
+    fn restart_lsp(
+        &mut self,
+        path: &Path,
+        language: &str,
+        contents: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.lsp.take();
+        self.clear_lsp_providers(cx);
+        if language != "rust" {
+            return;
+        }
+        let Some(program) = discover_rust_analyzer(None) else {
+            return;
+        };
+        let uri = match file_uri(path) {
+            Ok(uri) => uri,
+            Err(_) => return,
+        };
+        let (diagnostics_tx, diagnostics_rx) = async_channel::unbounded();
+        let client = match Client::start(&program, &self.root, diagnostics_tx) {
+            Ok(client) => client,
+            Err(_) => return,
+        };
+        if client.position_encoding() != "utf-16" {
+            // The offset math assumes UTF-16 code units; never wire
+            // providers against a server speaking anything else.
+            return;
+        }
+        if client.did_open(&uri, "rust", contents).is_err() {
+            return;
+        }
+        let providers = LspProviders::new(Arc::clone(&client), uri.clone());
+        let jumps = Rc::clone(&self.jump_back);
+        let editor_handle = self.editor.downgrade();
+        self.editor.update(cx, |editor, _| {
+            let lsp = editor.lsp_mut();
+            lsp.hover_provider = Some(providers.clone());
+            lsp.completion_provider = Some(providers.clone());
+            lsp.definition_provider = Some(providers.clone());
+            lsp.show_document = Some(Rc::new(
+                move |params: &lsp_types::ShowDocumentParams,
+                      _window: &mut Window,
+                      cx: &mut App| {
+                    if params.external == Some(true) {
+                        return false;
+                    }
+                    if let Ok(origin) =
+                        editor_handle.update(cx, |editor, _| editor.cursor_position())
+                    {
+                        let mut jumps = jumps.borrow_mut();
+                        if jumps.len() >= 100 {
+                            jumps.remove(0);
+                        }
+                        jumps.push(origin);
+                    }
+                    false
+                },
+            ));
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(event) = diagnostics_rx.recv().await {
+                let _ = view.update(cx, |this, cx| this.apply_diagnostics(&event, cx));
+            }
+        })
+        .detach();
+        self.lsp = Some(LspSession {
+            client,
+            uri: uri.to_string(),
+        });
+    }
+
+    fn clear_lsp_providers(&mut self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let lsp = editor.lsp_mut();
+            lsp.hover_provider = None;
+            lsp.completion_provider = None;
+            lsp.definition_provider = None;
+            lsp.show_document = None;
+            cx.notify();
+        });
+    }
+
+    fn apply_diagnostics(&mut self, event: &DiagnosticEvent, cx: &mut Context<Self>) {
+        let Some(session) = self.lsp.as_ref() else {
+            return;
+        };
+        if session.uri != event.uri {
+            return;
+        }
+        if event
+            .version
+            .is_some_and(|version| version < session.client.doc_version())
+        {
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().clone();
+            if let Some(set) = editor.diagnostics_mut() {
+                set.reset(&text);
+                set.extend(event.diagnostics.iter().cloned());
+                cx.notify();
+            }
+        });
+    }
+
+    /// Return to the origin of the last follow-definition jump, if any.
+    pub(crate) fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(position) = self.jump_back.borrow_mut().pop() else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.set_cursor_position(position, window, cx);
+            editor.focus(window, cx);
+        });
         cx.notify();
     }
 
@@ -378,6 +540,17 @@ impl Render for NativeEditor {
                                 menu
                             }),
                     )
+                    .when(!self.jump_back.borrow().is_empty(), |row| {
+                        row.child(
+                            Button::new("native-go-back")
+                                .accessibility_label("Go back to definition origin")
+                                .label("Back")
+                                .ghost()
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.go_back(window, cx)),
+                                ),
+                        )
+                    })
                     .child(div().text_sm().text_color(rgb(0x858989)).child(label))
                     .when(self.dirty, |row| {
                         row.child(div().text_sm().text_color(rgb(0xfbbf24)).child("Unsaved"))

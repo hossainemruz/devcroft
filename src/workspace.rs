@@ -909,6 +909,26 @@ impl Workspace {
         }
     }
 
+    /// Jump back to the origin of the last follow-definition hop in the
+    /// built-in editor. A no-op without a built-in session or history, so
+    /// the command stays harmless wherever it is offered.
+    fn editor_go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_history = self
+            .native_editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).has_jump_history());
+        if self.home_visible || !has_history {
+            return;
+        }
+        self.select_tab(WorkspaceTab::Editor as usize, window, cx);
+        if let Some(editor) = self.native_editor.as_ref() {
+            editor.update(cx, |editor, cx| editor.go_back(window, cx));
+        }
+        if self.command_open {
+            self.close_command_palette(window, cx);
+        }
+    }
+
     pub(crate) fn set_editor_choice(
         &mut self,
         choice: EditorChoice,
@@ -1233,6 +1253,7 @@ impl Workspace {
                 PaletteCommand::GoReview => self.select_tab(3, window, cx),
                 PaletteCommand::GoResources => self.select_tab(4, window, cx),
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
+                PaletteCommand::EditorGoBack => self.editor_go_back(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
                 PaletteCommand::GoHome => self.go_home(window, cx),
                 PaletteCommand::RepositoryRelationships => self.open_relationships(window, cx),
@@ -3296,6 +3317,7 @@ fn palette_icon(command: PaletteCommand) -> IconName {
         PaletteCommand::RepositoryRelationships => IconName::LayoutDashboard,
         PaletteCommand::AddRepository => IconName::Plus,
         PaletteCommand::OpenSettings => IconName::Settings,
+        PaletteCommand::EditorGoBack => IconName::ArrowLeft,
         PaletteCommand::SyncPortable => IconName::RotateCw,
     }
 }

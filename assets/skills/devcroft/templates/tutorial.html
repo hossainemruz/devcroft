@@ -7,6 +7,8 @@
 <!--
   Devcroft tutorial template. Keep this file self-contained and offline:
   inline CSS/JS/SVG only, no CDN links, no fetch, data: images only.
+  Keep .shell with direct main and nav.toc children, and the neutral theme
+  tokens: the Devcroft reader integrates these with its native rail and theme.
   Replace every placeholder, cite repository-relative path:line for each
   substantive claim, and label inference and simulations. See
   references/tutorials.md for the full contract.
@@ -14,40 +16,43 @@
 <style>
   :root {
     color-scheme: light dark;
-    --bg: #f5f7fa; --surface: #ffffff; --border: #d6dee8; --text: #131a23;
-    --muted: #526174; --accent: #8a4b00; --soft: rgba(138, 75, 0, .10);
+    --bg: #ffffff; --surface: #fafafa; --border: #e5e5e5; --text: #171717;
+    --muted: #737373; --accent: #2563eb; --soft: rgba(37, 99, 235, .10);
     --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0e151d; --surface: #151f2a; --border: #2a3a4d; --text: #e6edf5;
-      --muted: #9fb0c3; --accent: #ffb547; --soft: rgba(255, 181, 71, .14);
+      --bg: #0a0a0a; --surface: #171717; --border: #262626; --text: #fafafa;
+      --muted: #a3a3a3; --accent: #60a5fa; --soft: rgba(96, 165, 250, .12);
     }
   }
-  html { font-size: 17px; }
+  html { font-size: 16px; }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
     font: 400 1rem/1.6 var(--font); -webkit-font-smoothing: antialiased;
   }
   code { font: .875em var(--mono); }
-  .shell { max-width: 76rem; margin: 0 auto; padding: 2rem 1.5rem 4.5rem; display: grid; gap: 2.5rem; }
-  @media (min-width: 62.5rem) {
-    .shell { grid-template-columns: 11rem minmax(0, 1fr); gap: 3rem; align-items: start; }
-    .toc { position: sticky; top: 1.5rem; }
+  .shell { margin: 0 auto; display: grid; align-items: start; }
+  main { display: grid; gap: 1.75rem; min-width: 0; width: 100%; max-width: 54rem; margin: 0 auto; padding: 1rem 1rem 3rem; }
+  .toc { padding: .5rem; font-size: .875rem; }
+  .toc-title { padding: .5rem; margin: 0 0 .5rem; font-weight: 500; }
+  .toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
+  .toc a { display: block; padding: .375rem .5rem; border-radius: .375rem; color: var(--muted); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .toc a:hover, .toc a:focus-visible { color: var(--text); background: var(--surface); }
+  .toc a:focus-visible { outline: 1px solid var(--accent); }
+  @media (min-width: 50rem) {
+    .shell { grid-template-columns: minmax(0, 1fr) 19.375rem; }
+    main { grid-column: 1; grid-row: 1; }
+    .toc { grid-column: 2; grid-row: 1; position: sticky; top: 0; height: 100vh; overflow-y: auto; border-left: 1px solid var(--border); }
   }
-  .toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: .5rem 1rem; }
-  @media (min-width: 62.5rem) { .toc ol { flex-direction: column; } }
-  .toc a { color: var(--muted); text-decoration: none; font-size: .875rem; }
-  .toc a:hover, .toc a:focus-visible { color: var(--text); }
-  main { display: grid; gap: 3rem; min-width: 0; }
   header { display: grid; gap: .75rem; }
-  .eyebrow { margin: 0; font: 600 .75rem/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
-  h1 { margin: 0; font-size: clamp(2rem, 5vw, 3rem); line-height: 1.05; letter-spacing: -.02em; text-wrap: balance; max-width: 20ch; }
-  h2 { margin: 0; font-size: 1.5rem; line-height: 1.2; letter-spacing: -.015em; text-wrap: balance; }
+  .eyebrow { margin: 0; font: 600 .75rem/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  h1 { margin: 0; font-size: 1.875rem; line-height: 1.25; letter-spacing: -.02em; text-wrap: balance; max-width: none; }
+  h2 { margin: 0; font-size: 1.4375rem; line-height: 1.35; letter-spacing: -.015em; text-wrap: balance; }
   p { margin: 0; max-width: 68ch; }
-  .lead { font-size: 1.2rem; color: var(--muted); }
+  .lead { font-size: 1rem; color: var(--muted); }
   .lead b { color: var(--text); }
   .meta { font: 500 .8125rem/1.5 var(--mono); color: var(--muted); }
   section { display: grid; gap: 1rem; min-width: 0; }
@@ -71,7 +76,8 @@
 </head>
 <body>
 <div class="shell">
-  <nav class="toc" aria-label="Sections">
+  <nav class="toc" aria-label="On this page">
+    <p class="toc-title">On this page</p>
     <ol>
       <li><a href="#change">The change</a></li>
       <li><a href="#questions">Open questions</a></li>

@@ -1,0 +1,136 @@
+/* Reader chrome stays neutral; authored figures keep their semantic colors. */
+:root[data-devcroft-tutorial] {
+  color-scheme: light dark;
+  --bg: #fff !important;
+  --surface: #fafafa !important;
+  --border: #e5e5e5 !important;
+  --text: #171717 !important;
+  --muted: #737373 !important;
+  --reader-active: #f5f5f5;
+  --reader-active-text: #171717;
+  --reader-ring: #2f81f7;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif !important;
+  font-size: 16px;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-devcroft-tutorial] {
+    --bg: #0a0a0a !important;
+    --surface: #171717 !important;
+    --border: #262626 !important;
+    --text: #fafafa !important;
+    --muted: #a3a3a3 !important;
+    --reader-active: #262626;
+    --reader-active-text: #fafafa;
+  }
+}
+html[data-devcroft-tutorial], [data-devcroft-tutorial] body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+}
+[data-devcroft-tutorial] .shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 310px;
+  align-items: stretch;
+  gap: 0;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+[data-devcroft-tutorial] .shell > main {
+  grid-column: 1;
+  grid-row: 1;
+  display: block;
+  min-width: 0;
+  overflow: auto;
+  padding: 8px 16px 48px;
+  font: 400 16px/1.625 var(--font);
+  overflow-wrap: anywhere;
+  scroll-behavior: auto;
+}
+[data-devcroft-tutorial] .shell > main > * { max-width: 820px; margin-inline: auto; }
+[data-devcroft-tutorial] main > * + * { margin-top: 28px; }
+[data-devcroft-tutorial] h1 { font-size: 30px; line-height: 1.25; max-width: none; }
+[data-devcroft-tutorial] h2 { font-size: 23px; line-height: 1.35; }
+[data-devcroft-tutorial] h3 { font-size: 20px; line-height: 1.4; }
+[data-devcroft-tutorial] .lead { font-size: 16px; line-height: 1.625; }
+[data-devcroft-tutorial] .eyebrow { color: var(--muted); }
+[data-devcroft-tutorial] .frame { background-image: none; }
+[data-devcroft-tutorial] .toc {
+  box-sizing: border-box;
+  grid-column: 2;
+  grid-row: 1;
+  position: static;
+  width: 310px;
+  min-height: 0;
+  margin: 0;
+  padding: 8px 8px 16px;
+  border-left: 1px solid var(--border);
+  overflow: auto;
+  background: var(--bg);
+  font: 400 14px/1.4 var(--font);
+}
+[data-devcroft-tutorial] .toc > :not(ol) { display: none; }
+[data-devcroft-tutorial] .toc ol {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+[data-devcroft-tutorial] .toc li { margin: 0; padding: 0; min-width: 0; }
+[data-devcroft-tutorial] .toc a {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: var(--muted);
+  font: inherit;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+[data-devcroft-tutorial] .toc a:hover,
+[data-devcroft-tutorial] .toc a[aria-current="location"] {
+  color: var(--reader-active-text);
+  background: var(--reader-active);
+}
+[data-devcroft-tutorial] .toc a:focus-visible {
+  outline: 1px solid var(--reader-ring);
+  outline-offset: -1px;
+}
+[data-devcroft-tutorial] .toc > .reader-empty {
+  display: block;
+  padding: 12px;
+  color: var(--muted);
+}
+[data-devcroft-tutorial="browser"] .toc::before {
+  content: "On this page";
+  display: block;
+  padding: 8px;
+  margin-bottom: 8px;
+  color: var(--text);
+  font-weight: 500;
+}
+/* Embedded width follows the native rail; standalone copies also fit phones. */
+@media (max-width: 700px) {
+  [data-devcroft-tutorial="browser"] .shell { grid-template-columns: minmax(0, 1fr); overflow: auto; }
+  [data-devcroft-tutorial="browser"] .toc {
+    grid-column: 1; grid-row: 1; width: auto; border-left: 0;
+    border-bottom: 1px solid var(--border); overflow: visible;
+  }
+  [data-devcroft-tutorial="browser"] .shell > main { grid-row: 2; overflow: visible; }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-devcroft-tutorial] *, [data-devcroft-tutorial] *::before, [data-devcroft-tutorial] *::after {
+    scroll-behavior: auto !important;
+    animation: none !important;
+    transition: none !important;
+  }
+}

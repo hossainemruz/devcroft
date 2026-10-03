@@ -1015,6 +1015,11 @@ impl ArtifactBrowser {
                     })
                 })
             })
+            .on_open_change(cx.listener(|this, open, _, cx| {
+                if let Some(tutorial) = &this.tutorial {
+                    tutorial.update(cx, |view, cx| view.set_menu_open(*open, cx));
+                }
+            }))
     }
     /// Full-height outline rail beside the document. Entries and the active
     /// index mirror the preview's own table of contents (see
@@ -1363,17 +1368,12 @@ impl Render for ArtifactBrowser {
                 }
             }
             let is_tutorial = artifact.kind == Kind::Tutorial;
-            let mut meta_row = h_flex().w_full().justify_center().child(
+            let meta_row = h_flex().w_full().justify_center().child(
                 meta.flex_wrap()
                     .w_full()
                     .max_w(px(crate::preview::READING_WIDTH))
                     .pr(px(16.)),
             );
-            if is_tutorial {
-                // Tutorials omit the reader rail, which normally hosts the
-                // artifact options menu, so their actions live in the meta row.
-                meta_row = meta_row.child(self.render_options_menu(snapshot.clone(), archived, cx));
-            }
             main = main.child(meta_row);
             if let Some(draft) = self.draft.as_ref().filter(|draft| draft.document) {
                 main = main
@@ -1405,8 +1405,40 @@ impl Render for ArtifactBrowser {
                     );
                 detail = detail.child(main);
             } else if let Some(tutorial) = self.tutorial.as_ref().filter(|_| is_tutorial) {
-                main = main.child(div().flex_1().min_h_0().child(tutorial.clone()));
-                detail = detail.child(main);
+                // The sandbox draws the outline below this native rail header.
+                // Keep actions at the same right edge as Markdown artifacts.
+                detail = detail
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_stretch()
+                            .child(main.h_auto().pb_2())
+                            .child(
+                                h_flex()
+                                    .w(px(310.))
+                                    .flex_none()
+                                    .items_start()
+                                    .border_l_1()
+                                    .border_color(cx.theme().border)
+                                    .px_2()
+                                    .py_2()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("resource-outline-tab")
+                                            .ghost()
+                                            .small()
+                                            .label("On this page")
+                                            .bg(cx.theme().accent),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(self.render_options_menu(
+                                        snapshot.clone(),
+                                        archived,
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    .child(div().flex_1().min_h_0().child(tutorial.clone()));
             } else {
                 if let Some(preview) = &self.preview {
                     main = main.child(div().flex_1().min_h_0().child(preview.clone()));

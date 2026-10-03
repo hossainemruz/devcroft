@@ -10,11 +10,9 @@ use anyhow::{Context as _, Result};
 use gpui_kit::AnyElement;
 #[cfg(target_os = "macos")]
 use gpui_kit::Entity;
-use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
-};
+#[cfg(target_os = "macos")]
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::{
     Context, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     SharedString, Styled as _, Window, div,
@@ -29,8 +27,11 @@ pub(crate) struct TutorialView {
     body: Option<SharedString>,
     error: Option<SharedString>,
     focus_handle: FocusHandle,
+    menu_open: bool,
     #[cfg(target_os = "macos")]
     webview: Option<Entity<gpui_wry::WebView>>,
+    #[cfg(target_os = "macos")]
+    appearance: Option<String>,
 }
 
 impl TutorialView {
@@ -42,13 +43,25 @@ impl TutorialView {
             body: None,
             error: None,
             focus_handle: cx.focus_handle(),
+            menu_open: false,
             #[cfg(target_os = "macos")]
             webview: None,
+            #[cfg(target_os = "macos")]
+            appearance: None,
         }
     }
 
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// Native child views otherwise cover GPUI popup rows and intercept clicks.
+    pub(crate) fn set_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.menu_open = open;
+        if open {
+            self.set_visible(false, cx);
+        }
+        cx.notify();
     }
 
     /// Native child views do not follow GPUI layout visibility, so the host
@@ -125,7 +138,7 @@ impl TutorialView {
         let path = browser_cache_path(root, id);
         let dir = path.parent().context("Tutorial cache has no parent")?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        std::fs::write(&path, body.as_bytes())
+        std::fs::write(&path, reader_document(body, None))
             .with_context(|| format!("writing {}", path.display()))?;
         prune_browser_cache(dir, SystemTime::now());
         Ok(path)
@@ -139,10 +152,12 @@ impl TutorialView {
         let Some(body) = self.body.clone() else {
             return;
         };
-        let html = crate::webview::sandboxed_document(&body);
+        let appearance = reader_appearance(cx);
+        let html = crate::webview::sandboxed_document(&reader_document(&body, Some(&appearance)));
         match crate::webview::create(window, cx, |builder| builder.with_html(html)) {
             Ok(webview) => {
                 self.webview = Some(webview);
+                self.appearance = Some(appearance);
                 self.error = None;
             }
             Err(error) => {
@@ -157,6 +172,14 @@ impl Render for TutorialView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_os = "macos")]
         let native = {
+            if self
+                .appearance
+                .as_ref()
+                .is_some_and(|style| *style != reader_appearance(cx))
+            {
+                self.webview.take();
+                self.appearance = None;
+            }
             if self.webview.is_none() && self.body.is_some() && self.error.is_none() {
                 let view = cx.entity();
                 window.defer(cx, move |window, cx| {
@@ -164,10 +187,14 @@ impl Render for TutorialView {
                 });
             }
             let webview = self.webview.clone().filter(|_| self.error.is_none());
+            let visible =
+                !self.menu_open && !window.has_active_dialog(cx) && !window.has_active_sheet(cx);
             if let Some(webview) = &webview {
                 webview.update(cx, |view, _| {
-                    if !view.visible() {
+                    if visible && !view.visible() {
                         view.show();
+                    } else if !visible && view.visible() {
+                        view.hide();
                     }
                 });
                 let _ = crate::webview::accessibility::attach(webview.read(cx).raw());
@@ -187,33 +214,7 @@ impl Render for TutorialView {
         let mut frame = v_flex()
             .track_focus(&self.focus_handle)
             .size_full()
-            .min_h_0()
-            .gap_2()
-            .child(
-                h_flex()
-                    .flex_none()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .child(self.title.clone()),
-                    )
-                    .child(
-                        Button::new("tutorial-open-browser")
-                            .ghost()
-                            .small()
-                            .label("Open in browser")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let _ = this.open_in_browser(cx);
-                            })),
-                    ),
-            );
+            .min_h_0();
         if let Some(error) = &self.error {
             frame = frame.child(
                 div()
@@ -233,15 +234,55 @@ impl Render for TutorialView {
                     .p_4()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
+                    .child(div().child(self.title.clone()))
                     .child(if cfg!(target_os = "macos") {
                         "Rendering tutorial…"
                     } else {
-                        "Tutorials open in your browser on this platform."
+                        "Use Artifact options → Open in browser to read this tutorial."
                     }),
             );
         }
         frame
     }
+}
+
+/// Add reader presentation to the display copy, never to the stored artifact.
+/// This script runs in the same opaque frame as the authored content. It does
+/// not communicate with the host or change the sandbox's capabilities.
+fn reader_document(body: &str, appearance: Option<&str>) -> String {
+    let mode = if appearance.is_some() {
+        "embedded"
+    } else {
+        "browser"
+    };
+    format!(
+        "{body}<style>{}\n{}</style><script>\
+         document.documentElement.dataset.devcroftTutorial='{mode}';\n{}\n</script>",
+        include_str!("tutorial_view/reader.css"),
+        appearance.unwrap_or_default(),
+        include_str!("tutorial_view/reader.js"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn reader_appearance(cx: &gpui_kit::App) -> String {
+    let theme = cx.theme();
+    let color = |value: gpui_kit::Hsla| format!("#{:08x}", u32::from(value.to_rgb()));
+    format!(
+        ":root[data-devcroft-tutorial] {{ color-scheme: {}; \
+         --bg: {} !important; --surface: {} !important; --border: {} !important; \
+         --text: {} !important; --muted: {} !important; \
+         --reader-active: {}; --reader-active-text: {}; --reader-ring: {}; }}",
+        if theme.is_dark() { "dark" } else { "light" },
+        color(theme.background),
+        color(theme.muted),
+        color(theme.border),
+        color(theme.foreground),
+        color(theme.muted_foreground),
+        color(theme.accent),
+        color(theme.accent_foreground),
+        color(theme.ring),
+    )
 }
 
 /// Disposable browser copy under the device-local data root. It never lives
@@ -346,11 +387,37 @@ mod tests {
                     .join("tutorials")
                     .join("art-23456789.html")
             );
-            assert_eq!(
-                std::fs::read_to_string(&path).unwrap(),
-                "<!doctype html><p>hello</p>"
+            let copy = std::fs::read_to_string(&path).unwrap();
+            assert!(copy.starts_with("<!doctype html><p>hello</p>"));
+            assert!(copy.contains("devcroftTutorial='browser'"));
+            assert_eq!(view.body.as_deref(), Some("<!doctype html><p>hello</p>"));
+            view.show(
+                Some(root),
+                "art-23456789",
+                "Revised",
+                "<!doctype html><h1>Revised</h1>".into(),
+                cx,
             );
+            view.write_browser_copy().unwrap();
+            let copy = std::fs::read_to_string(path).unwrap();
+            assert!(copy.contains("<h1>Revised</h1>"));
+            assert!(!copy.contains("<p>hello</p>"));
         });
+    }
+
+    #[test]
+    fn reader_presentation_stays_inside_the_sandbox() {
+        let body = "<html><head></head><body><h1>Test</h1></body></html>";
+        let reader = reader_document(body, Some(":root { --bg: #123456; }"));
+        assert!(reader.starts_with(body));
+        assert!(reader.contains("devcroftTutorial='embedded'"));
+        let host = crate::webview::sandboxed_document(&reader);
+        assert!(host.contains("sandbox=\"allow-scripts\""));
+        assert_eq!(host.matches("<script>").count(), 1);
+        assert_eq!(host.matches("</script>").count(), 1);
+        assert_eq!(host.matches("connect-src 'none'").count(), 2);
+        assert!(!host.contains("postMessage"));
+        assert!(!host.contains("messageHandlers"));
     }
 
     #[test]

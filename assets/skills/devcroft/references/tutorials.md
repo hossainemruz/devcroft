@@ -40,8 +40,8 @@ claims, and the user reviews them.
 
 ## Offline sandbox contract (required)
 
-Devcroft renders tutorials in the same locked-down frame as review chapters, and
-**Open in browser** shows the same file. The page must work with no network and no
+Devcroft renders tutorials in a locked-down frame, and **Open in browser** shows
+the same content with the reader presentation applied. The page must work with no network and no
 host capabilities:
 
 - Inline all CSS, JavaScript, and SVG in the one file.
@@ -55,6 +55,31 @@ host capabilities:
 - No forms, popups, downloads, or top-level navigation.
 - The file must also open correctly from `file://`.
 - Keep it within 4 MiB of UTF-8 and keep embedded raster images small.
+
+## Devcroft presentation (required)
+
+Start from `templates/tutorial.html`, including when composing with another visual
+skill. Tutorials belong to the Resources reader; keep its chrome quiet so the
+figures carry the explanation.
+
+- Use the template's neutral palette: dark background `#0a0a0a`, surface `#171717`,
+  border `#262626`, text `#fafafa`, muted text `#a3a3a3`; light background `#ffffff`,
+  surface `#fafafa`, border `#e5e5e5`, text `#171717`, muted text `#737373`.
+- Keep `--bg`, `--surface`, `--border`, `--text`, `--muted`, and `--font` as the
+  page tokens. The embedded reader maps these to the active Devcroft theme. Use
+  accent colors for diagram meaning and interaction, not a tinted page canvas.
+- Keep a `.shell` with direct `main` and `nav.toc` children. On desktop, put the
+  contents rail on the **right**, 310px wide, with a subtle left border and compact
+  system-font links under “On this page”. On phones it may stack above the content.
+- Use one `h1` (30px), takeaway `h2` headings (23px), and optional `h3` headings
+  (20px), with 16px body text in an approximately 820px reading column. Keep the
+  title compact; avoid oversized hero typography, decorative grids, and extra
+  title bars. Diagrams and interactive figures can still be expressive.
+- Give sections stable IDs. The reader derives its outline from `h1`–`h3`, uses
+  authored `.toc` link labels where available, and highlights the current section.
+  Navigation and scroll tracking stay inside the sandbox; never add host messaging.
+- Devcroft supplies the artifact metadata and options menu above the right rail.
+  Do not reproduce those controls, add a comments panel, or add a second sidebar.
 
 ## Quality bar
 
@@ -86,8 +111,8 @@ substantive claim in the captured change:
 ## Composition with other skills
 
 If a visual-explainer skill is installed, use it for layout and visual craft, then
-adapt its output to this contract (self-contained and offline, evidence citations
-included). This reference is authoritative for the Devcroft integration. Without one,
+adapt its output to the Devcroft presentation above and this offline contract, with
+evidence citations included. This reference is authoritative for the Devcroft integration. Without one,
 start from the bundled `templates/tutorial.html` and the quality bar above.
 
 ## Viewing
@@ -95,5 +120,6 @@ start from the bundled `templates/tutorial.html` and the quality bar above.
 Resources lists the tutorial with a Tutorial badge. On macOS it renders in a
 sandboxed embedded view; **Open in browser** opens the cached copy in the default
 browser on every platform. Tutorials are view-only: there is no Markdown editor,
-outline, or comment UI, and comment commands are rejected. Archive and delete live in
-the artifact options menu.
+or comment UI, and comment commands are rejected. A right-hand “On this page”
+outline navigates the tutorial. Open in browser, Copy HTML, Copy ID, Archive, and
+Delete live in the artifact options menu above the rail.

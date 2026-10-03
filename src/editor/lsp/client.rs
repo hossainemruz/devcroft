@@ -61,7 +61,9 @@ impl Client {
         Self::handshake(transport, cwd, messages, diagnostics)
     }
 
-    fn handshake(
+    /// Test seam: run the handshake over an already-open transport (channel
+    /// adapters plus a stub server) instead of spawning a binary.
+    pub(crate) fn handshake(
         transport: Arc<Transport>,
         cwd: &Path,
         messages: mpsc::Receiver<ServerMessage>,
@@ -139,6 +141,12 @@ impl Client {
     #[allow(dead_code)]
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().expect("LSP state poisoned").clone()
+    }
+
+    /// Whether the server connection is still up. A crashed server keeps
+    /// degrading gracefully, and reopening the file restarts it.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.transport.is_alive()
     }
 
     fn record_error(&self, error: &anyhow::Error) {
@@ -518,5 +526,62 @@ mod tests {
                 .is_some_and(|recorded| recorded.contains("stale")),
             "failures stay observable for status surfaces"
         );
+    }
+
+    /// Live integration smoke test against a real rust-analyzer. Ignored by
+    /// default (needs the binary and seconds of analysis time); run
+    /// explicitly with `cargo test live_rust_analyzer -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_rust_analyzer_hover_and_definition() {
+        let Some(program) = super::super::discover_rust_analyzer(None) else {
+            panic!("rust-analyzer not found: `rustup component add rust-analyzer`");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"lsp-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let source = "/// Adds one.\nfn add_one(x: i32) -> i32 {\n    x + 1\n}\n\nfn main() {\n    let _ = add_one(41);\n}\n";
+        let file = dir.path().join("src").join("main.rs");
+        std::fs::write(&file, source).unwrap();
+        let uri = super::super::file_uri(&file).unwrap();
+
+        let (diagnostics_tx, _diagnostics_rx) = async_channel::unbounded();
+        let client = Client::start(&program, dir.path(), diagnostics_tx).unwrap();
+        assert_eq!(client.position_encoding(), "utf-16");
+        client.did_open(&uri, "rust", source).unwrap();
+
+        // Cold analysis can lag the first request; poll briefly rather than
+        // flaking on a single cold call.
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let hover = loop {
+            let result = client.hover(&uri, 1, lsp_types::Position::new(6, 14));
+            if let Ok(Some(hover)) = result {
+                break hover;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("rust-analyzer never answered hover: {:?}", result.err());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        let text = match hover.contents {
+            lsp_types::HoverContents::Markup(markup) => markup.value,
+            lsp_types::HoverContents::Array(marked) => format!("{marked:?}"),
+            lsp_types::HoverContents::Scalar(marked) => format!("{marked:?}"),
+        };
+        assert!(
+            text.contains("Adds one"),
+            "hover carries the doc comment: {text}"
+        );
+
+        let definitions = client
+            .definition(&uri, 1, lsp_types::Position::new(6, 14))
+            .unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].target_selection_range.start.line, 1);
+        client.shutdown();
     }
 }

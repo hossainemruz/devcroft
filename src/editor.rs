@@ -150,15 +150,19 @@ pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
         .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
         .unwrap_or_default();
     // Desktop apps often inherit a smaller PATH than an interactive shell.
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        directories.push(home.join(".local/bin"));
+        // rustup's default binary directory: GUI-launched apps never see
+        // the shell's PATH, and rust-analyzer usually lives here.
+        directories.push(home.join(".cargo/bin"));
+    }
     #[cfg(target_os = "macos")]
     {
         directories.extend([
             PathBuf::from("/opt/homebrew/bin"),
             PathBuf::from("/usr/local/bin"),
         ]);
-        if let Some(home) = std::env::var_os("HOME") {
-            directories.push(PathBuf::from(home).join(".local/bin"));
-        }
         if name == "code" {
             directories.push(PathBuf::from(
                 "/Applications/Visual Studio Code.app/Contents/Resources/app/bin",

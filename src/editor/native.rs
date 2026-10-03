@@ -188,7 +188,7 @@ impl NativeEditor {
         self.path = Some(canonical.clone());
         self.saved = Some(contents.clone());
         self.dirty = false;
-        self.restart_lsp(&canonical, language, &contents, window, cx);
+        self.restart_lsp(&canonical, language, window, cx);
         Ok(())
     }
 
@@ -290,10 +290,23 @@ impl NativeEditor {
         &mut self,
         path: &Path,
         language: &str,
-        contents: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The same live document keeps its session: edits already flowed to
+        // the server through Change events, so reopening must not respawn it
+        // (every Review line-click would otherwise restart rust-analyzer).
+        // A dead server is the exception: reopening revives it.
+        let Some(uri) = file_uri(path).ok() else {
+            return;
+        };
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|session| session.uri == uri.as_str() && session.client.is_alive())
+        {
+            return;
+        }
         self.lsp.take();
         self.clear_lsp_providers(cx);
         if language != "rust" {
@@ -301,10 +314,6 @@ impl NativeEditor {
         }
         let Some(program) = discover_rust_analyzer(None) else {
             return;
-        };
-        let uri = match file_uri(path) {
-            Ok(uri) => uri,
-            Err(_) => return,
         };
         let (diagnostics_tx, diagnostics_rx) = async_channel::unbounded();
         let client = match Client::start(&program, &self.root, diagnostics_tx) {
@@ -316,7 +325,10 @@ impl NativeEditor {
             // providers against a server speaking anything else.
             return;
         }
-        if client.did_open(&uri, "rust", contents).is_err() {
+        if client
+            .did_open(&uri, "rust", self.editor.read(cx).value().as_ref())
+            .is_err()
+        {
             return;
         }
         let providers = LspProviders::new(Arc::clone(&client), uri.clone());
@@ -582,5 +594,196 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "agent edit\n");
         save_if_unchanged(&path, b"agent edit\n", b"human edit\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "human edit\n");
+    }
+
+    /// Test host: a real window plus a bare `NativeEditor`, without entering
+    /// any repository workspace.
+    fn test_editor<'a>(
+        cx: &'a mut gpui_kit::TestAppContext,
+        dir: &std::path::Path,
+    ) -> (Entity<NativeEditor>, &'a mut gpui_kit::VisualTestContext) {
+        use std::{cell::RefCell, rc::Rc};
+        let holder: Rc<RefCell<Option<Entity<NativeEditor>>>> = Rc::new(RefCell::new(None));
+        let holder_for_window = holder.clone();
+        let root = dir.to_owned();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let editor = cx.new(|cx| NativeEditor::new(&root, HashMap::new(), window, cx));
+            *holder_for_window.borrow_mut() = Some(editor.clone());
+            gpui_kit::component::Root::new(editor, window, cx)
+        });
+        (holder.borrow().clone().unwrap(), test_cx)
+    }
+
+    /// Non-Rust files never start a session and expose no providers. Runs
+    /// identically with or without rust-analyzer installed.
+    #[gpui_kit::test]
+    fn non_rust_open_leaves_language_features_off(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx)
+            })
+            .unwrap()
+            .unwrap();
+        view.downgrade()
+            .update_in(test_cx, |view, _, cx| {
+                assert!(view.lsp.is_none());
+                let lsp = view.editor.read(cx).lsp();
+                assert!(lsp.hover_provider.is_none());
+                assert!(lsp.completion_provider.is_none());
+                assert!(lsp.definition_provider.is_none());
+            })
+            .unwrap();
+    }
+
+    /// Opening a Rust file keeps session and providers consistent however
+    /// discovery resolves: either both exist or neither does. Discovery
+    /// itself is environment-dependent (covered by the live integration
+    /// test); this pins the glue invariant.
+    #[gpui_kit::test]
+    fn rust_open_keeps_session_and_providers_consistent(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx)
+            })
+            .unwrap()
+            .unwrap();
+        view.downgrade()
+            .update_in(test_cx, |view, _, cx| {
+                let lsp = view.editor.read(cx).lsp();
+                let providers = lsp.hover_provider.is_some()
+                    || lsp.completion_provider.is_some()
+                    || lsp.definition_provider.is_some();
+                assert_eq!(
+                    view.lsp.is_some(),
+                    providers,
+                    "session and providers must agree"
+                );
+                assert_eq!(view.editor.read(cx).value().as_ref(), "fn main() {}\n");
+            })
+            .unwrap();
+    }
+
+    /// A stub-backed session applies diagnostics and restores the jump
+    /// origin, exercising the same wiring `restart_lsp` installs without
+    /// the environment-dependent discovery step.
+    #[gpui_kit::test]
+    fn stub_session_applies_diagnostics_and_goes_back(cx: &mut gpui_kit::TestAppContext) {
+        use crate::editor::lsp::transport::{Transport, test_util::stub_server};
+
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+
+        let (reader, writer) = stub_server();
+        let (transport, messages) = Transport::new(reader, writer);
+        let (diagnostics_tx, _diagnostics_rx) = async_channel::unbounded();
+        let client = Client::handshake(transport, dir.path(), messages, diagnostics_tx).unwrap();
+        // `open` canonicalizes (e.g. /var → /private/var on macOS), and the
+        // session keeps only the canonical URI: build the stub session from
+        // the same path the editor will compute, or the URIs never match.
+        let canonical = file.canonicalize().unwrap();
+        let uri = file_uri(&canonical).unwrap();
+        client.did_open(&uri, "rust", "fn main() {}\n").unwrap();
+
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.lsp = Some(LspSession {
+                    client: Arc::clone(&client),
+                    uri: uri.to_string(),
+                });
+                let providers = LspProviders::new(Arc::clone(&client), uri.clone());
+                view.editor.update(cx, |editor, _| {
+                    let lsp = editor.lsp_mut();
+                    lsp.hover_provider = Some(providers.clone());
+                    lsp.definition_provider = Some(providers.clone());
+                });
+                view.open(&file, None, window, cx).unwrap();
+                // The same document keeps its session instead of respawning.
+                assert!(view.lsp.is_some());
+                // Diagnostics for the current version apply into the editor
+                // set. (The open's own buffer fill already pushed version 2,
+                // so the version-1 event is stale by design — that is the
+                // next assertion's probe.)
+                view.apply_diagnostics(
+                    &DiagnosticEvent {
+                        uri: uri.to_string(),
+                        version: Some(2),
+                        diagnostics: vec![lsp_types::Diagnostic {
+                            range: lsp_types::Range {
+                                start: lsp_types::Position::new(0, 0),
+                                end: lsp_types::Position::new(0, 2),
+                            },
+                            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                            message: "stub diagnostic".to_owned(),
+                            ..Default::default()
+                        }],
+                    },
+                    cx,
+                );
+                let count = view.editor.update(cx, |editor, _| {
+                    editor.diagnostics_mut().map(|set| set.len())
+                });
+                // Stale diagnostics (older than the current version) are ignored.
+                view.apply_diagnostics(
+                    &DiagnosticEvent {
+                        uri: uri.to_string(),
+                        version: Some(1),
+                        diagnostics: vec![],
+                    },
+                    cx,
+                );
+                assert!(count.is_some_and(|count| count > 0));
+                // A recorded jump origin restores the cursor.
+                view.jump_back
+                    .borrow_mut()
+                    .push(gpui_kit::component::input::Position::new(0, 0));
+                view.editor.update(cx, |editor, cx| {
+                    editor.set_cursor_position(
+                        gpui_kit::component::input::Position::new(0, 11),
+                        window,
+                        cx,
+                    );
+                });
+                view.go_back(window, cx);
+                let cursor = view.editor.read(cx).cursor_position();
+                assert_eq!(cursor, gpui_kit::component::input::Position::new(0, 0));
+                assert!(!view.has_jump_history());
+            })
+            .unwrap();
+    }
+
+    /// Switching files drops jump origins recorded in the previous
+    /// document; they would restore meaningless offsets otherwise.
+    #[gpui_kit::test]
+    fn jump_history_clears_on_file_switch(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        std::fs::write(&first, "aaa\n").unwrap();
+        std::fs::write(&second, "bbb\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&first, None, window, cx).unwrap();
+                view.jump_back
+                    .borrow_mut()
+                    .push(gpui_kit::component::input::Position::new(0, 1));
+                view.open(&second, None, window, cx).unwrap();
+                assert!(!view.has_jump_history());
+            })
+            .unwrap();
     }
 }

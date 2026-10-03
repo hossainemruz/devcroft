@@ -18,7 +18,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -55,6 +55,7 @@ pub struct Transport {
     pending: Pending,
     next_id: AtomicU64,
     protocol_errors: AtomicU64,
+    exited: AtomicBool,
     _child: Option<WatchedChild>,
 }
 
@@ -110,6 +111,7 @@ impl Transport {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             protocol_errors: AtomicU64::new(0),
+            exited: AtomicBool::new(false),
             _child: child,
         });
         let (tx, rx) = mpsc::channel();
@@ -119,6 +121,13 @@ impl Transport {
             .spawn(move || reader_side.read_loop(reader, tx))
             .expect("Could not start LSP reader thread");
         (transport, rx)
+    }
+
+    /// Whether the reader thread is still running. Set when the server's
+    /// stdout closes (clean exit or crash); the next write or request then
+    /// fails fast through the usual paths.
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.exited.load(Ordering::SeqCst)
     }
 
     /// How many malformed frames the reader skipped. Anything non-zero in a
@@ -200,6 +209,7 @@ impl Transport {
         }
         // The server is gone (or nobody listens): wake every outstanding
         // caller so a crashed server can never hang the UI thread's task.
+        self.exited.store(true, Ordering::SeqCst);
         let mut pending = self.pending.lock().expect("LSP pending map poisoned");
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(anyhow::anyhow!("Language server exited")));
@@ -370,6 +380,43 @@ pub(crate) mod test_util {
         frame.extend_from_slice(&body);
         frame
     }
+
+    /// A stub language server for UI-level tests: answers `initialize` with
+    /// UTF-16 capabilities, answers any other request with null, and ignores
+    /// notifications. Anything fancier belongs in the client tests' fake.
+    pub(crate) fn stub_server() -> (ChannelReader, ChannelWriter) {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel();
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(ChannelReader::new(client_to_server_rx));
+            let mut writer = ChannelWriter::new(server_to_client_tx);
+            loop {
+                let frame = match super::read_frame(&mut reader) {
+                    Ok(Some(value)) => value,
+                    Ok(None) | Err(_) => break,
+                };
+                if frame.get("method").and_then(|m| m.as_str()) == Some("exit") {
+                    break;
+                }
+                if let Some(id) = frame.get("id").and_then(|id| id.as_u64()) {
+                    let result =
+                        if frame.get("method").and_then(|m| m.as_str()) == Some("initialize") {
+                            serde_json::json!({"capabilities": {"positionEncoding": "utf-16"}})
+                        } else {
+                            Value::Null
+                        };
+                    let _ = writer.write_all(&encode_frame(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "result": result,
+                    })));
+                    let _ = writer.flush();
+                }
+            }
+        });
+        (
+            ChannelReader::new(server_to_client_rx),
+            ChannelWriter::new(client_to_server_tx),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -485,9 +532,11 @@ mod tests {
         let caller = Arc::clone(&transport);
         let handle =
             thread::spawn(move || caller.request("echo", Value::Null, Duration::from_secs(30)));
+        assert!(transport.is_alive());
         thread::sleep(Duration::from_millis(200));
         drop(crash_tx);
         let error = handle.join().expect("request thread panicked").unwrap_err();
         assert!(error.to_string().contains("exited"));
+        assert!(!transport.is_alive());
     }
 }

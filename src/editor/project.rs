@@ -70,57 +70,6 @@ pub(super) fn scan(root: &Path) -> Vec<ProjectFile> {
     files
 }
 
-/// A small subsequence scorer. Contiguous matches and filename starts rank
-/// above scattered path matches; every returned result still contains the
-/// query characters in order.
-pub(super) fn fuzzy_files(files: &[ProjectFile], query: &str) -> Vec<ProjectFile> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return files.iter().take(MAX_RESULTS).cloned().collect();
-    }
-    let mut ranked: Vec<_> = files
-        .iter()
-        .filter_map(|file| fuzzy_score(&file.label, &query).map(|score| (score, file)))
-        .collect();
-    ranked.sort_unstable_by(|(ascore, a), (bscore, b)| {
-        bscore.cmp(ascore).then_with(|| a.label.cmp(&b.label))
-    });
-    ranked
-        .into_iter()
-        .take(MAX_RESULTS)
-        .map(|(_, file)| file.clone())
-        .collect()
-}
-
-fn fuzzy_score(path: &str, query: &str) -> Option<i64> {
-    let path = path.to_lowercase();
-    let mut chars = query.chars();
-    let mut next = chars.next()?;
-    let mut score = 0_i64;
-    let mut previous = None;
-    let mut preceding = None;
-    for (index, character) in path.chars().enumerate() {
-        let boundary = index == 0 || preceding.is_some_and(|c| c == '/' || c == '_' || c == '-');
-        preceding = Some(character);
-        if character != next {
-            continue;
-        }
-        score += 1;
-        if previous.is_some_and(|prior| index == prior + 1) {
-            score += 5;
-        }
-        if boundary {
-            score += 8;
-        }
-        previous = Some(index);
-        match chars.next() {
-            Some(character) => next = character,
-            None => return Some(score - path.chars().count() as i64 / 20),
-        }
-    }
-    None
-}
-
 /// Search only indexed files and cap memory, per-file I/O, and result count.
 /// Results are line based so choosing one can open at that location.
 pub(super) fn search_text(root: &Path, files: &[ProjectFile], query: &str) -> Vec<TextMatch> {
@@ -166,7 +115,7 @@ pub(super) fn search_text(root: &Path, files: &[ProjectFile], query: &str) -> Ve
 /// Reopen every component relative to the checkout so a path swapped to a
 /// symlink after indexing cannot make project search read outside files.
 #[cfg(unix)]
-fn read_indexed_file(root: &Path, entry: &ProjectFile) -> std::io::Result<Vec<u8>> {
+pub(super) fn read_indexed_file(root: &Path, entry: &ProjectFile) -> std::io::Result<Vec<u8>> {
     use std::os::unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _};
     use std::{
         ffi::CString,
@@ -219,7 +168,7 @@ fn read_indexed_file(root: &Path, entry: &ProjectFile) -> std::io::Result<Vec<u8
 }
 
 #[cfg(windows)]
-fn read_indexed_file(root: &Path, entry: &ProjectFile) -> std::io::Result<Vec<u8>> {
+pub(super) fn read_indexed_file(root: &Path, entry: &ProjectFile) -> std::io::Result<Vec<u8>> {
     use std::os::windows::{ffi::OsStringExt as _, io::AsRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 
@@ -255,7 +204,7 @@ fn read_indexed_file(root: &Path, entry: &ProjectFile) -> std::io::Result<Vec<u8
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_indexed_file(_root: &Path, _entry: &ProjectFile) -> std::io::Result<Vec<u8>> {
+pub(super) fn read_indexed_file(_root: &Path, _entry: &ProjectFile) -> std::io::Result<Vec<u8>> {
     Err(std::io::Error::other(
         "project search is unsupported on this platform",
     ))
@@ -280,17 +229,6 @@ mod tests {
         let matches = search_text(dir.path(), &files, "needle");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line, 1);
-    }
-
-    #[test]
-    fn fuzzy_matching_prefers_contiguous_filename() {
-        let files =
-            ["src/editor/native.rs", "notes/really_nice_archive.txt"].map(|label| ProjectFile {
-                path: PathBuf::from(label),
-                label: label.into(),
-            });
-        let matches = fuzzy_files(&files, "native");
-        assert_eq!(matches[0].label, "src/editor/native.rs");
     }
 
     #[cfg(unix)]

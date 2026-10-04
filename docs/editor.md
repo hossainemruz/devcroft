@@ -8,7 +8,7 @@ New installations start with the built-in editor. The choice is saved on this de
 
 ## Find and edit files
 
-- Open the project file finder with `Cmd+J`, then `o` on macOS (`Ctrl+J`, then `o` elsewhere), or the sidebar search icon. Type a partial path, select with arrow keys, and press Enter.
+- Open the project file finder with `Cmd+J`, then `f` on macOS (`Ctrl+J`, then `f` elsewhere), or the sidebar search icon. The floating finder uses fff to rank partial paths and typos, with results on the left and a syntax-highlighted preview on the right. Select with arrow keys or `Ctrl+N`/`Ctrl+P`, press Enter to open, and Escape to dismiss.
 - Use the project tree for folders and files. **… → Refresh files** picks up newly added files; **Search project** searches indexed text while respecting ignore rules.
 - Tabs retain separate drafts and undo histories. The tab indicator shows unsaved changes. Save with `Cmd+S` / `Ctrl+S`; closing a dirty tab offers Save, Discard, or Cancel.
 - Use **… → Go to line**, **Find in file**, and **Replace in file**. **… → Go back / Go forward** restores file/line navigation. Normal selection, clipboard, undo, and redo shortcuts work in the focused editor.

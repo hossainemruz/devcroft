@@ -135,6 +135,13 @@ const WORKSPACE: [Row; 8] = [
     },
 ];
 
+const FIND_FILE: Row = Row {
+    key: 'f',
+    label: "Find project file",
+    group: "Editor",
+    command: Command::OpenFile,
+};
+
 const OPEN_FILE: Row = Row {
     key: 'o',
     label: "Open project file",
@@ -205,7 +212,7 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
         Context::Relationships => RELATIONSHIPS.to_vec(),
     };
     if context == Context::Workspace && resource.built_in_editor {
-        result.push(OPEN_FILE);
+        result.extend([FIND_FILE, OPEN_FILE]);
     }
     if resource.selected && resource.editable && !resource.saving {
         result.extend(if resource.drafting {
@@ -448,11 +455,20 @@ mod tests {
     }
 
     #[test]
-    fn built_in_workspace_owns_o_for_file_opening() {
+    fn built_in_workspace_owns_f_and_o_for_file_opening() {
         let built_in = ResourceState {
             built_in_editor: true,
             ..Default::default()
         };
+        assert_eq!(
+            resolve(Context::Workspace, built_in, 'f'),
+            Some(Command::OpenFile)
+        );
+        assert_eq!(
+            resolve(Context::Workspace, ResourceState::default(), 'f'),
+            None
+        );
+        assert_eq!(resolve(Context::Home, built_in, 'f'), None);
         assert_eq!(
             resolve(Context::Workspace, built_in, 'o'),
             Some(Command::OpenFile)

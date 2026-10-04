@@ -1,6 +1,7 @@
 //! Editor preference and argument-safe optional external editor launches.
 
 mod drafts;
+mod finder;
 pub(crate) mod lsp;
 pub(crate) mod native;
 mod project;

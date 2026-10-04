@@ -1,6 +1,8 @@
 //! A deliberately small checkout editor: one UTF-8 file, explicit save, and
 //! protection against overwriting a file changed by an agent on disk.
 
+mod file_finder;
+
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -10,11 +12,15 @@ use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use super::drafts::{self, Draft, Journal};
+use super::finder::{self, Finder};
 use super::lsp::{Client, DiagnosticEvent, LspProviders, discover_rust_analyzer, file_uri};
 use super::project::{self, ProjectFile, TextMatch};
 use crate::editor::{ExternalEditor, ExternalEditorKind};
@@ -79,6 +85,17 @@ pub(crate) struct NativeEditor {
     files: Vec<ProjectFile>,
     icon_tiles: crate::review::icons::IconTiles,
     file_selection: usize,
+    finder: Option<Arc<Mutex<Finder>>>,
+    finder_error: Option<String>,
+    file_matches: Vec<ProjectFile>,
+    file_total: usize,
+    file_searching: bool,
+    file_generation: Arc<AtomicU64>,
+    preview_generation: u64,
+    preview_text: Option<String>,
+    preview_editor: Entity<EditorState>,
+    finder_previous: BrowserMode,
+    finder_scroll: gpui_kit::UniformListScrollHandle,
     index_generation: u64,
     file_query: Entity<InputState>,
     text_query: Entity<InputState>,
@@ -116,7 +133,7 @@ struct StashedDocument {
     subscribed: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowserMode {
     Closed,
     Files,
@@ -299,22 +316,12 @@ impl NativeEditor {
         .detach();
         let file_query = cx.new(|cx| InputState::new(window, cx).placeholder("Find a file…"));
         cx.subscribe(&file_query, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Change => {
-                this.file_selection = 0;
-                cx.notify();
-            }
-            InputEvent::PressEnter { .. } => {
-                let query = this.file_query.read(cx).value().to_string();
-                if let Some(file) =
-                    project::fuzzy_files(&this.files, &query).get(this.file_selection)
-                {
-                    this.request_open(file.path.clone(), None, cx);
-                    this.browser = BrowserMode::Tree;
-                }
-            }
+            InputEvent::Change => this.search_files(cx),
+            InputEvent::PressEnter { .. } => this.accept_file(cx),
             _ => {}
         })
         .detach();
+        let preview_editor = cx.new(|cx| EditorState::new(window, cx));
         let text_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search project text…"));
         cx.subscribe(&text_query, |this, _, event: &InputEvent, cx| match event {
@@ -338,8 +345,12 @@ impl NativeEditor {
         .detach();
         let scan_root = root.to_owned();
         cx.spawn_in(window, async move |view, cx| {
-            let files = cx
-                .background_spawn(async move { project::scan(&scan_root) })
+            let (files, finder) = cx
+                .background_spawn(async move {
+                    let files = project::scan(&scan_root);
+                    let finder = Finder::new(&files);
+                    (files, finder)
+                })
                 .await;
             let _ = view.update(cx, |this, cx| {
                 if this.index_generation == 0 {
@@ -349,6 +360,7 @@ impl NativeEditor {
                         cx,
                     );
                     this.files = files;
+                    this.install_finder(finder, cx);
                     this.indexing = false;
                     cx.notify();
                 }
@@ -446,6 +458,17 @@ impl NativeEditor {
             files: Vec::new(),
             icon_tiles: HashMap::new(),
             file_selection: 0,
+            finder: None,
+            finder_error: None,
+            file_matches: Vec::new(),
+            file_total: 0,
+            file_searching: false,
+            file_generation: Arc::new(AtomicU64::new(0)),
+            preview_generation: 0,
+            preview_text: None,
+            preview_editor,
+            finder_previous: BrowserMode::Tree,
+            finder_scroll: gpui_kit::UniformListScrollHandle::new(),
             index_generation: 0,
             file_query,
             text_query,
@@ -476,12 +499,22 @@ impl NativeEditor {
     }
 
     pub(crate) fn open_file_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browser != BrowserMode::Files {
+            self.finder_previous = self.browser;
+        }
         self.browser = BrowserMode::Files;
+        self.file_query
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.search_files(cx);
         self.file_query.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
     fn show_browser(&mut self, mode: BrowserMode, window: &mut Window, cx: &mut Context<Self>) {
+        if mode == BrowserMode::Files {
+            self.open_file_finder(window, cx);
+            return;
+        }
         self.browser = if self.browser == mode {
             BrowserMode::Closed
         } else {
@@ -526,10 +559,16 @@ impl NativeEditor {
         self.index_generation += 1;
         let generation = self.index_generation;
         self.indexing = true;
+        self.finder = None;
+        self.file_generation.fetch_add(1, Ordering::Relaxed);
         let root = self.root.clone();
         cx.spawn(async move |view, cx| {
-            let files = cx
-                .background_spawn(async move { project::scan(&root) })
+            let (files, finder) = cx
+                .background_spawn(async move {
+                    let files = project::scan(&root);
+                    let finder = Finder::new(&files);
+                    (files, finder)
+                })
                 .await;
             let _ = view.update(cx, |this, cx| {
                 if this.index_generation == generation {
@@ -539,6 +578,7 @@ impl NativeEditor {
                         cx,
                     );
                     this.files = files;
+                    this.install_finder(finder, cx);
                     this.indexing = false;
                     cx.notify();
                 }
@@ -1756,60 +1796,16 @@ impl NativeEditor {
             .px_2()
             .py_2()
             .overflow_y_scrollbar();
-        if self.browser == BrowserMode::Files {
-            panel = panel.on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.as_str();
-                if key == "arrowdown" || key == "arrowup" {
-                    let query = this.file_query.read(cx).value().to_string();
-                    let count = project::fuzzy_files(&this.files, &query).len();
-                    if count > 0 {
-                        if key == "arrowdown" {
-                            this.file_selection = (this.file_selection + 1).min(count - 1);
-                        } else {
-                            this.file_selection = this.file_selection.saturating_sub(1);
-                        }
-                        window.prevent_default();
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                }
-            }));
+        let mode = if self.browser == BrowserMode::Files {
+            self.finder_previous
+        } else {
+            self.browser
+        };
+        if mode == BrowserMode::Closed {
+            return None;
         }
-        match self.browser {
-            BrowserMode::Files => {
-                let query = self.file_query.read(cx).value().to_string();
-                panel = panel.child(Input::new(&self.file_query).small()).child(
-                    Button::new("native-refresh-files")
-                        .label("Refresh files")
-                        .ghost()
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_files(cx))),
-                );
-                if self.indexing {
-                    panel = panel.child("Indexing checkout…");
-                }
-                for (index, file) in project::fuzzy_files(&self.files, &query)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let path = file.path.clone();
-                    panel = panel.child(
-                        Button::new(format!("native-file-{}", file.label))
-                            .label(file.label)
-                            .when(index == self.file_selection, |button| button.primary())
-                            .when(index != self.file_selection, |button| button.ghost())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.error = this
-                                    .open(&path, None, window, cx)
-                                    .err()
-                                    .map(|error| format!("{error:#}"));
-                                if this.error.is_none() {
-                                    this.browser = BrowserMode::Tree;
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
-            }
+        match mode {
+            BrowserMode::Files => unreachable!(),
             BrowserMode::Tree => {
                 for item in tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits) {
                     let expanded = self.expanded_dirs.contains(&item.key);
@@ -2151,6 +2147,17 @@ impl Render for NativeEditor {
             }
             self.browser = BrowserMode::Tree;
         }
+        if let Some(text) = self.preview_text.take() {
+            let language = self
+                .file_matches
+                .get(self.file_selection)
+                .map(|file| language_for(&file.path))
+                .unwrap_or("text");
+            self.preview_editor.update(cx, |editor, cx| {
+                editor.set_highlighter(language, cx);
+                editor.set_value(text, window, cx);
+            });
+        }
         let label = self
             .path
             .as_ref()
@@ -2294,7 +2301,9 @@ impl Render for NativeEditor {
                     )
                     .child("UTF-8"),
             );
+        let finder = self.render_file_finder(cx);
         h_flex()
+            .relative()
             .size_full()
             .min_h_0()
             .items_stretch()
@@ -2306,7 +2315,11 @@ impl Render for NativeEditor {
                         BrowserMode::Files | BrowserMode::Text | BrowserMode::Line
                     ) || this.disk_comparison.is_some())
                 {
-                    this.browser = BrowserMode::Tree;
+                    if this.browser == BrowserMode::Files {
+                        this.close_file_finder(window, cx);
+                    } else {
+                        this.browser = BrowserMode::Tree;
+                    }
                     this.disk_comparison = None;
                     this.editor_focus(cx).focus(window, cx);
                     window.prevent_default();
@@ -2328,6 +2341,7 @@ impl Render for NativeEditor {
             }))
             .when_some(browser, |row, browser| row.child(browser))
             .child(code)
+            .when_some(finder, |row, finder| row.child(finder))
     }
 }
 
@@ -2429,20 +2443,19 @@ mod tests {
         let file = dir.path().join("hello world.txt");
         fs::write(&file, "hello\n").unwrap();
         let (view, test_cx) = test_editor(cx, dir.path());
-        view.downgrade()
-            .update_in(test_cx, |view, _, cx| {
-                view.files = project::scan(dir.path());
-                view.indexing = false;
-                cx.notify();
-            })
-            .unwrap();
+        test_cx.run_until_parked();
         test_cx.update(|window, cx| {
             window.render_frame(cx);
             assert!(window.find("native-open-file").visible());
-            assert!(window.find("native-editor-actions").visible());
             window.click("native-open-file", cx);
-            assert!(window.find("native-file-hello world.txt").visible());
-            window.click("native-file-hello world.txt", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-finder-close").visible());
+            assert!(window.find("native-file-0").visible());
+            window.click("native-file-0", cx);
+            window.render_frame(cx);
         });
         view.read_with(test_cx, |view, cx| {
             assert_eq!(
@@ -2450,6 +2463,68 @@ mod tests {
                 Some(file.canonicalize().unwrap().as_path())
             );
             assert_eq!(view.editor.read(cx).value().as_ref(), "hello\n");
+            assert_eq!(view.browser, BrowserMode::Tree);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn file_finder_keyboard_selection_preview_and_escape(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..80 {
+            fs::write(
+                dir.path().join(format!("file-{index:03}.rs")),
+                format!("fn file_{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.browser = BrowserMode::Closed;
+            view.open_file_finder(window, cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("down ctrl-n ctrl-p");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.file_selection, 1);
+            assert_eq!(
+                view.preview_editor.read(cx).value().as_ref(),
+                "fn file_1() {}\n"
+            );
+        });
+        for _ in 0..40 {
+            test_cx.simulate_keystrokes("down");
+        }
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-file-41").visible());
+        });
+        test_cx.simulate_keystrokes("escape");
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.browser, BrowserMode::Closed);
+            assert!(view.path.is_none());
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_file_finder(window, cx)
+        });
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("down enter");
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(
+                view.path.as_deref(),
+                Some(
+                    dir.path()
+                        .join("file-001.rs")
+                        .canonicalize()
+                        .unwrap()
+                        .as_path()
+                )
+            );
         });
     }
 

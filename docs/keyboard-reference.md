@@ -54,7 +54,7 @@ Resource actions appear on the Resources tab and on the global Artifacts page. D
 
 ## Built-in editor
 
-`Cmd+J`, then `o` on macOS (`Ctrl+J`, then `o` on Linux/Windows) focuses the checkout file finder. Type a partial path, use `↑`/`↓` to select a result, and press `Enter` to open it. The sidebar search icon also opens the finder. The **…** editor actions menu offers Search project, Go to line, Find in file, Replace in file, and Refresh files. `Cmd+S` / `Ctrl+S` saves the active file. The Back and Forward buttons follow file and line navigation. The editor's normal selection, clipboard, undo, and redo shortcuts remain available while it has focus.
+`Cmd+J`, then `o` on macOS (`Ctrl+J`, then `o` on Linux/Windows) focuses the checkout file finder. Type a partial path, use `↑`/`↓` to select a result, and press `Enter` to open it. The sidebar search icon also opens the finder. The **…** editor actions menu offers Search project, Go to line, Find in file, Replace in file, and Refresh files. `Cmd+S` / `Ctrl+S` saves the active file. **… → Go back / Go forward** follows file and line navigation. The editor's normal selection, clipboard, undo, and redo shortcuts remain available while it has focus.
 
 Git changes opens a near-window-sized terminal dialog running `lazygit` in the current checkout. Enter, plain Escape, and Tab belong to lazygit, not the dialog; press **Shift+Esc** while the terminal is focused to close it (the shortcut is shown in the dialog title). The ✕ button or navigation toggle (`Cmd+J` / `Ctrl+J`) also closes it. Each opening starts a new lazygit session in the current checkout.
 

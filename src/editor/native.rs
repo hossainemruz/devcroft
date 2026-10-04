@@ -1606,6 +1606,8 @@ impl NativeEditor {
         let has_file = self.path.is_some();
         let dirty = self.dirty;
         let trusted = self.lsp_trusted;
+        let can_go_back = self.has_jump_history();
+        let can_go_forward = !self.forward_locations.is_empty();
         Button::new("native-editor-actions")
             .label("⋯")
             .small()
@@ -1616,6 +1618,8 @@ impl NativeEditor {
                     ("Find in file", 0, has_file),
                     ("Replace in file", 1, has_file),
                     ("Go to line…", 2, has_file),
+                    ("Go back", 12, can_go_back),
+                    ("Go forward", 13, can_go_forward),
                     ("Save", 3, dirty),
                     ("Save as…", 4, has_file),
                     ("Discard changes", 5, dirty),
@@ -1648,6 +1652,8 @@ impl NativeEditor {
                                     cx.notify();
                                 }
                                 9 => this.refresh_files(cx),
+                                12 => this.go_back(window, cx),
+                                13 => this.go_forward(window, cx),
                                 _ => {
                                     if action == 11 {
                                         this.lsp_trusted = true;
@@ -1759,14 +1765,30 @@ impl NativeEditor {
                     let icon = if item.file.is_some() {
                         self.file_icon(&item.label)
                     } else {
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(px(16.))
-                        .text_color(rgb(0x737983))
-                        .into_any_element()
+                        h_flex()
+                            .gap_1()
+                            .flex_shrink_0()
+                            .child(
+                                Icon::new(if expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(px(16.))
+                                .text_color(rgb(0x737983)),
+                            )
+                            .when(!item.more, |row| {
+                                row.child(
+                                    Icon::new(if expanded {
+                                        IconName::FolderOpen
+                                    } else {
+                                        IconName::FolderClosed
+                                    })
+                                    .size(px(16.))
+                                    .text_color(rgb(0xa4a9b2)),
+                                )
+                            })
+                            .into_any_element()
                     };
                     let key = item.key.clone();
                     let id = if item.more {
@@ -2096,30 +2118,6 @@ impl Render for NativeEditor {
                     .border_b_1()
                     .border_color(rgb(0x202328))
                     .child(tabs)
-                    .when(self.has_jump_history(), |row| {
-                        row.child(
-                            Button::new("native-go-back")
-                                .label("‹")
-                                .small()
-                                .ghost()
-                                .accessibility_label("Go back")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.go_back(window, cx)),
-                                ),
-                        )
-                    })
-                    .when(!self.forward_locations.is_empty(), |row| {
-                        row.child(
-                            Button::new("native-go-forward")
-                                .label("›")
-                                .small()
-                                .ghost()
-                                .accessibility_label("Go forward")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.go_forward(window, cx)),
-                                ),
-                        )
-                    })
                     .child(actions),
             )
             .when_some(self.close_pending.clone(), |view, path| {

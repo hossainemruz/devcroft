@@ -3,7 +3,7 @@
 Devcroft is a small GPUI desktop workspace with Agent, Editor, Terminal, Review, and Resources tabs:
 
 - **Agent** resumes the checkout's most recent session when history exists, otherwise it launches your default agent (`opencode` unless changed in Settings → Agent) in your default shell. Use **New session…** in the Agent sidebar to pick a harness (`opencode`, `claude`, `codex`, or `omp`) explicitly for a new session.
-- **Editor** offers Neovim or Devcroft's built-in editor in **Settings → General → Editor**. Existing installations keep Neovim. The built-in editor has file tabs, a checkout tree, fuzzy file opening, project text search, syntax highlighting, find/replace, and explicit save; it is intended for small edits, not a full IDE.
+- **Editor** offers Neovim or Devcroft's built-in editor in **Settings → General → Editor**. New installations default to the built-in editor; existing installations retain their saved choice, or Neovim when unset. The built-in editor has file tabs, a checkout tree, fuzzy file opening, project text search, syntax highlighting, find/replace, and explicit save; it is intended for small edits, not a full IDE.
 - **Terminal** launches your default login shell.
 
 Terminal-backed tabs own independent PTY sessions. Switching tabs keeps the underlying process alive. Devcroft starts the default shell as an interactive login shell, then enters the Agent or Neovim command through that shell. This makes shell startup files, environment changes, aliases, functions, and tool-manager activation available to those commands.
@@ -14,7 +14,7 @@ Clean buffers reload after external edits. A dirty buffer stays open when its fi
 
 The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, italic, and bold italic), so Nerd Font symbols work without a separate system font installation. Attribution and license files are in [`assets/`](assets/).
 
-Rust semantic features are opt-in per checkout through **… → Trust checkout and enable Rust tooling**. See the [language/server matrix and trust model](docs/language-support.md) for prerequisites, supported features, and limitations.
+Rust semantic features are opt-in per checkout through **… → Trust checkout and enable Rust tooling**. See [editor setup and everyday use](docs/editor.md) for editor choice, shortcuts, external launchers, and file limits, and the [language/server matrix and trust model](docs/language-support.md) for Rust prerequisites and limitations.
 
 ## Home
 

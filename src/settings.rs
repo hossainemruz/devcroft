@@ -1372,7 +1372,7 @@ impl SettingsView {
             .child(
                 group(
                     "Editor",
-                    Some("Choose Neovim or Devcroft's built-in editor. New Editor tabs use this choice; existing sessions and drafts stay open."),
+                    Some("Choose Neovim or Devcroft's built-in editor. Switch the current editor and set the choice for new projects; existing sessions and drafts stay open."),
                 )
                 .child(
                     v_flex()

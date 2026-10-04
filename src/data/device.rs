@@ -199,6 +199,37 @@ pub(crate) struct DeviceStore {
 }
 
 impl DeviceStore {
+    /// Seed only an empty installation, before portable initialization writes
+    /// its first files. Existing data (even without device.json) retains the
+    /// legacy Neovim fallback. Publish without replacing a concurrent writer.
+    pub(crate) fn seed_fresh_install(&self, root: &DataRoot) -> Result<()> {
+        use std::io::Write as _;
+
+        let _guard = self.lock.lock();
+        for entry in std::fs::read_dir(root.root())? {
+            let entry = entry?;
+            if entry.file_name() != "portable"
+                || !entry.file_type()?.is_dir()
+                || std::fs::read_dir(entry.path())?.next().is_some()
+            {
+                return Ok(());
+            }
+        }
+        let state = DeviceState {
+            editor_choice: Some(EditorChoice::BuiltIn.id().to_owned()),
+            ..DeviceState::default()
+        };
+        let mut temp = tempfile::NamedTempFile::new_in(root.root())?;
+        serde_json::to_writer_pretty(&mut temp, &state)?;
+        temp.write_all(b"\n")?;
+        temp.as_file().sync_all()?;
+        match temp.persist_noclobber(&self.path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error.error).context("saving first-install editor choice"),
+        }
+    }
+
     pub(crate) fn new(root: &DataRoot) -> Self {
         Self {
             path: root.device_path(),
@@ -313,6 +344,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = store_in(dir.path()).load().unwrap();
         assert_eq!(state, DeviceState::default());
+    }
+
+    #[test]
+    fn first_install_seed_preserves_existing_and_unknown_preferences() {
+        for contents in [
+            r#"{}"#,
+            r#"{"editor_choice":"neovim","future":123}"#,
+            r#"{"editor_choice":"built_in"}"#,
+            r#"{"editor_choice":"future"}"#,
+            "invalid json",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = DataRoot::new(dir.path().to_owned());
+            super::super::ensure_dirs(root.root()).unwrap();
+            std::fs::write(root.device_path(), contents).unwrap();
+            DeviceStore::new(&root).seed_fresh_install(&root).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.device_path()).unwrap(),
+                contents
+            );
+        }
+    }
+
+    #[test]
+    fn first_install_seed_does_not_reclassify_existing_data_without_preferences() {
+        for existing in ["portable/workspace.json", "portable/.git/HEAD", "cache/old"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = DataRoot::new(dir.path().to_owned());
+            super::super::ensure_dirs(root.root()).unwrap();
+            let path = root.root().join(existing);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "existing").unwrap();
+            let store = DeviceStore::new(&root);
+            store.seed_fresh_install(&root).unwrap();
+            assert!(!root.device_path().exists());
+            assert_eq!(
+                store.load().unwrap().editor_choice_or_default(),
+                EditorChoice::Neovim
+            );
+        }
+    }
+
+    #[test]
+    fn first_install_choice_survives_unrelated_settings_and_explicit_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().to_owned());
+        super::super::ensure_dirs(root.root()).unwrap();
+        let store = DeviceStore::new(&root);
+        store.seed_fresh_install(&root).unwrap();
+        store
+            .update(|state| state.theme = Some("light".into()))
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().editor_choice_or_default(),
+            EditorChoice::BuiltIn
+        );
+        store
+            .update(|state| state.editor_choice = Some("neovim".into()))
+            .unwrap();
+        store.seed_fresh_install(&root).unwrap();
+        assert_eq!(
+            store.load().unwrap().editor_choice_or_default(),
+            EditorChoice::Neovim
+        );
     }
 
     #[test]

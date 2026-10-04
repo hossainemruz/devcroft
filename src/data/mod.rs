@@ -116,8 +116,9 @@ pub(crate) fn ensure_dirs(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve, `mkdir -p`, and first-run init `portable/` (clone when
-/// `clone_url` is given, else `git init` plus `workspace.json` seeding).
+/// Resolve, `mkdir -p`, seed a fresh installation's editor choice, and init
+/// `portable/` (clone when `clone_url` is given, else `git init` plus
+/// `workspace.json` seeding).
 /// Callers build [`DeviceStore`] and sync from the returned root.
 pub(crate) fn ensure_ready(clone_url: Option<&str>) -> Result<DataRoot> {
     let override_dir = env::var_os(ENV_OVERRIDE)
@@ -132,6 +133,7 @@ pub(crate) fn ensure_ready_with_override(
     clone_url: Option<&str>,
 ) -> Result<DataRoot> {
     let root = resolve_data_root_from_override(override_dir)?;
+    DeviceStore::new(&root).seed_fresh_install(&root)?;
     ensure_portable_init(
         &root,
         &InitOptions {
@@ -346,8 +348,22 @@ mod tests {
         assert!(root.portable_dir().join(".git").exists());
         let text = std::fs::read_to_string(root.portable_dir().join("workspace.json")).unwrap();
         assert!(text.contains("\"formatVersion\""));
+        assert_eq!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .editor_choice_or_default(),
+            crate::editor::EditorChoice::BuiltIn
+        );
         // Second startup is a no-op (already initialized).
         ensure_ready_with_override(Some(dir.path().join("data")), None).unwrap();
+        assert_eq!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .editor_choice_or_default(),
+            crate::editor::EditorChoice::BuiltIn
+        );
     }
 
     #[test]

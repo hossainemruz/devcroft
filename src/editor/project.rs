@@ -22,13 +22,79 @@ pub(super) struct TextMatch {
     pub path: PathBuf,
     pub label: String,
     pub line: usize,
+    pub column: usize,
     pub preview: String,
+}
+
+#[derive(Default)]
+pub(super) struct TextMatches {
+    pub items: Vec<TextMatch>,
+    pub truncated: bool,
+    pub error: Option<String>,
+}
+
+struct LiteralMatcher(regex::bytes::Regex);
+
+impl fff_grep::Matcher for LiteralMatcher {
+    type Error = fff_grep::NoError;
+
+    fn find_at(&self, bytes: &[u8], at: usize) -> Result<Option<fff_grep::Match>, Self::Error> {
+        Ok(self
+            .0
+            .find_at(bytes, at)
+            .map(|m| fff_grep::Match::new(m.start(), m.end())))
+    }
+
+    fn line_terminator(&self) -> Option<fff_grep::LineTerminator> {
+        Some(fff_grep::LineTerminator::byte(b'\n'))
+    }
+}
+
+struct TextSink<'a, F> {
+    file: &'a ProjectFile,
+    out: &'a mut TextMatches,
+    cancelled: &'a F,
+    matcher: &'a LiteralMatcher,
+}
+
+impl<F: Fn() -> bool> fff_grep::Sink for TextSink<'_, F> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _: &fff_grep::Searcher,
+        m: &fff_grep::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        if (self.cancelled)() {
+            return Ok(false);
+        }
+        if self.out.items.len() == MAX_RESULTS {
+            self.out.truncated = true;
+            return Ok(false);
+        }
+        self.out.items.push(TextMatch {
+            path: self.file.path.clone(),
+            label: self.file.label.clone(),
+            line: m.line_number().unwrap_or(1) as usize,
+            column: self.matcher.0.find(m.bytes()).map_or(0, |m| m.start()),
+            preview: String::from_utf8_lossy(m.bytes())
+                .trim()
+                .chars()
+                .take(160)
+                .collect(),
+        });
+        Ok(true)
+    }
 }
 
 /// `ignore` applies .gitignore, global excludes, and parent rules. Hidden
 /// source files remain visible; repository metadata and nested checkouts do
 /// not enter the index. Symlinks are deliberately not followed.
 pub(super) fn scan(root: &Path) -> Vec<ProjectFile> {
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let root = root.as_path();
     let filter_root = root.to_owned();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -72,18 +138,39 @@ pub(super) fn scan(root: &Path) -> Vec<ProjectFile> {
 
 /// Search only indexed files and cap memory, per-file I/O, and result count.
 /// Results are line based so choosing one can open at that location.
-pub(super) fn search_text(root: &Path, files: &[ProjectFile], query: &str) -> Vec<TextMatch> {
-    let query = query.trim();
+pub(super) fn search_text(
+    root: &Path,
+    files: &[ProjectFile],
+    query: &str,
+    cancelled: impl Fn() -> bool,
+) -> Option<TextMatches> {
     if query.is_empty() {
-        return Vec::new();
+        return Some(TextMatches::default());
     }
     let Ok(root) = root.canonicalize() else {
-        return Vec::new();
+        return Some(TextMatches::default());
     };
-    let needle = query.to_lowercase();
-    let mut out = Vec::new();
+    // Literal, Unicode-aware case-insensitive matching. fff's slice grep
+    // engine runs over our bounded reads instead of reopening checkout paths.
+    let matcher = match regex::bytes::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(regex) => LiteralMatcher(regex),
+        Err(error) => {
+            return Some(TextMatches {
+                error: Some(format!("Search unavailable: {error}")),
+                ..Default::default()
+            });
+        }
+    };
+    let searcher = fff_grep::SearcherBuilder::new().line_number(true).build();
+    let mut out = TextMatches::default();
     for file in files {
-        if out.len() >= MAX_RESULTS {
+        if cancelled() {
+            return None;
+        }
+        if out.truncated {
             break;
         }
         let Ok(bytes) = read_indexed_file(&root, file) else {
@@ -92,24 +179,21 @@ pub(super) fn search_text(root: &Path, files: &[ProjectFile], query: &str) -> Ve
         if bytes.contains(&0) {
             continue;
         }
-        let Ok(text) = std::str::from_utf8(&bytes) else {
+        let Ok(_) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        for (index, line) in text.lines().enumerate() {
-            if line.to_lowercase().contains(&needle) {
-                out.push(TextMatch {
-                    path: file.path.clone(),
-                    label: file.label.clone(),
-                    line: index + 1,
-                    preview: line.trim().chars().take(160).collect(),
-                });
-                if out.len() >= MAX_RESULTS {
-                    break;
-                }
-            }
-        }
+        let _ = searcher.search_slice(
+            &matcher,
+            &bytes,
+            TextSink {
+                file,
+                out: &mut out,
+                cancelled: &cancelled,
+                matcher: &matcher,
+            },
+        );
     }
-    out
+    if cancelled() { None } else { Some(out) }
 }
 
 /// Reopen every component relative to the checkout so a path swapped to a
@@ -122,11 +206,28 @@ pub(super) fn read_indexed_file(root: &Path, entry: &ProjectFile) -> std::io::Re
         os::fd::{AsRawFd as _, FromRawFd as _},
     };
 
+    // Retain original OS path bytes, including non-UTF-8 filenames. The
+    // display label is lossy and must never be used to reopen a file.
+    // Normalize an alias root only when needed to align it with the scan's
+    // canonical paths. A replaced canonical root still goes through the
+    // O_NOFOLLOW open below instead of resolving a new symlink target.
+    let canonical;
+    let (root, relative) = match entry.path.strip_prefix(root) {
+        Ok(relative) => (root, relative),
+        Err(_) => {
+            canonical = root.canonicalize()?;
+            let relative = entry
+                .path
+                .strip_prefix(&canonical)
+                .map_err(|_| std::io::Error::other("indexed path escaped checkout"))?;
+            (canonical.as_path(), relative)
+        }
+    };
     let mut directory = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(root)?;
-    let mut parts = Path::new(&entry.label).components().peekable();
+    let mut parts = relative.components().peekable();
     while let Some(part) = parts.next() {
         let std::path::Component::Normal(part) = part else {
             return Err(std::io::Error::other("invalid indexed path"));
@@ -226,9 +327,100 @@ mod tests {
         assert!(files.iter().any(|file| file.label == "visible.rs"));
         assert!(files.iter().any(|file| file.label == "nested/child.rs"));
         assert!(!files.iter().any(|file| file.label == "ignored.txt"));
-        let matches = search_text(dir.path(), &files, "needle");
+        let matches = search_text(dir.path(), &files, "needle", || false)
+            .unwrap()
+            .items;
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line, 1);
+    }
+
+    #[test]
+    fn fff_grep_matches_literal_unicode_text_and_preserves_line_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.txt"),
+            "before\r\n  CAFÉ [x].*\r\nlast [X].*",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "café [x].*\n").unwrap();
+        fs::write(dir.path().join("binary.txt"), b"[x].*\0").unwrap();
+        fs::write(dir.path().join("invalid.txt"), b"[x].*\xff").unwrap();
+        fs::write(dir.path().join("huge.txt"), "[x].*".repeat(500_000)).unwrap();
+        let files = scan(dir.path());
+        let found = search_text(dir.path(), &files, "[x].*", || false).unwrap();
+        assert_eq!(
+            found
+                .items
+                .iter()
+                .map(|m| (m.label.as_str(), m.line))
+                .collect::<Vec<_>>(),
+            vec![("a.txt", 2), ("a.txt", 3), ("b.txt", 1)]
+        );
+        assert_eq!(found.items[0].preview, "CAFÉ [x].*");
+        assert_eq!(
+            search_text(dir.path(), &files, "café", || false)
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+        assert!(
+            search_text(dir.path(), &files, "", || false)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(search_text(dir.path(), &files, "[x].*", || true).is_none());
+    }
+
+    #[test]
+    fn fff_grep_caps_matching_lines_and_reports_more_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.txt");
+        fs::write(&path, "needle\n".repeat(MAX_RESULTS)).unwrap();
+        let files = scan(dir.path());
+        let exact = search_text(dir.path(), &files, "needle", || false).unwrap();
+        assert_eq!(exact.items.len(), MAX_RESULTS);
+        assert!(!exact.truncated);
+        fs::write(path, "needle\n".repeat(MAX_RESULTS + 1)).unwrap();
+        let extra = search_text(dir.path(), &files, "needle", || false).unwrap();
+        assert_eq!(extra.items.len(), MAX_RESULTS);
+        assert!(extra.truncated);
+    }
+
+    // macOS filesystems reject filenames containing invalid UTF-8.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn grep_reads_original_non_utf8_filenames() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"bad-\xff.txt".to_vec());
+        fs::write(dir.path().join(&name), "needle\n").unwrap();
+        let files = scan(dir.path());
+        let found = search_text(dir.path(), &files, "needle", || false).unwrap();
+        assert_eq!(found.items.len(), 1);
+        assert_eq!(found.items[0].path.file_name(), Some(name.as_os_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_rejects_indexed_parent_directory_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let checkout = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(checkout.path().join("src")).unwrap();
+        fs::write(checkout.path().join("src/file.txt"), "safe\n").unwrap();
+        let files = scan(checkout.path());
+        fs::write(outside.path().join("file.txt"), "outside-secret\n").unwrap();
+        fs::remove_file(checkout.path().join("src/file.txt")).unwrap();
+        fs::remove_dir(checkout.path().join("src")).unwrap();
+        symlink(outside.path(), checkout.path().join("src")).unwrap();
+        assert!(
+            search_text(checkout.path(), &files, "outside-secret", || false)
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -243,6 +435,11 @@ mod tests {
         fs::write(outside.path().join("secret.txt"), "outside-secret\n").unwrap();
         fs::remove_file(&indexed).unwrap();
         symlink(outside.path().join("secret.txt"), &indexed).unwrap();
-        assert!(search_text(checkout.path(), &files, "outside-secret").is_empty());
+        assert!(
+            search_text(checkout.path(), &files, "outside-secret", || false)
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 }

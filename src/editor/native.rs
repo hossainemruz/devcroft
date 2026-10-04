@@ -87,12 +87,16 @@ pub(crate) struct NativeEditor {
     file_selection: usize,
     finder: Option<Arc<Mutex<Finder>>>,
     finder_error: Option<String>,
+    buffer_finder: Option<Arc<Mutex<Finder>>>,
+    buffer_finder_error: Option<String>,
+    buffer_index_generation: u64,
     file_matches: Vec<ProjectFile>,
     file_total: usize,
     file_searching: bool,
     file_generation: Arc<AtomicU64>,
     preview_generation: u64,
-    preview_text: Option<String>,
+    preview_text: Option<finder::Preview>,
+    preview_first_line: usize,
     preview_editor: Entity<EditorState>,
     finder_previous: BrowserMode,
     finder_scroll: gpui_kit::UniformListScrollHandle,
@@ -103,8 +107,8 @@ pub(crate) struct NativeEditor {
     search_results: Vec<TextMatch>,
     browser: BrowserMode,
     indexing: bool,
-    searching: bool,
-    search_generation: u64,
+    search_truncated: bool,
+    search_error: Option<String>,
     expanded_dirs: HashSet<String>,
     tree_limits: HashMap<String, usize>,
     disk_comparison: Option<String>,
@@ -137,6 +141,7 @@ struct StashedDocument {
 enum BrowserMode {
     Closed,
     Files,
+    Buffers,
     Tree,
     Text,
     Line,
@@ -325,13 +330,8 @@ impl NativeEditor {
         let text_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search project text…"));
         cx.subscribe(&text_query, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Change => {
-                this.search_generation += 1;
-                this.search_results.clear();
-                this.searching = false;
-                cx.notify();
-            }
-            InputEvent::PressEnter { .. } => this.search_project(cx),
+            InputEvent::Change => this.search_project(cx),
+            InputEvent::PressEnter { .. } => this.accept_file(cx),
             _ => {}
         })
         .detach();
@@ -360,8 +360,8 @@ impl NativeEditor {
                         cx,
                     );
                     this.files = files;
-                    this.install_finder(finder, cx);
                     this.indexing = false;
+                    this.install_finder(finder, cx);
                     cx.notify();
                 }
             });
@@ -460,12 +460,16 @@ impl NativeEditor {
             file_selection: 0,
             finder: None,
             finder_error: None,
+            buffer_finder: None,
+            buffer_finder_error: None,
+            buffer_index_generation: 0,
             file_matches: Vec::new(),
             file_total: 0,
             file_searching: false,
             file_generation: Arc::new(AtomicU64::new(0)),
             preview_generation: 0,
             preview_text: None,
+            preview_first_line: 1,
             preview_editor,
             finder_previous: BrowserMode::Tree,
             finder_scroll: gpui_kit::UniformListScrollHandle::new(),
@@ -476,8 +480,8 @@ impl NativeEditor {
             search_results: Vec::new(),
             browser: BrowserMode::Tree,
             indexing: true,
-            searching: false,
-            search_generation: 0,
+            search_truncated: false,
+            search_error: None,
             expanded_dirs: HashSet::from([String::new()]),
             tree_limits: HashMap::new(),
             disk_comparison: None,
@@ -499,7 +503,7 @@ impl NativeEditor {
     }
 
     pub(crate) fn open_file_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.browser != BrowserMode::Files {
+        if !self.finder_open() {
             self.finder_previous = self.browser;
         }
         self.browser = BrowserMode::Files;
@@ -510,9 +514,41 @@ impl NativeEditor {
         cx.notify();
     }
 
+    pub(crate) fn open_live_grep(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.finder_open() {
+            self.finder_previous = self.browser;
+        }
+        self.browser = BrowserMode::Text;
+        self.text_query
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.search_project(cx);
+        self.text_query.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_buffer_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.finder_open() {
+            self.finder_previous = self.browser;
+        }
+        self.browser = BrowserMode::Buffers;
+        self.file_query
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.refresh_buffer_finder(cx);
+        self.file_query.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
     fn show_browser(&mut self, mode: BrowserMode, window: &mut Window, cx: &mut Context<Self>) {
         if mode == BrowserMode::Files {
             self.open_file_finder(window, cx);
+            return;
+        }
+        if mode == BrowserMode::Text {
+            self.open_live_grep(window, cx);
+            return;
+        }
+        if mode == BrowserMode::Buffers {
+            self.open_buffer_finder(window, cx);
             return;
         }
         self.browser = if self.browser == mode {
@@ -521,7 +557,7 @@ impl NativeEditor {
             mode
         };
         let input = match self.browser {
-            BrowserMode::Files => Some(&self.file_query),
+            BrowserMode::Files | BrowserMode::Buffers => Some(&self.file_query),
             BrowserMode::Text => Some(&self.text_query),
             BrowserMode::Line => Some(&self.line_query),
             BrowserMode::Closed | BrowserMode::Tree => None,
@@ -532,35 +568,16 @@ impl NativeEditor {
         cx.notify();
     }
 
-    fn search_project(&mut self, cx: &mut Context<Self>) {
-        let query = self.text_query.read(cx).value().to_string();
-        let files = self.files.clone();
-        let root = self.root.clone();
-        self.search_generation += 1;
-        let generation = self.search_generation;
-        self.searching = true;
-        cx.spawn(async move |view, cx| {
-            let results = cx
-                .background_spawn(async move { project::search_text(&root, &files, &query) })
-                .await;
-            let _ = view.update(cx, |this, cx| {
-                if this.search_generation == generation {
-                    this.search_results = results;
-                    this.searching = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
     fn refresh_files(&mut self, cx: &mut Context<Self>) {
+        if self.browser == BrowserMode::Buffers {
+            self.refresh_buffer_finder(cx);
+            return;
+        }
         self.index_generation += 1;
         let generation = self.index_generation;
         self.indexing = true;
         self.finder = None;
-        self.file_generation.fetch_add(1, Ordering::Relaxed);
+        self.reset_finder_results();
         let root = self.root.clone();
         cx.spawn(async move |view, cx| {
             let (files, finder) = cx
@@ -578,8 +595,8 @@ impl NativeEditor {
                         cx,
                     );
                     this.files = files;
-                    this.install_finder(finder, cx);
                     this.indexing = false;
+                    this.install_finder(finder, cx);
                     cx.notify();
                 }
             });
@@ -761,12 +778,13 @@ impl NativeEditor {
             .root
             .canonicalize()
             .context("Checkout is unavailable")?;
-        let canonical = if self.inactive_documents.contains_key(path) {
-            path.to_owned()
-        } else {
-            path.canonicalize()
-                .with_context(|| format!("Could not open {}", path.display()))?
-        };
+        let canonical =
+            if self.path.as_deref() == Some(path) || self.inactive_documents.contains_key(path) {
+                path.to_owned()
+            } else {
+                path.canonicalize()
+                    .with_context(|| format!("Could not open {}", path.display()))?
+            };
         if !canonical.starts_with(&canonical_root) {
             bail!("Choose a file inside this checkout.");
         }
@@ -791,6 +809,7 @@ impl NativeEditor {
             self.record_origin(origin, moved, cx);
             return Ok(());
         }
+        let opened_new_tab = !self.inactive_documents.contains_key(&canonical);
         if let Some(stashed) = self.inactive_documents.remove(&canonical) {
             self.stash_active(cx);
             let subscribed = stashed.subscribed;
@@ -834,6 +853,9 @@ impl NativeEditor {
         self.check_disk(window, cx);
         self.restart_lsp(&canonical, language_for(&canonical), window, cx);
         self.record_origin(origin, true, cx);
+        if opened_new_tab && self.browser == BrowserMode::Buffers {
+            self.refresh_buffer_finder(cx);
+        }
         Ok(())
     }
 
@@ -956,6 +978,9 @@ impl NativeEditor {
             }
         } else {
             self.inactive_documents.remove(path);
+        }
+        if self.browser == BrowserMode::Buffers {
+            self.refresh_buffer_finder(cx);
         }
         cx.notify();
     }
@@ -1796,7 +1821,7 @@ impl NativeEditor {
             .px_2()
             .py_2()
             .overflow_y_scrollbar();
-        let mode = if self.browser == BrowserMode::Files {
+        let mode = if self.finder_open() {
             self.finder_previous
         } else {
             self.browser
@@ -1805,7 +1830,7 @@ impl NativeEditor {
             return None;
         }
         match mode {
-            BrowserMode::Files => unreachable!(),
+            BrowserMode::Files | BrowserMode::Buffers | BrowserMode::Text => unreachable!(),
             BrowserMode::Tree => {
                 for item in tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits) {
                     let expanded = self.expanded_dirs.contains(&item.key);
@@ -1887,33 +1912,6 @@ impl NativeEditor {
                                 } else if !this.expanded_dirs.insert(key.clone()) {
                                     this.expanded_dirs.remove(&key);
                                 }
-                                cx.notify();
-                            })),
-                    );
-                }
-            }
-            BrowserMode::Text => {
-                panel = panel.child(Input::new(&self.text_query).small()).child(
-                    Button::new("native-run-search")
-                        .label("Search")
-                        .outline()
-                        .on_click(cx.listener(|this, _, _, cx| this.search_project(cx))),
-                );
-                if self.searching {
-                    panel = panel.child("Searching…");
-                }
-                for (index, item) in self.search_results.iter().enumerate() {
-                    let path = item.path.clone();
-                    let line = item.line;
-                    panel = panel.child(
-                        Button::new(format!("native-search-{index}"))
-                            .label(format!("{}:{}  {}", item.label, line, item.preview))
-                            .ghost()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.error = this
-                                    .open(&path, Some(line), window, cx)
-                                    .err()
-                                    .map(|error| format!("{error:#}"));
                                 cx.notify();
                             })),
                     );
@@ -2147,16 +2145,48 @@ impl Render for NativeEditor {
             }
             self.browser = BrowserMode::Tree;
         }
-        if let Some(text) = self.preview_text.take() {
-            let language = self
-                .file_matches
-                .get(self.file_selection)
-                .map(|file| language_for(&file.path))
+        if let Some(preview) = self.preview_text.take() {
+            self.preview_first_line = preview.first_line;
+            let selected = self.selected_finder_file();
+            let language = selected
+                .as_ref()
+                .map(|(file, _)| language_for(&file.path))
                 .unwrap_or("text");
+            let target = selected.and_then(|(_, line)| line);
+            let query = self.text_query.read(cx).value().to_string();
+            let match_range = target.and_then(|line| preview.match_range(line, &query));
+            // Highlight the actual matched spelling so Unicode case folding
+            // also works with the editor's ASCII-insensitive search painter.
+            let matched_text = match_range
+                .as_ref()
+                .map(|range| preview.text[range.clone()].to_owned());
             self.preview_editor.update(cx, |editor, cx| {
                 editor.set_highlighter(language, cx);
-                editor.set_value(text, window, cx);
+                editor.set_line_number(target.is_none(), window, cx);
+                editor.set_value(preview.text, window, cx);
+                editor.close_search(cx);
+                if let Some(text) = matched_text {
+                    editor.set_search_query(text, true, cx);
+                }
+                if let Some(line) = target {
+                    editor.set_cursor_position(
+                        Position::new(line.saturating_sub(preview.first_line) as u32, 0),
+                        window,
+                        cx,
+                    );
+                }
+                if let Some(range) = match_range {
+                    editor.set_selected_range(range, cx);
+                }
             });
+            if self.finder_open() {
+                let query = if self.browser == BrowserMode::Text {
+                    &self.text_query
+                } else {
+                    &self.file_query
+                };
+                query.read(cx).focus_handle(cx).focus(window, cx);
+            }
         }
         let label = self
             .path
@@ -2312,10 +2342,13 @@ impl Render for NativeEditor {
                 if event.keystroke.key == "escape"
                     && (matches!(
                         this.browser,
-                        BrowserMode::Files | BrowserMode::Text | BrowserMode::Line
+                        BrowserMode::Files
+                            | BrowserMode::Buffers
+                            | BrowserMode::Text
+                            | BrowserMode::Line
                     ) || this.disk_comparison.is_some())
                 {
-                    if this.browser == BrowserMode::Files {
+                    if this.finder_open() {
                         this.close_file_finder(window, cx);
                     } else {
                         this.browser = BrowserMode::Tree;
@@ -2465,6 +2498,375 @@ mod tests {
             assert_eq!(view.editor.read(cx).value().as_ref(), "hello\n");
             assert_eq!(view.browser, BrowserMode::Tree);
         });
+    }
+
+    #[gpui_kit::test]
+    fn buffer_finder_searches_only_open_tabs_and_keeps_unsaved_documents(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("navigation.txt");
+        let second = dir.path().join("settings.txt");
+        fs::write(&first, "first\nsecond\n").unwrap();
+        fs::write(&second, "settings\n").unwrap();
+        fs::write(dir.path().join("navigation-closed.txt"), "closed\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "navigation.txt\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        let document_id = view.update_in(test_cx, |view, window, cx| {
+            view.open(&first, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value("unsaved buffer\nsecond\n", window, cx);
+                editor.set_cursor_position(Position::new(1, 3), window, cx);
+            });
+            view.dirty = true;
+            let id = view.editor.entity_id();
+            view.open(&second, None, window, cx).unwrap();
+            view.open_buffer_finder(window, cx);
+            id
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.browser, BrowserMode::Buffers);
+            assert_eq!(view.file_total, 2);
+            assert_eq!(view.file_matches.len(), 2);
+            assert!(
+                view.file_matches
+                    .iter()
+                    .all(|file| view.tabs.contains(&file.path))
+            );
+            assert_eq!(
+                view.preview_editor.read(cx).value().as_ref(),
+                "unsaved buffer\nsecond\n"
+            );
+            assert!(!view.files.iter().any(|file| file.label == "navigation.txt"));
+        });
+        test_cx.simulate_keystrokes("n a v i g a t o n");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.file_matches.len(), 1);
+            assert_eq!(view.file_matches[0].label, "navigation.txt");
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-file-0").visible());
+        });
+        test_cx.simulate_keystrokes("enter");
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.path.as_ref(), Some(&first.canonicalize().unwrap()));
+            assert_eq!(view.editor.entity_id(), document_id);
+            assert_eq!(
+                view.editor.read(cx).value().as_ref(),
+                "unsaved buffer\nsecond\n"
+            );
+            assert_eq!(view.editor.read(cx).cursor_position(), Position::new(1, 3));
+            assert!(view.dirty);
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.browser, BrowserMode::Tree);
+        });
+        assert_eq!(fs::read_to_string(first).unwrap(), "first\nsecond\n");
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_buffer_finder(window, cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("down");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.file_selection, 1);
+            assert_eq!(view.preview_editor.read(cx).value().as_ref(), "settings\n");
+        });
+        test_cx.simulate_keystrokes("escape");
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.editor.entity_id(), document_id);
+            assert_eq!(view.browser, BrowserMode::Tree);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn buffer_finder_previews_large_unicode_drafts_and_switches_deleted_tabs(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("deleted.txt");
+        let second = dir.path().join("keep.txt");
+        fs::write(&first, "original\n").unwrap();
+        fs::write(&second, "keep\n").unwrap();
+        let canonical = first.canonicalize().unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        let document_id = view.update_in(test_cx, |view, window, cx| {
+            view.open(&first, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value("界".repeat(20_000), window, cx)
+            });
+            view.dirty = true;
+            let id = view.editor.entity_id();
+            fs::remove_file(&first).unwrap();
+            view.open(&second, None, window, cx).unwrap();
+            view.open_buffer_finder(window, cx);
+            id
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-file-0").visible());
+        });
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.file_matches[0].path, canonical);
+            let text = view.preview_editor.read(cx).value();
+            assert!(text.starts_with("界"));
+            assert!(text.len() < 40_100);
+            assert!(text.ends_with("… Preview truncated\n"));
+        });
+        test_cx.update(|window, cx| {
+            window.click("native-file-0", cx);
+            window.render_frame(cx);
+        });
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.path.as_ref(), Some(&canonical));
+            assert_eq!(view.editor.entity_id(), document_id);
+            assert_eq!(view.editor.read(cx).text().len(), 60_000);
+            assert!(view.dirty);
+            assert!(view.error.is_none());
+        });
+        // Accepting the already-active deleted buffer must also keep it open.
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_buffer_finder(window, cx)
+        });
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("enter");
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.path.as_ref(), Some(&canonical));
+            assert_eq!(view.editor.entity_id(), document_id);
+            assert!(view.error.is_none());
+            assert_eq!(view.tabs.len(), 2);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn buffer_finder_handles_empty_tabs_and_rebuilds_after_closing_a_tab(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.browser = BrowserMode::Closed;
+            view.open_buffer_finder(window, cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("enter");
+        view.read_with(test_cx, |view, _| {
+            assert!(view.file_matches.is_empty());
+            assert_eq!(view.browser, BrowserMode::Buffers);
+            assert!(view.path.is_none());
+        });
+        test_cx.simulate_keystrokes("escape");
+        view.update_in(test_cx, |view, window, cx| {
+            assert_eq!(view.browser, BrowserMode::Closed);
+            view.open_buffer_finder(window, cx);
+        });
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            // External opens must appear while the picker is already visible.
+            view.open(&file, None, window, cx).unwrap();
+        });
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            assert_eq!(view.file_matches.len(), 1);
+            view.close_tab(&file.canonicalize().unwrap(), window, cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| {
+            assert!(view.tabs.is_empty());
+            assert!(view.file_matches.is_empty());
+            assert!(view.pending_open.is_none());
+            assert_eq!(view.browser, BrowserMode::Buffers);
+        });
+        view.update_in(test_cx, |view, _, cx| {
+            // A stale result arriving after close must never reopen the tab.
+            view.file_matches.push(ProjectFile {
+                path: file.canonicalize().unwrap(),
+                label: "hello.txt".into(),
+            });
+            view.accept_file(cx);
+            assert!(view.pending_open.is_none());
+        });
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("escape");
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_buffer_finder(window, cx);
+            view.open_file_finder(window, cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.browser, BrowserMode::Files);
+            assert_eq!(view.file_matches.len(), 1);
+            assert_eq!(view.file_matches[0].label, "hello.txt");
+        });
+    }
+
+    fn settle_live_grep(cx: &mut gpui_kit::VisualTestContext) {
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_grep_updates_on_typing_previews_and_opens_the_matching_line(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        fs::write(
+            &file,
+            format!(
+                "{}let needle = 1;\nlet NEEDLE = 2;\n",
+                "// context\n".repeat(350)
+            ),
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.rs"), "// needle\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(dir.path().join("ignored.rs"), "needle\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.browser = BrowserMode::Closed;
+            view.open_live_grep(window, cx);
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("n e e d l e");
+        settle_live_grep(test_cx);
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.browser, BrowserMode::Text);
+            assert_eq!(view.search_results.len(), 3);
+            assert_eq!(view.search_results[0].line, 351);
+            assert_eq!(view.preview_first_line, 331);
+            assert!(
+                view.preview_editor
+                    .read(cx)
+                    .value()
+                    .contains("let needle = 1;")
+            );
+            let preview = view.preview_editor.read(cx);
+            assert_eq!(&preview.value()[preview.selected_range()], "needle");
+            let search = preview.search_session();
+            assert!(search.is_active());
+            assert!(
+                !search.open,
+                "preview highlighting must not open a second search panel"
+            );
+            assert_eq!(search.matcher.len(), 2);
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-finder-close").visible());
+            assert!(window.find("native-search-0").visible());
+        });
+        test_cx.simulate_keystrokes("down ctrl-n ctrl-p");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.file_selection, 1);
+            let preview = view.preview_editor.read(cx);
+            assert_eq!(&preview.value()[preview.selected_range()], "NEEDLE");
+            assert_eq!(view.text_query.read(cx).value().as_ref(), "needle");
+        });
+        test_cx.simulate_keystrokes("enter");
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(
+                view.path.as_deref(),
+                Some(file.canonicalize().unwrap().as_path())
+            );
+            assert_eq!(
+                view.editor.read(cx).cursor_position(),
+                Position::new(351, 0)
+            );
+            assert_eq!(view.browser, BrowserMode::Closed);
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_file_finder(window, cx)
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(test_cx, |view, cx| {
+            assert!(
+                !view.preview_editor.read(cx).search_session().is_active(),
+                "file previews must clear grep word highlights"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn live_grep_cancels_old_queries_refreshes_and_restores_previous_view(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "old\nnew\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_file_finder(window, cx);
+            view.open_live_grep(window, cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("o l d");
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a n e w"
+        } else {
+            "ctrl-a n e w"
+        });
+        settle_live_grep(test_cx);
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.search_results.len(), 1);
+            assert_eq!(view.search_results[0].line, 2);
+            assert!(!view.file_searching);
+        });
+        fs::write(dir.path().join("b.txt"), "new\n").unwrap();
+        test_cx.update(|window, cx| window.click("native-finder-refresh", cx));
+        settle_live_grep(test_cx);
+        view.read_with(test_cx, |view, _| assert_eq!(view.search_results.len(), 2));
+        test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a backspace"
+        } else {
+            "ctrl-a backspace"
+        });
+        settle_live_grep(test_cx);
+        view.read_with(test_cx, |view, cx| {
+            assert!(!view.preview_editor.read(cx).search_session().is_active())
+        });
+        test_cx.simulate_keystrokes("enter");
+        view.read_with(test_cx, |view, _| {
+            assert!(view.search_results.is_empty());
+            assert_eq!(view.browser, BrowserMode::Text);
+            assert!(view.path.is_none());
+        });
+        test_cx.simulate_keystrokes("o l d");
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("escape");
+        settle_live_grep(test_cx);
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.browser, BrowserMode::Tree);
+            assert!(view.search_results.is_empty());
+            assert!(view.preview_text.is_none());
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        assert!(test_cx.debug_bounds("native-file-finder").is_none());
     }
 
     #[gpui_kit::test]

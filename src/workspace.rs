@@ -2607,7 +2607,10 @@ impl Workspace {
         if self.home_visible && self.home.read(cx).is_artifacts_page() {
             self.home.read(cx).artifacts_navigation_state(cx)
         } else if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
-            self.resources.read(cx).navigation_state()
+            navigation::ResourceState {
+                built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
+                ..self.resources.read(cx).navigation_state()
+            }
         } else {
             navigation::ResourceState {
                 built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
@@ -2886,11 +2889,19 @@ impl Workspace {
                 }
             }
             NavigationCommand::NewSession => self.prompt_new_agent_session(window, cx),
-            NavigationCommand::OpenFile => {
+            command @ (NavigationCommand::OpenFile
+            | NavigationCommand::SearchProject
+            | NavigationCommand::SwitchBuffer) => {
                 if self.editor_instance == Some(EditorChoice::BuiltIn) {
                     self.select_tab(WorkspaceTab::Editor as usize, window, cx);
                     if let Some(editor) = self.native_editor.as_ref() {
-                        editor.update(cx, |editor, cx| editor.open_file_finder(window, cx));
+                        editor.update(cx, |editor, cx| match command {
+                            NavigationCommand::SearchProject => editor.open_live_grep(window, cx),
+                            NavigationCommand::SwitchBuffer => {
+                                editor.open_buffer_finder(window, cx)
+                            }
+                            _ => editor.open_file_finder(window, cx),
+                        });
                     }
                 }
             }

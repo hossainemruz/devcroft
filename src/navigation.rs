@@ -38,6 +38,8 @@ pub(crate) enum Command {
     Back,
     NewSession,
     OpenFile,
+    SwitchBuffer,
+    SearchProject,
     EditMarkdown,
     AddComment,
     SaveDraft,
@@ -142,11 +144,18 @@ const FIND_FILE: Row = Row {
     command: Command::OpenFile,
 };
 
-const OPEN_FILE: Row = Row {
-    key: 'o',
-    label: "Open project file",
+const SWITCH_BUFFER: Row = Row {
+    key: 'b',
+    label: "Switch open tab",
     group: "Editor",
-    command: Command::OpenFile,
+    command: Command::SwitchBuffer,
+};
+
+const SEARCH_PROJECT: Row = Row {
+    key: 'w',
+    label: "Search project",
+    group: "Editor",
+    command: Command::SearchProject,
 };
 
 const ARTIFACTS: [Row; 3] = [
@@ -212,7 +221,11 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
         Context::Relationships => RELATIONSHIPS.to_vec(),
     };
     if context == Context::Workspace && resource.built_in_editor {
-        result.extend([FIND_FILE, OPEN_FILE]);
+        result.extend([FIND_FILE, SWITCH_BUFFER]);
+        // Resource drafts own `w` for Save, including while a save is running.
+        if !(resource.selected && resource.editable && resource.drafting) {
+            result.push(SEARCH_PROJECT);
+        }
     }
     if resource.selected && resource.editable && !resource.saving {
         result.extend(if resource.drafting {
@@ -455,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_workspace_owns_f_and_o_for_file_opening() {
+    fn built_in_workspace_owns_f_without_an_o_alias_for_file_opening() {
         let built_in = ResourceState {
             built_in_editor: true,
             ..Default::default()
@@ -469,14 +482,89 @@ mod tests {
             None
         );
         assert_eq!(resolve(Context::Home, built_in, 'f'), None);
-        assert_eq!(
-            resolve(Context::Workspace, built_in, 'o'),
-            Some(Command::OpenFile)
-        );
+        assert_eq!(resolve(Context::Workspace, built_in, 'o'), None);
         assert_eq!(
             resolve(Context::Workspace, ResourceState::default(), 'o'),
             None
         );
+    }
+
+    #[test]
+    fn built_in_workspace_owns_b_for_buffers_without_changing_back_navigation() {
+        let built_in = ResourceState {
+            built_in_editor: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(Context::Workspace, built_in, 'b'),
+            Some(Command::SwitchBuffer)
+        );
+        assert_eq!(
+            resolve(Context::Workspace, ResourceState::default(), 'b'),
+            None
+        );
+        assert_eq!(resolve(Context::Home, built_in, 'b'), None);
+        for context in [Context::Artifacts, Context::Relationships] {
+            assert_eq!(resolve(context, built_in, 'b'), Some(Command::Back));
+        }
+        for drafting in [false, true] {
+            let state = ResourceState {
+                selected: true,
+                editable: true,
+                drafting,
+                ..built_in
+            };
+            assert!(unique_keys(&rows(Context::Workspace, state)));
+            assert_eq!(
+                resolve(Context::Workspace, state, 'b'),
+                Some(Command::SwitchBuffer)
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_workspace_owns_w_for_search_without_changing_space_switching_or_draft_saving() {
+        let built_in = ResourceState {
+            built_in_editor: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(Context::Workspace, built_in, 'w'),
+            Some(Command::SearchProject)
+        );
+        assert_eq!(
+            resolve(Context::Workspace, ResourceState::default(), 'w'),
+            None
+        );
+        assert_eq!(resolve(Context::Workspace, built_in, 's'), None);
+        for context in [Context::Home, Context::Artifacts] {
+            assert_eq!(resolve(context, built_in, 's'), Some(Command::SwitchSpace));
+        }
+        for drafting in [false, true] {
+            let state = ResourceState {
+                selected: true,
+                editable: true,
+                drafting,
+                ..built_in
+            };
+            assert!(unique_keys(&rows(Context::Workspace, state)));
+            assert_eq!(
+                resolve(Context::Workspace, state, 'w'),
+                Some(if drafting {
+                    Command::SaveDraft
+                } else {
+                    Command::SearchProject
+                })
+            );
+            if drafting {
+                let saving = ResourceState {
+                    saving: true,
+                    ..state
+                };
+                assert!(unique_keys(&rows(Context::Workspace, saving)));
+                assert_eq!(resolve(Context::Workspace, saving, 'w'), None);
+            }
+        }
     }
 
     #[test]

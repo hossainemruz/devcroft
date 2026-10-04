@@ -52,8 +52,14 @@ pub(crate) struct NativeEditor {
     error: Option<String>,
     pending_open: Option<(PathBuf, Option<usize>)>,
     pending_line: Option<usize>,
+    pending_lsp_position: Option<lsp_types::Position>,
     executables: HashMap<String, String>,
     lsp: Option<LspSession>,
+    workspace_lsp: Option<Arc<Client>>,
+    lsp_starting: bool,
+    lsp_trusted: bool,
+    lsp_generation: u64,
+    lsp_status: String,
     /// Origins of follow-definition jumps (engine positions), newest last.
     /// Pushed by the `show_document` hook before the engine jumps.
     jump_back: Rc<RefCell<Vec<Position>>>,
@@ -151,9 +157,7 @@ enum DiskChange {
     Settled,
 }
 
-/// One live language session: exactly the document currently open, at the
-/// URI the server knows. Replaced on every successful open; dropped (and
-/// the server killed) when the editor moves to another file.
+/// The active document binding; its client belongs to the checkout workspace.
 struct LspSession {
     client: Arc<Client>,
     uri: String,
@@ -423,8 +427,14 @@ impl NativeEditor {
             error: None,
             pending_open: None,
             pending_line: None,
+            pending_lsp_position: None,
             executables,
             lsp: None,
+            workspace_lsp: None,
+            lsp_starting: false,
+            lsp_trusted: false,
+            lsp_generation: 0,
+            lsp_status: "Rust: disabled — trust checkout in … to enable tooling".into(),
             jump_back: Rc::new(RefCell::new(Vec::new())),
             disk_seen: None,
             conflict: false,
@@ -725,6 +735,13 @@ impl NativeEditor {
         });
         if self.path.as_deref() == Some(canonical.as_path()) {
             self.place_cursor(line, window, cx);
+            if self
+                .lsp
+                .as_ref()
+                .is_none_or(|session| !session.client.is_alive())
+            {
+                self.restart_lsp(&canonical, language_for(&canonical), window, cx);
+            }
             let moved = line.is_some_and(|line| {
                 origin
                     .as_ref()
@@ -857,6 +874,12 @@ impl NativeEditor {
                         return;
                     }
                 }
+                if self.path.as_ref() != Some(&path)
+                    && let Some(client) = &self.workspace_lsp
+                    && let Ok(uri) = file_uri(&path)
+                {
+                    let _ = client.did_save(uri.as_str());
+                }
                 self.close_pending = None;
                 self.finish_close(&path, window, cx);
             }
@@ -864,6 +887,11 @@ impl NativeEditor {
     }
 
     fn finish_close(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(client) = &self.workspace_lsp
+            && let Ok(uri) = file_uri(path)
+        {
+            client.did_close(uri.as_str());
+        }
         self.tabs.retain(|tab| tab != path);
         if self.path.as_deref() == Some(path) {
             self.disk_comparison = None;
@@ -905,6 +933,9 @@ impl NativeEditor {
         let contents = file_bytes_for_buffer(&saved, &draft).into_owned();
         match save_if_unchanged(&path, saved.as_bytes(), contents.as_bytes()) {
             Ok(()) => {
+                if let Some(session) = &self.lsp {
+                    let _ = session.client.did_save(&session.uri);
+                }
                 self.saved = Some(contents);
                 self.dirty = false;
                 self.error = None;
@@ -943,6 +974,19 @@ impl NativeEditor {
     /// One disk-poll step: detect an external change and apply it. The timer
     /// loop calls this every `DISK_POLL_INTERVAL`; tests call it directly.
     fn check_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(client) = &self.workspace_lsp {
+            let status = if !client.is_alive() {
+                "Rust: server stopped — Restart language server".into()
+            } else if let Some(error) = client.last_error() {
+                format!("Rust: {error} — Restart language server")
+            } else {
+                "rust-analyzer: ready".into()
+            };
+            if self.lsp_status != status {
+                self.lsp_status = status;
+                cx.notify();
+            }
+        }
         if let Some(change) = self.detect_disk_change(cx) {
             self.apply_disk_change(change, window, cx);
         }
@@ -1172,12 +1216,11 @@ impl NativeEditor {
             return;
         };
         let text = self.editor.read(cx).value().to_string();
-        let _ = session.client.did_change(&text);
+        let _ = session.client.did_change(&session.uri, &text);
     }
 
-    /// Restart the language session for a newly opened file. Any failure
-    /// (no server binary, failed handshake) leaves `lsp` empty and the file
-    /// perfectly editable without language features.
+    /// Bind a Rust document to the checkout client, starting it asynchronously
+    /// after the explicit trust decision. Failures preserve plain editing.
     fn restart_lsp(
         &mut self,
         path: &Path,
@@ -1185,78 +1228,157 @@ impl NativeEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The same live document keeps its session: edits already flowed to
-        // the server through Change events, so reopening must not respawn it
-        // (every Review line-click would otherwise restart rust-analyzer).
-        // A dead server is the exception: reopening revives it.
-        let Some(uri) = file_uri(path).ok() else {
-            return;
-        };
-        if self
-            .lsp
-            .as_ref()
-            .is_some_and(|session| session.uri == uri.as_str() && session.client.is_alive())
-        {
-            return;
-        }
-        self.lsp.take();
         self.clear_lsp_providers(cx);
+        self.lsp = None;
         if language != "rust" {
             return;
         }
-        let Some(program) = discover_rust_analyzer(None) else {
+        if !self.lsp_trusted {
+            self.lsp_status = "Rust: disabled — trust checkout in … (permits project tools)".into();
+            return;
+        }
+        let Ok(uri) = file_uri(path) else {
             return;
         };
+        if let Some(client) = self.workspace_lsp.clone().filter(|c| c.is_alive()) {
+            if client
+                .did_open(&uri, "rust", self.editor.read(cx).value().as_ref())
+                .is_ok()
+            {
+                self.attach_lsp(client, uri, cx);
+            }
+            return;
+        }
+        if self.lsp_starting {
+            return;
+        }
+        self.workspace_lsp = None;
+        let Some(program) = discover_rust_analyzer(None).filter(|program| {
+            program.is_absolute()
+                && program
+                    .canonicalize()
+                    .is_ok_and(|path| !path.starts_with(&self.canonical_root))
+        }) else {
+            self.lsp_status =
+                "Rust: rust-analyzer unavailable — install it, then Restart language server".into();
+            return;
+        };
+        self.lsp_starting = true;
+        self.lsp_generation += 1;
+        let generation = self.lsp_generation;
+        self.lsp_status = "Rust: starting rust-analyzer…".into();
+        let root = self.canonical_root.clone();
         let (diagnostics_tx, diagnostics_rx) = async_channel::unbounded();
-        let client = match Client::start(&program, &self.root, diagnostics_tx) {
-            Ok(client) => client,
-            Err(_) => return,
-        };
-        if client.position_encoding() != "utf-16" {
-            // The offset math assumes UTF-16 code units; never wire
-            // providers against a server speaking anything else.
-            return;
-        }
-        if client
-            .did_open(&uri, "rust", self.editor.read(cx).value().as_ref())
-            .is_err()
-        {
-            return;
-        }
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_spawn(async move { Client::start(&program, &root, diagnostics_tx) })
+                .await;
+            let accepted = view
+                .update_in(cx, |this, _, cx| {
+                    if this.lsp_generation != generation {
+                        return false;
+                    }
+                    this.lsp_starting = false;
+                    match result {
+                        Err(error) => {
+                            this.lsp_status = format!("Rust: {error:#} — Restart language server");
+                            cx.notify();
+                            false
+                        }
+                        Ok(client) => {
+                            // Rehydrate every Rust tab, including unsaved inactive buffers.
+                            for (path, doc) in &this.inactive_documents {
+                                if language_for(path) == "rust"
+                                    && let Ok(uri) = file_uri(path)
+                                {
+                                    let _ = client.did_open(
+                                        &uri,
+                                        "rust",
+                                        doc.editor.read(cx).value().as_ref(),
+                                    );
+                                }
+                            }
+                            this.workspace_lsp = Some(client.clone());
+                            this.lsp_status = "rust-analyzer: ready".into();
+                            if let Some(path) =
+                                this.path.as_ref().filter(|p| language_for(p) == "rust")
+                                && let Ok(uri) = file_uri(path)
+                            {
+                                let _ = client.did_open(
+                                    &uri,
+                                    "rust",
+                                    this.editor.read(cx).value().as_ref(),
+                                );
+                                this.attach_lsp(client, uri, cx);
+                            }
+                            cx.notify();
+                            true
+                        }
+                    }
+                })
+                .unwrap_or(false);
+            if !accepted {
+                return;
+            }
+            while let Ok(event) = diagnostics_rx.recv().await {
+                let active = view
+                    .update(cx, |this, cx| {
+                        if this.lsp_generation != generation {
+                            return false;
+                        }
+                        this.apply_diagnostics(&event, cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn attach_lsp(&mut self, client: Arc<Client>, uri: lsp_types::Uri, cx: &mut Context<Self>) {
+        debug_assert_eq!(client.position_encoding(), "utf-16");
         let providers = LspProviders::new(Arc::clone(&client), uri.clone());
-        let jumps = Rc::clone(&self.jump_back);
-        let editor_handle = self.editor.downgrade();
+        let target_view = cx.entity().downgrade();
         self.editor.update(cx, |editor, _| {
             let lsp = editor.lsp_mut();
-            lsp.hover_provider = Some(providers.clone());
-            lsp.completion_provider = Some(providers.clone());
-            lsp.definition_provider = Some(providers.clone());
+            lsp.hover_provider = client
+                .supports("textDocument/hover")
+                .then(|| providers.clone() as Rc<dyn gpui_kit::component::input::HoverProvider>);
+            lsp.completion_provider = client.supports("textDocument/completion").then(|| {
+                providers.clone() as Rc<dyn gpui_kit::component::input::CompletionProvider>
+            });
+            lsp.definition_provider = client.supports("textDocument/definition").then(|| {
+                providers.clone() as Rc<dyn gpui_kit::component::input::DefinitionProvider>
+            });
             lsp.show_document = Some(Rc::new(
                 move |params: &lsp_types::ShowDocumentParams,
                       _window: &mut Window,
                       cx: &mut App| {
-                    if params.external == Some(true) {
-                        return false;
-                    }
-                    if let Ok(origin) =
-                        editor_handle.update(cx, |editor, _| editor.cursor_position())
-                    {
-                        let mut jumps = jumps.borrow_mut();
-                        if jumps.len() >= 100 {
-                            jumps.remove(0);
-                        }
-                        jumps.push(origin);
-                    }
-                    false
+                    let target = super::lsp::path_from_uri(&params.uri);
+                    let position = params.selection.map(|range| range.start);
+                    let view = target_view.clone();
+                    cx.defer(move |cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            match target {
+                                Ok(path) => {
+                                    this.pending_open = Some((path, None));
+                                    this.pending_lsp_position = position;
+                                }
+                                Err(error) => {
+                                    this.error =
+                                        Some(format!("Could not follow definition: {error:#}"))
+                                }
+                            }
+                            cx.notify();
+                        });
+                    });
+                    true
                 },
             ));
         });
-        cx.spawn_in(window, async move |view, cx| {
-            while let Ok(event) = diagnostics_rx.recv().await {
-                let _ = view.update(cx, |this, cx| this.apply_diagnostics(&event, cx));
-            }
-        })
-        .detach();
         self.lsp = Some(LspSession {
             client,
             uri: uri.to_string(),
@@ -1275,23 +1397,46 @@ impl NativeEditor {
     }
 
     fn apply_diagnostics(&mut self, event: &DiagnosticEvent, cx: &mut Context<Self>) {
-        let Some(session) = self.lsp.as_ref() else {
+        let client = self
+            .workspace_lsp
+            .as_ref()
+            .or_else(|| self.lsp.as_ref().map(|s| &s.client));
+        let Some(client) = client else {
             return;
         };
-        if session.uri != event.uri {
+        let version = client.doc_version(&event.uri);
+        if version == 0 || event.version.is_some_and(|v| v != version) {
             return;
         }
-        if event
-            .version
-            .is_some_and(|version| version < session.client.doc_version())
+        let target = if self
+            .path
+            .as_ref()
+            .and_then(|p| file_uri(p).ok())
+            .is_some_and(|u| u.as_str() == event.uri)
         {
+            Some(self.editor.clone())
+        } else {
+            self.inactive_documents
+                .iter()
+                .find(|(path, _)| file_uri(path).is_ok_and(|u| u.as_str() == event.uri))
+                .map(|(_, doc)| doc.editor.clone())
+        };
+        let Some(target) = target else {
             return;
-        }
-        self.editor.update(cx, |editor, cx| {
+        };
+        target.update(cx, |editor, cx| {
             let text = editor.text().clone();
             if let Some(set) = editor.diagnostics_mut() {
                 set.reset(&text);
-                set.extend(event.diagnostics.iter().cloned());
+                set.extend(event.diagnostics.iter().cloned().map(|mut diagnostic| {
+                    diagnostic.range.start = super::lsp::providers::lsp_to_editor_position(
+                        &text,
+                        diagnostic.range.start,
+                    );
+                    diagnostic.range.end =
+                        super::lsp::providers::lsp_to_editor_position(&text, diagnostic.range.end);
+                    diagnostic
+                }));
                 cx.notify();
             }
         });
@@ -1460,6 +1605,7 @@ impl NativeEditor {
         let view = cx.entity().downgrade();
         let has_file = self.path.is_some();
         let dirty = self.dirty;
+        let trusted = self.lsp_trusted;
         Button::new("native-editor-actions")
             .label("⋯")
             .small()
@@ -1477,6 +1623,12 @@ impl NativeEditor {
                     ("Search project…", 7, true),
                     ("Show file tree", 8, true),
                     ("Refresh files", 9, true),
+                    ("Restart language server", 10, true),
+                    (
+                        "Trust checkout and enable Rust tooling (may run project tools)",
+                        11,
+                        !trusted,
+                    ),
                 ] {
                     let view = view.clone();
                     menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
@@ -1495,7 +1647,20 @@ impl NativeEditor {
                                     this.browser = BrowserMode::Tree;
                                     cx.notify();
                                 }
-                                _ => this.refresh_files(cx),
+                                9 => this.refresh_files(cx),
+                                _ => {
+                                    if action == 11 {
+                                        this.lsp_trusted = true;
+                                    }
+                                    this.lsp_generation += 1;
+                                    this.lsp_starting = false;
+                                    this.workspace_lsp = None;
+                                    this.lsp = None;
+                                    if let Some(path) = this.path.clone() {
+                                        this.restart_lsp(&path, language_for(&path), window, cx);
+                                    }
+                                    cx.notify();
+                                }
                             })
                             .ok();
                         },
@@ -1871,11 +2036,32 @@ impl Focusable for NativeEditor {
 
 impl Render for NativeEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let definition_origin = self.pending_lsp_position.and_then(|_| {
+            self.path.as_ref().map(|path| HistoryLocation {
+                path: path.clone(),
+                position: self.editor.read(cx).cursor_position(),
+            })
+        });
         if let Some((path, line)) = self.pending_open.take() {
             self.error = self
                 .open(&path, line, window, cx)
                 .err()
                 .map(|e| format!("{e:#}"));
+        }
+        if let Some(position) = self.pending_lsp_position.take()
+            && self.error.is_none()
+        {
+            self.editor.update(cx, |editor, cx| {
+                let position =
+                    super::lsp::providers::lsp_to_editor_position(editor.text(), position);
+                editor.set_cursor_position(position, window, cx);
+            });
+            if let Some(origin) = definition_origin
+                && self.path.as_ref() == Some(&origin.path)
+                && self.editor.read(cx).cursor_position() != origin.position
+            {
+                self.record_origin(Some(origin), true, cx);
+            }
         }
         if let Some(line) = self.pending_line.take() {
             if let Some(path) = self.path.clone() {
@@ -2037,6 +2223,12 @@ impl Render for NativeEditor {
                     .border_color(rgb(0x202328))
                     .child(div().flex_1().min_w_0().overflow_hidden().child(label))
                     .when(self.dirty, |row| row.child("Modified"))
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .text_ellipsis()
+                            .child(self.lsp_status.clone()),
+                    )
                     .child("UTF-8"),
             );
         h_flex()
@@ -2462,6 +2654,67 @@ mod tests {
     /// origin, exercising the same wiring `restart_lsp` installs without
     /// the environment-dependent discovery step.
     #[gpui_kit::test]
+    fn workspace_lsp_reuses_server_and_closes_only_closed_tabs(cx: &mut gpui_kit::TestAppContext) {
+        use crate::editor::lsp::transport::{Transport, test_util::stub_server};
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.rs");
+        let second = dir.path().join("second.rs");
+        fs::write(&first, "fn first() {}\n").unwrap();
+        fs::write(&second, "fn second() {}\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        let (reader, writer) = stub_server();
+        let (transport, messages) = Transport::new(reader, writer);
+        let (tx, _) = async_channel::unbounded();
+        let client = Client::handshake(transport, dir.path(), messages, tx).unwrap();
+        let first_uri = file_uri(&first.canonicalize().unwrap()).unwrap();
+        let second_uri = file_uri(&second.canonicalize().unwrap()).unwrap();
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&first, None, window, cx).unwrap();
+                assert!(!view.lsp_trusted && !view.lsp_starting && view.workspace_lsp.is_none());
+                view.lsp_trusted = true;
+                view.workspace_lsp = Some(client.clone());
+                view.open(&first, None, window, cx).unwrap();
+                view.open(&second, None, window, cx).unwrap();
+                assert!(Arc::ptr_eq(&view.lsp.as_ref().unwrap().client, &client));
+                assert!(client.doc_version(first_uri.as_str()) > 0);
+                let version = client.doc_version(first_uri.as_str());
+                view.open(&first, None, window, cx).unwrap();
+                assert_eq!(client.doc_version(first_uri.as_str()), version);
+                view.finish_close(&second.canonicalize().unwrap(), window, cx);
+                assert_eq!(client.doc_version(second_uri.as_str()), 0);
+                assert!(client.doc_version(first_uri.as_str()) > 0);
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn same_file_definition_preserves_back_history(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.rs");
+        fs::write(&file, "fn one() {}\nfn two() {}\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, Some(1), window, cx).unwrap();
+                view.pending_open = Some((file.clone(), None));
+                view.pending_lsp_position = Some(lsp_types::Position::new(1, 3));
+                cx.notify();
+            })
+            .unwrap();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                assert_eq!(view.editor.read(cx).cursor_position(), Position::new(1, 3));
+                view.go_back(window, cx);
+                assert_eq!(view.editor.read(cx).cursor_position(), Position::new(0, 0));
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn stub_session_applies_diagnostics_and_goes_back(cx: &mut gpui_kit::TestAppContext) {
         use crate::editor::lsp::transport::{Transport, test_util::stub_server};
 
@@ -2484,6 +2737,8 @@ mod tests {
 
         view.downgrade()
             .update_in(test_cx, |view, window, cx| {
+                view.lsp_trusted = true;
+                view.workspace_lsp = Some(client.clone());
                 view.lsp = Some(LspSession {
                     client: Arc::clone(&client),
                     uri: uri.to_string(),
@@ -2504,7 +2759,7 @@ mod tests {
                 view.apply_diagnostics(
                     &DiagnosticEvent {
                         uri: uri.to_string(),
-                        version: Some(2),
+                        version: Some(client.doc_version(uri.as_str())),
                         diagnostics: vec![lsp_types::Diagnostic {
                             range: lsp_types::Range {
                                 start: lsp_types::Position::new(0, 0),
@@ -2524,7 +2779,7 @@ mod tests {
                 view.apply_diagnostics(
                     &DiagnosticEvent {
                         uri: uri.to_string(),
-                        version: Some(1),
+                        version: Some(0),
                         diagnostics: vec![],
                     },
                     cx,

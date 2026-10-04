@@ -6,9 +6,9 @@
 //! different framing for a different server.
 //!
 //! The transport owns no language semantics: it moves framed values, matches
-//! responses to request ids, answers server-to-client requests with a null
-//! result, and forwards anything else as [`ServerMessage`]. Timeouts and
-//! stale-response handling live one layer up, in the client.
+//! responses to request ids, answers supported server requests, and rejects
+//! unsupported requests. A bounded writer queue keeps notifications off the UI
+//! thread. Request cancellation/timeouts remove pending entries and notify the server.
 
 use std::{
     collections::HashMap,
@@ -43,15 +43,19 @@ struct WatchedChild(Child);
 
 impl Drop for WatchedChild {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
-type Pending = Mutex<HashMap<u64, mpsc::SyncSender<Result<Value>>>>;
+type Pending = Mutex<HashMap<u64, (mpsc::SyncSender<Result<Value>>, Option<String>)>>;
 
 pub struct Transport {
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: mpsc::SyncSender<Value>,
     pending: Pending,
     next_id: AtomicU64,
     protocol_errors: AtomicU64,
@@ -67,13 +71,20 @@ impl Transport {
         args: &[OsString],
         cwd: &Path,
     ) -> Result<(Arc<Self>, mpsc::Receiver<ServerMessage>)> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = WatchedChild(
-            Command::new(program)
-                .args(args)
-                .current_dir(cwd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+            command
                 .spawn()
                 .with_context(|| format!("Could not start {}", program.display()))?,
         );
@@ -106,8 +117,9 @@ impl Transport {
         writer: impl Write + Send + 'static,
         child: Option<WatchedChild>,
     ) -> (Arc<Self>, mpsc::Receiver<ServerMessage>) {
+        let (write_tx, write_rx) = mpsc::sync_channel::<Value>(128);
         let transport = Arc::new(Self {
-            writer: Mutex::new(Box::new(writer)),
+            writer: write_tx,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             protocol_errors: AtomicU64::new(0),
@@ -115,11 +127,56 @@ impl Transport {
             _child: child,
         });
         let (tx, rx) = mpsc::channel();
-        let reader_side = Arc::clone(&transport);
+        let reader_side = Arc::downgrade(&transport);
         thread::Builder::new()
-            .name("lsp-reader".to_owned())
-            .spawn(move || reader_side.read_loop(reader, tx))
+            .name("lsp-reader".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(reader);
+                loop {
+                    let frame = read_frame(&mut reader);
+                    let Some(transport) = reader_side.upgrade() else {
+                        break;
+                    };
+                    match frame {
+                        Ok(Some(frame)) => {
+                            if !transport.dispatch(frame, &tx) {
+                                transport.fail_pending();
+                                break;
+                            }
+                        }
+                        result => {
+                            if result.is_err() {
+                                transport.protocol_errors.fetch_add(1, Ordering::SeqCst);
+                            }
+                            transport.fail_pending();
+                            break;
+                        }
+                    }
+                }
+            })
             .expect("Could not start LSP reader thread");
+        let writer_side = Arc::downgrade(&transport);
+        thread::Builder::new()
+            .name("lsp-writer".into())
+            .spawn(move || {
+                let mut writer = writer;
+                for value in write_rx {
+                    let result = (|| -> Result<()> {
+                        let body = serde_json::to_vec(&value)?;
+                        write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+                        writer.write_all(&body)?;
+                        writer.flush()?;
+                        Ok(())
+                    })();
+                    if result.is_err() {
+                        if let Some(transport) = writer_side.upgrade() {
+                            transport.fail_pending();
+                        }
+                        break;
+                    }
+                }
+            })
+            .expect("Could not start LSP writer thread");
         (transport, rx)
     }
 
@@ -141,12 +198,33 @@ impl Transport {
     /// response that arrives after the timeout finds no pending entry and is
     /// dropped; the caller treats the call as failed and stays responsive.
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.request_scoped(method, params, timeout, None)
+    }
+
+    pub fn request_scoped(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        scope: Option<&str>,
+    ) -> Result<Value> {
+        self.request_scoped_guarded(method, params, timeout, scope, || true)
+    }
+
+    pub fn request_scoped_guarded(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        scope: Option<&str>,
+        valid: impl FnOnce() -> bool,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(1);
         self.pending
             .lock()
             .expect("LSP pending map poisoned")
-            .insert(id, tx);
+            .insert(id, (tx, scope.map(str::to_owned)));
         if let Err(error) = self.write(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -159,6 +237,15 @@ impl Transport {
                 .remove(&id);
             return Err(error);
         }
+        // Covers an edit racing between the client's initial version check and enqueue.
+        if !valid() {
+            self.pending
+                .lock()
+                .expect("LSP pending map poisoned")
+                .remove(&id);
+            let _ = self.notify("$/cancelRequest", serde_json::json!({"id":id}));
+            bail!("Language request cancelled: document changed");
+        }
         match rx.recv_timeout(timeout) {
             Ok(response) => response,
             Err(_) => {
@@ -166,6 +253,7 @@ impl Transport {
                     .lock()
                     .expect("LSP pending map poisoned")
                     .remove(&id);
+                let _ = self.notify("$/cancelRequest", serde_json::json!({"id": id}));
                 bail!("Language server request {method} timed out");
             }
         }
@@ -181,63 +269,74 @@ impl Transport {
     }
 
     fn write(&self, value: &Value) -> Result<()> {
-        let body = serde_json::to_vec(value)?;
-        let mut writer = self.writer.lock().expect("LSP writer poisoned");
-        write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-        writer.write_all(&body)?;
-        writer.flush()?;
-        Ok(())
+        if !self.is_alive() {
+            bail!("Language server exited");
+        }
+        self.writer.try_send(value.clone()).map_err(|_| {
+            self.fail_pending();
+            anyhow::anyhow!("Language server is unavailable or not reading messages; restart it")
+        })
     }
 
-    fn read_loop(&self, reader: impl Read, sink: mpsc::Sender<ServerMessage>) {
-        let mut reader = BufReader::new(reader);
-        loop {
-            let frame = match read_frame(&mut reader) {
-                Ok(Some(value)) => value,
-                Ok(None) => break,
-                Err(_) => {
-                    // A corrupt frame desynchronizes nothing: the next read
-                    // re-syncs on the following Content-Length header, so
-                    // count the incident and keep reading.
-                    self.protocol_errors.fetch_add(1, Ordering::SeqCst);
-                    continue;
-                }
-            };
-            if !self.dispatch(frame, &sink) {
-                break;
-            }
-        }
-        // The server is gone (or nobody listens): wake every outstanding
-        // caller so a crashed server can never hang the UI thread's task.
+    fn fail_pending(&self) {
         self.exited.store(true, Ordering::SeqCst);
-        let mut pending = self.pending.lock().expect("LSP pending map poisoned");
-        for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(anyhow::anyhow!("Language server exited")));
+        for (_, (tx, _)) in self
+            .pending
+            .lock()
+            .expect("LSP pending map poisoned")
+            .drain()
+        {
+            let _ = tx.try_send(Err(anyhow::anyhow!("Language server exited")));
+        }
+    }
+
+    pub fn cancel_document(&self, uri: &str) {
+        let cancelled: Vec<_> = {
+            let mut pending = self.pending.lock().expect("LSP pending map poisoned");
+            let ids: Vec<_> = pending
+                .iter()
+                .filter(|(_, (_, scope))| scope.as_deref() == Some(uri))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id).map(|(tx, _)| (id, tx)))
+                .collect()
+        };
+        for (id, tx) in cancelled {
+            let _ = tx.try_send(Err(anyhow::anyhow!(
+                "Language request cancelled: document changed"
+            )));
+            let _ = self.notify("$/cancelRequest", serde_json::json!({"id": id}));
         }
     }
 
     /// Route one parsed value. Returns false when the loop should stop.
     fn dispatch(&self, value: Value, sink: &mpsc::Sender<ServerMessage>) -> bool {
+        if let (Some(id), Some(method)) =
+            (value.get("id"), value.get("method").and_then(Value::as_str))
+        {
+            let response = match method {
+                "workspace/configuration" => {
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result": value.pointer("/params/items").and_then(Value::as_array).map(|items| vec![Value::Null; items.len()]).unwrap_or_default()})
+                }
+                "window/workDoneProgress/create" => {
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":null})
+                }
+                _ => {
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Client does not support this request"}})
+                }
+            };
+            let _ = self.write(&response);
+            return true;
+        }
         let id = value.get("id").and_then(|id| id.as_u64());
         let method = value
             .get("method")
             .and_then(|method| method.as_str())
             .map(str::to_owned);
         match (id, method) {
-            (Some(id), Some(_method)) => {
-                // A server-to-client request (workspace/configuration,
-                // window/workDoneProgress/create, ...). The spike answers
-                // with a null result, which the protocol accepts as "no
-                // configuration / default handling".
-                let _ = self.write(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": Value::Null,
-                }));
-                true
-            }
             (Some(id), None) => {
-                if let Some(tx) = self
+                if let Some((tx, _)) = self
                     .pending
                     .lock()
                     .expect("LSP pending map poisoned")
@@ -255,7 +354,7 @@ impl Transport {
                 // Unknown ids are late responses to timed-out calls: drop.
                 true
             }
-            (None, Some(method)) => sink
+            (_, Some(method)) => sink
                 .send(ServerMessage::Notification {
                     method,
                     params: value.get("params").cloned().unwrap_or(Value::Null),
@@ -266,14 +365,30 @@ impl Transport {
     }
 }
 
+impl Drop for Transport {
+    fn drop(&mut self) {
+        if let Some(child) = self._child.take() {
+            thread::spawn(move || drop(child));
+        }
+    }
+}
+
 /// Read one framed message. `Ok(None)` is a clean EOF before any header byte.
 pub(crate) fn read_frame(reader: &mut BufReader<impl Read>) -> Result<Option<Value>> {
     use std::io::BufRead as _;
 
     let mut content_length: Option<u64> = None;
+    let mut header_bytes = 0;
     loop {
         let mut line = Vec::new();
-        let bytes = reader.read_until(b'\n', &mut line)?;
+        let bytes = std::io::Read::by_ref(reader)
+            .take(8192)
+            .read_until(b'\n', &mut line)?;
+        header_bytes += bytes;
+        anyhow::ensure!(
+            header_bytes < 8192,
+            "Language server headers exceed size bound"
+        );
         if bytes == 0 {
             return Ok(None);
         }
@@ -399,12 +514,13 @@ pub(crate) mod test_util {
                     break;
                 }
                 if let Some(id) = frame.get("id").and_then(|id| id.as_u64()) {
-                    let result =
-                        if frame.get("method").and_then(|m| m.as_str()) == Some("initialize") {
-                            serde_json::json!({"capabilities": {"positionEncoding": "utf-16"}})
-                        } else {
-                            Value::Null
-                        };
+                    let result = if frame.get("method").and_then(|m| m.as_str())
+                        == Some("initialize")
+                    {
+                        serde_json::json!({"capabilities": {"positionEncoding": "utf-16", "textDocumentSync": {"openClose": true, "change": 1}, "hoverProvider": true, "definitionProvider": true, "completionProvider": {}}})
+                    } else {
+                        Value::Null
+                    };
                     let _ = writer.write_all(&encode_frame(&serde_json::json!({
                         "jsonrpc": "2.0", "id": id, "result": result,
                     })));
@@ -473,6 +589,89 @@ mod tests {
             seen_rx,
             stop_tx,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_transport_kills_and_reaps_its_process() {
+        let (transport, _) = Transport::spawn(
+            Path::new("/bin/sh"),
+            &["-c".into(), "sleep 30".into()],
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        let pid = transport._child.as_ref().unwrap().0.id() as i32;
+        drop(transport);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "language server process was not reaped"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn full_writer_queue_fails_without_blocking_the_caller() {
+        struct BlockedWriter(mpsc::Receiver<()>);
+        impl Write for BlockedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (release, blocked) = mpsc::channel();
+        let (_out, input) = mpsc::channel();
+        let (transport, _) = Transport::new(ChannelReader::new(input), BlockedWriter(blocked));
+        let start = std::time::Instant::now();
+        let failed = (0..140).any(|_| transport.notify("test", Value::Null).is_err());
+        assert!(failed && !transport.is_alive());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        release.send(()).ok();
+    }
+
+    #[test]
+    fn cancelling_a_document_wakes_waiter_and_sends_cancel() {
+        let (in_tx, in_rx) = mpsc::channel();
+        let (_out_tx, out_rx) = mpsc::channel();
+        let (transport, _) = Transport::new(ChannelReader::new(out_rx), ChannelWriter::new(in_tx));
+        let mut reader = BufReader::new(ChannelReader::new(in_rx));
+        let client = transport.clone();
+        let waiter = thread::spawn(move || {
+            client.request_scoped(
+                "textDocument/hover",
+                Value::Null,
+                Duration::from_secs(5),
+                Some("file:///a"),
+            )
+        });
+        let request = read_frame(&mut reader).unwrap().unwrap();
+        transport.cancel_document("file:///a");
+        assert!(
+            waiter
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        let cancel = read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(cancel["method"], "$/cancelRequest");
+        assert_eq!(cancel["params"]["id"], request["id"]);
+    }
+
+    #[test]
+    fn reader_does_not_keep_transport_alive_when_owner_drops() {
+        let (in_tx, _in_rx) = mpsc::channel();
+        let (_out_tx, out_rx) = mpsc::channel();
+        let (transport, _) = Transport::new(ChannelReader::new(out_rx), ChannelWriter::new(in_tx));
+        let weak = Arc::downgrade(&transport);
+        drop(transport);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

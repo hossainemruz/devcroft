@@ -14,6 +14,8 @@ Clean buffers reload after external edits. A dirty buffer stays open when its fi
 
 The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, italic, and bold italic), so Nerd Font symbols work without a separate system font installation. Attribution and license files are in [`assets/`](assets/).
 
+Rust semantic features are opt-in per checkout through **… → Trust checkout and enable Rust tooling**. See the [language/server matrix and trust model](docs/language-support.md) for prerequisites, supported features, and limitations.
+
 ## Home
 
 Devcroft opens on Home without starting terminal processes. Open a recent project or use the shared command bar (`Cmd+K` for actions, `Cmd+P` for projects on macOS; `Ctrl+K` / `Ctrl+P` on Linux/Windows) to enter a repository workspace. The **Home** button and **Go Home** command return to the dashboard without stopping existing sessions.

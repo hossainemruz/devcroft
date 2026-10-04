@@ -1,17 +1,14 @@
-//! A minimal language client over [`Transport`].
-//!
-//! Scope is deliberately the Phase 2 feasibility spike: `initialize` with a
-//! fixed capability set, full-text `didOpen`/`didChange` synchronization,
-//! version-checked `hover`/`completion`/`definition` requests, and
-//! `publishDiagnostics` forwarding. Crash and timeout behavior degrades to
-//! errors the providers turn into empty results, so plain editing always
-//! keeps working when the server is missing or unhappy.
+//! One bounded workspace client with capability-gated requests, per-document
+//! versions, negotiated UTF-16 positions, full or whole-range incremental
+//! synchronization, and diagnostic forwarding. Providers run requests off
+//! the UI thread; notification writes are queued by the transport.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         mpsc,
     },
     time::Duration,
@@ -36,13 +33,15 @@ pub struct DiagnosticEvent {
 }
 
 struct DocState {
-    uri: String,
     version: i32,
+    text: String,
 }
 
 pub struct Client {
     transport: Arc<Transport>,
-    doc: Mutex<DocState>,
+    docs: Mutex<HashMap<String, DocState>>,
+    capabilities: Value,
+    next_version: AtomicI32,
     position_encoding: Mutex<String>,
     last_error: Mutex<Option<String>>,
     shut_down: AtomicBool,
@@ -75,9 +74,11 @@ impl Client {
             serde_json::json!({
                 "processId": std::process::id(),
                 "rootUri": root_uri,
+                "initializationOptions": {"checkOnSave": false, "cargo": {"buildScripts": {"enable": false}}, "procMacro": {"enable": false}},
                 "capabilities": {
+                    "general": {"positionEncodings": ["utf-16"]},
                     "textDocument": {
-                        "synchronization": {},
+                        "synchronization": {"didSave": true},
                         "completion": {},
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "definition": {},
@@ -97,14 +98,18 @@ impl Client {
             .and_then(|encoding| encoding.as_str())
             .unwrap_or("utf-16")
             .to_owned();
+        anyhow::ensure!(
+            encoding == "utf-16",
+            "Unsupported server position encoding: {encoding}; expected utf-16"
+        );
+        let capabilities = response.get("capabilities").cloned().unwrap_or(Value::Null);
         transport.notify("initialized", serde_json::json!({}))?;
 
         let client = Arc::new(Self {
             transport,
-            doc: Mutex::new(DocState {
-                uri: String::new(),
-                version: 0,
-            }),
+            docs: Mutex::new(HashMap::new()),
+            capabilities,
+            next_version: AtomicI32::new(1),
             position_encoding: Mutex::new(encoding),
             last_error: Mutex::new(None),
             shut_down: AtomicBool::new(false),
@@ -126,8 +131,7 @@ impl Client {
         Ok(client)
     }
 
-    /// Negotiated position encoding; the spike converts offsets assuming
-    /// UTF-16 and records anything else so tests stay honest.
+    /// The client advertises UTF-16 only and rejects incompatible servers.
     pub fn position_encoding(&self) -> String {
         self.position_encoding
             .lock()
@@ -136,9 +140,7 @@ impl Client {
     }
 
     /// Latest transport-level failure, for status surfaces and tests.
-    /// Phase 4 status UI consumes this; the spike records on every failed
-    /// request so plain editing stays silent while failures stay visible.
-    #[allow(dead_code)]
+    /// Plain editing stays available while the status surface reports failures.
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().expect("LSP state poisoned").clone()
     }
@@ -153,51 +155,124 @@ impl Client {
         *self.last_error.lock().expect("LSP state poisoned") = Some(format!("{error:#}"));
     }
 
-    pub fn doc_version(&self) -> i32 {
-        self.doc.lock().expect("LSP state poisoned").version
+    pub fn doc_version(&self, uri: &str) -> i32 {
+        self.docs
+            .lock()
+            .expect("LSP state poisoned")
+            .get(uri)
+            .map_or(0, |doc| doc.version)
     }
 
-    /// Open a document at version 1 with its full text.
+    pub fn supports(&self, method: &str) -> bool {
+        let name = match method {
+            "textDocument/hover" => "hoverProvider",
+            "textDocument/completion" => "completionProvider",
+            "textDocument/definition" => "definitionProvider",
+            _ => return false,
+        };
+        self.capabilities
+            .get(name)
+            .is_some_and(|v| v == true || v.is_object())
+    }
+
+    fn sync_kind(&self) -> i64 {
+        let sync = &self.capabilities["textDocumentSync"];
+        sync.as_i64()
+            .or_else(|| sync["change"].as_i64())
+            .unwrap_or(0)
+    }
+
+    fn open_close(&self) -> bool {
+        let sync = &self.capabilities["textDocumentSync"];
+        sync.is_number() && self.sync_kind() != 0 || sync["openClose"] == true
+    }
+
+    /// Each buffer stays open while its tab exists, including inactive drafts.
     pub fn did_open(&self, uri: &lsp_types::Uri, language_id: &str, text: &str) -> Result<()> {
-        *self.doc.lock().expect("LSP state poisoned") = DocState {
-            uri: uri.to_string(),
-            version: 1,
-        };
-        self.transport
-            .notify(
-                "textDocument/didOpen",
-                serde_json::json!({
-                    "textDocument": {
-                        "uri": uri,
-                        "languageId": language_id,
-                        "version": 1,
-                        "text": text,
-                    },
-                }),
-            )
-            .inspect_err(|error| self.record_error(error))
+        anyhow::ensure!(self.is_alive(), "Language server exited; restart it");
+        let mut docs = self.docs.lock().expect("LSP state poisoned");
+        if docs.contains_key(uri.as_str()) {
+            return Ok(());
+        }
+        let version = self.next_version.fetch_add(1, Ordering::SeqCst);
+        docs.insert(
+            uri.to_string(),
+            DocState {
+                version,
+                text: text.to_owned(),
+            },
+        );
+        if self.open_close() {
+            self.transport.notify("textDocument/didOpen", serde_json::json!({
+                "textDocument": { "uri":uri, "languageId":language_id, "version":version, "text":text }
+            })).inspect_err(|e| self.record_error(e))?;
+        }
+        Ok(())
     }
 
-    /// Push the full replacement text and return the new version. Full
-    /// synchronization is always legal, whatever sync kind the server
-    /// advertises, which keeps the spike free of capability branching.
-    pub fn did_change(&self, text: &str) -> Result<i32> {
-        let version = {
-            let mut doc = self.doc.lock().expect("LSP state poisoned");
-            doc.version += 1;
-            doc.version
+    pub fn did_change(&self, uri: &str, text: &str) -> Result<i32> {
+        anyhow::ensure!(self.is_alive(), "Language server exited; restart it");
+        let mut docs = self.docs.lock().expect("LSP state poisoned");
+        let doc = docs.get_mut(uri).context("Document is not open")?;
+        if doc.text == text {
+            return Ok(doc.version);
+        }
+        self.transport.cancel_document(uri);
+        doc.version = self.next_version.fetch_add(1, Ordering::SeqCst);
+        // Incremental-only servers receive a valid range replacing the old text.
+        let end = end_position(&doc.text);
+        doc.text = text.to_owned();
+        let change = match self.sync_kind() {
+            1 => serde_json::json!({"text":text}),
+            2 => {
+                serde_json::json!({"range":{"start":{"line":0,"character":0},"end":end},"text":text})
+            }
+            _ => return Ok(doc.version),
         };
-        let uri = self.doc.lock().expect("LSP state poisoned").uri.clone();
         self.transport
             .notify(
                 "textDocument/didChange",
                 serde_json::json!({
-                    "textDocument": { "uri": uri, "version": version },
-                    "contentChanges": [{ "text": text }],
+                    "textDocument":{"uri":uri,"version":doc.version}, "contentChanges":[change]
                 }),
             )
-            .inspect_err(|error| self.record_error(error))?;
-        Ok(version)
+            .inspect_err(|e| self.record_error(e))?;
+        Ok(doc.version)
+    }
+
+    pub fn did_save(&self, uri: &str) -> Result<()> {
+        let save = &self.capabilities["textDocumentSync"]["save"];
+        if save != true && !save.is_object() {
+            return Ok(());
+        }
+        let docs = self.docs.lock().expect("LSP state poisoned");
+        let Some(doc) = docs.get(uri) else {
+            return Ok(());
+        };
+        let mut params = serde_json::json!({"textDocument":{"uri":uri}});
+        if save["includeText"] == true {
+            params["text"] = doc.text.clone().into();
+        }
+        self.transport
+            .notify("textDocument/didSave", params)
+            .inspect_err(|e| self.record_error(e))
+    }
+
+    pub fn did_close(&self, uri: &str) {
+        self.transport.cancel_document(uri);
+        if self
+            .docs
+            .lock()
+            .expect("LSP state poisoned")
+            .remove(uri)
+            .is_some()
+            && self.open_close()
+        {
+            let _ = self.transport.notify(
+                "textDocument/didClose",
+                serde_json::json!({"textDocument":{"uri":uri}}),
+            );
+        }
     }
 
     pub fn hover(
@@ -280,6 +355,7 @@ impl Client {
 
     /// Best-effort `shutdown` + `exit`. The transport's drop kills and reaps
     /// the child regardless, so this path only aims for a clean goodbye.
+    #[cfg(test)]
     pub fn shutdown(&self) {
         if self.shut_down.swap(true, Ordering::SeqCst) {
             return;
@@ -298,30 +374,60 @@ impl Client {
         position: lsp_types::Position,
         timeout: Duration,
     ) -> Result<Value> {
+        if !self.supports(method) {
+            return Ok(Value::Null);
+        }
+        anyhow::ensure!(
+            self.doc_version(uri.as_str()) == version && version > 0,
+            "Discarded a stale document request"
+        );
         let response = self
             .transport
-            .request(
+            .request_scoped_guarded(
                 method,
                 serde_json::json!({
                     "textDocument": { "uri": uri },
                     "position": position,
                 }),
                 timeout,
+                Some(uri.as_str()),
+                || self.doc_version(uri.as_str()) == version,
             )
-            .inspect_err(|error| self.record_error(error))?;
-        if self.doc_version() != version {
+            .inspect_err(|error| {
+                if !error.to_string().contains("cancelled") {
+                    self.record_error(error);
+                }
+            })?;
+        if self.doc_version(uri.as_str()) != version {
             let stale = anyhow::anyhow!("Discarded a stale {method} response (document moved on)");
-            self.record_error(&stale);
             return Err(stale);
         }
+        *self.last_error.lock().expect("LSP state poisoned") = None;
         Ok(response)
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        self.shutdown();
+        if !self.shut_down.swap(true, Ordering::SeqCst) {
+            let transport = self.transport.clone();
+            thread::spawn(move || {
+                let _ = transport.request("shutdown", Value::Null, Duration::from_secs(1));
+                let _ = transport.notify("exit", Value::Null);
+            });
+        }
     }
+}
+
+fn end_position(text: &str) -> lsp_types::Position {
+    let line = text.bytes().filter(|b| *b == b'\n').count() as u32;
+    let character = text
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .encode_utf16()
+        .count() as u32;
+    lsp_types::Position::new(line, character)
 }
 
 fn url_of(path: &Path) -> Result<lsp_types::Uri> {
@@ -379,7 +485,7 @@ mod tests {
                     ("initialize", Some(id)) => reply(
                         &mut writer,
                         id,
-                        serde_json::json!({"capabilities": {"positionEncoding": "utf-16"}}),
+                        serde_json::json!({"capabilities": {"positionEncoding": "utf-16", "textDocumentSync": {"openClose": true, "change": 1, "save": true}, "hoverProvider": true, "definitionProvider": true, "completionProvider": {}}}),
                     ),
                     ("shutdown", Some(id)) => reply(&mut writer, id, Value::Null),
                     ("textDocument/hover", Some(id)) => reply(
@@ -459,8 +565,8 @@ mod tests {
                 .parse()
                 .unwrap();
         client.did_open(&uri, "rust", "fn main() {}\n").unwrap();
-        assert_eq!(client.doc_version(), 1);
-        let version = client.did_change("fn main() { }\n").unwrap();
+        assert_eq!(client.doc_version(uri.as_str()), 1);
+        let version = client.did_change(uri.as_str(), "fn main() { }\n").unwrap();
         assert_eq!(version, 2);
 
         let hover = client
@@ -515,17 +621,121 @@ mod tests {
         let uri: lsp_types::Uri = "file:///tmp/file.rs".parse().unwrap();
         client.did_open(&uri, "rust", "fn a() {}\n").unwrap();
         // Capture version 1, then move the document on before answering.
-        client.did_change("fn a() { }\n").unwrap();
+        client.did_change(uri.as_str(), "fn a() { }\n").unwrap();
         let error = client
             .hover(&uri, 1, lsp_types::Position::new(0, 0))
             .unwrap_err();
         assert!(error.to_string().contains("stale"));
         assert!(
-            client
-                .last_error()
-                .is_some_and(|recorded| recorded.contains("stale")),
-            "failures stay observable for status surfaces"
+            client.last_error().is_none(),
+            "Stale requests are normal, not a server failure"
         );
+    }
+
+    fn configured_client(capabilities: Value) -> (Arc<Client>, mpsc::Receiver<Value>) {
+        let (in_tx, in_rx) = mpsc::channel();
+        let (out_tx, out_rx) = mpsc::channel();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(ChannelReader::new(in_rx));
+            let mut writer = ChannelWriter::new(out_tx);
+            while let Ok(Some(frame)) = super::super::transport::read_frame(&mut reader) {
+                seen_tx.send(frame.clone()).ok();
+                if let Some(id) = frame.get("id") {
+                    let result = if frame["method"] == "initialize" {
+                        serde_json::json!({"capabilities":capabilities})
+                    } else {
+                        Value::Null
+                    };
+                    writer
+                        .write_all(&encode_frame(
+                            &serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+                        ))
+                        .unwrap();
+                }
+                if frame["method"] == "exit" {
+                    break;
+                }
+            }
+        });
+        let (transport, messages) =
+            Transport::new(ChannelReader::new(out_rx), ChannelWriter::new(in_tx));
+        let (tx, _) = async_channel::unbounded();
+        (
+            Client::handshake(transport, &std::env::temp_dir(), messages, tx).unwrap(),
+            seen_rx,
+        )
+    }
+
+    #[test]
+    fn multiple_documents_incremental_sync_save_close_and_reopen() {
+        let (client, seen) = configured_client(
+            serde_json::json!({"textDocumentSync":{"openClose":true,"change":2,"save":{"includeText":true}}}),
+        );
+        let first: lsp_types::Uri = "file:///tmp/first.rs".parse().unwrap();
+        let second: lsp_types::Uri = "file:///tmp/second.rs".parse().unwrap();
+        client.did_open(&first, "rust", "a🎉\n終").unwrap();
+        client.did_open(&second, "rust", "second").unwrap();
+        client
+            .did_open(&first, "rust", "ignored duplicate")
+            .unwrap();
+        let version = client.did_change(first.as_str(), "new").unwrap();
+        assert_eq!(client.doc_version(second.as_str()), 2);
+        client.did_save(first.as_str()).unwrap();
+        client.did_close(first.as_str());
+        assert_eq!(client.doc_version(first.as_str()), 0);
+        client.did_open(&first, "rust", "reopened").unwrap();
+        assert!(client.doc_version(first.as_str()) > version);
+        client.shutdown(); // response is a barrier for earlier outbound notifications
+        let frames: Vec<_> = seen.try_iter().collect();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f["method"] == "textDocument/didOpen")
+                .count(),
+            3
+        );
+        let change = frames
+            .iter()
+            .find(|f| f["method"] == "textDocument/didChange")
+            .unwrap();
+        assert_eq!(
+            change["params"]["contentChanges"][0]["range"]["end"],
+            serde_json::json!({"line":1,"character":1})
+        );
+        let save = frames
+            .iter()
+            .find(|f| f["method"] == "textDocument/didSave")
+            .unwrap();
+        assert_eq!(save["params"]["text"], "new");
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["method"] == "textDocument/didClose")
+        );
+        assert_eq!(end_position("a🎉"), lsp_types::Position::new(0, 3));
+    }
+
+    #[test]
+    fn unsupported_capabilities_do_not_send_requests_or_notifications() {
+        let (client, seen) = configured_client(serde_json::json!({}));
+        let uri: lsp_types::Uri = "file:///tmp/a.rs".parse().unwrap();
+        client.did_open(&uri, "rust", "a").unwrap();
+        let version = client.did_change(uri.as_str(), "b").unwrap();
+        assert!(
+            client
+                .hover(&uri, version, lsp_types::Position::new(0, 0))
+                .unwrap()
+                .is_none()
+        );
+        client.did_save(uri.as_str()).unwrap();
+        client.did_close(uri.as_str());
+        client.shutdown();
+        assert!(!seen.try_iter().any(|f| {
+            f["method"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("textDocument/"))
+        }));
     }
 
     /// Live integration smoke test against a real rust-analyzer. Ignored by
@@ -549,7 +759,7 @@ mod tests {
         std::fs::write(&file, source).unwrap();
         let uri = super::super::file_uri(&file).unwrap();
 
-        let (diagnostics_tx, _diagnostics_rx) = async_channel::unbounded();
+        let (diagnostics_tx, diagnostics_rx) = async_channel::unbounded();
         let client = Client::start(&program, dir.path(), diagnostics_tx).unwrap();
         assert_eq!(client.position_encoding(), "utf-16");
         client.did_open(&uri, "rust", source).unwrap();
@@ -582,6 +792,34 @@ mod tests {
             .unwrap();
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].target_selection_range.start.line, 1);
+        let completion = client
+            .completion(&uri, 1, lsp_types::Position::new(6, 17))
+            .unwrap();
+        let items = match completion {
+            lsp_types::CompletionResponse::Array(items) => items,
+            lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(
+            !items.is_empty(),
+            "rust-analyzer supplies semantic completion"
+        );
+        let version = client.did_change(uri.as_str(), "fn main( {\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(event) = diagnostics_rx.try_recv()
+                && event.uri == uri.as_str()
+                && event.version == Some(version)
+                && !event.diagnostics.is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rust-analyzer did not publish current syntax diagnostics"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        client.did_close(uri.as_str());
         client.shutdown();
     }
 }

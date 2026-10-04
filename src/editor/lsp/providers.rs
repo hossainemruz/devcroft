@@ -55,9 +55,7 @@ pub fn offset_to_lsp_position(text: &Rope, offset: usize) -> lsp_types::Position
 /// past the line content land on the content end. A trailing `\r` (the
 /// `slice_line` contract keeps it) counts as the line break, not content.
 ///
-/// Covered by tests; the spike's flows only convert offsets outward, while
-/// edit/diagnostic application (Phase 4) converts positions back inward.
-#[allow(dead_code)]
+/// Used to convert incoming ranges for the editor's scalar-column API.
 pub fn lsp_position_to_offset(text: &Rope, position: &lsp_types::Position) -> usize {
     let total = text.lines_len();
     if total == 0 {
@@ -81,6 +79,46 @@ pub fn lsp_position_to_offset(text: &Rope, position: &lsp_types::Position) -> us
     offset
 }
 
+/// GPUI's inbound ranges use scalar columns, while the wire uses UTF-16.
+pub fn lsp_to_editor_position(text: &Rope, position: lsp_types::Position) -> lsp_types::Position {
+    text.offset_to_position(lsp_position_to_offset(text, &position))
+}
+
+fn editor_range(text: &Rope, range: lsp_types::Range) -> lsp_types::Range {
+    lsp_types::Range::new(
+        lsp_to_editor_position(text, range.start),
+        lsp_to_editor_position(text, range.end),
+    )
+}
+
+fn editor_completion(text: &Rope, mut response: CompletionResponse) -> CompletionResponse {
+    let items = match &mut response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => &mut list.items,
+    };
+    // The engine applies one replacement, not workspace/import edits or snippets.
+    items.retain(|item| {
+        item.additional_text_edits
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+            && item.insert_text_format != Some(lsp_types::InsertTextFormat::SNIPPET)
+    });
+    for item in items {
+        if let Some(edit) = &mut item.text_edit {
+            match edit {
+                lsp_types::CompletionTextEdit::Edit(edit) => {
+                    edit.range = editor_range(text, edit.range)
+                }
+                lsp_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                    edit.insert = editor_range(text, edit.insert);
+                    edit.replace = editor_range(text, edit.replace);
+                }
+            }
+        }
+    }
+    response
+}
+
 impl CompletionProvider for LspProviders {
     fn completions(
         &self,
@@ -92,17 +130,21 @@ impl CompletionProvider for LspProviders {
     ) -> Task<Result<CompletionResponse>> {
         let client = Arc::clone(&self.client);
         let uri = self.uri.clone();
-        let version = client.doc_version();
+        let version = client.doc_version(uri.as_str());
         let position = offset_to_lsp_position(text, offset);
+        let text = text.clone();
         // The blocking request runs on a background thread; the engine
         // holds the Task and polls it without ever blocking the UI.
         cx.background_executor().clone().spawn(async move {
             // The server tracks the document through didChange; the request
             // carries the version the offset was read at so a concurrent
             // edit discards the answer as stale.
-            Ok(client
-                .completion(&uri, version, position)
-                .unwrap_or(lsp_types::CompletionResponse::Array(Vec::new())))
+            Ok(editor_completion(
+                &text,
+                client
+                    .completion(&uri, version, position)
+                    .unwrap_or(lsp_types::CompletionResponse::Array(Vec::new())),
+            ))
         })
     }
 
@@ -124,11 +166,18 @@ impl HoverProvider for LspProviders {
     ) -> Task<Result<Option<lsp_types::Hover>>> {
         let client = Arc::clone(&self.client);
         let uri = self.uri.clone();
-        let version = client.doc_version();
+        let version = client.doc_version(uri.as_str());
         let position = offset_to_lsp_position(text, offset);
-        cx.background_executor()
-            .clone()
-            .spawn(async move { Ok(client.hover(&uri, version, position).unwrap_or(None)) })
+        let text = text.clone();
+        cx.background_executor().clone().spawn(async move {
+            Ok(client
+                .hover(&uri, version, position)
+                .unwrap_or(None)
+                .map(|mut hover| {
+                    hover.range = hover.range.map(|range| editor_range(&text, range));
+                    hover
+                }))
+        })
     }
 }
 
@@ -142,12 +191,22 @@ impl DefinitionProvider for LspProviders {
     ) -> Task<Result<Vec<lsp_types::LocationLink>>> {
         let client = Arc::clone(&self.client);
         let uri = self.uri.clone();
-        let version = client.doc_version();
+        let version = client.doc_version(uri.as_str());
         let position = offset_to_lsp_position(text, offset);
+        let text = text.clone();
         cx.background_executor().clone().spawn(async move {
             Ok(client
                 .definition(&uri, version, position)
-                .unwrap_or_default())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut link| {
+                    link.origin_selection_range = link
+                        .origin_selection_range
+                        .map(|range| editor_range(&text, range));
+                    // Target ranges remain UTF-16: NativeEditor opens the target before converting them.
+                    link
+                })
+                .collect())
         })
     }
 }
@@ -161,6 +220,32 @@ mod tests {
     /// protocol-correct answer is 6.
     fn sample() -> Rope {
         Rope::from("a 中文🎉 test\nsecond line\n")
+    }
+
+    #[test]
+    fn completion_edit_after_emoji_uses_scalar_columns() {
+        let text = Rope::from("🎉abc");
+        let item = lsp_types::CompletionItem {
+            label: "replacement".into(),
+            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 2),
+                    lsp_types::Position::new(0, 5),
+                ),
+                new_text: "new".into(),
+            })),
+            ..Default::default()
+        };
+        let CompletionResponse::Array(items) =
+            editor_completion(&text, CompletionResponse::Array(vec![item]))
+        else {
+            unreachable!()
+        };
+        let Some(lsp_types::CompletionTextEdit::Edit(edit)) = &items[0].text_edit else {
+            unreachable!()
+        };
+        assert_eq!(edit.range.start.character, 1);
+        assert_eq!(edit.range.end.character, 4);
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod commands;
 #[allow(dead_code, unused_imports)]
 mod data;
 mod editor;
+mod editor_icons;
 mod empty_state;
 mod fonts;
 mod git_status;

@@ -56,6 +56,34 @@ impl ExternalEditorKind {
         }
     }
 
+    /// Shared discovery for Settings availability and actual launches.
+    pub(crate) fn installed_executable(self) -> Option<PathBuf> {
+        let names: &[&str] = match self {
+            Self::Zed => &["zed", "zeditor"],
+            Self::VsCode => &["code"],
+        };
+        if let Some(path) = names.iter().find_map(|name| find_executable(name)) {
+            return Some(path);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let relative = match self {
+                Self::Zed => "Zed.app/Contents/MacOS/cli",
+                Self::VsCode => "Visual Studio Code.app/Contents/Resources/app/bin/code",
+            };
+            let mut roots = vec![PathBuf::from("/Applications")];
+            if let Some(home) = std::env::var_os("HOME") {
+                roots.push(PathBuf::from(home).join("Applications"));
+            }
+            roots
+                .into_iter()
+                .map(|root| root.join(relative))
+                .find(|path| is_executable(path))
+        }
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Zed => "Zed",
@@ -107,19 +135,10 @@ impl ExternalEditor {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let (name, fallback): (&str, &[&str]) = match self.kind {
-            ExternalEditorKind::Zed => ("zed", &["zeditor"]),
-            ExternalEditorKind::VsCode => ("code", &[]),
-        };
-        let program = configured
-            .and_then(find_executable)
-            .or_else(|| if configured.is_some() { None } else { find_executable(name) })
-            .or_else(|| fallback.iter().find_map(|name| find_executable(name)))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Could not find {name}. Install its command-line launcher or set its executable path in Settings → General."
-                )
-            })?;
+        let program = match configured {
+            Some(path) => find_executable(path),
+            None => self.kind.installed_executable(),
+        }.ok_or_else(|| anyhow::anyhow!("Could not find {}. Install the application or its command-line launcher, then check Settings → Editor.", self.kind.label()))?;
         let target = match file {
             Some(path) if path.is_absolute() => path.to_owned(),
             Some(path) => checkout.join(path),
@@ -141,6 +160,56 @@ impl ExternalEditor {
         }
         Ok((program, args))
     }
+}
+
+/// Probe the same login-shell environment used by terminal editor sessions.
+/// Runs on a background worker; never starts Neovim or loads its configuration.
+pub(crate) fn neovim_available() -> Result<bool> {
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    probe_neovim(&shell, std::time::Duration::from_secs(3))
+}
+
+fn probe_neovim(shell: &Path, timeout: std::time::Duration) -> Result<bool> {
+    let mut command = Command::new(shell);
+    command
+        .args(["-lic", "command -v nvim >/dev/null 2>&1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        anyhow::anyhow!("Could not check Neovim through your login shell: {error}")
+    })?;
+    let deadline = std::time::Instant::now() + timeout;
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status.success()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Ok(None) => {
+                break Err(anyhow::anyhow!(
+                    "Neovim check timed out. Check your shell startup files and try again."
+                ));
+            }
+            Err(error) => break Err(error.into()),
+        }
+    };
+    // Also stop any background children spawned by shell startup scripts.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
@@ -209,6 +278,28 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[cfg(unix)]
+    #[test]
+    fn neovim_probe_uses_shell_environment_and_times_out() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("shell");
+        let binary = dir.path().join("nvim");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The binary exists only on the PATH provided by shell startup.
+        std::fs::write(&shell, format!("#!/bin/sh\n[ \"$1\" = '-lic' ] || exit 2\nexport PATH={}\nexec /bin/sh -c \"$2\"\n", crate::agent_activity::shell_quote(dir.path().to_str().unwrap()))).unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(probe_neovim(&shell, Duration::from_secs(1)).unwrap());
+        std::fs::remove_file(binary).unwrap();
+        assert!(!probe_neovim(&shell, Duration::from_secs(1)).unwrap());
+        std::fs::write(&shell, "#!/bin/sh\nexec /bin/sleep 10\n").unwrap();
+        let start = Instant::now();
+        assert!(probe_neovim(&shell, Duration::from_millis(60)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 
     fn editor(kind: ExternalEditorKind) -> ExternalEditor {
         ExternalEditor::new(

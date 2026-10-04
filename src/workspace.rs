@@ -220,7 +220,7 @@ pub(crate) struct Workspace {
     tabs: Vec<Option<Entity<TerminalPane>>>,
     editor_instance: Option<EditorChoice>,
     editor_preference: EditorChoice,
-    editor_executables: HashMap<String, String>,
+    external_editors: HashMap<String, bool>,
     native_editor: Option<Entity<NativeEditor>>,
     review: Entity<ReviewView>,
     /// Harness the visible Agent pane was spawned with. Preserved across
@@ -412,9 +412,9 @@ impl Workspace {
             .as_ref()
             .map(|state| state.editor_choice_or_default())
             .unwrap_or_default();
-        let editor_executables = stored
+        let external_editors = stored
             .as_ref()
-            .and_then(|state| state.editor_executables.clone())
+            .and_then(|state| state.external_editors.clone())
             .unwrap_or_default();
         // Isolation profiles: seed/reconcile the portable catalog (Personal
         // and Work plus any legacy group names the records reference) and
@@ -778,7 +778,7 @@ impl Workspace {
             tabs,
             editor_instance: None,
             editor_preference,
-            editor_executables,
+            external_editors,
             native_editor: None,
             review,
             session_agent,
@@ -939,12 +939,12 @@ impl Workspace {
         if !self.home_visible {
             self.editor_instance = Some(choice);
             if choice == EditorChoice::BuiltIn && self.native_editor.is_none() {
-                let executables = self.editor_executables.clone();
+                let external_editors = self.external_editors.clone();
                 let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
                 self.native_editor = Some(cx.new(|cx| {
                     NativeEditor::new(
                         &self.working_directory,
-                        executables,
+                        external_editors,
                         draft_root.as_deref(),
                         window,
                         cx,
@@ -968,25 +968,24 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn set_external_executable(
+    pub(crate) fn set_external_editor_enabled(
         &mut self,
         kind: ExternalEditorKind,
-        executable: Option<String>,
+        enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(executable) = executable {
-            self.editor_executables
-                .insert(kind.id().to_owned(), executable);
-        } else {
-            self.editor_executables.remove(kind.id());
-        }
-        let executables = self.editor_executables.clone();
+        self.external_editors.insert(kind.id().to_owned(), enabled);
+        let external_editors = self.external_editors.clone();
         if let Some(editor) = self.native_editor.as_ref() {
-            editor.update(cx, |view, cx| view.set_executables(executables.clone(), cx));
+            editor.update(cx, |view, cx| {
+                view.set_external_editors(external_editors.clone(), cx)
+            });
         }
         for tabs in self.inactive_repositories.values() {
             if let Some(editor) = tabs.native_editor.as_ref() {
-                editor.update(cx, |view, cx| view.set_executables(executables.clone(), cx));
+                editor.update(cx, |view, cx| {
+                    view.set_external_editors(external_editors.clone(), cx)
+                });
             }
         }
         cx.notify();
@@ -1658,12 +1657,12 @@ impl Workspace {
             self.editor_instance = Some(self.editor_preference);
         }
         if self.editor_instance == Some(EditorChoice::BuiltIn) && self.native_editor.is_none() {
-            let executables = self.editor_executables.clone();
+            let external_editors = self.external_editors.clone();
             let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
             self.native_editor = Some(cx.new(|cx| {
                 NativeEditor::new(
                     &self.working_directory,
-                    executables,
+                    external_editors,
                     draft_root.as_deref(),
                     window,
                     cx,

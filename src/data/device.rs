@@ -15,7 +15,7 @@ use serde_json::Value;
 use super::{DataRoot, write_json_atomic};
 use crate::agent::AgentKind;
 use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, snap_sidebar_limit};
-use crate::editor::{EditorChoice, ExternalEditorKind};
+use crate::editor::EditorChoice;
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
 /// Selectable automatic portable-sync intervals, in minutes.
@@ -79,10 +79,9 @@ pub(crate) struct DeviceState {
     /// preserve the historical Neovim behavior for existing installations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) editor_choice: Option<String>,
-    /// Launcher overrides keyed by editor id, so switching choices never
-    /// runs a different editor through a stale custom executable.
+    /// Optional external launchers. Missing entries preserve enabled defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) editor_executables: Option<HashMap<String, String>>,
+    pub(crate) external_editors: Option<HashMap<String, bool>>,
     /// Machine-local checkout bindings by repository key: the linked local
     /// checkout plus remote alias. Portable metadata lives in
     /// `portable/repositories/<key>/repository.json`; only the binding that
@@ -118,11 +117,6 @@ impl DeviceState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn editor_executable_for(&self, kind: ExternalEditorKind) -> Option<String> {
-        self.editor_executables
-            .as_ref()
-            .and_then(|executables| executables.get(kind.id()).cloned())
-    }
     /// Effective app-wide font size: the stored value clamped to the
     /// settable range, or the default when unset.
     pub(crate) fn app_font_size_or_default(&self) -> f32 {
@@ -321,18 +315,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(built_in.editor_choice_or_default(), EditorChoice::BuiltIn);
-        assert_eq!(
-            built_in
-                .editor_executable_for(ExternalEditorKind::VsCode)
-                .as_deref(),
-            Some("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
-        );
-        assert_eq!(
-            built_in
-                .editor_executable_for(ExternalEditorKind::Zed)
-                .as_deref(),
-            Some("/opt/zed")
-        );
         assert_eq!(
             serde_json::to_value(built_in).unwrap()["editor_choice"],
             "built_in"

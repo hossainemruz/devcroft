@@ -7,20 +7,22 @@
 //! harness cards with per-agent toggles, the default-agent dropdown (enabled
 //! agents only), the sidebar session-limit slider (10–50, step 5), and
 //! Devcroft skill cards with a header refresh action.
-//! Keybindings documents the current global shortcuts.
+//! Editor hosts default-editor radio cards, Neovim availability, and external
+//! launcher switches. Keybindings documents the current global shortcuts.
 //!
 //! [`SettingsView`] is a long-lived [`Workspace`](crate::workspace::Workspace)
 //! entity rendered inside a dialog (`window.open_dialog`): the dialog owns
 //! open/close while the view keeps the selected section and edits across
 //! reopenings.
 
-use gpui_kit::component::Disableable as _;
+use gpui_kit::base::Radio;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -47,6 +49,7 @@ use crate::data::{
     set_origin, space_eq,
 };
 use crate::editor::{EditorChoice, ExternalEditorKind};
+use crate::editor_icons::{self, EditorIconTiles};
 use crate::fonts::TERMINAL_FONT_FAMILY;
 use crate::metrics::{
     DEFAULT_APP_FONT_SIZE, MAX_APP_FONT_SIZE, MIN_APP_FONT_SIZE, clamp_app_font_size,
@@ -60,15 +63,17 @@ pub(crate) enum SettingsSection {
     Spaces,
     Sync,
     Agent,
+    Editor,
     Keybindings,
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::General,
         Self::Spaces,
         Self::Sync,
         Self::Agent,
+        Self::Editor,
         Self::Keybindings,
     ];
 
@@ -78,6 +83,7 @@ impl SettingsSection {
             Self::Spaces => "Spaces",
             Self::Sync => "Sync",
             Self::Agent => "Agent",
+            Self::Editor => "Editor",
             Self::Keybindings => "Keybindings",
         }
     }
@@ -88,6 +94,7 @@ impl SettingsSection {
             Self::Spaces => "Isolation profiles for repositories, Home, and artifacts.",
             Self::Sync => "Portable data Git sync.",
             Self::Agent => "Agent pane preferences.",
+            Self::Editor => "Default editor and external launchers.",
             Self::Keybindings => "Current shortcuts.",
         }
     }
@@ -107,11 +114,14 @@ pub(crate) struct SettingsView {
     font_size: f32,
     terminal_preferences_error: Option<String>,
     editor_choice: EditorChoice,
-    external_launcher: ExternalEditorKind,
-    editor_executables: HashMap<String, String>,
-    editor_executable: Option<String>,
-    editor_executable_input: Entity<InputState>,
+    external_editors: HashMap<String, bool>,
+    installed_editors: HashMap<String, bool>,
+    external_checking: bool,
     editor_error: Option<String>,
+    neovim_available: bool,
+    neovim_check_error: Option<String>,
+    neovim_checking: bool,
+    editor_card_focus: [FocusHandle; 2],
     data_root: Option<DataRoot>,
     sync_tracker: SyncTracker,
     sync_interval: Option<u64>,
@@ -143,6 +153,9 @@ pub(crate) struct SettingsView {
     /// set is fixed, so tiles are rasterized once at creation and shared by
     /// every render.
     agent_icon_tiles: Rc<AgentIconTiles>,
+    /// Full-color editor brand logos for the Editor section. The set is
+    /// fixed, so tiles decode once at creation and are shared by every render.
+    editor_icon_tiles: Rc<EditorIconTiles>,
     /// Spaces section: the portable catalog, the new-space input, and the
     /// inline rename/delete editor for one row at a time.
     spaces: Vec<String>,
@@ -190,20 +203,10 @@ impl SettingsView {
             .as_ref()
             .map(|state| state.editor_choice_or_default())
             .unwrap_or_default();
-        let editor_executables = stored
+        let external_editors = stored
             .as_ref()
-            .and_then(|state| state.editor_executables.clone())
+            .and_then(|state| state.external_editors.clone())
             .unwrap_or_default();
-        let external_launcher = ExternalEditorKind::Zed;
-        let editor_executable = editor_executables.get(external_launcher.id()).cloned();
-        let editor_executable_input = cx.new(|cx| {
-            let mut input =
-                InputState::new(window, cx).placeholder("Command name or absolute executable path");
-            if let Some(value) = editor_executable.as_ref() {
-                input.set_value(value.clone(), window, cx);
-            }
-            input
-        });
         let session_limit = stored
             .as_ref()
             .map(|state| state.recent_sessions_limit_or_default())
@@ -249,6 +252,8 @@ impl SettingsView {
         .detach();
         let mut agent_icon_tiles = AgentIconTiles::new();
         agent_icons::ensure_tiles(AgentKind::ALL, &mut agent_icon_tiles, cx);
+        let mut editor_icon_tiles = EditorIconTiles::new();
+        editor_icons::ensure_tiles(crate::editor_icons::EditorIcon::ALL, &mut editor_icon_tiles);
         let skill_statuses = crate::agent_skill::Target::ALL
             .into_iter()
             .map(|target| {
@@ -261,11 +266,14 @@ impl SettingsView {
             font_size: clamp_app_font_size(initial_font_size),
             terminal_preferences_error: None,
             editor_choice,
-            external_launcher,
-            editor_executables,
-            editor_executable,
-            editor_executable_input,
+            external_editors,
+            installed_editors: HashMap::new(),
+            external_checking: false,
             editor_error: None,
+            neovim_available: false,
+            neovim_check_error: None,
+            neovim_checking: false,
+            editor_card_focus: [cx.focus_handle(), cx.focus_handle()],
             data_root,
             sync_tracker,
             sync_interval,
@@ -294,6 +302,7 @@ impl SettingsView {
             default_agent,
             default_agent_error: None,
             agent_icon_tiles: Rc::new(agent_icon_tiles),
+            editor_icon_tiles: Rc::new(editor_icon_tiles),
             spaces,
             space_input,
             space_rename_input,
@@ -313,24 +322,18 @@ impl SettingsView {
     /// never shows stale state (e.g. after external git or CLI edits).
     /// Called before the dialog opens.
     pub(crate) fn refresh_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check_neovim(cx);
+        self.check_external_editors(cx);
         if let Some(root) = self.data_root.clone() {
             let stored = DeviceStore::new(&root).load().ok();
             self.editor_choice = stored
                 .as_ref()
                 .map(|state| state.editor_choice_or_default())
                 .unwrap_or_default();
-            self.editor_executables = stored
+            self.external_editors = stored
                 .as_ref()
-                .and_then(|state| state.editor_executables.clone())
+                .and_then(|state| state.external_editors.clone())
                 .unwrap_or_default();
-            self.editor_executable = self
-                .editor_executables
-                .get(self.external_launcher.id())
-                .cloned();
-            let executable = self.editor_executable.clone().unwrap_or_default();
-            self.editor_executable_input.update(cx, |input, cx| {
-                input.set_value(executable, window, cx);
-            });
             self.sync_interval = stored
                 .as_ref()
                 .and_then(|state| state.sync_interval_minutes);
@@ -815,10 +818,12 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if choice == EditorChoice::Neovim && (self.neovim_checking || !self.neovim_available) {
+            return;
+        }
         if self.editor_choice == choice {
             return;
         }
-        self.editor_choice = choice;
         self.editor_error = None;
         if let Some(root) = self.data_root.as_ref()
             && let Err(error) = DeviceStore::new(root).update(|state| {
@@ -826,7 +831,10 @@ impl SettingsView {
             })
         {
             self.editor_error = Some(format!("Could not save editor choice: {error:#}"));
+            cx.notify();
+            return;
         }
+        self.editor_choice = choice;
         if let Some(workspace) = self.workspace.as_ref() {
             workspace
                 .update(cx, |workspace, cx| {
@@ -837,56 +845,92 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn set_external_launcher(
+    fn set_external_editor_enabled(
         &mut self,
         kind: ExternalEditorKind,
-        window: &mut Window,
+        enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        self.external_launcher = kind;
-        self.editor_executable = self.editor_executables.get(kind.id()).cloned();
-        let executable = self.editor_executable.clone().unwrap_or_default();
-        self.editor_executable_input
-            .update(cx, |input, cx| input.set_value(executable, window, cx));
+        if self.external_checking
+            || !self
+                .installed_editors
+                .get(kind.id())
+                .copied()
+                .unwrap_or(false)
+        {
+            return;
+        }
+        let mut editors = self.external_editors.clone();
+        editors.insert(kind.id().to_owned(), enabled);
+        if let Some(root) = &self.data_root
+            && let Err(error) = DeviceStore::new(root)
+                .update(|state| state.external_editors = Some(editors.clone()))
+        {
+            self.editor_error = Some(format!(
+                "Could not save external editor preference: {error:#}"
+            ));
+            cx.notify();
+            return;
+        }
+        self.external_editors = editors;
         self.editor_error = None;
+        if let Some(workspace) = &self.workspace {
+            let _ = workspace.update(cx, |view, cx| {
+                view.set_external_editor_enabled(kind, enabled, cx)
+            });
+        }
         cx.notify();
     }
 
-    fn save_editor_executable(&mut self, cx: &mut Context<Self>) {
-        let value = self
-            .editor_executable_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_owned();
-        let value = (!value.is_empty()).then_some(value);
-        self.editor_executable = value.clone();
-        if let Some(value) = value.as_ref() {
-            self.editor_executables
-                .insert(self.external_launcher.id().to_owned(), value.clone());
-        } else {
-            self.editor_executables.remove(self.external_launcher.id());
+    fn check_external_editors(&mut self, cx: &mut Context<Self>) {
+        if self.external_checking {
+            return;
         }
-        self.editor_error = None;
-        if let Some(root) = self.data_root.as_ref()
-            && let Err(error) = DeviceStore::new(root).update(|state| {
-                state.editor_executables = Some(self.editor_executables.clone());
-            })
-        {
-            self.editor_error = Some(format!("Could not save editor executable: {error:#}"));
-        }
-        if let Some(workspace) = self.workspace.as_ref() {
-            let kind = self.external_launcher;
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.set_external_executable(kind, value, cx)
+        self.external_checking = true;
+        cx.spawn(async move |view, cx| {
+            let installed = cx
+                .background_spawn(async {
+                    ExternalEditorKind::ALL
+                        .into_iter()
+                        .map(|kind| (kind.id().to_owned(), kind.installed_executable().is_some()))
+                        .collect()
                 })
-                .ok();
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.installed_editors = installed;
+                this.external_checking = false;
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn check_neovim(&mut self, cx: &mut Context<Self>) {
+        if self.neovim_checking {
+            return;
         }
+        self.neovim_checking = true;
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async { crate::editor::neovim_available() })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.neovim_available = matches!(result, Ok(true));
+                this.neovim_check_error = result.err().map(|error| error.to_string());
+                this.neovim_checking = false;
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
     fn select_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if section == SettingsSection::Editor {
+            self.check_neovim(cx);
+            self.check_external_editors(cx);
+        }
         if self.active_section != section {
             self.active_section = section;
             cx.notify();
@@ -1159,6 +1203,9 @@ impl SettingsView {
                                 }
                                 SettingsSection::Sync => self.render_sync(cx).into_any_element(),
                                 SettingsSection::Agent => self.render_agent(cx).into_any_element(),
+                                SettingsSection::Editor => {
+                                    self.render_editor(cx).into_any_element()
+                                }
                                 SettingsSection::Keybindings => {
                                     self.render_keybindings().into_any_element()
                                 }
@@ -1347,12 +1394,121 @@ impl SettingsView {
         }
     }
 
+    fn render_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor_tiles = self.editor_icon_tiles.clone();
+        v_flex().gap_4()
+            .child(v_flex().gap_2()
+                .child(v_flex().gap_1()
+                    .child(h_flex().gap_2().items_center().justify_between()
+                        .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child("Default editor"))
+                        .child(Button::new("check-neovim").label("Refresh").small().ghost().disabled(self.neovim_checking)
+                            .on_click(cx.listener(|this, _, _, cx| this.check_neovim(cx)))))
+                    .child(div().text_xs().text_color(rgb(0x737878)).child("Choose how project files open. Switching keeps existing editor sessions and unsaved drafts available.")))
+                .child(gpui_kit::base::RadioGroup::new("default-editor-cards")
+                    .axis(gpui_kit::Axis::Horizontal).flex().flex_row().items_stretch().gap_3().w_full()
+                    .children([EditorChoice::BuiltIn, EditorChoice::Neovim].into_iter().enumerate().map(|(index, choice)| {
+                        let selected = self.editor_choice == choice;
+                        let unavailable = choice == EditorChoice::Neovim && (self.neovim_checking || !self.neovim_available);
+                        let view = cx.entity().downgrade();
+                        let focus = self.editor_card_focus[index].clone();
+                        let title = choice.label();
+                        let tiles = editor_tiles.clone();
+                        let description = match choice {
+                            EditorChoice::BuiltIn => "File tabs, project search, syntax highlighting, and optional Rust tooling. Ready to use.",
+                            EditorChoice::Neovim => "Your configuration, plugins, and modal keyboard workflow in a terminal.",
+                        };
+                        let icon: AnyElement = match choice {
+                            EditorChoice::BuiltIn => Icon::new(IconName::FileText).size(px(crate::editor_icons::ICON_PX)).into_any_element(),
+                            EditorChoice::Neovim => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Neovim, &tiles, crate::editor_icons::ICON_PX),
+                        };
+                        Radio::new(format!("default-editor-{}", choice.id()))
+                            .accessibility_label(format!("Default editor: {title}{}", if unavailable { " (unavailable)" } else { "" }))
+                            .track_focus(&focus).set_position(index + 1, 2)
+                            .checked(selected).disabled(unavailable)
+                            .flex().flex_row().items_start().gap_2()
+                            .flex_1().min_w_0().px_3().py_2()
+                            .focus(|style| style.border_color(rgb(0x9acfff)))
+                            .child(div().size(px(16.)).mt(px(1.)).flex_shrink_0().rounded_full().border_1()
+                                .border_color(rgb(if unavailable { 0x4b5057 } else if selected { 0x61afef } else { 0x737983 }))
+                                .flex().items_center().justify_center()
+                                .when(selected, |circle| circle.child(div().size(px(7.)).rounded_full().bg(rgb(if unavailable { 0x737983 } else { 0x61afef })))))
+                            .when(!unavailable, |radio| radio
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    focus.focus(window, cx);
+                                    cx.stop_propagation();
+                                })
+                                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                                    let next = match event.keystroke.key.as_str() {
+                                        "space" | "enter" => Some(choice),
+                                        "arrowdown" | "arrowright" | "down" | "right" => Some(EditorChoice::Neovim),
+                                        "arrowup" | "arrowleft" | "up" | "left" => Some(EditorChoice::BuiltIn),
+                                        _ => None,
+                                    };
+                                    if let Some(next) = next {
+                                        this.set_editor_choice(next, window, cx);
+                                        if this.editor_choice == next {
+                                            this.editor_card_focus[usize::from(next == EditorChoice::Neovim)].focus(window, cx);
+                                        }
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    }
+                                })))
+                            .child(v_flex().gap_1().flex_1().min_w_0()
+                                .child(h_flex().items_center().gap_2()
+                                    .child(icon)
+                                    .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child(title))
+                                    .when(selected, |row| row.child(div().text_xs().text_color(rgb(0x61afef)).child("Default"))))
+                                .child(div().text_xs().text_color(rgb(0x999fa8)).child(description))
+                                .when(choice == EditorChoice::Neovim, |card| {
+                                    let status = if self.neovim_checking {
+                                        "Checking for Neovim…".to_owned()
+                                    } else if let Some(error) = &self.neovim_check_error {
+                                        error.clone()
+                                    } else if self.neovim_available {
+                                        "Available in your login shell".to_owned()
+                                    } else {
+                                        "Neovim was not found. Install nvim and make it available on PATH.".to_owned()
+                                    };
+                                    card.child(div().text_xs().text_color(rgb(if unavailable && !self.neovim_checking { 0xf87171 } else { 0x858989 })).child(status))
+                                }))
+                            .on_change(move |_, _, window, cx| { let _ = view.update(cx, |this, cx| this.set_editor_choice(choice, window, cx)); })
+                            .map(|radio| v_flex().flex_1().min_w_0().rounded_md().border_1()
+                                .border_color(rgb(if selected { 0x61afef } else { 0x30343a }))
+                                .bg(rgb(if selected { 0x172331 } else { 0x111416 }))
+                                .child(radio))
+                    }))))
+            .when_some(self.editor_error.clone(), |view, error| view.child(div().text_sm().text_color(rgb(0xf87171)).child(error)))
+            .child(v_flex().gap_2()
+                .child(v_flex().gap_1()
+                    .child(h_flex().gap_2().items_center().justify_between()
+                        .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child("External editors"))
+                        .child(Button::new("check-external-editors").label("Refresh").small().ghost().disabled(self.external_checking)
+                            .on_click(cx.listener(|this, _, _, cx| this.check_external_editors(cx)))))
+                    .child(div().text_xs().text_color(rgb(0x737878)).child("Choose which applications appear in the editor’s Open in menu.")))
+                .children(ExternalEditorKind::ALL.into_iter().map(|kind| {
+                    let installed = self.installed_editors.get(kind.id()).copied().unwrap_or(false);
+                    let enabled = self.external_editors.get(kind.id()).copied().unwrap_or(true);
+                    let view = cx.entity().downgrade();
+                    let icon = match kind {
+                        ExternalEditorKind::Zed => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Zed, &editor_tiles, crate::editor_icons::ICON_PX),
+                        ExternalEditorKind::VsCode => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::VsCode, &editor_tiles, crate::editor_icons::ICON_PX),
+                    };
+                    div().px_3().py_2().rounded_md().border_1().border_color(rgb(0x30343a)).bg(rgb(0x111416))
+                        .child(h_flex().gap_3().items_center().justify_between()
+                            .child(h_flex().gap_2().items_center().flex_1().min_w_0()
+                                .child(icon)
+                                .child(v_flex().gap_0().flex_1().min_w_0()
+                                    .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child(kind.label()))
+                                    .child(div().text_xs().text_color(rgb(if installed || self.external_checking { 0x999fa8 } else { 0xf87171 }))
+                                        .child(if self.external_checking { "Checking installation…" } else if installed { "Installed · Available from the editor’s Open in menu." } else { "Not found. Install the application or its command-line launcher." }))))
+                            .child(Switch::new(format!("external-editor-{}", kind.id())).checked(enabled && installed).disabled(!installed || self.external_checking)
+                                .on_change(move |enabled, _, cx| { let _ = view.update(cx, |this, cx| this.set_external_editor_enabled(kind, *enabled, cx)); }))
+                    )
+                })))
+    }
+
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
-        let editor_view = view.clone();
-        let launcher_view = view.clone();
-        let editor_choice = self.editor_choice;
-        let external_launcher = self.external_launcher;
         let size = self.font_size;
         let is_default = (size - DEFAULT_APP_FONT_SIZE).abs() < f32::EPSILON;
         v_flex()
@@ -1369,87 +1525,6 @@ impl SettingsView {
             .when_some(self.terminal_preferences_error.clone(), |this, error| {
                 this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
             })
-            .child(
-                group(
-                    "Editor",
-                    Some("Choose Neovim or Devcroft's built-in editor. Switch the current editor and set the choice for new projects; existing sessions and drafts stay open."),
-                )
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(
-                            Button::new("editor-choice")
-                                .accessibility_label(format!("Editor: {}", editor_choice.label()))
-                                .outline()
-                                .dropdown_caret(true)
-                                .label(editor_choice.label())
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for choice in EditorChoice::ALL {
-                                        let option_view = launcher_view.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(choice.label())
-                                                .checked(choice == editor_choice)
-                                                .on_click(move |_, window, cx| {
-                                                    option_view
-                                                        .update(cx, |this, cx| {
-                                                            this.set_editor_choice(choice, window, cx)
-                                                        })
-                                                        .ok();
-                                                }),
-                                        );
-                                    }
-                                    menu
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x858989))
-                                .child("Open the checkout in Zed or VS Code from the Editor tab. Install its CLI launcher or set an override below."),
-                        )
-                        .child(
-                            Button::new("external-launcher-choice")
-                                .accessibility_label(format!("External launcher: {}", external_launcher.label()))
-                                .outline()
-                                .dropdown_caret(true)
-                                .label(format!("{} launcher", external_launcher.label()))
-                                .dropdown_menu(move |mut menu, _, _| {
-                                    for kind in ExternalEditorKind::ALL {
-                                        let option_view = editor_view.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(kind.label())
-                                                .checked(kind == external_launcher)
-                                                .on_click(move |_, window, cx| {
-                                                    option_view.update(cx, |this, cx| {
-                                                        this.set_external_launcher(kind, window, cx)
-                                                    }).ok();
-                                                }),
-                                        );
-                                    }
-                                    menu
-                                }),
-                        )
-                        .child(
-                            div()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                )
-                                .child(Input::new(&self.editor_executable_input)),
-                        )
-                        .child(
-                            Button::new("save-editor-executable")
-                                .label("Save executable")
-                                .outline()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.save_editor_executable(cx)
-                                })),
-                        ),
-                )
-                .when_some(self.editor_error.clone(), |this, error| {
-                    this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
-                }),
-            )
             .child(
                 group("Appearance", None).child(live_row(
                     "App font size",
@@ -2461,6 +2536,171 @@ impl Render for SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn editor_cards_preserve_selection_when_neovim_is_unavailable(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        cx.update(gpui_kit::init);
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let settings = cx.new(|cx| {
+                SettingsView::new(
+                    window,
+                    None,
+                    DEFAULT_APP_FONT_SIZE,
+                    SyncTracker::default(),
+                    cx,
+                )
+            });
+            settings.update(cx, |view, _| {
+                view.active_section = SettingsSection::Editor;
+                view.editor_choice = EditorChoice::BuiltIn;
+                view.neovim_available = false;
+                view.neovim_checking = false;
+            });
+            *slot.borrow_mut() = Some(settings.clone());
+            gpui_kit::component::Root::new(settings, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("default-editor-built_in").visible());
+            assert!(window.find("default-editor-neovim").visible());
+            let builtin = window.find("default-editor-built_in").bounds();
+            let neovim = window.find("default-editor-neovim").bounds();
+            let retry = window.find("check-neovim").bounds();
+            assert_eq!(builtin.origin.y, neovim.origin.y);
+            assert!((builtin.size.width - neovim.size.width).abs() < px(1.));
+            assert!(builtin.right() <= neovim.left());
+            // "Refresh" sits in the Default editor title line, above the
+            // cards and right-aligned with the section.
+            assert!(retry.bottom() <= builtin.top());
+            assert!(retry.bottom() <= neovim.top());
+            assert!(retry.right() >= neovim.right());
+            window.click("default-editor-neovim", cx);
+            window.click("default-editor-built_in", cx);
+            window.press("down", cx);
+        });
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.editor_choice, EditorChoice::BuiltIn)
+        });
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                // The handler also guards against unavailable or in-flight checks.
+                view.set_editor_choice(EditorChoice::Neovim, window, cx);
+                assert_eq!(view.editor_choice, EditorChoice::BuiltIn);
+                view.neovim_available = true;
+                view.neovim_checking = true;
+                view.set_editor_choice(EditorChoice::Neovim, window, cx);
+                assert_eq!(view.editor_choice, EditorChoice::BuiltIn);
+                view.neovim_checking = false;
+                cx.notify();
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().to_owned());
+        view.update(test_cx, |view, _| view.data_root = Some(root.clone()));
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("default-editor-neovim", cx);
+        });
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.editor_choice, EditorChoice::Neovim)
+        });
+        assert_eq!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .editor_choice_or_default(),
+            EditorChoice::Neovim
+        );
+        test_cx.update(|window, cx| {
+            window.click("default-editor-built_in", cx);
+        });
+        assert_eq!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .editor_choice_or_default(),
+            EditorChoice::BuiltIn
+        );
+        test_cx.update(|window, cx| {
+            window.press("down", cx);
+        });
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.editor_choice, EditorChoice::Neovim)
+        });
+        test_cx.update(|window, cx| {
+            window.press("up", cx);
+        });
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.editor_choice, EditorChoice::BuiltIn)
+        });
+        for key in ["space", "enter"] {
+            view.downgrade()
+                .update_in(test_cx, |view, window, cx| {
+                    view.set_editor_choice(EditorChoice::BuiltIn, window, cx);
+                    view.editor_card_focus[1].focus(window, cx);
+                })
+                .unwrap();
+            test_cx.update(|window, cx| {
+                window.render_frame(cx);
+                window.press(key, cx);
+            });
+            view.read_with(test_cx, |view, _| {
+                assert_eq!(view.editor_choice, EditorChoice::Neovim)
+            });
+        }
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.set_editor_choice(EditorChoice::BuiltIn, window, cx)
+            })
+            .unwrap();
+        view.update(test_cx, |view, cx| {
+            view.external_checking = false;
+            view.installed_editors.insert("zed".into(), true);
+            view.installed_editors.insert("vscode".into(), false);
+            view.set_external_editor_enabled(ExternalEditorKind::VsCode, true, cx);
+            assert!(!view.external_editors.contains_key("vscode"));
+            view.set_external_editor_enabled(ExternalEditorKind::Zed, false, cx);
+            assert_eq!(view.external_editors.get("zed"), Some(&false));
+        });
+        assert_eq!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .external_editors
+                .unwrap()
+                .get("zed"),
+            Some(&false)
+        );
+        view.update(test_cx, |view, cx| {
+            view.set_external_editor_enabled(ExternalEditorKind::Zed, true, cx);
+        });
+        assert_eq!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .external_editors
+                .unwrap()
+                .get("zed"),
+            Some(&true)
+        );
+        // A failed save must not report a selection that was never persisted.
+        std::fs::remove_file(root.device_path()).unwrap();
+        std::fs::create_dir(root.device_path()).unwrap();
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.set_editor_choice(EditorChoice::Neovim, window, cx);
+                assert_eq!(view.editor_choice, EditorChoice::BuiltIn);
+                assert!(view.editor_error.is_some());
+            })
+            .unwrap();
+    }
 
     #[test]
     fn sections_cover_the_requested_set_in_order() {
@@ -2470,7 +2710,14 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            vec!["General", "Spaces", "Sync", "Agent", "Keybindings"]
+            vec![
+                "General",
+                "Spaces",
+                "Sync",
+                "Agent",
+                "Editor",
+                "Keybindings"
+            ]
         );
         for section in SettingsSection::ALL {
             assert!(

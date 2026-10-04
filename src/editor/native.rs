@@ -53,7 +53,7 @@ pub(crate) struct NativeEditor {
     pending_open: Option<(PathBuf, Option<usize>)>,
     pending_line: Option<usize>,
     pending_lsp_position: Option<lsp_types::Position>,
-    executables: HashMap<String, String>,
+    external_editors: HashMap<String, bool>,
     lsp: Option<LspSession>,
     workspace_lsp: Option<Arc<Client>>,
     lsp_starting: bool,
@@ -239,7 +239,7 @@ fn tree_rows(
 impl NativeEditor {
     pub(crate) fn new(
         root: &Path,
-        executables: HashMap<String, String>,
+        external_editors: HashMap<String, bool>,
         data_root: Option<&Path>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -428,7 +428,7 @@ impl NativeEditor {
             pending_open: None,
             pending_line: None,
             pending_lsp_position: None,
-            executables,
+            external_editors,
             lsp: None,
             workspace_lsp: None,
             lsp_starting: false,
@@ -1199,12 +1199,12 @@ impl NativeEditor {
         }
     }
 
-    pub(crate) fn set_executables(
+    pub(crate) fn set_external_editors(
         &mut self,
-        executables: HashMap<String, String>,
+        external_editors: HashMap<String, bool>,
         cx: &mut Context<Self>,
     ) {
-        self.executables = executables;
+        self.external_editors = external_editors;
         cx.notify();
     }
 
@@ -1501,12 +1501,19 @@ impl NativeEditor {
     }
 
     fn open_external(&mut self, kind: ExternalEditorKind, cx: &mut Context<Self>) {
-        let executable = self.executables.get(kind.id()).cloned();
-        match ExternalEditor::new(kind, executable).launch(&self.root, None, None) {
+        if !self
+            .external_editors
+            .get(kind.id())
+            .copied()
+            .unwrap_or(true)
+        {
+            return;
+        }
+        match ExternalEditor::new(kind, None).launch(&self.root, None, None) {
             Ok(()) => self.error = None,
             Err(error) => {
                 self.error = Some(format!(
-                    "Could not launch {}: {error:#}. Configure its launcher in Settings → General.",
+                    "Could not launch {}: {error:#}. Install the application or its command-line launcher, then choose Check again in Settings → Editor.",
                     kind.label()
                 ));
             }
@@ -1606,6 +1613,7 @@ impl NativeEditor {
         let has_file = self.path.is_some();
         let dirty = self.dirty;
         let trusted = self.lsp_trusted;
+        let external_editors = self.external_editors.clone();
         let can_go_back = self.has_jump_history();
         let can_go_forward = !self.forward_locations.is_empty();
         Button::new("native-editor-actions")
@@ -1674,6 +1682,11 @@ impl NativeEditor {
                 }
                 menu = menu.separator();
                 for kind in ExternalEditorKind::ALL {
+                    if !external_editors.get(kind.id()).copied().unwrap_or(true)
+                        || kind.installed_executable().is_none()
+                    {
+                        continue;
+                    }
                     let view = view.clone();
                     menu = menu.item(
                         PopupMenuItem::new(format!("Open in {}", kind.label())).on_click(

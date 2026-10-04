@@ -2,7 +2,7 @@
 
 ## Choose an editor
 
-Open **Settings → General → Editor** from Home or a project. Choose **Devcroft editor** for the built-in editor, or **Neovim** for your terminal editor and its existing configuration. Neovim requires `nvim` on your environment's executable path; the built-in editor does not.
+Open **Settings → Editor** from Home or a project. Choose **Devcroft editor** for the built-in editor, or **Neovim** for your terminal editor and its existing configuration. Select either editor using its radio card. Neovim requires an installed `nvim` executable; its card is disabled with an error if Devcroft cannot find it. Use **Check again** after installation. Detection asks your interactive login shell whether `nvim` is available, without running Neovim; a stalled shell check times out after three seconds. The built-in editor is always available.
 
 New installations start with the built-in editor. The choice is saved on this device. Existing installations with no saved editor choice keep Neovim. First-run detection is conservative: any existing device settings or data counts as an existing installation, including portable data restored from another machine. Changing the choice switches the current project's editor while keeping its Neovim session and built-in drafts alive; returning to either restores that instance. Other open projects keep their existing editor instances. New projects use the saved choice.
 
@@ -26,7 +26,9 @@ Rust completion, hover, definitions, and diagnostics require an installed rust-a
 
 Use the built-in editor's **… → Open in Zed / VS Code** action to launch the checkout externally. These launchers are separate from your editor preference.
 
-Install the editor's command-line launcher (`zed`/`zeditor` or `code`). If the desktop environment cannot find it, select the launcher in **Settings → General** and set its executable path. Enter a program path, not a shell command or arguments; paths containing spaces do not need shell quotes. A launch failure leaves your current editor and drafts available.
+Enable **Zed** or **VS Code** with its switch in **Settings → Editor → External editors**. Disabled editors are removed from the built-in editor’s Open in menu. If an editor is not found, its switch is disabled; install the application or command-line launcher, then choose **Check again**.
+
+Devcroft uses the same executable discovery for installation checks and launches: the desktop PATH and common binary directories, plus `/Applications` and `~/Applications` app bundles on macOS. No custom executable configuration is needed or supported. Existing custom-path settings are ignored. A launch failure leaves your editor and drafts available.
 
 ## File safety and limits
 

@@ -20,8 +20,9 @@ use super::project::{self, ProjectFile, TextMatch};
 use crate::editor::{ExternalEditor, ExternalEditorKind};
 use anyhow::{Context as _, Result, bail};
 use gpui_kit::component::{
-    Icon, IconName, Sizable as _,
+    Icon, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    dialog::{Confirm, DialogFooter},
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState, Position},
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -32,7 +33,7 @@ use gpui_kit::img;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window, div, px, rgb,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, Styled, Window, div, px, rgb,
 };
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -204,7 +205,7 @@ fn tree_rows(
                 if more_rows.insert(parent.clone()) {
                     rows.push(TreeRow {
                         key: parent.clone(),
-                        label: "Show more…".into(),
+                        label: "Show more".into(),
                         depth,
                         file: None,
                         more: true,
@@ -434,7 +435,7 @@ impl NativeEditor {
             lsp_starting: false,
             lsp_trusted: false,
             lsp_generation: 0,
-            lsp_status: "Rust: disabled — trust checkout in … to enable tooling".into(),
+            lsp_status: "Rust: disabled — click to trust this checkout and enable tooling".into(),
             jump_back: Rc::new(RefCell::new(Vec::new())),
             disk_seen: None,
             conflict: false,
@@ -1234,7 +1235,8 @@ impl NativeEditor {
             return;
         }
         if !self.lsp_trusted {
-            self.lsp_status = "Rust: disabled — trust checkout in … (permits project tools)".into();
+            self.lsp_status =
+                "Rust: disabled — click to trust this checkout and enable tooling".into();
             return;
         }
         let Ok(uri) = file_uri(path) else {
@@ -1608,11 +1610,69 @@ impl NativeEditor {
         row.into_any_element()
     }
 
+    /// Grant trust for this checkout and start Rust tooling. Only reachable
+    /// through the status-bar trust dialog: trusting may run project tools,
+    /// so it asks for explicit confirmation instead of living in the menu.
+    fn trust_checkout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lsp_trusted {
+            return;
+        }
+        self.lsp_trusted = true;
+        self.restart_language_server(window, cx);
+    }
+
+    /// Drop the current language-server state and start over. Used by the
+    /// editor menu's Restart entry; restarting never changes trust.
+    fn restart_language_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.lsp_generation += 1;
+        self.lsp_starting = false;
+        self.workspace_lsp = None;
+        self.lsp = None;
+        if let Some(path) = self.path.clone() {
+            self.restart_lsp(&path, language_for(&path), window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Confirm checkout trust in a dialog. Opened by clicking the disabled
+    /// Rust status indicator in the footer.
+    fn open_trust_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lsp_trusted {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title("Trust this checkout?")
+                .child("Trusting enables Rust tooling with rust-analyzer and may run project tools in this checkout. This lasts for the editor workspace's lifetime.")
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel-trust-checkout")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-trust-checkout")
+                                .primary()
+                                .label("Trust checkout")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                }),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |this, cx| this.trust_checkout(window, cx))
+                        .is_ok()
+                })
+        });
+    }
+
     fn render_editor_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let has_file = self.path.is_some();
         let dirty = self.dirty;
-        let trusted = self.lsp_trusted;
         let external_editors = self.external_editors.clone();
         let can_go_back = self.has_jump_history();
         let can_go_forward = !self.forward_locations.is_empty();
@@ -1625,22 +1685,17 @@ impl NativeEditor {
                 for (label, action, enabled) in [
                     ("Find in file", 0, has_file),
                     ("Replace in file", 1, has_file),
-                    ("Go to line…", 2, has_file),
+                    ("Go to line", 2, has_file),
                     ("Go back", 12, can_go_back),
                     ("Go forward", 13, can_go_forward),
                     ("Save", 3, dirty),
-                    ("Save as…", 4, has_file),
+                    ("Save as", 4, has_file),
                     ("Discard changes", 5, dirty),
-                    ("Find file…", 6, true),
-                    ("Search project…", 7, true),
+                    ("Find file", 6, true),
+                    ("Search project", 7, true),
                     ("Show file tree", 8, true),
                     ("Refresh files", 9, true),
                     ("Restart language server", 10, true),
-                    (
-                        "Trust checkout and enable Rust tooling (may run project tools)",
-                        11,
-                        !trusted,
-                    ),
                 ] {
                     let view = view.clone();
                     menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
@@ -1662,19 +1717,8 @@ impl NativeEditor {
                                 9 => this.refresh_files(cx),
                                 12 => this.go_back(window, cx),
                                 13 => this.go_forward(window, cx),
-                                _ => {
-                                    if action == 11 {
-                                        this.lsp_trusted = true;
-                                    }
-                                    this.lsp_generation += 1;
-                                    this.lsp_starting = false;
-                                    this.workspace_lsp = None;
-                                    this.lsp = None;
-                                    if let Some(path) = this.path.clone() {
-                                        this.restart_lsp(&path, language_for(&path), window, cx);
-                                    }
-                                    cx.notify();
-                                }
+                                10 => this.restart_language_server(window, cx),
+                                _ => {}
                             })
                             .ok();
                         },
@@ -2238,6 +2282,14 @@ impl Render for NativeEditor {
                         div()
                             .max_w(px(420.))
                             .text_ellipsis()
+                            .when(!self.lsp_trusted, |status| {
+                                status.cursor_pointer().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.open_trust_dialog(window, cx)
+                                    }),
+                                )
+                            })
                             .child(self.lsp_status.clone()),
                     )
                     .child("UTF-8"),

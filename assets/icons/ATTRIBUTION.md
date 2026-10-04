@@ -13,7 +13,8 @@ a harness logo, drop `<key>.svg` next to these and extend `icon_svg`.
 
 ## Editor brand icons
 
-The top-level PNGs `neovim.png`, `zed.png`, and `vscode.png` are the
+The Devcroft app mark `logo.png` is used as the full-color logo for the built-in editor in the Settings
+Editor section (see `src/editor_icons.rs`). The top-level PNGs `neovim.png`, `zed.png`, and `vscode.png` are the
 respective editors' brand marks, used as full-color logos in the Settings
 Editor section (see `src/editor_icons.rs`). They belong to their respective
 owners (the Neovim project, Zed Industries, Microsoft) and are redistributed

@@ -531,7 +531,7 @@ impl AddRepositoryView {
                     )
                     .child(
                         Button::new("add-repository-browse")
-                            .label("Browse…")
+                            .label("Browse")
                             .on_click(move |_, window, cx| {
                                 view.update(cx, |this, cx| this.browse(window, cx)).ok();
                             }),

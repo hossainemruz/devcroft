@@ -4,7 +4,7 @@ Syntax highlighting is available for the bundled grammars. Semantic features cur
 
 ## Enable Rust tooling
 
-Open a Rust file, then choose **… → Trust checkout and enable Rust tooling (may run project tools)**. This decision lasts for that editor workspace's lifetime; reopening the app requires trusting again. Plain editing and syntax highlighting work without trust or a server.
+Open a Rust file, then click the disabled Rust indicator in the editor status bar and confirm **Trust checkout**. This decision lasts for that editor workspace's lifetime; reopening the app requires trusting again. Plain editing and syntax highlighting work without trust or a server.
 
 Trust permits starting the installed server in this checkout. Rust tooling can consult Cargo/toolchain configuration and execute project-configured tools. Devcroft disables rust-analyzer's check-on-save, build-script analysis, and proc macros. Repository-supplied server commands, shell command strings, and custom server configuration are not supported. The server executable must resolve outside the checkout; relative executable paths are rejected.
 

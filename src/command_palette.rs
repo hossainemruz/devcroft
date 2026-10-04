@@ -32,7 +32,7 @@ gpui_kit::actions!(
 /// (`ctrl-k` on Linux/Windows) opens the action commands (navigation,
 /// settings, sync); `cmd-p` on macOS (`ctrl-p` on Linux/Windows) opens
 /// project navigation (recent repositories plus adding one). `Add
-/// repository…` lives only in projects mode, so every command has a single
+/// repository` lives only in projects mode, so every command has a single
 /// home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteMode {
@@ -172,8 +172,8 @@ impl PaletteCommand {
             Self::EditorGoBack => "Editor: Go Back",
             Self::BrowseArtifacts => "Browse artifacts",
             Self::RepositoryRelationships => "Repository relationships",
-            Self::AddRepository => "Add repository…",
-            Self::OpenSettings => "Open settings…",
+            Self::AddRepository => "Add repository",
+            Self::OpenSettings => "Open settings",
             Self::SyncPortable => "Sync portable data now",
         }
     }

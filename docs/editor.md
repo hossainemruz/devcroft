@@ -20,7 +20,7 @@ New installations start with the built-in editor. The choice is saved on this de
 
 Syntax highlighting covers Rust, TOML (including Cargo.lock), Python, JavaScript/JSX, TypeScript/TSX, Go, shell, Markdown, HTML, CSS, JSON, YAML, C/C++, Java, and Ruby. Other text files remain editable without highlighting.
 
-Rust completion, hover, definitions, and diagnostics require an installed rust-analyzer and the explicit **… → Trust checkout and enable Rust tooling (may run project tools)** action. Trust lasts for the editor workspace's lifetime. The [language support guide](language-support.md) describes executable discovery, prerequisites, the tested server matrix, restart, and limitations. Other languages currently have no semantic server integration.
+Rust completion, hover, definitions, and diagnostics require an installed rust-analyzer and trusting the checkout: click the disabled Rust indicator in the editor status bar and confirm **Trust checkout**. Trust lasts for the editor workspace's lifetime. The [language support guide](language-support.md) describes executable discovery, prerequisites, the tested server matrix, restart, and limitations. Other languages currently have no semantic server integration.
 
 ## Open in Zed or VS Code
 

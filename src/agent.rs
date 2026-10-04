@@ -2,7 +2,7 @@
 //!
 //! Entering a checkout resumes its most recent session when history exists;
 //! otherwise the Agent tab starts the default harness (Settings > Agent,
-//! [`AgentKind::DEFAULT`] until changed). Use **New session…** to pick a
+//! [`AgentKind::DEFAULT`] until changed). Use **New session** to pick a
 //! harness explicitly for a new session; open sessions keep running with
 //! the harness they started with ([`AgentKind::command`]).
 //!

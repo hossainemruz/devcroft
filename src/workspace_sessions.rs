@@ -43,7 +43,7 @@ fn session_section(title: &'static str, count: usize, cx: &App) -> impl IntoElem
         )
 }
 
-/// Keyboard-navigable agent chooser behind `New session…`.
+/// Keyboard-navigable agent chooser behind `New session`.
 /// Backed by the kit's `List`, so up/down move the selection, Enter confirms,
 /// Esc closes, and the global default (Settings > Agent) starts selected
 /// with a `Default` badge. Only enabled harnesses are offered; the list never

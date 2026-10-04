@@ -22,7 +22,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -1418,7 +1418,7 @@ impl SettingsView {
                             EditorChoice::Neovim => "Your configuration, plugins, and modal keyboard workflow in a terminal.",
                         };
                         let icon: AnyElement = match choice {
-                            EditorChoice::BuiltIn => Icon::new(IconName::FileText).size(px(crate::editor_icons::ICON_PX)).into_any_element(),
+                            EditorChoice::BuiltIn => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Devcroft, &tiles, crate::editor_icons::ICON_PX),
                             EditorChoice::Neovim => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Neovim, &tiles, crate::editor_icons::ICON_PX),
                         };
                         Radio::new(format!("default-editor-{}", choice.id()))
@@ -1456,8 +1456,7 @@ impl SettingsView {
                             .child(v_flex().gap_1().flex_1().min_w_0()
                                 .child(h_flex().items_center().gap_2()
                                     .child(icon)
-                                    .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child(title))
-                                    .when(selected, |row| row.child(div().text_xs().text_color(rgb(0x61afef)).child("Default"))))
+                                    .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child(title)))
                                 .child(div().text_xs().text_color(rgb(0x999fa8)).child(description))
                                 .when(choice == EditorChoice::Neovim, |card| {
                                     let status = if self.neovim_checking {
@@ -1469,7 +1468,14 @@ impl SettingsView {
                                     } else {
                                         "Neovim was not found. Install nvim and make it available on PATH.".to_owned()
                                     };
-                                    card.child(div().text_xs().text_color(rgb(if unavailable && !self.neovim_checking { 0xf87171 } else { 0x858989 })).child(status))
+                                    let status_color = if self.neovim_checking {
+                                        rgb(0x858989)
+                                    } else if self.neovim_check_error.is_some() || !self.neovim_available {
+                                        rgb(0xf87171)
+                                    } else {
+                                        rgb(0x4ade80)
+                                    };
+                                    card.child(div().text_xs().text_color(status_color).child(status))
                                 }))
                             .on_change(move |_, _, window, cx| { let _ = view.update(cx, |this, cx| this.set_editor_choice(choice, window, cx)); })
                             .map(|radio| v_flex().flex_1().min_w_0().rounded_md().border_1()
@@ -1499,7 +1505,7 @@ impl SettingsView {
                                 .child(icon)
                                 .child(v_flex().gap_0().flex_1().min_w_0()
                                     .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child(kind.label()))
-                                    .child(div().text_xs().text_color(rgb(if installed || self.external_checking { 0x999fa8 } else { 0xf87171 }))
+                                    .child(div().text_xs().text_color(if self.external_checking { rgb(0x999fa8) } else if installed { rgb(0x4ade80) } else { rgb(0xf87171) })
                                         .child(if self.external_checking { "Checking installation…" } else if installed { "Installed · Available from the editor’s Open in menu." } else { "Not found. Install the application or its command-line launcher." }))))
                             .child(Switch::new(format!("external-editor-{}", kind.id())).checked(enabled && installed).disabled(!installed || self.external_checking)
                                 .on_change(move |enabled, _, cx| { let _ = view.update(cx, |this, cx| this.set_external_editor_enabled(kind, *enabled, cx)); }))
@@ -1962,7 +1968,7 @@ impl SettingsView {
 
         let agents = group(
             "Agents",
-            Some("Choose which harnesses are available. The default and New session… only offer enabled agents."),
+            Some("Choose which harnesses are available. The default and New session only offer enabled agents."),
         )
         .child(
             v_flex()
@@ -2034,7 +2040,7 @@ impl SettingsView {
         let current_icon = agent_icons::agent_icon(current, &tiles, agent_icons::ICON_PX);
         let default = group(
             "Default agent",
-            Some("Launched when the Agent tab opens without history, and pre-selected in New session…. Open sessions keep running."),
+            Some("Launched when the Agent tab opens without history, and pre-selected in New session. Open sessions keep running."),
         )
         .child(
             h_flex().gap_2().items_center().child(

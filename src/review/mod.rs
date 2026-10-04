@@ -9,7 +9,7 @@
 pub(crate) mod comments;
 mod feedback;
 pub(crate) mod git;
-mod icons;
+pub(crate) mod icons;
 pub(crate) mod model;
 // Crate-visible so the text diff tool renders and highlights its result with
 // the same rows and syntax machinery the review uses.

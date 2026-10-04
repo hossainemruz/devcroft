@@ -14,6 +14,7 @@ pub(crate) enum Context {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourceState {
+    pub built_in_editor: bool,
     pub selected: bool,
     pub drafting: bool,
     pub saving: bool,
@@ -36,6 +37,7 @@ pub(crate) enum Command {
     Home,
     Back,
     NewSession,
+    OpenFile,
     EditMarkdown,
     AddComment,
     SaveDraft,
@@ -133,6 +135,13 @@ const WORKSPACE: [Row; 8] = [
     },
 ];
 
+const OPEN_FILE: Row = Row {
+    key: 'o',
+    label: "Open project file",
+    group: "Editor",
+    command: Command::OpenFile,
+};
+
 const ARTIFACTS: [Row; 3] = [
     Row {
         key: ' ',
@@ -195,6 +204,9 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
         Context::Artifacts => ARTIFACTS.to_vec(),
         Context::Relationships => RELATIONSHIPS.to_vec(),
     };
+    if context == Context::Workspace && resource.built_in_editor {
+        result.push(OPEN_FILE);
+    }
     if resource.selected && resource.editable && !resource.saving {
         result.extend(if resource.drafting {
             RESOURCE_DRAFT
@@ -409,18 +421,21 @@ mod tests {
                     drafting: false,
                     saving: false,
                     editable: true,
+                    ..Default::default()
                 },
                 ResourceState {
                     selected: true,
                     drafting: true,
                     saving: false,
                     editable: true,
+                    ..Default::default()
                 },
                 ResourceState {
                     selected: true,
                     drafting: true,
                     saving: true,
                     editable: true,
+                    ..Default::default()
                 },
             ] {
                 let available = rows(context, resource);
@@ -430,6 +445,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn built_in_workspace_owns_o_for_file_opening() {
+        let built_in = ResourceState {
+            built_in_editor: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(Context::Workspace, built_in, 'o'),
+            Some(Command::OpenFile)
+        );
+        assert_eq!(
+            resolve(Context::Workspace, ResourceState::default(), 'o'),
+            None
+        );
     }
 
     #[test]

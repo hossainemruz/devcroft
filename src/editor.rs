@@ -1,7 +1,9 @@
 //! Editor preference and argument-safe optional external editor launches.
 
+mod drafts;
 pub(crate) mod lsp;
 pub(crate) mod native;
+mod project;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

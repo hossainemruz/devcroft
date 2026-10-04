@@ -2,32 +2,37 @@
 //! protection against overwriting a file changed by an agent on disk.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fs,
     hash::{Hash as _, Hasher as _},
     io::{self, Write as _},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use super::drafts::{self, Draft, Journal};
 use super::lsp::{Client, DiagnosticEvent, LspProviders, discover_rust_analyzer, file_uri};
+use super::project::{self, ProjectFile, TextMatch};
 use crate::editor::{ExternalEditor, ExternalEditorKind};
 use anyhow::{Context as _, Result, bail};
 use gpui_kit::component::{
-    Disableable as _,
+    Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Editor, EditorState, InputEvent, Position},
+    input::{Editor, EditorState, Input, InputEvent, InputState, Position},
     menu::{DropdownMenu as _, PopupMenuItem},
+    scroll::ScrollableElement as _,
     v_flex,
 };
+use gpui_kit::img;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
-    PathPromptOptions, Render, Styled, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window, div, px, rgb,
 };
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -39,12 +44,14 @@ const DISK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(crate) struct NativeEditor {
     root: PathBuf,
+    canonical_root: PathBuf,
     editor: Entity<EditorState>,
     path: Option<PathBuf>,
     saved: Option<String>,
     dirty: bool,
     error: Option<String>,
     pending_open: Option<(PathBuf, Option<usize>)>,
+    pending_line: Option<usize>,
     executables: HashMap<String, String>,
     lsp: Option<LspSession>,
     /// Origins of follow-definition jumps (engine positions), newest last.
@@ -59,6 +66,63 @@ pub(crate) struct NativeEditor {
     conflict: bool,
     /// One-line status about disk activity (reload, deletion, format).
     disk_notice: Option<String>,
+    tabs: Vec<PathBuf>,
+    inactive_documents: HashMap<PathBuf, StashedDocument>,
+    close_pending: Option<PathBuf>,
+    files: Vec<ProjectFile>,
+    icon_tiles: crate::review::icons::IconTiles,
+    file_selection: usize,
+    index_generation: u64,
+    file_query: Entity<InputState>,
+    text_query: Entity<InputState>,
+    line_query: Entity<InputState>,
+    search_results: Vec<TextMatch>,
+    browser: BrowserMode,
+    indexing: bool,
+    searching: bool,
+    search_generation: u64,
+    expanded_dirs: HashSet<String>,
+    tree_limits: HashMap<String, usize>,
+    disk_comparison: Option<String>,
+    back_locations: Vec<HistoryLocation>,
+    forward_locations: Vec<HistoryLocation>,
+    navigating_history: bool,
+    journal_path: Option<PathBuf>,
+    journal_lock: Arc<Mutex<()>>,
+    journal_digest: Option<u64>,
+}
+
+#[derive(Clone)]
+struct HistoryLocation {
+    path: PathBuf,
+    position: Position,
+}
+
+struct StashedDocument {
+    editor: Entity<EditorState>,
+    saved: String,
+    dirty: bool,
+    disk_seen: Option<DiskSeen>,
+    conflict: bool,
+    disk_notice: Option<String>,
+    jump_back: Rc<RefCell<Vec<Position>>>,
+    subscribed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserMode {
+    Closed,
+    Files,
+    Tree,
+    Text,
+    Line,
+}
+
+#[derive(Clone, Copy)]
+enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
 }
 
 /// What the last disk check observed. `Content` hashes the bytes so an
@@ -95,23 +159,195 @@ struct LspSession {
     uri: String,
 }
 
+struct TreeRow {
+    key: String,
+    label: String,
+    depth: usize,
+    file: Option<PathBuf>,
+    more: bool,
+}
+
+const TREE_PAGE_SIZE: usize = 100;
+
+fn tree_rows(
+    files: &[ProjectFile],
+    expanded: &HashSet<String>,
+    limits: &HashMap<String, usize>,
+) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    let mut seen_dirs = HashSet::new();
+    let mut child_counts: HashMap<String, usize> = HashMap::new();
+    let mut more_rows = HashSet::new();
+    for file in files {
+        let parts: Vec<_> = file.label.split('/').collect();
+        let mut parent = String::new();
+        for (depth, part) in parts.iter().enumerate() {
+            if !expanded.contains(&parent) {
+                break;
+            }
+            let key = if parent.is_empty() {
+                (*part).to_owned()
+            } else {
+                format!("{parent}/{part}")
+            };
+            let is_file = depth + 1 == parts.len();
+            if !is_file && seen_dirs.contains(&key) {
+                parent = key;
+                continue;
+            }
+            let count = child_counts.entry(parent.clone()).or_default();
+            if *count >= limits.get(&parent).copied().unwrap_or(TREE_PAGE_SIZE) {
+                if more_rows.insert(parent.clone()) {
+                    rows.push(TreeRow {
+                        key: parent.clone(),
+                        label: "Show more…".into(),
+                        depth,
+                        file: None,
+                        more: true,
+                    });
+                }
+                break;
+            }
+            *count += 1;
+            if is_file {
+                rows.push(TreeRow {
+                    key: key.clone(),
+                    label: (*part).to_owned(),
+                    depth,
+                    file: Some(file.path.clone()),
+                    more: false,
+                });
+            } else if seen_dirs.insert(key.clone()) {
+                rows.push(TreeRow {
+                    key: key.clone(),
+                    label: (*part).to_owned(),
+                    depth,
+                    file: None,
+                    more: false,
+                });
+            }
+            parent = key;
+        }
+    }
+    rows
+}
+
 impl NativeEditor {
     pub(crate) fn new(
         root: &Path,
         executables: HashMap<String, String>,
+        data_root: Option<&Path>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let journal_path = data_root.map(|data_root| drafts::journal_path(data_root, root));
+        let recovered = journal_path
+            .as_ref()
+            .map_or_else(Vec::new, |path| drafts::read(path, root));
+        let mut inactive_documents = HashMap::new();
+        let mut tabs = Vec::new();
+        for mut draft in recovered {
+            draft.path = draft.path.canonicalize().unwrap_or_else(|_| {
+                draft
+                    .path
+                    .parent()
+                    .and_then(|parent| parent.canonicalize().ok())
+                    .zip(draft.path.file_name())
+                    .map(|(parent, name)| parent.join(name))
+                    .unwrap_or_else(|| draft.path.clone())
+            });
+            let document = cx.new(|cx| {
+                let mut editor = EditorState::new(window, cx);
+                editor.set_highlighter(language_for(&draft.path), cx);
+                editor.set_value(draft.text.clone(), window, cx);
+                editor
+            });
+            if document.read(cx).value().as_ref() != draft.text {
+                continue;
+            }
+            tabs.push(draft.path.clone());
+            inactive_documents.insert(
+                draft.path,
+                StashedDocument {
+                    editor: document,
+                    saved: draft.saved,
+                    dirty: true,
+                    disk_seen: None,
+                    conflict: false,
+                    disk_notice: Some("Recovered unsaved draft from the last session.".into()),
+                    jump_back: Rc::new(RefCell::new(Vec::new())),
+                    subscribed: false,
+                },
+            );
+        }
+        tabs.sort();
         let editor = cx.new(|cx| EditorState::new(window, cx));
         cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                this.dirty = this
-                    .saved
-                    .as_ref()
-                    .is_some_and(|saved| editor.read(cx).value().as_ref() != saved.as_str());
+                this.dirty = this.saved.as_ref().is_some_and(|saved| {
+                    file_bytes_for_buffer(saved, editor.read(cx).value().as_ref()) != saved.as_str()
+                });
                 this.push_text_to_server(cx);
                 cx.notify();
             }
+        })
+        .detach();
+        let file_query = cx.new(|cx| InputState::new(window, cx).placeholder("Find a file…"));
+        cx.subscribe(&file_query, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                this.file_selection = 0;
+                cx.notify();
+            }
+            InputEvent::PressEnter { .. } => {
+                let query = this.file_query.read(cx).value().to_string();
+                if let Some(file) =
+                    project::fuzzy_files(&this.files, &query).get(this.file_selection)
+                {
+                    this.request_open(file.path.clone(), None, cx);
+                    this.browser = BrowserMode::Tree;
+                }
+            }
+            _ => {}
+        })
+        .detach();
+        let text_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search project text…"));
+        cx.subscribe(&text_query, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                this.search_generation += 1;
+                this.search_results.clear();
+                this.searching = false;
+                cx.notify();
+            }
+            InputEvent::PressEnter { .. } => this.search_project(cx),
+            _ => {}
+        })
+        .detach();
+        let line_query = cx.new(|cx| InputState::new(window, cx).placeholder("Line number…"));
+        cx.subscribe(&line_query, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.pending_line = this.line_query.read(cx).value().parse().ok();
+                cx.notify();
+            }
+        })
+        .detach();
+        let scan_root = root.to_owned();
+        cx.spawn_in(window, async move |view, cx| {
+            let files = cx
+                .background_spawn(async move { project::scan(&scan_root) })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.index_generation == 0 {
+                    crate::review::icons::ensure_tiles(
+                        files.iter().map(|file| file.label.as_str()),
+                        &mut this.icon_tiles,
+                        cx,
+                    );
+                    this.files = files;
+                    this.indexing = false;
+                    cx.notify();
+                }
+            });
         })
         .detach();
         // Watch the open file for external edits (agents write on save). The
@@ -123,32 +359,100 @@ impl NativeEditor {
                 let Ok(change) = change else {
                     break;
                 };
-                let Some(change) = change else {
-                    continue;
-                };
-                let applied = cx.update(|window, cx| {
-                    view.update(cx, |this, cx| this.apply_disk_change(change, window, cx))
-                });
-                if !matches!(applied, Ok(Ok(()))) {
-                    break;
+                if let Some(change) = change {
+                    let applied = cx.update(|window, cx| {
+                        view.update(cx, |this, cx| this.apply_disk_change(change, window, cx))
+                    });
+                    if !matches!(applied, Ok(Ok(()))) {
+                        break;
+                    }
                 }
+                let write = view.update(cx, |this, cx| this.journal_if_changed(cx));
+                if let Ok(Some((path, journal, lock))) = write {
+                    let result = cx
+                        .background_spawn(async move {
+                            let _guard = lock.lock().expect("draft journal lock poisoned");
+                            drafts::write(&path, &journal)
+                        })
+                        .await;
+                    if let Err(error) = result {
+                        let _ = view.update(cx, |this, cx| {
+                            this.journal_digest = None;
+                            this.error = Some(format!("Could not save recovery draft: {error:#}"));
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+        cx.on_app_quit(|this, cx| {
+            let snapshot = this.journal_path.clone().map(|path| {
+                let journal = this.draft_snapshot(cx);
+                let lock = Arc::clone(&this.journal_lock);
+                cx.background_spawn(async move {
+                    let _guard = lock.lock().expect("draft journal lock poisoned");
+                    let _ = drafts::write(&path, &journal);
+                })
+            });
+            async move {
+                if let Some(task) = snapshot {
+                    task.await;
+                }
+            }
+        })
+        .detach();
+        cx.on_release(|this, cx| {
+            if let Some(path) = this.journal_path.as_ref() {
+                let journal = this.draft_snapshot(cx);
+                let _guard = this
+                    .journal_lock
+                    .lock()
+                    .expect("draft journal lock poisoned");
+                let _ = drafts::write(path, &journal);
             }
         })
         .detach();
         Self {
             root: root.to_owned(),
+            canonical_root: root.canonicalize().unwrap_or_else(|_| root.to_owned()),
             editor,
             path: None,
             saved: None,
             dirty: false,
             error: None,
             pending_open: None,
+            pending_line: None,
             executables,
             lsp: None,
             jump_back: Rc::new(RefCell::new(Vec::new())),
             disk_seen: None,
             conflict: false,
             disk_notice: None,
+            tabs,
+            inactive_documents,
+            close_pending: None,
+            files: Vec::new(),
+            icon_tiles: HashMap::new(),
+            file_selection: 0,
+            index_generation: 0,
+            file_query,
+            text_query,
+            line_query,
+            search_results: Vec::new(),
+            browser: BrowserMode::Tree,
+            indexing: true,
+            searching: false,
+            search_generation: 0,
+            expanded_dirs: HashSet::from([String::new()]),
+            tree_limits: HashMap::new(),
+            disk_comparison: None,
+            back_locations: Vec::new(),
+            forward_locations: Vec::new(),
+            navigating_history: false,
+            journal_path,
+            journal_lock: Arc::new(Mutex::new(())),
+            journal_digest: None,
         }
     }
 
@@ -157,7 +461,230 @@ impl NativeEditor {
     }
 
     pub(crate) fn has_jump_history(&self) -> bool {
-        !self.jump_back.borrow().is_empty()
+        !self.jump_back.borrow().is_empty() || !self.back_locations.is_empty()
+    }
+
+    pub(crate) fn open_file_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser = BrowserMode::Files;
+        self.file_query.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn show_browser(&mut self, mode: BrowserMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser = if self.browser == mode {
+            BrowserMode::Closed
+        } else {
+            mode
+        };
+        let input = match self.browser {
+            BrowserMode::Files => Some(&self.file_query),
+            BrowserMode::Text => Some(&self.text_query),
+            BrowserMode::Line => Some(&self.line_query),
+            BrowserMode::Closed | BrowserMode::Tree => None,
+        };
+        if let Some(input) = input {
+            input.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn search_project(&mut self, cx: &mut Context<Self>) {
+        let query = self.text_query.read(cx).value().to_string();
+        let files = self.files.clone();
+        let root = self.root.clone();
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        self.searching = true;
+        cx.spawn(async move |view, cx| {
+            let results = cx
+                .background_spawn(async move { project::search_text(&root, &files, &query) })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.search_generation == generation {
+                    this.search_results = results;
+                    this.searching = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn refresh_files(&mut self, cx: &mut Context<Self>) {
+        self.index_generation += 1;
+        let generation = self.index_generation;
+        self.indexing = true;
+        let root = self.root.clone();
+        cx.spawn(async move |view, cx| {
+            let files = cx
+                .background_spawn(async move { project::scan(&root) })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.index_generation == generation {
+                    crate::review::icons::ensure_tiles(
+                        files.iter().map(|file| file.label.as_str()),
+                        &mut this.icon_tiles,
+                        cx,
+                    );
+                    this.files = files;
+                    this.indexing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn compare_with_disk(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        match read_text_file(path) {
+            Ok(disk) => {
+                let draft = self.editor.read(cx).value().to_string();
+                let diff = similar::TextDiff::from_lines(&disk, &draft);
+                let comparison = diff.unified_diff().header("disk", "draft").to_string();
+                let preview: String = comparison.chars().take(20_000).collect();
+                self.disk_comparison = Some(if preview.len() < comparison.len() {
+                    format!(
+                        "{preview}\n… diff truncated; use Review or an external editor for the full file"
+                    )
+                } else {
+                    preview
+                });
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("Could not compare: {error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let picker =
+            cx.prompt_for_new_path(parent, path.file_name().and_then(|name| name.to_str()));
+        let draft = self.editor.read(cx).value().to_string();
+        let copy = self
+            .saved
+            .as_deref()
+            .map_or_else(
+                || Cow::Borrowed(draft.as_str()),
+                |saved| file_bytes_for_buffer(saved, &draft),
+            )
+            .into_owned();
+        cx.spawn_in(window, async move |view, cx| {
+            let Some(target) = picker.await.ok().into_iter().flatten().flatten().next() else {
+                return;
+            };
+            let result = (|| -> Result<()> {
+                let parent = target.parent().context("Save location has no parent")?;
+                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+                if copy.len() as u64 > MAX_FILE_BYTES {
+                    bail!("The draft is larger than 2 MiB. Open it in Zed or VS Code.");
+                }
+                temporary.write_all(copy.as_bytes())?;
+                temporary.as_file().sync_all()?;
+                temporary
+                    .persist_noclobber(&target)
+                    .context("Could not create the copy")?;
+                Ok(())
+            })();
+            let _ = view.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.disk_notice = Some(format!(
+                            "Saved a copy to {}. The original draft is still open.",
+                            target.display()
+                        ));
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(format!("Could not save a copy: {error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn stash_active(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        self.disk_comparison = None;
+        self.clear_lsp_providers(cx);
+        self.lsp.take();
+        self.inactive_documents.insert(
+            path,
+            StashedDocument {
+                editor: self.editor.clone(),
+                saved: self.saved.take().unwrap_or_default(),
+                dirty: self.dirty,
+                disk_seen: self.disk_seen.take(),
+                conflict: self.conflict,
+                disk_notice: self.disk_notice.take(),
+                jump_back: Rc::clone(&self.jump_back),
+                subscribed: true,
+            },
+        );
+    }
+
+    fn draft_snapshot(&self, cx: &App) -> Journal {
+        let mut drafts = Vec::new();
+        if self.dirty
+            && let (Some(path), Some(saved)) = (&self.path, &self.saved)
+        {
+            drafts.push(Draft {
+                path: path.clone(),
+                saved: saved.clone(),
+                text: self.editor.read(cx).value().to_string(),
+            });
+        }
+        for (path, document) in &self.inactive_documents {
+            if document.dirty {
+                drafts.push(Draft {
+                    path: path.clone(),
+                    saved: document.saved.clone(),
+                    text: document.editor.read(cx).value().to_string(),
+                });
+            }
+        }
+        drafts.sort_by(|a, b| a.path.cmp(&b.path));
+        Journal {
+            root: self.root.clone(),
+            drafts,
+        }
+    }
+
+    fn journal_if_changed(&mut self, cx: &App) -> Option<(PathBuf, Journal, Arc<Mutex<()>>)> {
+        let path = self.journal_path.clone()?;
+        let journal = self.draft_snapshot(cx);
+        let digest = content_hash(&serde_json::to_vec(&journal).ok()?);
+        if self.journal_digest == Some(digest) {
+            return None;
+        }
+        self.journal_digest = Some(digest);
+        Some((path, journal, Arc::clone(&self.journal_lock)))
+    }
+
+    fn subscribe_changes(&self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
+        cx.subscribe(editor, |this, editor, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && this.editor.entity_id() == editor.entity_id()
+            {
+                this.dirty = this.saved.as_ref().is_some_and(|saved| {
+                    file_bytes_for_buffer(saved, editor.read(cx).value().as_ref()) != saved.as_str()
+                });
+                this.push_text_to_server(cx);
+                cx.notify();
+            }
+        })
+        .detach();
     }
 
     /// A Review event has no Window handle. Apply it on the next render, when
@@ -183,39 +710,96 @@ impl NativeEditor {
             .root
             .canonicalize()
             .context("Checkout is unavailable")?;
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("Could not open {}", path.display()))?;
+        let canonical = if self.inactive_documents.contains_key(path) {
+            path.to_owned()
+        } else {
+            path.canonicalize()
+                .with_context(|| format!("Could not open {}", path.display()))?
+        };
         if !canonical.starts_with(&canonical_root) {
             bail!("Choose a file inside this checkout.");
         }
-        if self.dirty {
-            if self.path.as_deref() == Some(canonical.as_path()) {
-                self.editor.update(cx, |editor, cx| {
-                    if let Some(line) = line.filter(|line| *line > 0) {
-                        editor.set_cursor_position(
-                            Position::new((line - 1).min(u32::MAX as usize) as u32, 0),
-                            window,
-                            cx,
-                        );
-                    }
-                    editor.focus(window, cx);
-                });
-                return Ok(());
-            }
-            bail!("Save or discard the current changes before opening another file.");
+        let origin = self.path.as_ref().map(|path| HistoryLocation {
+            path: path.clone(),
+            position: self.editor.read(cx).cursor_position(),
+        });
+        if self.path.as_deref() == Some(canonical.as_path()) {
+            self.place_cursor(line, window, cx);
+            let moved = line.is_some_and(|line| {
+                origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.position.line != line.saturating_sub(1) as u32)
+            });
+            self.record_origin(origin, moved, cx);
+            return Ok(());
         }
-        let contents = read_text_file(&canonical)?;
-        let language = language_for(&canonical);
-        let old_text = self.saved.clone().unwrap_or_default();
-        let old_language = self
-            .path
-            .as_ref()
-            .map(|path| language_for(path))
-            .unwrap_or("");
+        if let Some(stashed) = self.inactive_documents.remove(&canonical) {
+            self.stash_active(cx);
+            let subscribed = stashed.subscribed;
+            self.editor = stashed.editor;
+            if !subscribed {
+                self.subscribe_changes(&self.editor, cx);
+            }
+            self.saved = Some(stashed.saved);
+            self.dirty = stashed.dirty;
+            self.disk_seen = stashed.disk_seen;
+            self.conflict = stashed.conflict;
+            self.disk_notice = stashed.disk_notice;
+            self.jump_back = stashed.jump_back;
+        } else {
+            let contents = read_text_file(&canonical)?;
+            let language = language_for(&canonical);
+            let next_editor = cx.new(|cx| {
+                let mut editor = EditorState::new(window, cx);
+                editor.set_highlighter(language, cx);
+                editor.set_value(contents.clone(), window, cx);
+                editor
+            });
+            if next_editor.read(cx).value().as_ref() != contents {
+                bail!(
+                    "This file's text format cannot be preserved by the built-in editor. Open it in Zed or VS Code."
+                );
+            }
+            self.stash_active(cx);
+            self.editor = next_editor;
+            self.subscribe_changes(&self.editor, cx);
+            self.saved = Some(contents);
+            self.dirty = false;
+            self.conflict = false;
+            self.disk_notice = None;
+            self.disk_seen = None;
+            self.jump_back = Rc::new(RefCell::new(Vec::new()));
+            self.tabs.push(canonical.clone());
+        }
+        self.path = Some(canonical.clone());
+        self.place_cursor(line, window, cx);
+        self.check_disk(window, cx);
+        self.restart_lsp(&canonical, language_for(&canonical), window, cx);
+        self.record_origin(origin, true, cx);
+        Ok(())
+    }
+
+    fn record_origin(
+        &mut self,
+        origin: Option<HistoryLocation>,
+        moved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if moved
+            && !self.navigating_history
+            && let Some(origin) = origin
+        {
+            if self.back_locations.len() >= 100 {
+                self.back_locations.remove(0);
+            }
+            self.back_locations.push(origin);
+            self.forward_locations.clear();
+            cx.notify();
+        }
+    }
+
+    fn place_cursor(&mut self, line: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
-            editor.set_highlighter(language, cx);
-            editor.set_value(contents.clone(), window, cx);
             if let Some(line) = line.filter(|line| *line > 0) {
                 editor.set_cursor_position(
                     Position::new((line - 1).min(u32::MAX as usize) as u32, 0),
@@ -225,80 +809,100 @@ impl NativeEditor {
             }
             editor.focus(window, cx);
         });
-        if self.editor.read(cx).value().as_ref() != contents {
-            self.editor.update(cx, |editor, cx| {
-                editor.set_highlighter(old_language, cx);
-                editor.set_value(old_text, window, cx);
-            });
-            bail!(
-                "This file's text format cannot be preserved by the built-in editor. Open it in Zed or VS Code."
-            );
-        }
-        if self.path.as_deref() != Some(canonical.as_path()) {
-            // A different file: origins recorded in the previous document
-            // would jump to meaningless offsets here.
-            self.jump_back.borrow_mut().clear();
-        }
-        self.path = Some(canonical.clone());
-        self.saved = Some(contents.clone());
-        self.dirty = false;
-        self.conflict = false;
-        self.disk_notice = None;
-        self.disk_seen = None;
-        self.restart_lsp(&canonical, language, window, cx);
-        Ok(())
     }
 
-    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
-            self.error =
-                Some("Save or discard the current changes before opening another file.".into());
+    fn close_tab(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty = if self.path.as_deref() == Some(path) {
+            self.dirty
+        } else {
+            self.inactive_documents
+                .get(path)
+                .is_some_and(|document| document.dirty)
+        };
+        if dirty {
+            self.close_pending = Some(path.to_owned());
             cx.notify();
-            return;
+        } else {
+            self.finish_close(path, window, cx);
         }
-        let picker = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open a file in this checkout".into()),
-        });
-        cx.spawn_in(window, async move |view, cx| match picker.await {
-            Ok(Ok(Some(mut paths))) => {
-                if let Some(path) = paths.pop() {
-                    let _ = cx.update(|window, cx| {
-                        view.update(cx, |this, cx| {
-                            this.error = this
-                                .open(&path, None, window, cx)
-                                .err()
-                                .map(|e| format!("{e:#}"));
-                            cx.notify();
-                        })
-                        .ok();
-                    });
-                }
+    }
+
+    fn confirm_close(&mut self, choice: CloseChoice, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.close_pending.clone() else {
+            return;
+        };
+        match choice {
+            CloseChoice::Cancel => {
+                self.close_pending = None;
+                cx.notify();
             }
-            Ok(Ok(None)) | Err(_) => {}
-            Ok(Err(error)) => {
-                let _ = cx.update(|_, cx| {
-                    view.update(cx, |this, cx| {
-                        this.error = Some(format!("Could not open file picker: {error:#}"));
+            CloseChoice::Discard => {
+                self.close_pending = None;
+                self.finish_close(&path, window, cx);
+            }
+            CloseChoice::Save => {
+                if self.path.as_deref() == Some(path.as_path()) {
+                    self.save(window, cx);
+                    if self.dirty {
+                        return;
+                    }
+                } else if let Some(document) = self.inactive_documents.get_mut(&path) {
+                    let draft = document.editor.read(cx).value().to_string();
+                    let replacement = file_bytes_for_buffer(&document.saved, &draft);
+                    if let Err(error) =
+                        save_if_unchanged(&path, document.saved.as_bytes(), replacement.as_bytes())
+                    {
+                        self.error = Some(format!("Could not save: {error:#}"));
                         cx.notify();
-                    })
-                    .ok();
-                });
+                        return;
+                    }
+                }
+                self.close_pending = None;
+                self.finish_close(&path, window, cx);
             }
-        })
-        .detach();
+        }
+    }
+
+    fn finish_close(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        self.tabs.retain(|tab| tab != path);
+        if self.path.as_deref() == Some(path) {
+            self.disk_comparison = None;
+            self.lsp.take();
+            self.path = None;
+            self.saved = None;
+            self.dirty = false;
+            self.conflict = false;
+            self.disk_seen = None;
+            self.disk_notice = None;
+            self.jump_back.borrow_mut().clear();
+            if let Some(next) = self.tabs.last().cloned() {
+                self.error = self
+                    .open(&next, None, window, cx)
+                    .err()
+                    .map(|error| format!("{error:#}"));
+            } else {
+                let editor = cx.new(|cx| EditorState::new(window, cx));
+                self.editor = editor;
+                self.subscribe_changes(&self.editor, cx);
+            }
+        } else {
+            self.inactive_documents.remove(path);
+        }
+        cx.notify();
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dirty {
+            return;
+        }
         let Some(path) = self.path.clone() else {
             return;
         };
         let Some(saved) = self.saved.clone() else {
             return;
         };
-        let contents = self.editor.read(cx).value().to_string();
+        let draft = self.editor.read(cx).value().to_string();
+        let contents = file_bytes_for_buffer(&saved, &draft).into_owned();
         match save_if_unchanged(&path, saved.as_bytes(), contents.as_bytes()) {
             Ok(()) => {
                 self.saved = Some(contents);
@@ -386,7 +990,13 @@ impl NativeEditor {
         // Compare against the buffer before the repeat guard: a user action
         // (typing the disk text, or discarding) can make them match even
         // though the disk bytes are the ones already seen.
-        if bytes == self.editor.read(cx).value().as_bytes() {
+        if bytes
+            == file_bytes_for_buffer(
+                self.saved.as_deref().unwrap_or_default(),
+                self.editor.read(cx).value().as_ref(),
+            )
+            .as_bytes()
+        {
             self.disk_seen = Some(seen);
             return Some(DiskChange::Adopted);
         }
@@ -689,13 +1299,59 @@ impl NativeEditor {
 
     /// Return to the origin of the last follow-definition jump, if any.
     pub(crate) fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(position) = self.jump_back.borrow_mut().pop() else {
+        let Some(target) = self.back_locations.pop() else {
+            if let Some(position) = self.jump_back.borrow_mut().pop() {
+                self.editor.update(cx, |editor, cx| {
+                    editor.set_cursor_position(position, window, cx);
+                    editor.focus(window, cx);
+                });
+                cx.notify();
+            }
             return;
         };
-        self.editor.update(cx, |editor, cx| {
-            editor.set_cursor_position(position, window, cx);
-            editor.focus(window, cx);
+        let current = self.path.as_ref().map(|path| HistoryLocation {
+            path: path.clone(),
+            position: self.editor.read(cx).cursor_position(),
         });
+        self.navigating_history = true;
+        let result = self.open(&target.path, None, window, cx);
+        self.navigating_history = false;
+        if let Err(error) = result {
+            self.back_locations.push(target);
+            self.error = Some(format!("Could not go back: {error:#}"));
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.set_cursor_position(target.position, window, cx)
+        });
+        if let Some(current) = current {
+            self.forward_locations.push(current);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.forward_locations.pop() else {
+            return;
+        };
+        let current = self.path.as_ref().map(|path| HistoryLocation {
+            path: path.clone(),
+            position: self.editor.read(cx).cursor_position(),
+        });
+        self.navigating_history = true;
+        let result = self.open(&target.path, None, window, cx);
+        self.navigating_history = false;
+        if let Err(error) = result {
+            self.forward_locations.push(target);
+            self.error = Some(format!("Could not go forward: {error:#}"));
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.set_cursor_position(target.position, window, cx)
+        });
+        if let Some(current) = current {
+            self.back_locations.push(current);
+        }
         cx.notify();
     }
 
@@ -712,14 +1368,407 @@ impl NativeEditor {
         }
         cx.notify();
     }
+
+    fn file_icon(&self, name: &str) -> AnyElement {
+        use crate::review::icons::{FALLBACK, icon_key};
+        match self
+            .icon_tiles
+            .get(icon_key(name))
+            .or_else(|| self.icon_tiles.get(FALLBACK))
+        {
+            Some(tile) => img(tile.clone())
+                .size(px(16.))
+                .flex_shrink_0()
+                .into_any_element(),
+            None => Icon::new(IconName::File)
+                .size(px(16.))
+                .text_color(rgb(0x858989))
+                .into_any_element(),
+        }
+    }
+
+    fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = h_flex()
+            .debug_selector(|| "native-tab-strip".into())
+            .h(px(43.))
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .px_2()
+            .overflow_x_scrollbar();
+        for path in &self.tabs {
+            let selected = self.path.as_deref() == Some(path.as_path());
+            let dirty = if selected {
+                self.dirty
+            } else {
+                self.inactive_documents
+                    .get(path)
+                    .is_some_and(|document| document.dirty)
+            };
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let tab_path = path.clone();
+            let close_path = path.clone();
+            row = row.child(
+                h_flex()
+                    .h(px(32.))
+                    .flex_shrink_0()
+                    .gap_0()
+                    .pr_1()
+                    .rounded_md()
+                    .when(selected, |row| row.bg(rgb(0x1c1e22)))
+                    .child(
+                        Button::new(format!("native-tab-{}", path.display()))
+                            .small()
+                            .ghost()
+                            .accessibility_label(name.clone())
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .text_color(rgb(if selected { 0xe0e2e5 } else { 0x8b9099 }))
+                                    .child(self.file_icon(&name))
+                                    .child(name),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.error = this
+                                    .open(&tab_path, None, window, cx)
+                                    .err()
+                                    .map(|e| format!("{e:#}"));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("native-close-{}", path.display()))
+                            .accessibility_label("Close file")
+                            .label(if dirty { "●" } else { "×" })
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(&close_path, window, cx);
+                            })),
+                    ),
+            );
+        }
+        row.into_any_element()
+    }
+
+    fn render_editor_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let has_file = self.path.is_some();
+        let dirty = self.dirty;
+        Button::new("native-editor-actions")
+            .label("⋯")
+            .small()
+            .ghost()
+            .accessibility_label("Editor actions")
+            .dropdown_menu(move |mut menu, _, _| {
+                for (label, action, enabled) in [
+                    ("Find in file", 0, has_file),
+                    ("Replace in file", 1, has_file),
+                    ("Go to line…", 2, has_file),
+                    ("Save", 3, dirty),
+                    ("Save as…", 4, has_file),
+                    ("Discard changes", 5, dirty),
+                    ("Find file…", 6, true),
+                    ("Search project…", 7, true),
+                    ("Show file tree", 8, true),
+                    ("Refresh files", 9, true),
+                ] {
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| match action {
+                                0 | 1 => this
+                                    .editor
+                                    .update(cx, |editor, cx| editor.open_search(action == 1, cx)),
+                                2 => this.show_browser(BrowserMode::Line, window, cx),
+                                3 => this.save(window, cx),
+                                4 => this.save_as(window, cx),
+                                5 => this.discard(window, cx),
+                                6 => this.open_file_finder(window, cx),
+                                7 => this.show_browser(BrowserMode::Text, window, cx),
+                                8 => {
+                                    this.browser = BrowserMode::Tree;
+                                    cx.notify();
+                                }
+                                _ => this.refresh_files(cx),
+                            })
+                            .ok();
+                        },
+                    ));
+                }
+                menu = menu.separator();
+                for kind in ExternalEditorKind::ALL {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!("Open in {}", kind.label())).on_click(
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| this.open_external(kind, cx))
+                                    .ok();
+                            },
+                        ),
+                    );
+                }
+                menu
+            })
+    }
+
+    fn render_browser(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.browser == BrowserMode::Closed {
+            return None;
+        }
+        let mut panel = v_flex()
+            .flex_1()
+            .min_h_0()
+            .gap_0()
+            .px_2()
+            .py_2()
+            .overflow_y_scrollbar();
+        if self.browser == BrowserMode::Files {
+            panel = panel.on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                if key == "arrowdown" || key == "arrowup" {
+                    let query = this.file_query.read(cx).value().to_string();
+                    let count = project::fuzzy_files(&this.files, &query).len();
+                    if count > 0 {
+                        if key == "arrowdown" {
+                            this.file_selection = (this.file_selection + 1).min(count - 1);
+                        } else {
+                            this.file_selection = this.file_selection.saturating_sub(1);
+                        }
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }));
+        }
+        match self.browser {
+            BrowserMode::Files => {
+                let query = self.file_query.read(cx).value().to_string();
+                panel = panel.child(Input::new(&self.file_query).small()).child(
+                    Button::new("native-refresh-files")
+                        .label("Refresh files")
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_files(cx))),
+                );
+                if self.indexing {
+                    panel = panel.child("Indexing checkout…");
+                }
+                for (index, file) in project::fuzzy_files(&self.files, &query)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let path = file.path.clone();
+                    panel = panel.child(
+                        Button::new(format!("native-file-{}", file.label))
+                            .label(file.label)
+                            .when(index == self.file_selection, |button| button.primary())
+                            .when(index != self.file_selection, |button| button.ghost())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.error = this
+                                    .open(&path, None, window, cx)
+                                    .err()
+                                    .map(|error| format!("{error:#}"));
+                                if this.error.is_none() {
+                                    this.browser = BrowserMode::Tree;
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            BrowserMode::Tree => {
+                for item in tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits) {
+                    let expanded = self.expanded_dirs.contains(&item.key);
+                    let selected = item.file.is_some()
+                        && self
+                            .path
+                            .as_ref()
+                            .and_then(|path| path.strip_prefix(&self.canonical_root).ok())
+                            .is_some_and(|path| path == Path::new(&item.key));
+                    let icon = if item.file.is_some() {
+                        self.file_icon(&item.label)
+                    } else {
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(px(16.))
+                        .text_color(rgb(0x737983))
+                        .into_any_element()
+                    };
+                    let key = item.key.clone();
+                    let id = if item.more {
+                        format!("native-tree-more-{key}")
+                    } else if item.file.is_some() {
+                        format!("native-tree-file-{key}")
+                    } else {
+                        format!("native-tree-dir-{key}")
+                    };
+                    panel = panel.child(
+                        Button::new(id)
+                            .ghost()
+                            .small()
+                            .h(px(28.))
+                            .w_full()
+                            .p_0()
+                            .accessibility_label(item.label.clone())
+                            .when(selected, |row| row.bg(rgb(0x222b36)))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .pl(px(10. + item.depth as f32 * 16.))
+                                    .pr_2()
+                                    .text_color(rgb(if selected { 0x61afef } else { 0xa4a9b2 }))
+                                    .child(icon)
+                                    .child(
+                                        div().flex_1().min_w_0().text_ellipsis().child(item.label),
+                                    )
+                                    .when(selected && self.dirty, |row| row.child("●")),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if item.more {
+                                    *this
+                                        .tree_limits
+                                        .entry(key.clone())
+                                        .or_insert(TREE_PAGE_SIZE) += TREE_PAGE_SIZE;
+                                } else if let Some(path) = &item.file {
+                                    this.error = this
+                                        .open(path, None, window, cx)
+                                        .err()
+                                        .map(|e| format!("{e:#}"));
+                                } else if !this.expanded_dirs.insert(key.clone()) {
+                                    this.expanded_dirs.remove(&key);
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            BrowserMode::Text => {
+                panel = panel.child(Input::new(&self.text_query).small()).child(
+                    Button::new("native-run-search")
+                        .label("Search")
+                        .outline()
+                        .on_click(cx.listener(|this, _, _, cx| this.search_project(cx))),
+                );
+                if self.searching {
+                    panel = panel.child("Searching…");
+                }
+                for (index, item) in self.search_results.iter().enumerate() {
+                    let path = item.path.clone();
+                    let line = item.line;
+                    panel = panel.child(
+                        Button::new(format!("native-search-{index}"))
+                            .label(format!("{}:{}  {}", item.label, line, item.preview))
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.error = this
+                                    .open(&path, Some(line), window, cx)
+                                    .err()
+                                    .map(|error| format!("{error:#}"));
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            BrowserMode::Line => {
+                panel = panel.child(Input::new(&self.line_query).small()).child(
+                    Button::new("native-go-line")
+                        .label("Go to line")
+                        .outline()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let line = this.line_query.read(cx).value().parse().ok();
+                            if let Some(path) = this.path.clone() {
+                                this.error = this
+                                    .open(&path, line, window, cx)
+                                    .err()
+                                    .map(|error| format!("{error:#}"));
+                            }
+                            this.browser = BrowserMode::Tree;
+                            cx.notify();
+                        })),
+                );
+            }
+            BrowserMode::Closed => unreachable!(),
+        }
+        let project_name = self
+            .root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        Some(
+            v_flex()
+                .debug_selector(|| "native-sidebar".into())
+                .w(px(260.))
+                .h_full()
+                .flex_shrink_0()
+                .min_h_0()
+                .bg(rgb(0x121416))
+                .border_r_1()
+                .border_color(rgb(0x26292e))
+                .child(
+                    h_flex()
+                        .h(px(44.))
+                        .flex_shrink_0()
+                        .px_3()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_sm()
+                                .text_color(rgb(0xd3d6dc))
+                                .child(project_name),
+                        )
+                        .child(
+                            Button::new("native-open-file")
+                                .icon(IconName::Search)
+                                .small()
+                                .ghost()
+                                .accessibility_label("Find file")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_file_finder(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("native-file-tree")
+                                .icon(IconName::FolderClosed)
+                                .small()
+                                .ghost()
+                                .accessibility_label("Show file tree")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.browser = BrowserMode::Tree;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(panel)
+                .into_any_element(),
+        )
+    }
 }
 
 fn language_for(path: &Path) -> &'static str {
+    if path.file_name().is_some_and(|name| name == "Cargo.lock") {
+        return "toml";
+    }
     match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
         "rs" => "rust",
+        "toml" => "toml",
         "py" => "python",
         "js" | "jsx" => "javascript",
-        "ts" | "tsx" => "typescript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
         "go" => "go",
         "sh" => "bash",
         "md" => "markdown",
@@ -755,6 +1804,27 @@ fn text_from_bytes(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).context("This file is not UTF-8; open it in Zed or VS Code")
 }
 
+/// Keep a file's consistent newline convention when the editor inserts a
+/// newline or text is pasted. Mixed-newline files are left byte-for-byte as
+/// edited because there is no unambiguous style to apply.
+fn file_bytes_for_buffer<'a>(saved: &str, draft: &'a str) -> Cow<'a, str> {
+    let has_crlf = saved.contains("\r\n");
+    let has_lone_lf = saved.as_bytes().iter().enumerate().any(|(index, byte)| {
+        *byte == b'\n' && (index == 0 || saved.as_bytes()[index - 1] != b'\r')
+    });
+    if has_crlf && !has_lone_lf {
+        let lone = draft.as_bytes().iter().enumerate().any(|(index, byte)| {
+            *byte == b'\n' && (index == 0 || draft.as_bytes()[index - 1] != b'\r')
+        });
+        if lone {
+            return Cow::Owned(draft.replace("\r\n", "\n").replace('\n', "\r\n"));
+        }
+    } else if !has_crlf && has_lone_lf && draft.contains("\r\n") {
+        return Cow::Owned(draft.replace("\r\n", "\n"));
+    }
+    Cow::Borrowed(draft)
+}
+
 fn content_hash(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -762,6 +1832,9 @@ fn content_hash(bytes: &[u8]) -> u64 {
 }
 
 fn save_if_unchanged(path: &Path, original: &[u8], replacement: &[u8]) -> Result<()> {
+    if replacement.len() as u64 > MAX_FILE_BYTES {
+        bail!("The draft is larger than 2 MiB. Open it in Zed or VS Code.");
+    }
     let current =
         fs::read(path).with_context(|| format!("Could not re-read {}", path.display()))?;
     if current != original {
@@ -785,6 +1858,8 @@ fn save_if_unchanged(path: &Path, original: &[u8], replacement: &[u8]) -> Result
     temporary
         .persist(path)
         .context("Could not replace the file")?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -802,80 +1877,100 @@ impl Render for NativeEditor {
                 .err()
                 .map(|e| format!("{e:#}"));
         }
+        if let Some(line) = self.pending_line.take() {
+            if let Some(path) = self.path.clone() {
+                self.error = self
+                    .open(&path, Some(line), window, cx)
+                    .err()
+                    .map(|error| format!("{error:#}"));
+            }
+            self.browser = BrowserMode::Tree;
+        }
         let label = self
             .path
             .as_ref()
-            .and_then(|path| path.strip_prefix(&self.root).ok())
+            .and_then(|path| path.strip_prefix(&self.canonical_root).ok())
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "No file open".into());
-        let view = cx.entity().downgrade();
-        v_flex()
-            .size_full()
-            .gap_2()
-            .p_3()
+        let browser = self.render_browser(cx);
+        let tabs = self.render_tabs(cx);
+        let actions = self.render_editor_menu(cx).into_any_element();
+        let code = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(rgb(0x0c0e10))
             .child(
                 h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("native-open-file")
-                            .label("Open file…")
-                            .outline()
-                            .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx))),
-                    )
-                    .child(
-                        Button::new("native-save-file")
-                            .label("Save")
-                            .primary()
-                            .disabled(!self.dirty)
-                            .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
-                    )
-                    .when(self.dirty, |row| {
-                        row.child(
-                            Button::new("native-discard-file")
-                                .label("Discard changes")
-                                .ghost()
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.discard(window, cx)),
-                                ),
-                        )
-                    })
-                    .child(
-                        Button::new("native-open-in")
-                            .accessibility_label("Open in")
-                            .outline()
-                            .dropdown_caret(true)
-                            .label("Open in")
-                            .dropdown_menu(move |mut menu, _, _| {
-                                for kind in ExternalEditorKind::ALL {
-                                    let option_view = view.clone();
-                                    menu = menu.item(PopupMenuItem::new(kind.label()).on_click(
-                                        move |_, _, cx| {
-                                            option_view
-                                                .update(cx, |this, cx| this.open_external(kind, cx))
-                                                .ok();
-                                        },
-                                    ));
-                                }
-                                menu
-                            }),
-                    )
-                    .when(!self.jump_back.borrow().is_empty(), |row| {
+                    .debug_selector(|| "native-toolbar".into())
+                    .h(px(44.))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(0x202328))
+                    .child(tabs)
+                    .when(self.has_jump_history(), |row| {
                         row.child(
                             Button::new("native-go-back")
-                                .accessibility_label("Go back to definition origin")
-                                .label("Back")
+                                .label("‹")
+                                .small()
                                 .ghost()
+                                .accessibility_label("Go back")
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.go_back(window, cx)),
                                 ),
                         )
                     })
-                    .child(div().text_sm().text_color(rgb(0x858989)).child(label))
-                    .when(self.dirty, |row| {
-                        row.child(div().text_sm().text_color(rgb(0xfbbf24)).child("Unsaved"))
-                    }),
+                    .when(!self.forward_locations.is_empty(), |row| {
+                        row.child(
+                            Button::new("native-go-forward")
+                                .label("›")
+                                .small()
+                                .ghost()
+                                .accessibility_label("Go forward")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.go_forward(window, cx)),
+                                ),
+                        )
+                    })
+                    .child(actions),
             )
+            .when_some(self.close_pending.clone(), |view, path| {
+                view.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_sm().child(format!(
+                            "Save changes to {} before closing?",
+                            path.display()
+                        )))
+                        .child(
+                            Button::new("native-close-save")
+                                .label("Save")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_close(CloseChoice::Save, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("native-close-discard")
+                                .label("Discard")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_close(CloseChoice::Discard, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("native-close-cancel")
+                                .label("Cancel")
+                                .ghost()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_close(CloseChoice::Cancel, window, cx)
+                                })),
+                        ),
+                )
+            })
             .when_some(self.error.clone(), |view, error| {
                 view.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
             })
@@ -899,15 +1994,85 @@ impl Render for NativeEditor {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.reload_from_disk(window, cx)
                                 })),
+                        )
+                        .child(
+                            Button::new("native-compare-file")
+                                .label("Compare")
+                                .outline()
+                                .on_click(cx.listener(|this, _, _, cx| this.compare_with_disk(cx))),
                         ),
+                )
+            })
+            .when_some(self.disk_comparison.clone(), |view, comparison| {
+                view.child(
+                    v_flex()
+                        .max_h(px(220.))
+                        .overflow_y_scrollbar()
+                        .p_2()
+                        .border_1()
+                        .border_color(rgb(0x454545))
+                        .child(div().text_sm().child("Disk → draft"))
+                        .child(div().text_xs().child(comparison)),
                 )
             })
             .child(
                 div()
+                    .debug_selector(|| "native-code-pane".into())
                     .flex_1()
-                    .min_h(px(160.))
-                    .child(Editor::new(&self.editor).h_full()),
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .pt_2()
+                    .child(Editor::new(&self.editor).h_full().appearance(false)),
             )
+            .child(
+                h_flex()
+                    .h(px(24.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(0x727985))
+                    .border_t_1()
+                    .border_color(rgb(0x202328))
+                    .child(div().flex_1().min_w_0().overflow_hidden().child(label))
+                    .when(self.dirty, |row| row.child("Modified"))
+                    .child("UTF-8"),
+            );
+        h_flex()
+            .size_full()
+            .min_h_0()
+            .items_stretch()
+            .overflow_hidden()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape"
+                    && (matches!(
+                        this.browser,
+                        BrowserMode::Files | BrowserMode::Text | BrowserMode::Line
+                    ) || this.disk_comparison.is_some())
+                {
+                    this.browser = BrowserMode::Tree;
+                    this.disk_comparison = None;
+                    this.editor_focus(cx).focus(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if event.keystroke.key.eq_ignore_ascii_case("s")
+                    && crate::command_palette::is_primary_modifier(
+                        event.keystroke.modifiers.platform,
+                        event.keystroke.modifiers.control,
+                    )
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.shift
+                    && this.path.is_some()
+                {
+                    this.save(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .when_some(browser, |row, browser| row.child(browser))
+            .child(code)
     }
 }
 
@@ -915,6 +2080,28 @@ impl Render for NativeEditor {
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[test]
+    fn expanded_tree_keeps_later_top_level_folders_visible() {
+        let mut files: Vec<ProjectFile> = (0..350)
+            .map(|index| ProjectFile {
+                path: PathBuf::from(format!("a/{index:03}.txt")),
+                label: format!("a/{index:03}.txt"),
+            })
+            .collect();
+        files.push(ProjectFile {
+            path: PathBuf::from("z/last.txt"),
+            label: "z/last.txt".into(),
+        });
+        let expanded = HashSet::from([String::new(), "a".into()]);
+        let rows = tree_rows(&files, &expanded, &HashMap::new());
+        assert!(rows.iter().any(|row| row.key == "z"));
+        assert!(rows.iter().any(|row| row.more && row.key == "a"));
+        assert_eq!(
+            rows.iter().filter(|row| row.file.is_some()).count(),
+            TREE_PAGE_SIZE
+        );
+    }
 
     #[test]
     fn save_preserves_draft_when_disk_changed_and_keeps_permissions() {
@@ -928,22 +2115,288 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "human edit\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_posix_mode_and_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        fs::write(&target, "before\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &link).unwrap();
+        save_if_unchanged(&target, b"before\n", b"after\n").unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&link).unwrap(), "after\n");
+    }
+
     /// Test host: a real window plus a bare `NativeEditor`, without entering
     /// any repository workspace.
     fn test_editor<'a>(
         cx: &'a mut gpui_kit::TestAppContext,
         dir: &std::path::Path,
     ) -> (Entity<NativeEditor>, &'a mut gpui_kit::VisualTestContext) {
+        test_editor_with_data(cx, dir, None)
+    }
+
+    fn test_editor_with_data<'a>(
+        cx: &'a mut gpui_kit::TestAppContext,
+        dir: &std::path::Path,
+        data_root: Option<PathBuf>,
+    ) -> (Entity<NativeEditor>, &'a mut gpui_kit::VisualTestContext) {
         use std::{cell::RefCell, rc::Rc};
         let holder: Rc<RefCell<Option<Entity<NativeEditor>>>> = Rc::new(RefCell::new(None));
         let holder_for_window = holder.clone();
         let root = dir.to_owned();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
-            let editor = cx.new(|cx| NativeEditor::new(&root, HashMap::new(), window, cx));
+            let editor = cx.new(|cx| {
+                NativeEditor::new(&root, HashMap::new(), data_root.as_deref(), window, cx)
+            });
             *holder_for_window.borrow_mut() = Some(editor.clone());
             gpui_kit::component::Root::new(editor, window, cx)
         });
         (holder.borrow().clone().unwrap(), test_cx)
+    }
+
+    #[gpui_kit::test]
+    fn file_finder_controls_open_a_checkout_file(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello world.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, _, cx| {
+                view.files = project::scan(dir.path());
+                view.indexing = false;
+                cx.notify();
+            })
+            .unwrap();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-open-file").visible());
+            assert!(window.find("native-editor-actions").visible());
+            window.click("native-open-file", cx);
+            assert!(window.find("native-file-hello world.txt").visible());
+            window.click("native-file-hello world.txt", cx);
+        });
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(
+                view.path.as_deref(),
+                Some(file.canonicalize().unwrap().as_path())
+            );
+            assert_eq!(view.editor.read(cx).value().as_ref(), "hello\n");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn editor_layout_keeps_chrome_compact_and_code_fills_remaining_height(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        fs::write(&file, "hello\nworld\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx).unwrap();
+                view.browser = BrowserMode::Tree;
+                cx.notify();
+            })
+            .unwrap();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        let toolbar = test_cx.debug_bounds("native-toolbar").unwrap();
+        let tabs = test_cx.debug_bounds("native-tab-strip").unwrap();
+        let sidebar = test_cx.debug_bounds("native-sidebar").unwrap();
+        let code = test_cx.debug_bounds("native-code-pane").unwrap();
+        assert_eq!(toolbar.size.height, px(44.));
+        assert_eq!(tabs.size.height, px(43.));
+        assert_eq!(tabs.top(), toolbar.top());
+        assert_eq!(code.top(), toolbar.bottom());
+        assert_eq!(toolbar.top(), sidebar.top());
+        assert_eq!(code.bottom() + px(24.), sidebar.bottom());
+        assert_eq!(code.left(), sidebar.right());
+        assert!(
+            code.size.height > px(300.),
+            "code pane must fill the window"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn disk_comparison_clears_when_switching_tabs(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&first, None, window, cx).unwrap();
+                view.compare_with_disk(cx);
+                assert!(view.disk_comparison.is_some());
+                view.open(&second, None, window, cx).unwrap();
+                assert!(view.disk_comparison.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn dirty_tabs_keep_separate_buffers_and_close_requires_a_choice(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&first, None, window, cx).unwrap();
+                view.editor
+                    .update(cx, |editor, cx| editor.set_value("draft\n", window, cx));
+                view.dirty = true;
+                assert!(view.dirty);
+                view.open(&second, None, window, cx).unwrap();
+                view.editor.update(cx, |editor, cx| {
+                    editor.set_value("other draft\n", window, cx)
+                });
+                view.dirty = true;
+                view.open(&first, None, window, cx).unwrap();
+                assert_eq!(view.editor.read(cx).value().as_ref(), "draft\n");
+                assert!(view.dirty);
+                view.close_tab(&first.canonicalize().unwrap(), window, cx);
+                assert!(view.close_pending.is_some());
+                view.confirm_close(CloseChoice::Cancel, window, cx);
+                assert_eq!(
+                    view.path.as_deref(),
+                    Some(first.canonicalize().unwrap().as_path())
+                );
+                view.close_tab(&first.canonicalize().unwrap(), window, cx);
+                view.confirm_close(CloseChoice::Discard, window, cx);
+                assert_eq!(view.editor.read(cx).value().as_ref(), "other draft\n");
+                assert_eq!(fs::read_to_string(&first).unwrap(), "first\n");
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn back_and_forward_restore_file_locations(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        fs::write(&first, "one\ntwo\n").unwrap();
+        fs::write(&second, "a\nb\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&first, Some(2), window, cx).unwrap();
+                view.open(&second, None, window, cx).unwrap();
+                view.go_back(window, cx);
+                assert_eq!(
+                    view.path.as_deref(),
+                    Some(first.canonicalize().unwrap().as_path())
+                );
+                assert_eq!(view.editor.read(cx).cursor_position().line, 1);
+                view.go_forward(window, cx);
+                assert_eq!(
+                    view.path.as_deref(),
+                    Some(second.canonicalize().unwrap().as_path())
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn recovery_opens_a_draft_without_replacing_changed_disk(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let checkout = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let file = checkout.path().join("main.txt");
+        fs::write(&file, "agent\n").unwrap();
+        let journal_path = drafts::journal_path(data.path(), checkout.path());
+        drafts::write(
+            &journal_path,
+            &Journal {
+                root: checkout.path().to_owned(),
+                drafts: vec![Draft {
+                    path: file.clone(),
+                    saved: "before\n".into(),
+                    text: "human\n".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let (view, test_cx) =
+            test_editor_with_data(cx, checkout.path(), Some(data.path().to_owned()));
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                assert_eq!(view.tabs.len(), 1);
+                view.open(&file, None, window, cx).unwrap();
+                assert_eq!(view.editor.read(cx).value().as_ref(), "human\n");
+                assert!(view.conflict);
+                assert_eq!(fs::read_to_string(&file).unwrap(), "agent\n");
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn crlf_content_survives_open_and_save(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("windows.txt");
+        fs::write(&file, b"one\r\ntwo\r\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx).unwrap();
+                view.editor.update(cx, |editor, cx| {
+                    editor.set_value("one\r\nchanged\r\n", window, cx)
+                });
+                view.dirty = true;
+                view.save(window, cx);
+                assert_eq!(fs::read(&file).unwrap(), b"one\r\nchanged\r\n");
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn typing_a_newline_keeps_crlf_style(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("windows.txt");
+        fs::write(&file, b"one\r\ntwo\r\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx).unwrap();
+                view.editor.update(cx, |editor, cx| {
+                    editor.set_cursor_position(Position::new(1, 3), window, cx)
+                });
+            })
+            .unwrap();
+        test_cx.update(|window, cx| window.input("\nnew", cx));
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                assert!(view.dirty);
+                view.save(window, cx);
+            })
+            .unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"one\r\ntwo\r\nnew\r\n");
     }
 
     /// Non-Rust files never start a session and expose no providers. Runs
@@ -1099,7 +2552,7 @@ mod tests {
     /// Switching files drops jump origins recorded in the previous
     /// document; they would restore meaningless offsets otherwise.
     #[gpui_kit::test]
-    fn jump_history_clears_on_file_switch(cx: &mut gpui_kit::TestAppContext) {
+    fn file_switch_adds_history_without_moving_local_origins(cx: &mut gpui_kit::TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("a.txt");
@@ -1114,7 +2567,8 @@ mod tests {
                     .borrow_mut()
                     .push(gpui_kit::component::input::Position::new(0, 1));
                 view.open(&second, None, window, cx).unwrap();
-                assert!(!view.has_jump_history());
+                assert!(view.jump_back.borrow().is_empty());
+                assert!(view.has_jump_history());
             })
             .unwrap();
     }

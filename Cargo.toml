@@ -40,6 +40,9 @@ gpui-kit = { version = "0.7.0", features = [
   "tree-sitter-rust",
   "tree-sitter-scala",
   "tree-sitter-yaml",
+  "tree-sitter-toml",
+  "tree-sitter-typescript",
+  "tree-sitter-tsx",
 ] }
 ignore = "0.4.33"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
@@ -60,6 +63,9 @@ wry = { version = "=0.53.3", package = "lb-wry" }
 raw-window-handle = { version = "0.6", features = ["std"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 gpui-kit = { version = "0.7.0", features = ["test-support"] }

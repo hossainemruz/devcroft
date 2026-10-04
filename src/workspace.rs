@@ -940,10 +940,16 @@ impl Workspace {
             self.editor_instance = Some(choice);
             if choice == EditorChoice::BuiltIn && self.native_editor.is_none() {
                 let executables = self.editor_executables.clone();
-                self.native_editor =
-                    Some(cx.new(|cx| {
-                        NativeEditor::new(&self.working_directory, executables, window, cx)
-                    }));
+                let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
+                self.native_editor = Some(cx.new(|cx| {
+                    NativeEditor::new(
+                        &self.working_directory,
+                        executables,
+                        draft_root.as_deref(),
+                        window,
+                        cx,
+                    )
+                }));
             }
             if choice == EditorChoice::Neovim && self.tabs[WorkspaceTab::Editor as usize].is_none()
             {
@@ -1653,9 +1659,16 @@ impl Workspace {
         }
         if self.editor_instance == Some(EditorChoice::BuiltIn) && self.native_editor.is_none() {
             let executables = self.editor_executables.clone();
-            self.native_editor = Some(
-                cx.new(|cx| NativeEditor::new(&self.working_directory, executables, window, cx)),
-            );
+            let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
+            self.native_editor = Some(cx.new(|cx| {
+                NativeEditor::new(
+                    &self.working_directory,
+                    executables,
+                    draft_root.as_deref(),
+                    window,
+                    cx,
+                )
+            }));
         }
         self.refresh_review_editor_action(cx);
         for tab in WorkspaceTab::ALL {
@@ -2597,7 +2610,10 @@ impl Workspace {
         } else if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
             self.resources.read(cx).navigation_state()
         } else {
-            navigation::ResourceState::default()
+            navigation::ResourceState {
+                built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
+                ..Default::default()
+            }
         }
     }
 
@@ -2871,6 +2887,14 @@ impl Workspace {
                 }
             }
             NavigationCommand::NewSession => self.prompt_new_agent_session(window, cx),
+            NavigationCommand::OpenFile => {
+                if self.editor_instance == Some(EditorChoice::BuiltIn) {
+                    self.select_tab(WorkspaceTab::Editor as usize, window, cx);
+                    if let Some(editor) = self.native_editor.as_ref() {
+                        editor.update(cx, |editor, cx| editor.open_file_finder(window, cx));
+                    }
+                }
+            }
             command @ (NavigationCommand::EditMarkdown
             | NavigationCommand::AddComment
             | NavigationCommand::SaveDraft

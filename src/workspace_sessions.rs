@@ -319,7 +319,7 @@ impl Workspace {
             // it explicitly.
             if self
                 .session_space(&session.checkout)
-                .is_some_and(|space| !space_eq(&space, &self.active_space))
+                .is_some_and(|space| !self.active_space.matches(&space))
             {
                 continue;
             }

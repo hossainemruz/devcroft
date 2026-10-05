@@ -94,7 +94,7 @@ pub(crate) struct ArtifactBrowser {
     refresh: Refresh,
     include_archived: bool,
     kind_filter: Option<Kind>,
-    /// Active isolation profile. `None` (repository-scoped browsers) shows
+    /// Active isolation profile. `None` (All or repository-scoped browsers) shows
     /// every artifact in scope; the global browser follows the workspace's
     /// active space. Artifacts whose space could not be resolved (their
     /// repository record is gone) stay visible in every space rather than
@@ -342,8 +342,10 @@ impl ArtifactBrowser {
     /// current draft is stashed under the old space and the new space's own
     /// draft (if any) is restored, so isolation holds without discarding
     /// unsaved work.
-    pub(crate) fn set_space(&mut self, space: String, cx: &mut Context<Self>) {
-        let next = (self.scope == Scope::Global).then_some(space);
+    pub(crate) fn set_space(&mut self, space: crate::data::SpaceSelection, cx: &mut Context<Self>) {
+        let next = (self.scope == Scope::Global)
+            .then(|| space.name().map(str::to_owned))
+            .flatten();
         if self.space_filter == next {
             return;
         }

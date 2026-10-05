@@ -369,6 +369,22 @@ fn space_switching_stashes_drafts_and_never_shows_another_spaces_editor(
         );
     });
 
+    browser.update(cx, |browser, cx| {
+        browser.set_space(crate::data::SpaceSelection::All, cx)
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, _| {
+        assert!(browser.draft.is_none());
+        let ids = browser
+            .list
+            .artifacts
+            .iter()
+            .map(|row| row.artifact.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&work.artifact.id.as_str()));
+        assert!(ids.contains(&home.artifact.id.as_str()));
+    });
+
     browser.update(cx, |browser, cx| browser.set_space("Work".into(), cx));
     cx.run_until_parked();
     browser.update(cx, |browser, _| {

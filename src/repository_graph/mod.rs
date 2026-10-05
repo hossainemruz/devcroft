@@ -58,7 +58,7 @@ pub(crate) struct GraphPage {
     active: bool,
     /// Active isolation profile: the graph shows only this space's
     /// repositories and keeps its canvas layout keyed by space name.
-    space: String,
+    space: crate::data::SpaceSelection,
     /// Catalog names offered by the node inspector's Space selector.
     space_names: Vec<String>,
     graph: Option<Graph>,
@@ -128,7 +128,7 @@ impl GraphPage {
             focus_handle,
             root,
             active: false,
-            space: crate::data::DEFAULT_SPACE.to_owned(),
+            space: crate::data::DEFAULT_SPACE.into(),
             space_names: Vec::new(),
             graph: None,
             layouts,
@@ -157,8 +157,13 @@ impl GraphPage {
     /// the new space are prepared in memory only; persistence waits for the
     /// first load to finish (see [`Self::persist_layout`]) so switching before
     /// the graph was ever opened cannot overwrite the saved layouts.
-    pub(crate) fn set_space(&mut self, space: String, names: Vec<String>, cx: &mut Context<Self>) {
-        let changed = !crate::data::space_eq(&self.space, &space);
+    pub(crate) fn set_space(
+        &mut self,
+        space: crate::data::SpaceSelection,
+        names: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = !self.space.equivalent(&space);
         self.space = space;
         self.space_names = names;
         if changed {
@@ -239,11 +244,14 @@ impl GraphPage {
     fn layout(&self) -> &SpaceLayout {
         self.layouts
             .spaces
-            .get(&self.space)
+            .get(self.space.layout_key())
             .unwrap_or(&EMPTY_LAYOUT)
     }
     fn layout_mut(&mut self) -> &mut SpaceLayout {
-        self.layouts.spaces.entry(self.space.clone()).or_default()
+        self.layouts
+            .spaces
+            .entry(self.space.layout_key().to_owned())
+            .or_default()
     }
     fn ensure_positions(&mut self) {
         let keys: Vec<_> = self
@@ -253,7 +261,7 @@ impl GraphPage {
                 graph
                     .nodes
                     .iter()
-                    .filter(|n| crate::data::space_eq(&n.repository.space, &self.space))
+                    .filter(|n| self.space.matches(&n.repository.space))
                     .map(|n| n.key().to_owned())
                     .collect()
             })
@@ -274,7 +282,7 @@ impl GraphPage {
                     .nodes
                     .iter()
                     .filter(|node| {
-                        crate::data::space_eq(&node.repository.space, &self.space)
+                        self.space.matches(&node.repository.space)
                             && (search.is_empty()
                                 || format!(
                                     "{} {} {}",
@@ -343,7 +351,7 @@ impl GraphPage {
             .as_ref()
             .into_iter()
             .flat_map(|g| &g.nodes)
-            .filter(|n| crate::data::space_eq(&n.repository.space, &self.space))
+            .filter(|n| self.space.matches(&n.repository.space))
             .map(|n| n.key().to_owned())
             .collect();
         let edges = self
@@ -1036,7 +1044,7 @@ impl GraphPage {
             _ => String::new(),
         };
         let label = if current.trim().is_empty() {
-            self.space.clone()
+            self.space.creation_space(&self.space_names)
         } else {
             current.clone()
         };
@@ -1144,7 +1152,7 @@ impl Render for GraphPage {
                         Tag::secondary()
                             .with_size(Size::Small)
                             .rounded_full()
-                            .child(self.space.clone()),
+                            .child(self.space.label().to_owned()),
                     )
                     .child(
                         div()
@@ -1361,6 +1369,18 @@ mod tests {
             // Legacy `group` values migrate: "work" resolves to the catalog
             // spelling, and the space-less record lands in the default space.
             assert_eq!(page.visible_nodes(cx).len(), 2);
+            page.set_space(
+                crate::data::SpaceSelection::All,
+                vec!["Personal".into(), "Work".into(), "Custom".into()],
+                cx,
+            );
+            assert_eq!(page.visible_nodes(cx).len(), 4);
+            page.arrange(cx);
+            assert_eq!(page.layout().positions.len(), 4);
+            assert_eq!(
+                page.layouts.spaces["Work"].positions["api"],
+                Point::new(321., 123.)
+            );
             page.set_space(
                 "Custom".into(),
                 vec!["Personal".into(), "Work".into(), "Custom".into()],

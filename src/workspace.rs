@@ -46,9 +46,9 @@ use crate::command_palette::{
     palette_mode_for_shortcut, palette_sections_for_mode,
 };
 use crate::data::{
-    DEFAULT_SPACE, DataRoot, DeviceStore, RecentRepository, Spaces, SyncStatus, SyncTracker,
+    DataRoot, DeviceStore, RecentRepository, SpaceSelection, Spaces, SyncStatus, SyncTracker,
     checkout_for, ensure_spaces, recent_repositories, record_repository_open, resolve_current_key,
-    space_eq, sync_portable_with_tracker,
+    sync_portable_with_tracker,
 };
 use crate::editor::{EditorChoice, ExternalEditorKind, native::NativeEditor};
 use crate::git_status::{GitStatus, load_git_status};
@@ -207,7 +207,7 @@ pub(crate) struct Workspace {
     /// (`device.json`) and drives every space-filtered surface; the catalog
     /// is portable and syncs with the records it scopes.
     spaces: Spaces,
-    active_space: String,
+    active_space: SpaceSelection,
     /// The titlebar space switcher's controlled popover plus the menu it
     /// shows, built per opening and owned here (never window-keyed state).
     /// The focus handle is captured at build time: closing must not read the
@@ -430,12 +430,15 @@ impl Workspace {
                 }
                 catalog
             });
-        let active_space = stored
-            .as_ref()
-            .and_then(|state| state.active_space.as_deref())
-            .and_then(|name| spaces.canonical(name))
-            .or_else(|| spaces.first().map(str::to_owned))
-            .unwrap_or_else(|| DEFAULT_SPACE.to_owned());
+        let active_space = spaces.selection(
+            stored
+                .as_ref()
+                .and_then(|state| state.active_space.as_deref()),
+            stored
+                .as_ref()
+                .and_then(|state| state.all_spaces)
+                .unwrap_or(false),
+        );
         let mut enabled_agents = stored
             .as_ref()
             .map(|state| state.enabled_agents_or_default())
@@ -1278,7 +1281,7 @@ impl Workspace {
     fn open_add_repository(&self, window: &mut Window, cx: &mut Context<Self>) {
         let data_root = self.data_root.clone();
         let spaces = self.spaces.names();
-        let active_space = self.active_space.clone();
+        let active_space = self.active_space.creation_space(&spaces);
         let view = cx.new(|cx| AddRepositoryView::new(window, cx, data_root, spaces, active_space));
         cx.subscribe(
             &view,
@@ -1305,7 +1308,7 @@ impl Workspace {
         let data_root = self.data_root.clone();
         let key = key.to_owned();
         let spaces = self.spaces.names();
-        let active_space = self.active_space.clone();
+        let active_space = self.active_space.creation_space(&spaces);
         let view = cx.new(|cx| {
             AddRepositoryView::for_link(window, cx, data_root, key.clone(), spaces, active_space)
         });
@@ -1354,7 +1357,7 @@ impl Workspace {
                 };
                 let data_root = this.data_root.clone();
                 let spaces = this.spaces.names();
-                let active_space = this.active_space.clone();
+                let active_space = this.active_space.creation_space(&spaces);
                 let view = cx.new(|cx| {
                     AddRepositoryView::for_edit(
                         window,
@@ -1749,22 +1752,32 @@ impl Workspace {
     /// stays open (an explicit context); its sidebar keeps its own sessions.
     pub(crate) fn switch_space(
         &mut self,
-        space: String,
+        selection: SpaceSelection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(canonical) = self.spaces.canonical(&space) else {
-            return;
+        let selection = match selection {
+            SpaceSelection::All => SpaceSelection::All,
+            SpaceSelection::Named(name) => {
+                let Some(canonical) = self.spaces.canonical(&name) else {
+                    return;
+                };
+                SpaceSelection::Named(canonical)
+            }
         };
-        if space_eq(&canonical, &self.active_space) {
+        if self.active_space.equivalent(&selection) {
+            self.close_space_menu(window, cx);
             return;
         }
-        self.active_space = canonical.clone();
+        self.active_space = selection.clone();
         self.close_space_menu(window, cx);
         self.close_navigation(cx);
         if let Some(root) = &self.data_root {
             let _ = DeviceStore::new(root).update(|state| {
-                state.active_space = Some(canonical.clone());
+                state.all_spaces = Some(selection == SpaceSelection::All);
+                if let Some(name) = selection.name() {
+                    state.active_space = Some(name.to_owned());
+                }
             });
         }
         self.refresh_spaces();
@@ -1813,7 +1826,7 @@ impl Workspace {
                 agent.state == ActivityState::NeedsAttention
                     && self
                         .session_space(checkout)
-                        .is_none_or(|space| space_eq(&space, &self.active_space))
+                        .is_none_or(|space| self.active_space.matches(&space))
             })
             .count()
     }
@@ -1834,21 +1847,29 @@ impl Workspace {
     /// value the catalog does not know falls back to the first space.
     pub(crate) fn reload_spaces(&mut self, cx: &mut Context<Self>) {
         self.refresh_spaces();
-        if !self.spaces.contains(&self.active_space) {
+        if self
+            .active_space
+            .name()
+            .is_some_and(|name| !self.spaces.contains(name))
+        {
             let stored = self
                 .data_root
                 .as_ref()
-                .and_then(|root| DeviceStore::new(root).load().ok())
-                .and_then(|state| state.active_space);
-            self.active_space = stored
-                .as_deref()
-                .and_then(|name| self.spaces.canonical(name))
-                .or_else(|| self.spaces.first().map(str::to_owned))
-                .unwrap_or_else(|| DEFAULT_SPACE.to_owned());
+                .and_then(|root| DeviceStore::new(root).load().ok());
+            self.active_space = self.spaces.selection(
+                stored
+                    .as_ref()
+                    .and_then(|state| state.active_space.as_deref()),
+                stored
+                    .as_ref()
+                    .and_then(|state| state.all_spaces)
+                    .unwrap_or(false),
+            );
             if let Some(root) = &self.data_root {
                 let active = self.active_space.clone();
                 let _ = DeviceStore::new(root).update(|state| {
-                    state.active_space = Some(active.clone());
+                    state.active_space = active.name().map(str::to_owned);
+                    state.all_spaces = Some(active == SpaceSelection::All);
                 });
             }
         }
@@ -1894,7 +1915,7 @@ impl Workspace {
                     .small()
                     .dropdown_caret(true)
                     .max_w(px(200.))
-                    .label(active.clone())
+                    .label(active.selector_label())
                     .tooltip("Switch space · s in navigation mode"),
             )
             .content(move |_, _, _| match &menu {
@@ -1909,20 +1930,25 @@ impl Workspace {
     /// element state is involved.
     fn open_space_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_spaces();
-        let names = self.spaces.names();
+        let selections = std::iter::once(SpaceSelection::All)
+            .chain(self.spaces.names().into_iter().map(SpaceSelection::Named))
+            .collect::<Vec<_>>();
         let active = self.active_space.clone();
         let workspace = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, _, _| {
             let mut menu = menu.min_w(px(200.));
-            for name in names {
-                let selected = space_eq(&name, &active);
+            for selection in selections {
+                let selected = selection.equivalent(&active);
                 let workspace = workspace.clone();
-                menu = menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(
-                    move |_, window, cx| {
-                        let _ = workspace
-                            .update(cx, |this, cx| this.switch_space(name.clone(), window, cx));
-                    },
-                ));
+                menu = menu.item(
+                    PopupMenuItem::new(selection.selector_label())
+                        .checked(selected)
+                        .on_click(move |_, window, cx| {
+                            let _ = workspace.update(cx, |this, cx| {
+                                this.switch_space(selection.clone(), window, cx)
+                            });
+                        }),
+                );
             }
             menu
         });
@@ -2296,7 +2322,7 @@ impl Workspace {
             self.recent_repositories
                 .iter()
                 .filter(|repository| {
-                    space_eq(&repository.space, &self.active_space)
+                    self.active_space.matches(&repository.space)
                         && activity
                             .for_checkout(&repository.checkout_path)
                             .is_some_and(|agent| agent.state == ActivityState::NeedsAttention)
@@ -2306,7 +2332,7 @@ impl Workspace {
         } else {
             self.recent_repositories
                 .iter()
-                .filter(|repository| space_eq(&repository.space, &self.active_space))
+                .filter(|repository| self.active_space.matches(&repository.space))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -4208,6 +4234,14 @@ mod tests {
             Root::new(workspace, window, cx)
         });
         let view = holder.borrow().clone().unwrap();
+        // Menu tests persist selections; give each one its own device store.
+        let space_directory = tempfile::tempdir().unwrap();
+        view.update(test_cx, |view, cx| {
+            view.data_root = Some(DataRoot::new(space_directory.path().to_owned()));
+            view.spaces = ensure_spaces(view.data_root.as_ref().unwrap()).unwrap();
+            view.active_space = view.spaces.selection(None, false);
+            view.reload_spaces(cx);
+        });
         for _ in 0..3 {
             test_cx.update(|window, cx| window.render_frame(cx));
             test_cx.run_until_parked();
@@ -4218,7 +4252,7 @@ mod tests {
                 .spaces
                 .names()
                 .into_iter()
-                .find(|name| !space_eq(name, &active));
+                .find(|name| !active.matches(name));
             (active, other)
         });
         let Some(other) = other else {
@@ -4249,10 +4283,10 @@ mod tests {
             view.spaces
                 .names()
                 .iter()
-                .position(|name| space_eq(name, &other))
+                .position(|name| crate::data::space_eq(name, &other))
                 .unwrap()
         });
-        test_cx.update(|window, cx| window.click(other_index, cx));
+        test_cx.update(|window, cx| window.click(other_index + 1, cx));
         test_cx.run_until_parked();
         for _ in 0..3 {
             test_cx.update(|window, cx| window.render_frame(cx));
@@ -4260,7 +4294,7 @@ mod tests {
         }
         assert_eq!(
             view.update(test_cx, |view, _| view.active_space.clone()),
-            other
+            SpaceSelection::Named(other)
         );
         // Exercise the global Artifacts page in the new space before
         // switching back. (A repository workspace would spawn PTY reader
@@ -4282,10 +4316,10 @@ mod tests {
             view.spaces
                 .names()
                 .iter()
-                .position(|name| space_eq(name, &active))
+                .position(|name| active.matches(name))
                 .unwrap()
         });
-        test_cx.update(|window, cx| window.click(index, cx));
+        test_cx.update(|window, cx| window.click(index + 1, cx));
         test_cx.run_until_parked();
         for _ in 0..3 {
             test_cx.update(|window, cx| window.render_frame(cx));
@@ -4320,6 +4354,14 @@ mod tests {
             Root::new(workspace, window, cx)
         });
         let view = holder.borrow().clone().unwrap();
+        // Menu tests persist selections; give each one its own device store.
+        let space_directory = tempfile::tempdir().unwrap();
+        view.update(test_cx, |view, cx| {
+            view.data_root = Some(DataRoot::new(space_directory.path().to_owned()));
+            view.spaces = ensure_spaces(view.data_root.as_ref().unwrap()).unwrap();
+            view.active_space = view.spaces.selection(None, false);
+            view.reload_spaces(cx);
+        });
         let release = |test_cx: &mut gpui_kit::VisualTestContext, key: &str| {
             test_cx.simulate_event(gpui_kit::KeyUpEvent {
                 keystroke: gpui_kit::Keystroke::parse(key).unwrap(),
@@ -4336,10 +4378,7 @@ mod tests {
         let active = view.update(test_cx, |view, _| view.active_space.clone());
         assert!(view.update(test_cx, |view, _| view.space_menu_open));
         assert!(names.len() >= 2, "need two spaces for this test");
-        let target_index = names
-            .iter()
-            .position(|name| !space_eq(name, &active))
-            .unwrap();
+        let target_index = names.iter().position(|name| !active.matches(name)).unwrap();
 
         // The menu must hold focus for its key bindings to fire.
         let menu_focus = view.update(test_cx, |view, cx| {
@@ -4352,14 +4391,14 @@ mod tests {
         );
         // Nothing is selected on open: the first Down selects the first
         // entry, each further Down moves one step.
-        for _ in 0..=target_index {
+        for _ in 0..=target_index + 1 {
             test_cx.simulate_keystrokes("down");
         }
         test_cx.simulate_keystrokes("enter");
         test_cx.run_until_parked();
         assert_eq!(
             view.update(test_cx, |view, _| view.active_space.clone()),
-            names[target_index],
+            SpaceSelection::Named(names[target_index].clone()),
             "arrow keys + Enter must pick the highlighted space"
         );
         assert!(!view.update(test_cx, |view, _| view.space_menu_open));
@@ -4367,6 +4406,28 @@ mod tests {
         let after = test_cx.update(|window, cx| window.focused(cx));
         assert!(after.is_some(), "focus must land somewhere after closing");
         assert_ne!(after, menu_focus, "focus must leave the dropped menu");
+        // The first row is All and remains selectable from the keyboard.
+        test_cx.update(|window, cx| view.update(cx, |view, cx| view.open_space_menu(window, cx)));
+        test_cx.simulate_keystrokes("down");
+        test_cx.simulate_keystrokes("enter");
+        test_cx.run_until_parked();
+        view.update(test_cx, |view, cx| {
+            assert_eq!(view.active_space, SpaceSelection::All);
+            assert!(!view.space_menu_open);
+            view.reload_spaces(cx);
+            assert_eq!(view.active_space, SpaceSelection::All);
+            let state = DeviceStore::new(view.data_root.as_ref().unwrap())
+                .load()
+                .unwrap();
+            assert_eq!(state.all_spaces, Some(true));
+            assert_eq!(
+                view.spaces.selection(
+                    state.active_space.as_deref(),
+                    state.all_spaces.unwrap_or(false)
+                ),
+                SpaceSelection::All
+            );
+        });
     }
 
     /// The navigation-mode `s` entry opens the titlebar space switcher and
@@ -4393,6 +4454,14 @@ mod tests {
             Root::new(workspace, window, cx)
         });
         let view = holder.borrow().clone().unwrap();
+        // Menu tests persist selections; give each one its own device store.
+        let space_directory = tempfile::tempdir().unwrap();
+        view.update(test_cx, |view, cx| {
+            view.data_root = Some(DataRoot::new(space_directory.path().to_owned()));
+            view.spaces = ensure_spaces(view.data_root.as_ref().unwrap()).unwrap();
+            view.active_space = view.spaces.selection(None, false);
+            view.reload_spaces(cx);
+        });
         let state = |test_cx: &mut gpui_kit::VisualTestContext| {
             view.update(test_cx, |view, _| {
                 (
@@ -4411,7 +4480,7 @@ mod tests {
         assert!(navigation_open);
         assert!(!menu_open);
         assert!(!spaces.is_empty(), "the catalog seeds at startup");
-        assert!(spaces.iter().any(|name| space_eq(name, &active)));
+        assert!(spaces.iter().any(|name| active.matches(name)));
         // Held-key bookkeeping swallows repeats until a key-up.
         test_cx.simulate_event(gpui_kit::KeyUpEvent {
             keystroke: gpui_kit::Keystroke::parse("j").unwrap(),

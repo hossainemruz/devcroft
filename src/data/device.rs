@@ -50,6 +50,9 @@ pub(crate) struct DeviceState {
     /// startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) active_space: Option<String>,
+    /// Aggregate browsing choice, separate from real catalog space names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) all_spaces: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sync_interval_minutes: Option<u64>,
     /// App-wide font size (General settings). Absent means the default;

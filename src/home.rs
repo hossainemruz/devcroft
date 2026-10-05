@@ -29,8 +29,8 @@ fn item_id(prefix: &str, id: &str) -> SharedString {
 
 use crate::data::dashboard::{Category, Dashboard, Item, Kind, safe_web_url};
 use crate::data::{
-    DataRoot, RecentRepository, RepositoryEntry, SyncStatus, SyncTracker, all_repositories,
-    recent_repositories,
+    DataRoot, RecentRepository, RepositoryEntry, SpaceSelection, SyncStatus, SyncTracker,
+    all_repositories, recent_repositories,
 };
 use crate::git_status::{GitStatus, load_git_status};
 use crate::relative_time::{current_unix_secs, relative_duration_label};
@@ -286,7 +286,7 @@ pub(crate) struct HomeView {
     /// Isolation profiles, in catalog order, and the active one. Every Home
     /// list filters on the active space; the switcher lives in the titlebar.
     spaces: Vec<String>,
-    active_space: String,
+    active_space: SpaceSelection,
     sessions: Vec<(crate::agent_sessions::SessionSummary, String)>,
     session_errors: Vec<String>,
     sessions_loaded: bool,
@@ -354,10 +354,10 @@ impl HomeView {
     pub(crate) fn set_space(
         &mut self,
         spaces: Vec<String>,
-        active: String,
+        active: SpaceSelection,
         cx: &mut Context<Self>,
     ) {
-        let changed = !crate::data::space_eq(&self.active_space, &active) || self.spaces != spaces;
+        let changed = !self.active_space.equivalent(&active) || self.spaces != spaces;
         self.spaces = spaces;
         self.active_space = active.clone();
         // A project filter naming another space's project would hide its own
@@ -419,7 +419,7 @@ impl HomeView {
             project_errors: Vec::new(),
             project_refresh: crate::artifacts::Refresh::default(),
             spaces: Vec::new(),
-            active_space: crate::data::DEFAULT_SPACE.to_owned(),
+            active_space: crate::data::DEFAULT_SPACE.into(),
             sessions: Vec::new(),
             session_errors: Vec::new(),
             sessions_loaded: false,
@@ -515,7 +515,7 @@ impl HomeView {
     fn visible_projects(&self) -> Vec<RepositoryEntry> {
         self.all_projects
             .iter()
-            .filter(|entry| crate::data::space_eq(&entry.space, &self.active_space))
+            .filter(|entry| self.active_space.matches(&entry.space))
             .cloned()
             .collect()
     }
@@ -863,7 +863,7 @@ impl HomeView {
                     // dashboard shows up to four of this space's projects even
                     // when another space holds the most recent opens.
                     let mut projects = recent_repositories(&root, usize::MAX);
-                    projects.retain(|project| crate::data::space_eq(&project.space, &space));
+                    projects.retain(|project| space.matches(&project.space));
                     projects.truncate(4);
                     (projects, all_repositories(&root))
                 })
@@ -972,7 +972,7 @@ impl HomeView {
         // An item constructed without a space (a fresh `Item::new`) starts in
         // the active space, like every quick-add path.
         let item_space = if item.space.trim().is_empty() {
-            self.active_space.clone()
+            self.creation_space()
         } else {
             item.space.clone()
         };
@@ -1203,14 +1203,28 @@ impl HomeView {
             .unwrap_or_else(|| format!("{key} (removed)"))
     }
 
+    fn creation_space(&self) -> String {
+        self.active_space.creation_space(&self.spaces)
+    }
+
+    fn todo_creation_space(&self, project: Option<&str>) -> String {
+        if self.active_space == SpaceSelection::All
+            && let Some(entry) =
+                project.and_then(|key| self.all_projects.iter().find(|p| p.key == key))
+        {
+            return entry.space.clone();
+        }
+        self.creation_space()
+    }
+
     /// Whether a dashboard item belongs to the active space.
     pub(super) fn in_active_space(&self, item: &Item) -> bool {
-        crate::data::space_eq(&item.space, &self.active_space)
+        self.active_space.matches(&item.space)
     }
 
     /// Whether a repository entry belongs to the active space.
     pub(super) fn in_active_space_entry(&self, entry: &RepositoryEntry) -> bool {
-        crate::data::space_eq(&entry.space, &self.active_space)
+        self.active_space.matches(&entry.space)
     }
 
     /// Inbox todos in global order, filtered by completion, space, and
@@ -1342,7 +1356,7 @@ impl HomeView {
                             Tag::secondary()
                                 .with_size(Size::Small)
                                 .rounded_full()
-                                .child(self.active_space.clone()),
+                                .child(self.active_space.label().to_owned()),
                         ),
                 )
                 .child(
@@ -2175,13 +2189,12 @@ impl HomeView {
                             .label(add_label)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let mut item = Item::new(kind);
-                                item.space = this.active_space.clone();
+                                item.space = this.creation_space();
                                 this.editor(item, window, cx)
                             })),
                     ),
             )
         } else if is_todo {
-            let space = self.active_space.clone();
             let project = match &self.todo_project_filter {
                 TodoProjectFilter::All | TodoProjectFilter::Unscoped => String::new(),
                 TodoProjectFilter::Project(key) => key.clone(),
@@ -2200,7 +2213,7 @@ impl HomeView {
                             .label(add_label)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let mut item = Item::new(kind);
-                                item.space = space.clone();
+                                item.space = this.todo_creation_space(Some(&project));
                                 item.project = project.clone();
                                 this.editor(item, window, cx)
                             })),
@@ -2221,7 +2234,7 @@ impl HomeView {
                             .label(add_label)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let mut item = Item::new(kind);
-                                item.space = this.active_space.clone();
+                                item.space = this.creation_space();
                                 this.editor(item, window, cx)
                             })),
                     ),
@@ -2357,6 +2370,47 @@ fn project_navigation(key: &str, index: usize, count: usize, columns: usize) -> 
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn all_spaces_includes_every_home_list_and_keeps_concrete_creation_defaults(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let home = cx.new(|cx| HomeView::new(None, SyncTracker::default(), cx));
+        home.update(cx, |home, cx| {
+            home.set_space(
+                vec!["Personal".into(), "Work".into()],
+                SpaceSelection::All,
+                cx,
+            );
+            home.all_projects = vec![
+                project_entry("home", "Personal"),
+                project_entry("work", "Work"),
+            ];
+            home.data.items = [Kind::Todo, Kind::Reading, Kind::PullRequest]
+                .into_iter()
+                .flat_map(|kind| {
+                    ["Personal", "Work"].map(move |space| {
+                        let mut item = Item::new(kind);
+                        item.space = space.to_owned();
+                        item.title = space.to_owned();
+                        item
+                    })
+                })
+                .collect();
+            assert_eq!(home.visible_projects().len(), 2);
+            assert_eq!(home.visible_todos().len(), 2);
+            assert_eq!(home.visible_reading().len(), 2);
+            assert_eq!(home.visible_pull_requests(Category::ToReview).len(), 2);
+            assert_eq!(home.creation_space(), "Personal");
+            assert_eq!(home.todo_creation_space(Some("work")), "Work");
+            home.set_space(vec!["Personal".into(), "Work".into()], "work".into(), cx);
+            assert_eq!(home.visible_projects().len(), 1);
+            assert_eq!(home.visible_todos().len(), 1);
+            assert_eq!(home.visible_reading().len(), 1);
+            assert_eq!(home.visible_pull_requests(Category::ToReview).len(), 1);
+        });
+    }
 
     #[test]
     fn project_keys_follow_the_responsive_grid_without_escaping_it() {

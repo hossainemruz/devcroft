@@ -18,7 +18,7 @@ impl HomeView {
                 Tag::secondary()
                     .with_size(Size::Small)
                     .rounded_full()
-                    .child(self.active_space.clone()),
+                    .child(self.active_space.label().to_owned()),
             );
         let show_completed = self.show_completed;
         filters = filters.child(
@@ -72,7 +72,6 @@ impl HomeView {
             for item in items {
                 view = view.child(self.todo_card(&item, cx));
             }
-            let space = self.active_space.clone();
             let project = column.key.clone().unwrap_or_default();
             view = view.child(
                 Button::new(("add-todo-column", index))
@@ -81,7 +80,7 @@ impl HomeView {
                     .label("+ Add todo")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let mut item = Item::new(Kind::Todo);
-                        item.space = space.clone();
+                        item.space = this.todo_creation_space(Some(&project));
                         item.project = project.clone();
                         this.editor(item, window, cx);
                     })),
@@ -91,7 +90,7 @@ impl HomeView {
         if visible_columns == 0 {
             // No column survived the filters: keep an entry point so the
             // board is never a dead end.
-            let space = self.active_space.clone();
+            let space = self.creation_space();
             board = board.child(
                 v_flex()
                     .gap_3()

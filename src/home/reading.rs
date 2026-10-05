@@ -81,7 +81,7 @@ impl HomeView {
                         .label("+ Add link")
                         .on_click(cx.listener(|this, _, window, cx| {
                             let mut item = Item::new(Kind::Reading);
-                            item.space = this.active_space.clone();
+                            item.space = this.creation_space();
                             this.editor(item, window, cx);
                         })),
                 ),

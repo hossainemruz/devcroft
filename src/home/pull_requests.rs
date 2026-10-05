@@ -21,8 +21,7 @@ impl HomeView {
     }
 
     pub(super) fn visible_pull_requests(&self, category: Category) -> Vec<Item> {
-        self.data
-            .pull_requests(category, Some(self.active_space.as_str()))
+        self.data.pull_requests(category, self.active_space.name())
     }
 
     pub(super) fn refresh_pull_requests(&mut self, force: bool, cx: &mut Context<Self>) {
@@ -292,7 +291,7 @@ impl HomeView {
                 Tag::secondary()
                     .with_size(Size::Small)
                     .rounded_full()
-                    .child(self.active_space.clone()),
+                    .child(self.active_space.label().to_owned()),
             );
         let mut board = h_flex().items_stretch().gap_4().flex_wrap();
         for (index, category) in Category::ALL.into_iter().enumerate() {
@@ -330,7 +329,7 @@ impl HomeView {
             for item in items {
                 column = column.child(self.pr_card(&item, true, cx));
             }
-            let space = self.active_space.clone();
+            let space = self.creation_space();
             column = column.child(
                 Button::new(("add-pr-column", index))
                     .ghost()

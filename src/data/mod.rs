@@ -46,8 +46,8 @@ pub(crate) use repositories::{
     resolve_current_key, suggest_repository_key, unlink_repository, update_repository_metadata,
 };
 pub(crate) use spaces::{
-    DEFAULT_SPACE, SpaceRewrite, Spaces, delete_space, ensure_spaces, normalize_name, rename_space,
-    space_eq, space_matches,
+    DEFAULT_SPACE, SpaceRewrite, SpaceSelection, Spaces, delete_space, ensure_spaces,
+    normalize_name, rename_space, space_eq, space_matches,
 };
 pub(crate) use sync::{
     SyncOutcome, SyncStatus, SyncTracker, sync_portable, sync_portable_with_tracker,

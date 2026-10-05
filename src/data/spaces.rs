@@ -36,6 +36,72 @@ const MAX_NAME_CHARS: usize = 48;
 /// old `Group::Personal` default.
 pub(crate) const DEFAULT_SPACE: &str = "Personal";
 
+/// Global browsing selection. All is a filter, never a record's space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SpaceSelection {
+    All,
+    Named(String),
+}
+
+impl From<String> for SpaceSelection {
+    fn from(name: String) -> Self {
+        Self::Named(name)
+    }
+}
+
+impl From<&str> for SpaceSelection {
+    fn from(name: &str) -> Self {
+        Self::Named(name.to_owned())
+    }
+}
+
+impl SpaceSelection {
+    pub(crate) fn label(&self) -> &str {
+        self.name().unwrap_or("All")
+    }
+
+    /// Distinguish an existing catalog entry called All in the switcher.
+    pub(crate) fn selector_label(&self) -> String {
+        match self {
+            Self::Named(name) if space_eq(name, "All") => format!("{name} (space)"),
+            _ => self.label().to_owned(),
+        }
+    }
+
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::All => None,
+            Self::Named(name) => Some(name),
+        }
+    }
+
+    pub(crate) fn matches(&self, space: &str) -> bool {
+        self.name().is_none_or(|name| space_eq(space, name))
+    }
+
+    pub(crate) fn equivalent(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::All, Self::All) => true,
+            (Self::Named(left), Self::Named(right)) => space_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Assignment controls always use a concrete space, including in All.
+    pub(crate) fn creation_space(&self, names: &[String]) -> String {
+        self.name()
+            .or_else(|| names.first().map(String::as_str))
+            .unwrap_or(DEFAULT_SPACE)
+            .to_owned()
+    }
+
+    /// NUL cannot occur in a valid catalog name, keeping aggregate layouts
+    /// separate even when a user has a space named "All".
+    pub(crate) fn layout_key(&self) -> &str {
+        self.name().unwrap_or("\0all-spaces")
+    }
+}
+
 /// Spaces seeded into a catalog that has none.
 pub(crate) const DEFAULT_SEED: [&str; 2] = ["Personal", "Work"];
 
@@ -113,6 +179,19 @@ pub(crate) fn space_matches(stored: Option<&str>, active: &str) -> bool {
 }
 
 impl Spaces {
+    /// Restore the machine-local browsing choice; unknown named spaces
+    /// follow the first catalog entry after a remote rename/delete.
+    pub(crate) fn selection(&self, stored: Option<&str>, all: bool) -> SpaceSelection {
+        if all {
+            SpaceSelection::All
+        } else {
+            self.canonical(stored.unwrap_or_default())
+                .or_else(|| self.first().map(str::to_owned))
+                .unwrap_or_else(|| DEFAULT_SPACE.to_owned())
+                .into()
+        }
+    }
+
     pub(crate) fn path(root: &DataRoot) -> std::path::PathBuf {
         root.portable_dir().join(FILE_NAME)
     }
@@ -777,6 +856,33 @@ mod tests {
         let root = DataRoot::new(dir.path().join("data"));
         crate::data::ensure_dirs(root.root()).unwrap();
         (dir, root)
+    }
+
+    #[test]
+    fn aggregate_selection_is_distinct_from_a_space_named_all_and_survives_catalog_changes() {
+        let mut catalog = Spaces::default();
+        catalog.spaces = vec![
+            Space::new("Personal"),
+            Space::new("Work"),
+            Space::new("All"),
+        ];
+        let aggregate = catalog.selection(Some("Work"), true);
+        assert_eq!(aggregate, SpaceSelection::All);
+        for name in ["Personal", "Work", "All", "Unknown"] {
+            assert!(aggregate.matches(name));
+        }
+        let named = catalog.selection(Some("all"), false);
+        assert_eq!(named, SpaceSelection::Named("All".into()));
+        assert!(!named.matches("Work"));
+        assert!(!aggregate.equivalent(&named));
+        assert_eq!(aggregate.selector_label(), "All");
+        assert_eq!(named.selector_label(), "All (space)");
+        assert_ne!(aggregate.layout_key(), named.layout_key());
+        assert_eq!(aggregate.creation_space(&catalog.names()), "Personal");
+        assert_eq!(catalog.selection(Some("Missing"), false), "Personal".into());
+        catalog.spaces.remove(0);
+        assert_eq!(catalog.selection(Some("Missing"), true), aggregate);
+        assert_eq!(aggregate.creation_space(&catalog.names()), "Work");
     }
 
     #[test]

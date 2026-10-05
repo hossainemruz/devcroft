@@ -2672,7 +2672,7 @@ impl Workspace {
             WorkspaceTab::Editor if self.editor_instance == Some(EditorChoice::BuiltIn) => self
                 .native_editor
                 .as_ref()
-                .map(|editor| vec![("Editor", editor.read(cx).editor_focus(cx))])
+                .map(|editor| editor.read(cx).navigation_panes(cx))
                 .unwrap_or_default(),
             WorkspaceTab::Editor | WorkspaceTab::Terminal => self
                 .tabs
@@ -2702,6 +2702,12 @@ impl Workspace {
             .rposition(|(_, focus)| focus.contains_focused(window, cx))
             .unwrap_or(0);
         self.navigation_open = true;
+        if !self.home_visible
+            && self.active_tab == WorkspaceTab::Editor
+            && let Some(editor) = &self.native_editor
+        {
+            editor.update(cx, |editor, cx| editor.set_navigation_active(true, cx));
+        }
         self.sync_tutorial_navigation(cx);
         // Start item cursors where `j`/`k` should repeat from: the active
         // session in the sidebar, the first Home card on the dashboard.
@@ -2739,6 +2745,9 @@ impl Workspace {
         let was_open = self.navigation_open;
         if was_open {
             self.navigation_open = false;
+            if let Some(editor) = &self.native_editor {
+                editor.update(cx, |editor, cx| editor.set_navigation_active(false, cx));
+            }
             self.sync_tutorial_navigation(cx);
         }
         if self.session_cursor.is_some() {
@@ -2806,7 +2815,7 @@ impl Workspace {
     /// Move the item cursor within the focused pane for navigation-mode
     /// `j`/`k`. Keeps the mode open for repeats; locations without a list
     /// consume the key and stay open. Clamps at the ends like pane movement.
-    fn move_navigation_item(&mut self, down: bool, cx: &mut Context<Self>) {
+    fn move_navigation_item(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.relationships_visible {
             return;
         }
@@ -2840,6 +2849,13 @@ impl Workspace {
                         .update(cx, |view, cx| view.move_diff_scroll(down, cx)),
                     _ => {}
                 },
+                WorkspaceTab::Editor if self.editor_instance == Some(EditorChoice::BuiltIn) => {
+                    if let Some(editor) = &self.native_editor {
+                        editor.update(cx, |editor, cx| {
+                            editor.move_navigation_item(self.navigation_pane, down, window, cx)
+                        });
+                    }
+                }
                 WorkspaceTab::Editor | WorkspaceTab::Terminal | WorkspaceTab::Git => {}
             }
         }
@@ -2848,7 +2864,8 @@ impl Workspace {
 
     /// Navigation-mode `Enter`: open the `j`/`k` cursor item when one is
     /// active (sessions sidebar, Home cards), otherwise keep the focused pane
-    /// like before. Runs once and returns to normal mode either way.
+    /// like before. Folder toggles keep navigation open; other activations
+    /// return to normal mode.
     fn accept_navigation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.home_visible
             && self.active_tab == WorkspaceTab::Agent
@@ -2869,6 +2886,18 @@ impl Workspace {
                 self.close_navigation(cx);
                 return;
             }
+        }
+        if !self.home_visible
+            && !self.relationships_visible
+            && self.active_tab == WorkspaceTab::Editor
+            && self.editor_instance == Some(EditorChoice::BuiltIn)
+            && let Some(editor) = &self.native_editor
+            && editor.read(cx).navigation_in_tree(self.navigation_pane)
+            && editor.update(cx, |editor, cx| {
+                editor.activate_navigation_cursor(window, cx)
+            })
+        {
+            return;
         }
         self.close_navigation(cx);
     }
@@ -2955,7 +2984,7 @@ impl Workspace {
 
     /// Whether navigation-mode `j`/`k` moves something at the current
     /// location: Home cards, the Artifacts list, the sessions sidebar, the
-    /// Resources sidebar, or Review files/diff. Other panes consume the keys
+    /// Resources sidebar, Review files/diff, or the built-in editor. Other panes consume the keys
     /// and stay open.
     fn navigation_item_available(&self, cx: &App) -> bool {
         if self.relationships_visible {
@@ -2973,12 +3002,22 @@ impl Workspace {
             }
             WorkspaceTab::Resources => self.navigation_pane == 0,
             WorkspaceTab::Review => matches!(self.navigation_pane, 0 | 1),
+            WorkspaceTab::Editor if self.editor_instance == Some(EditorChoice::BuiltIn) => {
+                self.native_editor.as_ref().is_some_and(|editor| {
+                    let editor = editor.read(cx);
+                    editor.navigation_in_tree(self.navigation_pane)
+                        || editor
+                            .navigation_panes(cx)
+                            .get(self.navigation_pane)
+                            .is_some_and(|(label, _)| *label == "Editor")
+                })
+            }
             WorkspaceTab::Editor | WorkspaceTab::Terminal | WorkspaceTab::Git => false,
         }
     }
 
     /// Whether navigation-mode `Enter` opens the `j`/`k` cursor item instead
-    /// of only keeping the focused pane: the sessions sidebar and Home cards.
+    /// of only keeping the focused pane: the editor tree, sessions sidebar and Home cards.
     /// Artifact and review lists apply their selection live, so `Enter` there
     /// only keeps focus.
     fn navigation_enter_opens(&self, cx: &App) -> bool {
@@ -2998,7 +3037,13 @@ impl Workspace {
         {
             return self.home.read(cx).navigation_cursor_active();
         }
-        false
+        !self.home_visible
+            && self.active_tab == WorkspaceTab::Editor
+            && self.editor_instance == Some(EditorChoice::BuiltIn)
+            && self
+                .native_editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).navigation_in_tree(self.navigation_pane))
     }
 
     /// The mode toggle: `cmd-j` on macOS, `ctrl-j` on Linux/Windows.
@@ -3160,8 +3205,8 @@ impl Workspace {
             NavigationDecision::FocusPrevious => {
                 self.move_navigation_component_focus(false, window, cx)
             }
-            NavigationDecision::PrevItem => self.move_navigation_item(false, cx),
-            NavigationDecision::NextItem => self.move_navigation_item(true, cx),
+            NavigationDecision::PrevItem => self.move_navigation_item(false, window, cx),
+            NavigationDecision::NextItem => self.move_navigation_item(true, window, cx),
             NavigationDecision::Execute(command) => {
                 self.run_navigation_command(command, window, cx)
             }
@@ -3943,6 +3988,133 @@ mod tests {
     use super::*;
     use gpui_kit::component::Root;
     use std::path::PathBuf;
+
+    #[gpui_kit::test]
+    fn built_in_editor_navigation_keeps_mode_open_and_moves_between_visible_panes(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{KeyUpEvent, Keystroke, test::TestWindowExt as _};
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("hello.txt");
+        std::fs::write(&file, "hello\nworld\n").unwrap();
+        std::fs::create_dir(directory.path().join("nested")).unwrap();
+        std::fs::write(directory.path().join("nested/child.txt"), "child\n").unwrap();
+        let root = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let captured = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| {
+                let mut workspace = Workspace::new(window, cx, &root);
+                workspace.home_visible = false;
+                workspace.active_tab = WorkspaceTab::Editor;
+                workspace.editor_instance = Some(EditorChoice::BuiltIn);
+                let editor =
+                    cx.new(|cx| NativeEditor::new(&root, HashMap::new(), None, window, cx));
+                editor.update(cx, |editor, cx| editor.request_open(file, None, cx));
+                workspace.native_editor = Some(editor);
+                workspace
+            });
+            *captured.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        let press = |cx: &mut gpui_kit::VisualTestContext, key: &str| {
+            cx.simulate_keystrokes(key);
+            cx.simulate_event(KeyUpEvent {
+                keystroke: Keystroke::parse(key).unwrap(),
+            });
+        };
+        let trigger = if cfg!(target_os = "macos") {
+            "cmd-j"
+        } else {
+            "ctrl-j"
+        };
+        press(test_cx, trigger);
+        for (key, pane) in [
+            ("h", 0),
+            ("h", 0),
+            ("j", 0),
+            ("k", 0),
+            ("l", 1),
+            ("l", 1),
+            ("j", 1),
+            ("k", 1),
+        ] {
+            press(test_cx, key);
+            view.read_with(test_cx, |view, cx| {
+                assert!(view.navigation_open);
+                assert_eq!(view.navigation_pane, pane);
+                let panes = view.navigation_panes(cx);
+                assert_eq!(panes.len(), 2);
+            });
+            let expected = view.update(test_cx, |view, cx| {
+                view.navigation_panes(cx)[pane].1.clone()
+            });
+            assert_eq!(
+                test_cx.update(|window, cx| window.focused(cx)),
+                Some(expected)
+            );
+        }
+        press(test_cx, "enter");
+        assert!(!view.update(test_cx, |view, _| view.navigation_open));
+        press(test_cx, trigger);
+        press(test_cx, "h");
+        press(test_cx, "enter");
+        assert!(!view.update(test_cx, |view, _| view.navigation_open));
+        let editor_focus = view.update(test_cx, |view, cx| {
+            view.native_editor
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .editor_focus(cx)
+        });
+        assert_eq!(
+            test_cx.update(|window, cx| window.focused(cx)),
+            Some(editor_focus.clone()),
+            "Enter opens the tree file and focuses its editor"
+        );
+        press(test_cx, trigger);
+        press(test_cx, "h");
+        press(test_cx, "k"); // Folders precede files: move from hello.txt to nested.
+        let sidebar_focus = view.update(test_cx, |view, cx| view.navigation_panes(cx)[0].1.clone());
+        for _ in 0..3 {
+            // Expand, collapse, then expand again.
+            press(test_cx, "enter");
+            assert!(
+                view.update(test_cx, |view, _| view.navigation_open),
+                "folder toggles keep navigation mode open"
+            );
+            assert_eq!(
+                test_cx.update(|window, cx| window.focused(cx)),
+                Some(sidebar_focus.clone())
+            );
+        }
+        press(test_cx, "j"); // Walk into the expanded folder without retoggling the mode.
+        press(test_cx, "enter");
+        assert!(
+            !view.update(test_cx, |view, _| view.navigation_open),
+            "opening a file exits navigation mode"
+        );
+        let child_focus = view.update(test_cx, |view, cx| {
+            view.native_editor
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .editor_focus(cx)
+        });
+        assert_ne!(
+            child_focus, editor_focus,
+            "the child file has its own editor buffer"
+        );
+        assert_eq!(
+            test_cx.update(|window, cx| window.focused(cx)),
+            Some(child_focus)
+        );
+    }
 
     /// End-to-end toggle lifecycle through the real dispatch path: press the
     /// toggle, hold-repeat it (must not double-toggle), release, toggle off,

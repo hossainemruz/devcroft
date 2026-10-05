@@ -30,7 +30,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     dialog::{Confirm, DialogFooter},
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState, Position},
+    input::{Editor, EditorState, Input, InputEvent, InputState, MoveDown, MoveUp, Position},
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     v_flex,
@@ -39,7 +39,8 @@ use gpui_kit::img;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, Styled, Window, div, px, rgb,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -111,6 +112,10 @@ pub(crate) struct NativeEditor {
     search_error: Option<String>,
     expanded_dirs: HashSet<String>,
     tree_limits: HashMap<String, usize>,
+    sidebar_focus: FocusHandle,
+    tree_scroll: ScrollHandle,
+    navigation_active: bool,
+    tree_cursor: Option<String>,
     disk_comparison: Option<String>,
     back_locations: Vec<HistoryLocation>,
     forward_locations: Vec<HistoryLocation>,
@@ -194,8 +199,43 @@ struct TreeRow {
     more: bool,
 }
 
+impl TreeRow {
+    fn id(&self) -> String {
+        let kind = if self.more {
+            "more"
+        } else if self.file.is_some() {
+            "file"
+        } else {
+            "dir"
+        };
+        format!("native-tree-{kind}-{}", self.key)
+    }
+}
+
 const TREE_PAGE_SIZE: usize = 100;
 
+/// Sort the index once in the background, before rendering or paginating
+/// the tree. At each level, directories precede files and siblings sort by
+/// name; a directory's descendants stay together.
+fn sort_tree_files(files: &mut [ProjectFile]) {
+    files.sort_unstable_by(|a, b| {
+        let mut a = a.label.split('/').peekable();
+        let mut b = b.label.split('/').peekable();
+        while let (Some(a_name), Some(b_name)) = (a.next(), b.next()) {
+            let order = a
+                .peek()
+                .is_none()
+                .cmp(&b.peek().is_none())
+                .then_with(|| a_name.cmp(b_name));
+            if !order.is_eq() {
+                return order;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// `files` must be ordered by `sort_tree_files`.
 fn tree_rows(
     files: &[ProjectFile],
     expanded: &HashSet<String>,
@@ -347,8 +387,9 @@ impl NativeEditor {
         cx.spawn_in(window, async move |view, cx| {
             let (files, finder) = cx
                 .background_spawn(async move {
-                    let files = project::scan(&scan_root);
+                    let mut files = project::scan(&scan_root);
                     let finder = Finder::new(&files);
+                    sort_tree_files(&mut files);
                     (files, finder)
                 })
                 .await;
@@ -484,6 +525,10 @@ impl NativeEditor {
             search_error: None,
             expanded_dirs: HashSet::from([String::new()]),
             tree_limits: HashMap::new(),
+            sidebar_focus: cx.focus_handle().tab_stop(true),
+            tree_scroll: ScrollHandle::new(),
+            navigation_active: false,
+            tree_cursor: None,
             disk_comparison: None,
             back_locations: Vec::new(),
             forward_locations: Vec::new(),
@@ -496,6 +541,126 @@ impl NativeEditor {
 
     pub(crate) fn editor_focus(&self, cx: &App) -> FocusHandle {
         self.editor.read(cx).focus_handle(cx)
+    }
+
+    pub(crate) fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
+        let mut panes = Vec::new();
+        let mode = if self.finder_open() {
+            self.finder_previous
+        } else {
+            self.browser
+        };
+        if mode != BrowserMode::Closed {
+            panes.push(("Files", self.sidebar_focus.clone()));
+        }
+        panes.push(("Editor", self.editor_focus(cx)));
+        panes
+    }
+
+    pub(crate) fn navigation_in_tree(&self, pane: usize) -> bool {
+        pane == 0 && self.browser == BrowserMode::Tree && !self.finder_open()
+    }
+
+    fn tree_cursor_index(&self, rows: &[TreeRow]) -> Option<usize> {
+        rows.iter()
+            .position(|row| self.tree_cursor.as_ref() == Some(&row.id()))
+            .or_else(|| {
+                rows.iter().position(|row| {
+                    row.file.as_ref().is_some_and(|path| {
+                        self.path.as_ref().is_some_and(|active| {
+                            active == path || active == &self.canonical_root.join(&row.key)
+                        })
+                    })
+                })
+            })
+            .or_else(|| (!rows.is_empty()).then_some(0))
+    }
+
+    pub(crate) fn set_navigation_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.navigation_active = active;
+        self.tree_cursor = None;
+        if active {
+            // Completion/code-action menus own Up/Down while open. Cancel
+            // pending requests as well so navigation always moves the code.
+            self.editor
+                .update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+            let rows = tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits);
+            if let Some(index) = self.tree_cursor_index(&rows) {
+                self.tree_cursor = Some(rows[index].id());
+                self.tree_scroll.scroll_to_item(index);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn move_navigation_item(
+        &mut self,
+        pane: usize,
+        down: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation_in_tree(pane) {
+            let rows = tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits);
+            if let Some(index) = self.tree_cursor_index(&rows) {
+                let index = crate::navigation::move_index(index, rows.len(), down);
+                self.tree_cursor = Some(rows[index].id());
+                self.tree_scroll.scroll_to_item(index);
+                self.sidebar_focus.focus(window, cx);
+                cx.notify();
+            }
+        } else if self
+            .navigation_panes(cx)
+            .get(pane)
+            .is_some_and(|(label, _)| *label == "Editor")
+        {
+            self.editor_focus(cx).focus(window, cx);
+            // Use the editor's own vertical motion so wrapped lines, folds,
+            // preferred columns and scrolling behave like the arrow keys.
+            if down {
+                window.dispatch_action(Box::new(MoveDown), cx);
+            } else {
+                window.dispatch_action(Box::new(MoveUp), cx);
+            }
+        }
+    }
+
+    /// Returns true after toggling a folder so navigation can continue in
+    /// the tree with the same row highlighted.
+    pub(crate) fn activate_navigation_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let rows = tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits);
+        if let Some(index) = self.tree_cursor_index(&rows) {
+            let row = &rows[index];
+            let toggled_folder = row.file.is_none() && !row.more;
+            self.tree_cursor = Some(row.id());
+            self.activate_tree_row(row, window, cx);
+            if toggled_folder {
+                self.sidebar_focus.focus(window, cx);
+            }
+            return toggled_folder;
+        }
+        false
+    }
+
+    fn activate_tree_row(&mut self, row: &TreeRow, window: &mut Window, cx: &mut Context<Self>) {
+        if row.more {
+            *self
+                .tree_limits
+                .entry(row.key.clone())
+                .or_insert(TREE_PAGE_SIZE) += TREE_PAGE_SIZE;
+        } else if let Some(path) = &row.file {
+            self.error = self
+                .open(path, None, window, cx)
+                .err()
+                .map(|error| format!("{error:#}"));
+        } else if !self.expanded_dirs.insert(row.key.clone()) {
+            self.expanded_dirs.remove(&row.key);
+        }
+        cx.notify();
     }
 
     pub(crate) fn has_jump_history(&self) -> bool {
@@ -582,8 +747,9 @@ impl NativeEditor {
         cx.spawn(async move |view, cx| {
             let (files, finder) = cx
                 .background_spawn(async move {
-                    let files = project::scan(&root);
+                    let mut files = project::scan(&root);
                     let finder = Finder::new(&files);
+                    sort_tree_files(&mut files);
                     (files, finder)
                 })
                 .await;
@@ -1810,17 +1976,20 @@ impl NativeEditor {
             })
     }
 
-    fn render_browser(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_browser(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.browser == BrowserMode::Closed {
             return None;
         }
         let mut panel = v_flex()
+            .id("native-tree-rows")
             .flex_1()
             .min_h_0()
             .gap_0()
             .px_2()
             .py_2()
-            .overflow_y_scrollbar();
+            .track_scroll(&self.tree_scroll)
+            .overflow_y_scroll()
+            .vertical_scrollbar(&self.tree_scroll);
         let mode = if self.finder_open() {
             self.finder_previous
         } else {
@@ -1832,7 +2001,12 @@ impl NativeEditor {
         match mode {
             BrowserMode::Files | BrowserMode::Buffers | BrowserMode::Text => unreachable!(),
             BrowserMode::Tree => {
-                for item in tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits) {
+                let rows = tree_rows(&self.files, &self.expanded_dirs, &self.tree_limits);
+                let cursor = self
+                    .navigation_active
+                    .then(|| self.tree_cursor_index(&rows))
+                    .flatten();
+                for (index, item) in rows.into_iter().enumerate() {
                     let expanded = self.expanded_dirs.contains(&item.key);
                     let selected = item.file.is_some()
                         && self
@@ -1868,14 +2042,7 @@ impl NativeEditor {
                             })
                             .into_any_element()
                     };
-                    let key = item.key.clone();
-                    let id = if item.more {
-                        format!("native-tree-more-{key}")
-                    } else if item.file.is_some() {
-                        format!("native-tree-file-{key}")
-                    } else {
-                        format!("native-tree-dir-{key}")
-                    };
+                    let id = item.id();
                     panel = panel.child(
                         Button::new(id)
                             .ghost()
@@ -1885,6 +2052,9 @@ impl NativeEditor {
                             .p_0()
                             .accessibility_label(item.label.clone())
                             .when(selected, |row| row.bg(rgb(0x222b36)))
+                            .when(cursor == Some(index), |row| {
+                                row.border_1().border_color(rgb(0x61afef))
+                            })
                             .child(
                                 h_flex()
                                     .w_full()
@@ -1894,25 +2064,16 @@ impl NativeEditor {
                                     .text_color(rgb(if selected { 0x61afef } else { 0xa4a9b2 }))
                                     .child(icon)
                                     .child(
-                                        div().flex_1().min_w_0().text_ellipsis().child(item.label),
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_ellipsis()
+                                            .child(item.label.clone()),
                                     )
                                     .when(selected && self.dirty, |row| row.child("●")),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                if item.more {
-                                    *this
-                                        .tree_limits
-                                        .entry(key.clone())
-                                        .or_insert(TREE_PAGE_SIZE) += TREE_PAGE_SIZE;
-                                } else if let Some(path) = &item.file {
-                                    this.error = this
-                                        .open(path, None, window, cx)
-                                        .err()
-                                        .map(|e| format!("{e:#}"));
-                                } else if !this.expanded_dirs.insert(key.clone()) {
-                                    this.expanded_dirs.remove(&key);
-                                }
-                                cx.notify();
+                                this.activate_tree_row(&item, window, cx);
                             })),
                     );
                 }
@@ -1946,13 +2107,19 @@ impl NativeEditor {
         Some(
             v_flex()
                 .debug_selector(|| "native-sidebar".into())
+                .id("native-sidebar")
+                .track_focus(&self.sidebar_focus)
                 .w(px(260.))
                 .h_full()
                 .flex_shrink_0()
                 .min_h_0()
                 .bg(rgb(0x121416))
                 .border_r_1()
-                .border_color(rgb(0x26292e))
+                .border_color(rgb(if self.sidebar_focus.contains_focused(window, cx) {
+                    0x61afef
+                } else {
+                    0x26292e
+                }))
                 .child(
                     h_flex()
                         .h(px(44.))
@@ -2194,7 +2361,7 @@ impl Render for NativeEditor {
             .and_then(|path| path.strip_prefix(&self.canonical_root).ok())
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "No file open".into());
-        let browser = self.render_browser(cx);
+        let browser = self.render_browser(window, cx);
         let tabs = self.render_tabs(cx);
         let actions = self.render_editor_menu(cx).into_any_element();
         let code = v_flex()
@@ -2384,6 +2551,88 @@ mod tests {
     use gpui_kit::test::TestWindowExt as _;
 
     #[test]
+    fn tree_sorts_folders_before_files_at_each_level() {
+        let mut files: Vec<_> = [
+            "a.txt",
+            "zfolder/a.txt",
+            "bfolder/x.txt",
+            ".gitignore",
+            "zfolder/zfolder/c.txt",
+            "bfolder/zfolder/file.txt",
+        ]
+        .into_iter()
+        .map(|label| ProjectFile {
+            path: PathBuf::from(label),
+            label: label.into(),
+        })
+        .collect();
+        sort_tree_files(&mut files);
+        let expanded = [
+            "",
+            "bfolder",
+            "bfolder/zfolder",
+            "zfolder",
+            "zfolder/zfolder",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let rows = tree_rows(&files, &expanded, &HashMap::new());
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            [
+                "bfolder",
+                "bfolder/zfolder",
+                "bfolder/zfolder/file.txt",
+                "bfolder/x.txt",
+                "zfolder",
+                "zfolder/zfolder",
+                "zfolder/zfolder/c.txt",
+                "zfolder/a.txt",
+                ".gitignore",
+                "a.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_paginates_after_sorting_folders_first() {
+        let mut files: Vec<_> = (0..105)
+            .map(|index| {
+                let label = format!("a-{index:03}.txt");
+                ProjectFile {
+                    path: PathBuf::from(&label),
+                    label,
+                }
+            })
+            .collect();
+        files.push(ProjectFile {
+            path: "zfolder/child.txt".into(),
+            label: "zfolder/child.txt".into(),
+        });
+        sort_tree_files(&mut files);
+        let rows = tree_rows(&files, &HashSet::from([String::new()]), &HashMap::new());
+        assert_eq!(rows[0].key, "zfolder", "folders must be on the first page");
+        assert_eq!(rows[1].key, "a-000.txt");
+        assert_eq!(
+            rows.iter().filter(|row| row.file.is_some()).count(),
+            TREE_PAGE_SIZE - 1
+        );
+        assert!(
+            rows.last().unwrap().more,
+            "Show more follows the sorted siblings"
+        );
+        let rows = tree_rows(
+            &files,
+            &HashSet::from([String::new()]),
+            &HashMap::from([(String::new(), 200)]),
+        );
+        assert_eq!(rows[0].key, "zfolder");
+        assert_eq!(rows.last().unwrap().key, "a-104.txt");
+        assert!(!rows.iter().any(|row| row.more));
+    }
+
+    #[test]
     fn expanded_tree_keeps_later_top_level_folders_visible() {
         let mut files: Vec<ProjectFile> = (0..350)
             .map(|index| ProjectFile {
@@ -2467,6 +2716,179 @@ mod tests {
             gpui_kit::component::Root::new(editor, window, cx)
         });
         (holder.borrow().clone().unwrap(), test_cx)
+    }
+
+    #[gpui_kit::test]
+    fn navigation_tree_moves_without_opening_and_activates_folders_files_and_more(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let files: Vec<_> = (0..105)
+            .map(|index| {
+                let label = format!("src/file-{index:03}.txt");
+                let path = dir.path().join(&label);
+                fs::write(&path, "hello\nworld\n").unwrap();
+                ProjectFile { path, label }
+            })
+            .collect();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.files = files;
+            view.set_navigation_active(true, cx);
+            assert_eq!(view.navigation_panes(cx).len(), 2);
+            view.move_navigation_item(0, false, window, cx);
+            assert_eq!(view.tree_cursor.as_deref(), Some("native-tree-dir-src"));
+            assert!(view.path.is_none());
+            assert!(view.activate_navigation_cursor(window, cx));
+            assert!(view.expanded_dirs.contains("src"));
+            view.move_navigation_item(0, true, window, cx);
+            assert_eq!(
+                view.tree_cursor.as_deref(),
+                Some("native-tree-file-src/file-000.txt")
+            );
+            assert!(view.path.is_none(), "movement only highlights the row");
+            view.activate_navigation_cursor(window, cx);
+            assert_eq!(
+                view.path,
+                Some(view.canonical_root.join("src/file-000.txt"))
+            );
+            view.editor
+                .update(cx, |editor, cx| editor.set_value("draft", window, cx));
+            view.move_navigation_item(0, true, window, cx);
+            view.activate_navigation_cursor(window, cx);
+            assert!(
+                view.inactive_documents
+                    .values()
+                    .any(|doc| doc.editor.read(cx).text().to_string() == "draft")
+            );
+            for _ in 0..110 {
+                view.move_navigation_item(0, true, window, cx);
+            }
+            assert_eq!(view.tree_cursor.as_deref(), Some("native-tree-more-src"));
+            view.activate_navigation_cursor(window, cx);
+            assert_eq!(view.tree_limits.get("src"), Some(&200));
+            assert!(
+                tree_rows(&view.files, &view.expanded_dirs, &view.tree_limits)
+                    .iter()
+                    .any(|row| row.key == "src/file-104.txt")
+            );
+            view.set_navigation_active(false, cx);
+            assert!(!view.navigation_active);
+            assert!(view.tree_cursor.is_none());
+            view.browser = BrowserMode::Closed;
+            assert_eq!(view.navigation_panes(cx).len(), 1);
+            assert!(!view.navigation_in_tree(0));
+            view.files.clear();
+            view.browser = BrowserMode::Tree;
+            view.set_navigation_active(true, cx);
+            view.move_navigation_item(0, true, window, cx);
+            view.activate_navigation_cursor(window, cx);
+            assert!(
+                view.tree_cursor.is_none(),
+                "empty trees consume movement safely"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn navigation_tree_scrolls_highlighted_rows_into_view(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update(test_cx, |view, cx| {
+            view.files = (0..80)
+                .map(|index| {
+                    let label = format!("file-{index:03}.txt");
+                    ProjectFile {
+                        path: dir.path().join(&label),
+                        label,
+                    }
+                })
+                .collect();
+            view.set_navigation_active(true, cx);
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.update_in(test_cx, |view, window, cx| {
+            for _ in 0..79 {
+                view.move_navigation_item(0, true, window, cx);
+            }
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(test_cx, |view, _| {
+            assert!(view.tree_scroll.offset().y < px(0.));
+            let viewport = view.tree_scroll.bounds();
+            let row = view.tree_scroll.bounds_for_item(79).unwrap();
+            let bottom = row.bottom() + view.tree_scroll.offset().y;
+            assert!(
+                bottom <= viewport.bottom(),
+                "highlighted row must be visible"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn navigation_editor_moves_vertically_without_changing_text(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        let text = "hello\nx\nworld\n";
+        fs::write(&file, text).unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.set_cursor_position(Position::new(0, 4), window, cx)
+            });
+            view.editor.update(cx, |editor, cx| {
+                editor.present_completion_items(
+                    0,
+                    "",
+                    vec![lsp_types::CompletionItem {
+                        label: "hello".into(),
+                        ..Default::default()
+                    }],
+                    cx,
+                );
+                editor.set_overlay_action_handler(|_, _, _, _| true);
+                assert!(editor.completion_menu_state().open);
+            });
+            view.set_navigation_active(true, cx);
+            assert!(!view.editor.read(cx).completion_menu_state().open);
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        for (down, row, column) in [
+            (true, 1, 1),
+            (true, 2, 4),
+            (false, 1, 1),
+            (false, 0, 4),
+            (false, 0, 4),
+        ] {
+            view.update_in(test_cx, |view, window, cx| {
+                view.move_navigation_item(1, down, window, cx)
+            });
+            test_cx.run_until_parked();
+            test_cx.update(|window, cx| window.render_frame(cx));
+            view.read_with(test_cx, |view, cx| {
+                assert_eq!(
+                    view.editor.read(cx).cursor_position(),
+                    Position::new(row, column)
+                );
+                assert_eq!(view.editor.read(cx).text().to_string(), text);
+                assert!(!view.dirty);
+            });
+        }
+        view.update_in(test_cx, |view, window, cx| {
+            view.browser = BrowserMode::Closed;
+            view.move_navigation_item(0, true, window, cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).cursor_position().line, 1)
+        });
     }
 
     #[gpui_kit::test]
@@ -2720,6 +3142,32 @@ mod tests {
             .advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
         cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_grep_keeps_alphabetical_priority_when_tree_is_folder_first(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("zfolder")).unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        fs::write(dir.path().join("zfolder/child.txt"), "needle\n".repeat(201)).unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            assert_eq!(view.files[0].label, "zfolder/child.txt");
+            view.open_live_grep(window, cx);
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("n e e d l e");
+        settle_live_grep(test_cx);
+        view.read_with(test_cx, |view, _| {
+            assert!(view.search_truncated);
+            assert_eq!(view.search_results.len(), 200);
+            assert_eq!(view.search_results[0].label, "a.txt");
+            assert_eq!(view.search_results[1].label, "zfolder/child.txt");
+        });
     }
 
     #[gpui_kit::test]

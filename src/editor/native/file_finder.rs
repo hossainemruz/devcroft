@@ -190,7 +190,7 @@ impl NativeEditor {
             if epoch.load(Ordering::Relaxed) != generation {
                 return;
             }
-            let Ok(Some((root, files))) = view.update(cx, |this, _| {
+            let Ok(Some((root, mut files))) = view.update(cx, |this, _| {
                 (this.file_generation.load(Ordering::Relaxed) == generation
                     && this.browser == BrowserMode::Text)
                     .then(|| (this.canonical_root.clone(), this.files.clone()))
@@ -199,6 +199,9 @@ impl NativeEditor {
             };
             let results = cx
                 .background_spawn(async move {
+                    // The sidebar groups folders first, but grep retains its
+                    // alphabetical file priority before applying its limit.
+                    files.sort_unstable_by(|a, b| a.label.cmp(&b.label));
                     project::search_text(&root, &files, &query, || {
                         epoch.load(Ordering::Relaxed) != generation
                     })

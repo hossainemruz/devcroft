@@ -2630,18 +2630,29 @@ impl Workspace {
         if self.relationships_visible {
             return navigation::ResourceState::default();
         }
-        if self.home_visible && self.home.read(cx).is_artifacts_page() {
-            self.home.read(cx).artifacts_navigation_state(cx)
-        } else if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
-            navigation::ResourceState {
-                built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
-                ..self.resources.read(cx).navigation_state()
-            }
+        if self.home_visible {
+            return if self.home.read(cx).is_artifacts_page() {
+                self.home.read(cx).artifacts_navigation_state(cx)
+            } else {
+                navigation::ResourceState::default()
+            };
+        }
+        let resource = if self.active_tab == WorkspaceTab::Resources {
+            self.resources.read(cx).navigation_state()
         } else {
-            navigation::ResourceState {
-                built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
-                ..Default::default()
-            }
+            navigation::ResourceState::default()
+        };
+        navigation::ResourceState {
+            active_tab: match self.active_tab {
+                WorkspaceTab::Agent => Some(navigation::Tab::Agent),
+                WorkspaceTab::Editor => Some(navigation::Tab::Editor),
+                WorkspaceTab::Terminal => Some(navigation::Tab::Terminal),
+                WorkspaceTab::Review => Some(navigation::Tab::Review),
+                WorkspaceTab::Resources => Some(navigation::Tab::Resources),
+                WorkspaceTab::Git => None,
+            },
+            built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
+            ..resource
         }
     }
 
@@ -3231,36 +3242,170 @@ impl Workspace {
             NavigationContext::Workspace => self.active_tab.label(),
         };
         let viewport = window.viewport_size();
-        let hud_width = (f32::from(viewport.width) - 32.).clamp(200., 330.);
+        let hud_width = (f32::from(viewport.width) - 32.).clamp(200., 420.);
         let hud_height = (f32::from(viewport.height) - WORKSPACE_HEADER_HEIGHT - 36.).max(120.);
-        let mut commands = v_flex().gap_1();
-        let mut previous = "";
-        for row in rows {
-            if row.group != previous {
-                previous = row.group;
-                commands = commands.child(
+        // Leave a little slack for border rounding so a full row never wraps
+        // its last cell because of a fractional pixel.
+        let content_width = hud_width - 36.;
+        let columns = if content_width >= 340. { 2 } else { 1 };
+        let cell_width = (content_width - 8. * (columns - 1) as f32) / columns as f32;
+        let shortcut = |keys: String, label: String, width: f32, active: bool| {
+            h_flex()
+                .w(px(width))
+                .flex_shrink_0()
+                .items_center()
+                .gap_1p5()
+                .child(
                     div()
-                        .pt_2()
+                        .min_w(px(18.))
+                        .flex_shrink_0()
                         .text_xs()
-                        .text_color(rgb(0x858989))
-                        .child(row.group),
-                );
+                        .font_semibold()
+                        .text_color(rgb(0x93c5fd))
+                        .child(keys),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .text_xs()
+                        .when(active, |label| label.font_semibold())
+                        .text_color(rgb(if active { 0xbfdbfe } else { 0xc1c7d0 }))
+                        .child(label),
+                )
+        };
+        let binding = |keys: String, label: String| shortcut(keys, label, cell_width, false);
+        let action = |row: &navigation::Row| {
+            binding(
+                if row.key == ' ' {
+                    "Space".to_owned()
+                } else {
+                    row.key_label()
+                },
+                if row.command == NavigationCommand::GitChanges {
+                    "Git changes".to_owned()
+                } else {
+                    row.label.to_owned()
+                },
+            )
+        };
+        let section = |title: &str, content: gpui_kit::Div| {
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(rgb(0x939caa))
+                        .child(title.to_owned()),
+                )
+                .child(content)
+        };
+        let mut sections = v_flex().gap_4();
+        // Keep presentation independent of key resolution: every policy row
+        // appears once, while contextual actions lead and shared controls trail.
+        let contextual_groups = if self.navigation_context(cx) == NavigationContext::Workspace
+            && self.active_tab == WorkspaceTab::Agent
+        {
+            ["Agent", "Resource", "Editor", "Home"]
+        } else {
+            ["Resource", "Editor", "Agent", "Home"]
+        };
+        for group in contextual_groups {
+            let contextual: Vec<_> = rows.iter().filter(|row| row.group == group).collect();
+            if !contextual.is_empty() {
+                sections = sections.child(section(
+                    &format!("{group} actions"),
+                    h_flex()
+                        .flex_wrap()
+                        .gap_x_2()
+                        .gap_y_1()
+                        .children(contextual.into_iter().map(action)),
+                ));
             }
-            commands = commands.child(
-                h_flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .w(px(20.))
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(rgb(0x60a5fa))
-                            .child(row.key_label()),
-                    )
-                    .child(div().text_sm().child(row.label)),
-            );
         }
+        let is_tab = |command| {
+            matches!(
+                command,
+                NavigationCommand::Agent
+                    | NavigationCommand::Editor
+                    | NavigationCommand::Terminal
+                    | NavigationCommand::Review
+                    | NavigationCommand::Resources
+            )
+        };
+        let tabs: Vec<_> = rows.iter().filter(|row| is_tab(row.command)).collect();
+        if !tabs.is_empty() {
+            // Split the five workspace tabs into two rows (three, then two).
+            let tab_columns = tabs.len().div_ceil(2);
+            let tab_width = (content_width - 8. * (tab_columns - 1) as f32) / tab_columns as f32;
+            sections = sections.child(section(
+                "Switch tab",
+                v_flex()
+                    .gap_1()
+                    .children(tabs.chunks(tab_columns).map(|tab_row| {
+                        h_flex().gap_2().children(tab_row.iter().map(|row| {
+                            let label = if tab_width < 96. {
+                                match row.command {
+                                    NavigationCommand::Agent => "Ag",
+                                    NavigationCommand::Editor => "Ed",
+                                    NavigationCommand::Terminal => "TTY",
+                                    NavigationCommand::Review => "Rev",
+                                    NavigationCommand::Resources => "Res",
+                                    _ => row.label,
+                                }
+                            } else {
+                                row.label
+                            };
+                            shortcut(
+                                row.key_label(),
+                                label.to_owned(),
+                                tab_width,
+                                row.label == context_title,
+                            )
+                        }))
+                    })),
+            ));
+        }
+        let mut common = h_flex().flex_wrap().gap_x_2().gap_y_1().children(
+            rows.iter()
+                .filter(|row| row.group == "Navigate" && !is_tab(row.command))
+                .map(action),
+        );
+        common = common.child(binding("Tab / ⇧Tab".to_owned(), "Cycle focus".to_owned()));
+        if panes.len() > 1 {
+            common = common.child(binding("h / l".to_owned(), "Change pane".to_owned()));
+        }
+        if self.navigation_item_available(cx) {
+            common = common.child(binding("j / k".to_owned(), "Move down / up".to_owned()));
+        }
+        common = common
+            .child(binding(
+                "Enter".to_owned(),
+                if self.navigation_enter_opens(cx) {
+                    "Open / toggle"
+                } else {
+                    "Keep focus"
+                }
+                .to_owned(),
+            ))
+            .child(binding(
+                if cfg!(target_os = "macos") {
+                    "Esc / ⌘J"
+                } else {
+                    "Esc / Ctrl+J"
+                }
+                .to_owned(),
+                "Close".to_owned(),
+            ));
+        sections = sections.child(
+            div()
+                .pt_3()
+                .border_t_1()
+                .border_color(rgb(0x30363e))
+                .child(section("Common", common)),
+        );
         div()
             .absolute()
             .bottom(px(16.))
@@ -3271,69 +3416,45 @@ impl Workspace {
                     .max_h(px(hud_height))
                     .overflow_y_scrollbar()
                     .p_4()
-                    .gap_2()
+                    .gap_4()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x3a3d3d))
-                    .bg(rgb(0x151717))
+                    .border_color(rgb(0x3a424d))
+                    .bg(rgb(0x151a20))
                     .shadow_lg()
                     .child(
                         h_flex()
+                            .items_center()
                             .justify_between()
+                            .gap_2()
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(format!("Navigation · {context_title}")),
+                                v_flex()
+                                    .gap_1()
+                                    .child(div().text_sm().font_semibold().child("Navigation"))
+                                    .child(div().text_xs().text_color(rgb(0x939caa)).child(
+                                        if context_title == pane {
+                                            context_title.to_owned()
+                                        } else {
+                                            format!("{context_title} · {pane}")
+                                        },
+                                    )),
                             )
                             .child(
                                 div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0x332b1b))
                                     .text_xs()
-                                    .text_color(rgb(0x858989))
-                                    .child(format!("Pane: {pane}")),
+                                    .text_color(rgb(0xe8bd62))
+                                    .child("Keys active"),
                             ),
                     )
-                    .child(commands)
-                    .child({
-                        let item = self.navigation_item_available(cx);
-                        let enter = if self.navigation_enter_opens(cx) {
-                            "Enter open"
-                        } else {
-                            "Enter keep focus"
-                        };
-                        let toggle = if cfg!(target_os = "macos") {
-                            "⌘J"
-                        } else {
-                            "Ctrl+J"
-                        };
-                        let hint = match (panes.len() > 1, item) {
-                            (true, true) => format!(
-                                "Tab focus · h/l pane · j/k move · {enter} · Esc/{toggle} close"
-                            ),
-                            (true, false) => {
-                                format!("Tab focus · h/l pane · {enter} · Esc/{toggle} close")
-                            }
-                            (false, true) => {
-                                format!("Tab focus · j/k move · {enter} · Esc/{toggle} close")
-                            }
-                            (false, false) => format!("Tab focus · Esc/{toggle} close"),
-                        };
-                        div()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(rgb(0x292b2b))
-                            .text_xs()
-                            .text_color(rgb(0x858989))
-                            .child(hint)
-                    }),
+                    .child(sections),
             )
             .into_any_element()
     }
 
-    /// Reserve room for the active label so switching modes never shifts search.
-    /// Display-only on purpose — pointer presses dismiss the mode through
-    /// the root capture handler, so a click-to-toggle here would race that
-    /// dismissal. The hint stays the way in and out.
     fn render_navigation_indicator(&self) -> AnyElement {
         h_flex()
             .flex_none()
@@ -4020,6 +4141,41 @@ mod tests {
             Root::new(workspace, window, cx)
         });
         let view = holder.borrow().clone().unwrap();
+        view.update(test_cx, |view, cx| {
+            for tab in WorkspaceTab::ALL {
+                view.active_tab = tab;
+                let state = view.navigation_resource_state(cx);
+                let rows = navigation::rows(view.navigation_context(cx), state);
+                for (command, available) in [
+                    (NavigationCommand::NewSession, tab == WorkspaceTab::Agent),
+                    (NavigationCommand::OpenFile, tab == WorkspaceTab::Editor),
+                    (NavigationCommand::SwitchBuffer, tab == WorkspaceTab::Editor),
+                    (
+                        NavigationCommand::SearchProject,
+                        tab == WorkspaceTab::Editor,
+                    ),
+                ] {
+                    assert_eq!(
+                        rows.iter().any(|row| row.command == command),
+                        available,
+                        "{tab:?}: {command:?}"
+                    );
+                }
+            }
+            view.active_tab = WorkspaceTab::Editor;
+            view.home_visible = true;
+            assert_eq!(
+                view.navigation_resource_state(cx),
+                navigation::ResourceState::default()
+            );
+            view.home_visible = false;
+            view.relationships_visible = true;
+            assert_eq!(
+                view.navigation_resource_state(cx),
+                navigation::ResourceState::default()
+            );
+            view.relationships_visible = false;
+        });
         test_cx.run_until_parked();
         test_cx.update(|window, cx| window.render_frame(cx));
         let press = |cx: &mut gpui_kit::VisualTestContext, key: &str| {

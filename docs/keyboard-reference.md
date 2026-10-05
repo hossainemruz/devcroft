@@ -9,7 +9,15 @@ Toggle with `Cmd+J` on macOS (`Ctrl+J` on Linux/Windows). The top bar shows a
 a keyboard badge with `⌘J` on macOS (`Ctrl+J` elsewhere) right after the command
 bar. It becomes an amber `Navigation` badge while the mode owns the keyboard,
 without shifting the search field. The key list sits
-at the bottom-right of the window.
+at the bottom-right of the window. Contextual actions appear only for the
+active tab or page and come first. Workspace tab shortcuts use two compact
+rows (three tabs, then two), with the active tab highlighted. The final
+**Common** section groups shared commands and focus, movement, and close
+controls. All sections use the same small text and blue shortcut labels
+without keycap outlines. Contextual and common sections use fewer columns in
+narrow windows; labels shorten with an ellipsis when needed. Short windows
+can scroll the overlay. Very narrow tab rows use abbreviated names
+(`Ag`, `Ed`, `TTY`, `Rev`, `Res`) to keep both rows readable.
 
 ## Direct shortcuts (normal mode)
 
@@ -39,7 +47,9 @@ These three also work inside navigation mode: the palettes exit to normal mode a
 | Everywhere in navigation mode | `Tab` Next focusable component, `Shift+Tab` Previous focusable component (mode stays open) |
 | Home dashboard | `a` Add repository, `r` Browse artifacts, `s` Switch space |
 | Space switcher (open) | `↑`/`↓` Highlight a space, `Enter` switch to it, `Escape` close |
-| Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Git changes, `Space` Home, `n` New agent session; `f` Find project file, `b` Switch open tab when Built-in is selected; `w` Search project when Built-in is selected and no resource draft is open |
+| Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Git changes, `Space` Home |
+| Editor tab (Built-in selected) | `f` Find project file, `b` Switch open tab, `w` Search project |
+| Agent tab | `n` New agent session |
 | Global Artifacts page | `Space` Home, `b` Back to origin, `s` Switch space, plus artifact actions below when available |
 | Selected resource, no draft or save running | `m` Edit Markdown, `c` Add comment |
 | Resource draft, save not running | `w` Save draft, `q` Cancel draft |
@@ -58,7 +68,7 @@ Resource actions appear on the Resources tab and on the global Artifacts page. D
 
 With navigation mode open, `h` / `l` (or `←` / `→`) move between the visible sidebar and code area. In the file tree, `j` / `k` (or `↓` / `↑`) highlight rows and scroll them into view; `Enter` toggles a folder while keeping navigation mode open and its row highlighted. Opening a file or activating Show more leaves navigation mode. In the code area, `j` / `k` move the cursor vertically using the editor's usual arrow-key behavior, including wrapped lines and preferred columns. Movement keeps the mode open and preserves document contents; `Enter` or `Escape` returns to normal editing. A hidden sidebar is skipped.
 
-`Cmd+J`, then `f` on macOS (`Ctrl+J`, then `f` on Linux/Windows) focuses the checkout file finder. Type a partial path, use `↑`/`↓` to select a result, and press `Enter` to open it. The sidebar search icon also opens the finder. `Cmd+J`, then `b` (`Ctrl+J`, then `b` elsewhere) opens the same finder with only open tabs. Its preview includes unsaved edits; Enter switches tabs while preserving their buffers and cursor positions. `Cmd+J`, then `w` (`Ctrl+J`, then `w` elsewhere) opens live grep in the same popup. On the Resources tab, `w` saves an open resource draft. Results update as you type; Enter opens the selected file at the matching line. The **…** editor actions menu offers Search project, Go to line, Find in file, Replace in file, and Refresh files. `Cmd+S` / `Ctrl+S` saves the active file. **… → Go back / Go forward** follows file and line navigation. The editor's normal selection, clipboard, undo, and redo shortcuts remain available while it has focus.
+On the Editor tab with Built-in selected, `Cmd+J`, then `f` on macOS (`Ctrl+J`, then `f` on Linux/Windows) focuses the checkout file finder. Type a partial path, use `↑`/`↓` to select a result, and press `Enter` to open it. The sidebar search icon also opens the finder. `Cmd+J`, then `b` (`Ctrl+J`, then `b` elsewhere) opens the same finder with only open tabs. Its preview includes unsaved edits; Enter switches tabs while preserving their buffers and cursor positions. `Cmd+J`, then `w` (`Ctrl+J`, then `w` elsewhere) opens live grep in the same popup. On the Resources tab, `w` saves an open resource draft. Results update as you type; Enter opens the selected file at the matching line. The **…** editor actions menu offers Search project, Go to line, Find in file, Replace in file, and Refresh files. `Cmd+S` / `Ctrl+S` saves the active file. **… → Go back / Go forward** follows file and line navigation. The editor's normal selection, clipboard, undo, and redo shortcuts remain available while it has focus.
 
 Git changes opens a near-window-sized terminal dialog running `lazygit` in the current checkout. Enter, plain Escape, and Tab belong to lazygit, not the dialog; press **Shift+Esc** while the terminal is focused to close it (the shortcut is shown in the dialog title). The ✕ button or navigation toggle (`Cmd+J` / `Ctrl+J`) also closes it. Each opening starts a new lazygit session in the current checkout.
 

@@ -182,6 +182,7 @@ impl ArtifactBrowser {
 
     pub(crate) fn navigation_state(&self) -> crate::navigation::ResourceState {
         crate::navigation::ResourceState {
+            active_tab: None,
             built_in_editor: false,
             selected: self.selected.is_some(),
             drafting: self.draft.is_some(),

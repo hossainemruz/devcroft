@@ -14,6 +14,8 @@ pub(crate) enum Context {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResourceState {
+    /// Present only while a repository workspace tab is visible.
+    pub active_tab: Option<Tab>,
     pub built_in_editor: bool,
     pub selected: bool,
     pub drafting: bool,
@@ -21,6 +23,15 @@ pub(crate) struct ResourceState {
     /// Whether the selection supports Markdown editing and comments. Tutorial
     /// resources are view-only HTML, so their resource rows are omitted.
     pub editable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tab {
+    Agent,
+    Editor,
+    Terminal,
+    Review,
+    Resources,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -86,7 +97,7 @@ const HOME: [Row; 3] = [
     },
 ];
 
-const WORKSPACE: [Row; 8] = [
+const WORKSPACE: [Row; 7] = [
     Row {
         key: 'a',
         label: "Agent",
@@ -129,13 +140,14 @@ const WORKSPACE: [Row; 8] = [
         group: "Navigate",
         command: Command::Home,
     },
-    Row {
-        key: 'n',
-        label: "New agent session",
-        group: "Workspace",
-        command: Command::NewSession,
-    },
 ];
+
+const NEW_SESSION: Row = Row {
+    key: 'n',
+    label: "New agent session",
+    group: "Agent",
+    command: Command::NewSession,
+};
 
 const FIND_FILE: Row = Row {
     key: 'f',
@@ -220,14 +232,18 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
         Context::Artifacts => ARTIFACTS.to_vec(),
         Context::Relationships => RELATIONSHIPS.to_vec(),
     };
-    if context == Context::Workspace && resource.built_in_editor {
-        result.extend([FIND_FILE, SWITCH_BUFFER]);
-        // Resource drafts own `w` for Save, including while a save is running.
-        if !(resource.selected && resource.editable && resource.drafting) {
-            result.push(SEARCH_PROJECT);
-        }
+    if context == Context::Workspace && resource.active_tab == Some(Tab::Agent) {
+        result.push(NEW_SESSION);
     }
-    if resource.selected && resource.editable && !resource.saving {
+    if context == Context::Workspace
+        && resource.active_tab == Some(Tab::Editor)
+        && resource.built_in_editor
+    {
+        result.extend([FIND_FILE, SWITCH_BUFFER, SEARCH_PROJECT]);
+    }
+    let resource_context = context == Context::Artifacts
+        || (context == Context::Workspace && resource.active_tab == Some(Tab::Resources));
+    if resource_context && resource.selected && resource.editable && !resource.saving {
         result.extend(if resource.drafting {
             RESOURCE_DRAFT
         } else {
@@ -336,6 +352,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_session_is_only_available_on_the_agent_tab() {
+        for context in [
+            Context::Home,
+            Context::Workspace,
+            Context::Artifacts,
+            Context::Relationships,
+        ] {
+            for active_tab in [
+                None,
+                Some(Tab::Agent),
+                Some(Tab::Editor),
+                Some(Tab::Terminal),
+                Some(Tab::Review),
+                Some(Tab::Resources),
+            ] {
+                let state = ResourceState {
+                    active_tab,
+                    ..Default::default()
+                };
+                let available = context == Context::Workspace && active_tab == Some(Tab::Agent);
+                assert_eq!(
+                    rows(context, state)
+                        .iter()
+                        .any(|row| row.command == Command::NewSession),
+                    available
+                );
+                assert_eq!(
+                    decide(true, Input::Key('n'), context, state),
+                    if available {
+                        Decision::Execute(Command::NewSession)
+                    } else {
+                        Decision::Consume
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tab_actions_ignore_other_tabs_even_with_retained_editor_and_resource_state() {
+        for active_tab in [
+            None,
+            Some(Tab::Agent),
+            Some(Tab::Editor),
+            Some(Tab::Terminal),
+            Some(Tab::Review),
+            Some(Tab::Resources),
+        ] {
+            for context in [
+                Context::Home,
+                Context::Workspace,
+                Context::Artifacts,
+                Context::Relationships,
+            ] {
+                for drafting in [false, true] {
+                    let state = ResourceState {
+                        active_tab,
+                        built_in_editor: true,
+                        selected: true,
+                        editable: true,
+                        drafting,
+                        ..Default::default()
+                    };
+                    let editor = context == Context::Workspace && active_tab == Some(Tab::Editor);
+                    let resource = context == Context::Artifacts
+                        || (context == Context::Workspace && active_tab == Some(Tab::Resources));
+                    for (key, command, available) in [
+                        ('f', Command::OpenFile, editor),
+                        ('m', Command::EditMarkdown, resource && !drafting),
+                        ('c', Command::AddComment, resource && !drafting),
+                        ('q', Command::CancelDraft, resource && drafting),
+                    ] {
+                        assert_eq!(
+                            rows(context, state)
+                                .iter()
+                                .any(|row| row.command == command),
+                            available
+                        );
+                        assert_eq!(
+                            decide(true, Input::Key(key), context, state),
+                            if available {
+                                Decision::Execute(command)
+                            } else {
+                                Decision::Consume
+                            }
+                        );
+                    }
+                    assert_eq!(
+                        resolve(context, state, 'w'),
+                        if editor {
+                            Some(Command::SearchProject)
+                        } else if resource && drafting {
+                            Some(Command::SaveDraft)
+                        } else {
+                            None
+                        }
+                    );
+                    assert_eq!(
+                        rows(context, state)
+                            .iter()
+                            .any(|row| row.command == Command::SwitchBuffer),
+                        editor
+                    );
+                    assert_eq!(
+                        resolve(context, state, 'b'),
+                        if editor {
+                            Some(Command::SwitchBuffer)
+                        } else if matches!(context, Context::Artifacts | Context::Relationships) {
+                            Some(Command::Back)
+                        } else {
+                            None
+                        }
+                    );
+                    assert!(unique_keys(&rows(context, state)));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn contexts_offer_only_their_actions() {
         assert_eq!(
             resolve(Context::Home, ResourceState::default(), 'a'),
@@ -437,6 +573,7 @@ mod tests {
             for resource in [
                 ResourceState::default(),
                 ResourceState {
+                    active_tab: Some(Tab::Resources),
                     selected: true,
                     drafting: false,
                     saving: false,
@@ -444,6 +581,7 @@ mod tests {
                     ..Default::default()
                 },
                 ResourceState {
+                    active_tab: Some(Tab::Resources),
                     selected: true,
                     drafting: true,
                     saving: false,
@@ -451,6 +589,7 @@ mod tests {
                     ..Default::default()
                 },
                 ResourceState {
+                    active_tab: Some(Tab::Resources),
                     selected: true,
                     drafting: true,
                     saving: true,
@@ -470,6 +609,7 @@ mod tests {
     #[test]
     fn built_in_workspace_owns_f_without_an_o_alias_for_file_opening() {
         let built_in = ResourceState {
+            active_tab: Some(Tab::Editor),
             built_in_editor: true,
             ..Default::default()
         };
@@ -492,6 +632,7 @@ mod tests {
     #[test]
     fn built_in_workspace_owns_b_for_buffers_without_changing_back_navigation() {
         let built_in = ResourceState {
+            active_tab: Some(Tab::Editor),
             built_in_editor: true,
             ..Default::default()
         };
@@ -523,53 +664,52 @@ mod tests {
     }
 
     #[test]
-    fn built_in_workspace_owns_w_for_search_without_changing_space_switching_or_draft_saving() {
-        let built_in = ResourceState {
+    fn search_and_draft_saving_follow_the_active_tab() {
+        let editor = ResourceState {
+            active_tab: Some(Tab::Editor),
             built_in_editor: true,
+            selected: true,
+            editable: true,
+            drafting: true,
             ..Default::default()
         };
         assert_eq!(
-            resolve(Context::Workspace, built_in, 'w'),
+            resolve(Context::Workspace, editor, 'w'),
             Some(Command::SearchProject)
         );
+        let resources = ResourceState {
+            active_tab: Some(Tab::Resources),
+            ..editor
+        };
         assert_eq!(
-            resolve(Context::Workspace, ResourceState::default(), 'w'),
-            None
+            resolve(Context::Workspace, resources, 'w'),
+            Some(Command::SaveDraft)
         );
-        assert_eq!(resolve(Context::Workspace, built_in, 's'), None);
-        for context in [Context::Home, Context::Artifacts] {
-            assert_eq!(resolve(context, built_in, 's'), Some(Command::SwitchSpace));
+        for key in ['f', 'b'] {
+            assert_eq!(resolve(Context::Workspace, resources, key), None);
         }
-        for drafting in [false, true] {
-            let state = ResourceState {
-                selected: true,
-                editable: true,
-                drafting,
-                ..built_in
-            };
-            assert!(unique_keys(&rows(Context::Workspace, state)));
-            assert_eq!(
-                resolve(Context::Workspace, state, 'w'),
-                Some(if drafting {
-                    Command::SaveDraft
-                } else {
-                    Command::SearchProject
-                })
-            );
-            if drafting {
-                let saving = ResourceState {
-                    saving: true,
-                    ..state
-                };
-                assert!(unique_keys(&rows(Context::Workspace, saving)));
-                assert_eq!(resolve(Context::Workspace, saving, 'w'), None);
-            }
+        let saving = ResourceState {
+            saving: true,
+            ..resources
+        };
+        assert_eq!(resolve(Context::Workspace, saving, 'w'), None);
+        assert_eq!(resolve(Context::Artifacts, saving, 'w'), None);
+        let external_editor = ResourceState {
+            built_in_editor: false,
+            ..editor
+        };
+        for key in ['f', 'b', 'w'] {
+            assert_eq!(resolve(Context::Workspace, external_editor, key), None);
+        }
+        for context in [Context::Home, Context::Artifacts] {
+            assert_eq!(resolve(context, editor, 's'), Some(Command::SwitchSpace));
         }
     }
 
     #[test]
     fn resource_rows_follow_draft_and_save_state() {
         let selected = ResourceState {
+            active_tab: Some(Tab::Resources),
             selected: true,
             editable: true,
             ..Default::default()
@@ -596,6 +736,7 @@ mod tests {
 
         // View-only resources keep selection but expose no edit/comment rows.
         let view_only = ResourceState {
+            active_tab: Some(Tab::Resources),
             selected: true,
             ..Default::default()
         };

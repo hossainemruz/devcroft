@@ -3242,14 +3242,14 @@ impl Workspace {
             NavigationContext::Workspace => self.active_tab.label(),
         };
         let viewport = window.viewport_size();
-        let hud_width = (f32::from(viewport.width) - 32.).clamp(200., 420.);
+        let hud_width = (f32::from(viewport.width) - 32.).clamp(200., 360.);
         let hud_height = (f32::from(viewport.height) - WORKSPACE_HEADER_HEIGHT - 36.).max(120.);
         // Leave a little slack for border rounding so a full row never wraps
         // its last cell because of a fractional pixel.
-        let content_width = hud_width - 36.;
-        let columns = if content_width >= 340. { 2 } else { 1 };
+        let content_width = hud_width - 28.;
+        let columns = if content_width >= 300. { 2 } else { 1 };
         let cell_width = (content_width - 8. * (columns - 1) as f32) / columns as f32;
-        let shortcut = |keys: String, label: String, width: f32, active: bool| {
+        let shortcut = |keys: String, label: String, width: f32| {
             h_flex()
                 .w(px(width))
                 .flex_shrink_0()
@@ -3257,11 +3257,14 @@ impl Workspace {
                 .gap_1p5()
                 .child(
                     div()
-                        .min_w(px(18.))
                         .flex_shrink_0()
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(0x2a3138))
+                        .bg(rgb(0x0d1116))
                         .text_xs()
-                        .font_semibold()
-                        .text_color(rgb(0x93c5fd))
+                        .text_color(rgb(0x858989))
                         .child(keys),
                 )
                 .child(
@@ -3270,12 +3273,11 @@ impl Workspace {
                         .min_w_0()
                         .text_ellipsis()
                         .text_xs()
-                        .when(active, |label| label.font_semibold())
-                        .text_color(rgb(if active { 0xbfdbfe } else { 0xc1c7d0 }))
+                        .text_color(rgb(0x939caa))
                         .child(label),
                 )
         };
-        let binding = |keys: String, label: String| shortcut(keys, label, cell_width, false);
+        let binding = |keys: String, label: String| shortcut(keys, label, cell_width);
         let action = |row: &navigation::Row| {
             binding(
                 if row.key == ' ' {
@@ -3292,17 +3294,16 @@ impl Workspace {
         };
         let section = |title: &str, content: gpui_kit::Div| {
             v_flex()
-                .gap_2()
+                .gap_1p5()
                 .child(
                     div()
                         .text_xs()
-                        .font_semibold()
-                        .text_color(rgb(0x939caa))
+                        .text_color(rgb(0x6b7480))
                         .child(title.to_owned()),
                 )
                 .child(content)
         };
-        let mut sections = v_flex().gap_4();
+        let mut sections = v_flex().gap_3();
         // Keep presentation independent of key resolution: every policy row
         // appears once, while contextual actions lead and shared controls trail.
         let contextual_groups = if self.navigation_context(cx) == NavigationContext::Workspace
@@ -3362,7 +3363,6 @@ impl Workspace {
                                 row.key_label(),
                                 label.to_owned(),
                                 tab_width,
-                                row.label == context_title,
                             )
                         }))
                     })),
@@ -3399,56 +3399,32 @@ impl Workspace {
                 .to_owned(),
                 "Close".to_owned(),
             ));
-        sections = sections.child(
-            div()
-                .pt_3()
-                .border_t_1()
-                .border_color(rgb(0x30363e))
-                .child(section("Common", common)),
-        );
+        sections = sections.child(section("Common", common));
         div()
             .absolute()
-            .bottom(px(16.))
-            .right(px(16.))
+            .bottom(px(12.))
+            .right(px(12.))
+            .opacity(0.96)
             .child(
                 v_flex()
                     .w(px(hud_width))
                     .max_h(px(hud_height))
                     .overflow_y_scrollbar()
-                    .p_4()
-                    .gap_4()
-                    .rounded_lg()
+                    .p_3()
+                    .gap_3()
+                    .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x3a424d))
-                    .bg(rgb(0x151a20))
-                    .shadow_lg()
+                    .border_color(rgb(0x2a3138))
+                    .bg(rgb(0x12161c))
+                    .shadow_md()
                     .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(div().text_sm().font_semibold().child("Navigation"))
-                                    .child(div().text_xs().text_color(rgb(0x939caa)).child(
-                                        if context_title == pane {
-                                            context_title.to_owned()
-                                        } else {
-                                            format!("{context_title} · {pane}")
-                                        },
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(0x332b1b))
-                                    .text_xs()
-                                    .text_color(rgb(0xe8bd62))
-                                    .child("Keys active"),
-                            ),
+                        div().text_xs().text_color(rgb(0x6b7480)).child(
+                            if context_title == pane {
+                                format!("Navigation · {context_title}")
+                            } else {
+                                format!("Navigation · {context_title} · {pane}")
+                            },
+                        ),
                     )
                     .child(sections),
             )

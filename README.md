@@ -1,4 +1,6 @@
-# Devcroft: Your personal development workspace
+# Devcroft
+
+> Your personal development workspace
 
 Devcroft is a GPUI based desktop app for personal development workflow. It focuses on keeping development workflow same no matter which harness you use. Vim like keyboard navigation let you fly between projects with ease.
 

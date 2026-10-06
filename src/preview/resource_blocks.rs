@@ -182,6 +182,20 @@ impl PreviewView {
                 }
             })
             .style(style)
+            .code_block_actions(|block, _, _| {
+                let code = block.code();
+                Button::new("copy")
+                    .ghost()
+                    .small()
+                    .compact()
+                    .label("Copy")
+                    .tooltip("Copy code block")
+                    .accessibility_label("Copy code block")
+                    .on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+                        window.push_notification("Copied code block", cx);
+                    })
+            })
             .code_block_highlighter({
                 let dark = cx.theme().is_dark();
                 let cache = self.code_highlights.clone();

@@ -24,13 +24,16 @@ use gpui_kit::base::{Scrollbar, TextView, TextViewStyle};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextViewState};
-use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton,
-    Overflow, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Window, div, px, relative, rems,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, HighlightStyle, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset,
+    MouseButton, Overflow, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window, div, px,
+    relative, rems,
 };
 
 /// Shared column width for document content and resource metadata.
@@ -910,6 +913,12 @@ impl Render for PreviewView {
             .style()
             .clone();
         code_block.overflow.x = Some(Overflow::Scroll);
+        // Scrollable code blocks are opt-in: with `overflow.y = Scroll`
+        // plus a max height, long blocks cap their height, get their own
+        // scrollbar, and keep wheel events inside the block until the code
+        // reaches its edge (gpui-kit v0.7.1).
+        code_block.overflow.y = Some(Overflow::Scroll);
+        code_block = code_block.max_h(px(320.));
         let table_head = div()
             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
             .bg(cx.theme().accent.opacity(0.5))

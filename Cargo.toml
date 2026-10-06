@@ -19,7 +19,7 @@ gix = { version = "0.87.1", default-features = false, features = ["parallel", "r
 # picker's languages that both engines can color, so a picked language means
 # the same thing on both tabs. SQL is the exception: `tree-sitter-sequel`
 # pins an old `cc`, which conflicts with the rest of the graph.
-gpui-kit = { version = "0.7.0", features = [
+gpui-kit = { version = "0.7.1", features = [
   "tree-sitter",
   "tree-sitter-bash",
   "tree-sitter-c",
@@ -66,7 +66,7 @@ globset = "0.4.20"
 notify = "7.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui-wry = "=0.7.0"
+gpui-wry = "=0.7.1"
 wry = { version = "=0.53.3", package = "lb-wry" }
 raw-window-handle = { version = "0.6", features = ["std"] }
 objc2 = "0.6"
@@ -76,7 +76,7 @@ objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-gpui-kit = { version = "0.7.0", features = ["test-support"] }
+gpui-kit = { version = "0.7.1", features = ["test-support"] }
 
 [profile.dev]
 debug = "limited"

@@ -1,0 +1,7 @@
+# Terminal
+
+Terminal-backed tabs own independent PTY sessions. Switching tabs keeps the underlying process alive. Devcroft starts the default shell as an interactive login shell, then enters the Agent or Neovim command through that shell. This makes shell startup files, environment changes, aliases, functions, and tool-manager activation available to those commands.
+
+The terminal UI bundles JetBrains Mono NL Nerd Font Mono v3.5.1 (regular, bold, italic, and bold italic), so Nerd Font symbols work without a separate system font installation. Attribution and license files are in [`assets/`](../assets/).
+
+The renderer supports ANSI color, keyboard input, bracketed paste, focus, resizing, scrollback, and scroll-wheel reporting to full-screen applications. Keyboard input automatically returns a scrolled terminal viewport to the active prompt. Each terminal row is shaped as one GPUI text layout with Ghostty styles applied as highlights. Mouse clicks, releases, drags, and hover are forwarded when the terminal application requests them. Hold **Shift** while dragging to select and copy text locally; double/triple-click selects a word/line. **Ctrl-click** (**Cmd-click** on macOS) opens HTTP(S) links, including OSC 8 links. Plain-text URL detection currently covers a single displayed row. Image protocols are not yet supported. The Ghostty binding is pinned to a reviewed upstream revision so builds remain reproducible.

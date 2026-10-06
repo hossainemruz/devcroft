@@ -1,6 +1,6 @@
-# Devcroft
+# Devcroft: Your personal development workspace
 
-Devcroft is a GPUI desktop workspace with Agent, Editor, Terminal, Review, and Resources tabs for working on repositories with agent harnesses.
+Devcroft is a GPUI based desktop app for personal development workflow. It focuses on keeping development workflow same no matter which harness you use. Vim like keyboard navigation let you fly between projects with ease.
 
 > Status: pre-release (0.1.0). Build from source; there are no packaged binaries yet because the release pipeline is still coming.
 
@@ -77,7 +77,7 @@ mise run test
 
 ## Contributing
 
-Issues and PRs are welcome. Run `mise run check` before opening a PR. There is no formal contribution process yet; describe what you changed and how you verified it.
+GitHub Issues are disabled — please use GitHub Discussions for bug reports, feature requests, questions, ideas, and support. PRs are welcome, including AI-assisted ones: they must meet the same quality bar as any other contribution (run `mise run check`, describe what changed and how you verified it), and the author is responsible for everything in the PR. For security reports, see [Security Policy](SECURITY.md) instead of opening a discussion.
 
 ## License
 

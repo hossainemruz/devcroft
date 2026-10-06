@@ -23,7 +23,7 @@ New installations start with the built-in editor. The choice is saved on this de
 
 Syntax highlighting covers Rust, TOML (including Cargo.lock), Python, JavaScript/JSX, TypeScript/TSX, Go, shell, Markdown, HTML, CSS, JSON, YAML, C/C++, Java, and Ruby. Other text files remain editable without highlighting.
 
-Rust completion, hover, definitions, and diagnostics require an installed rust-analyzer and trusting the checkout: click the disabled Rust indicator in the editor status bar and confirm **Trust checkout**. Trust lasts for the editor workspace's lifetime. The [language support guide](language-support.md) describes executable discovery, prerequisites, the tested server matrix, restart, and limitations. Other languages currently have no semantic server integration.
+Completion, hover, definitions, and diagnostics support Rust, Go, JavaScript/TypeScript, and Python. Trust the checkout through the editor footer; when support is missing, choose **Install**, **Use existing**, or **Not now**. Manage installations and configuration in **Settings → Editor → Language servers**. The [language support guide](language-support.md) describes prerequisites, tested platforms, roots, restart, and limitations.
 
 ## Open in Zed or VS Code
 
@@ -39,4 +39,4 @@ Clean buffers reload after external edits. Dirty buffers keep your draft and off
 
 Files must be regular UTF-8 text, contain no NUL bytes, and be at most 2 MiB. Mixed line endings remain editable and are not normalized automatically. Checkout-escaping paths are rejected. Deleted files are not silently recreated; review a rename or deletion before saving. Project indexing and search are bounded. For unsupported files, use an external editor.
 
-This editor is intended for code exploration and small edits. It has no debugger, extensions, broad refactoring, or automatic language-server installation. Native UI verification for the latest editor changes and Linux/Windows runtime validation remain open; the macOS headless and live-server checks are recorded in the language support guide.
+This editor is intended for code exploration and small edits. It has no debugger, extensions, or broad refactoring. Language-server installation is offered on demand and requires your selection. Linux/Windows runtime validation remains open; the macOS headless and live-server checks are recorded in the language support guide.

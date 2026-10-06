@@ -152,7 +152,7 @@ impl CompletionProvider for LspProviders {
         // Member access and Rust paths are the completions worth waking a
         // cold server for; ordinary identifier typing still resolves through
         // the explicit completion key.
-        new_text.ends_with('.') || new_text.ends_with(':')
+        self.client.completion_trigger(new_text)
     }
 }
 

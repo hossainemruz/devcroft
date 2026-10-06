@@ -2,6 +2,7 @@
 
 mod drafts;
 mod finder;
+mod languages;
 pub(crate) mod lsp;
 pub(crate) mod native;
 mod project;
@@ -228,6 +229,9 @@ pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
         // rustup's default binary directory: GUI-launched apps never see
         // the shell's PATH, and rust-analyzer usually lives here.
         directories.push(home.join(".cargo/bin"));
+        directories.push(home.join("go/bin"));
+        directories.push(home.join(".local/share/mise/shims"));
+        directories.push(home.join(".volta/bin"));
     }
     #[cfg(target_os = "macos")]
     {

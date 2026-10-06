@@ -3,8 +3,13 @@
 //! thread. References, document symbols, custom repository commands, and
 //! additional language servers are deferred. Failures leave plain editing usable.
 
+pub(crate) mod catalog;
 pub(crate) mod client;
+pub(crate) mod install;
+pub(crate) mod manager;
+pub(crate) mod process;
 pub(crate) mod providers;
+pub(crate) mod settings;
 pub(crate) mod transport;
 
 pub(crate) use client::{Client, DiagnosticEvent};
@@ -14,11 +19,13 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+#[cfg(test)]
 use super::find_executable;
 
 /// Locate a `rust-analyzer` binary from the device environment: an explicit path wins when
 /// it resolves, otherwise fall back to `PATH` (plus the GUI-launch
 /// directories the external-editor launcher already knows about).
+#[cfg(test)]
 pub(crate) fn discover_rust_analyzer(explicit: Option<&str>) -> Option<PathBuf> {
     explicit
         .map(str::trim)

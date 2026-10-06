@@ -114,6 +114,7 @@ pub(crate) struct SettingsView {
     font_size: f32,
     terminal_preferences_error: Option<String>,
     editor_choice: EditorChoice,
+    language_servers: Entity<crate::editor::lsp::settings::LanguageServers>,
     external_editors: HashMap<String, bool>,
     installed_editors: HashMap<String, bool>,
     external_checking: bool,
@@ -266,6 +267,14 @@ impl SettingsView {
             font_size: clamp_app_font_size(initial_font_size),
             terminal_preferences_error: None,
             editor_choice,
+            language_servers: cx.new(|cx| {
+                crate::editor::lsp::settings::LanguageServers::new(
+                    data_root.as_ref().map(|r| r.root().to_owned()),
+                    None,
+                    window,
+                    cx,
+                )
+            }),
             external_editors,
             installed_editors: HashMap::new(),
             external_checking: false,
@@ -1414,7 +1423,7 @@ impl SettingsView {
                         let title = choice.label();
                         let tiles = editor_tiles.clone();
                         let description = match choice {
-                            EditorChoice::BuiltIn => "File tabs, project search, syntax highlighting, and optional Rust tooling. Ready to use.",
+                            EditorChoice::BuiltIn => "File tabs, project search, syntax highlighting, and optional language servers. Ready to use.",
                             EditorChoice::Neovim => "Your configuration, plugins, and modal keyboard workflow in a terminal.",
                         };
                         let icon: AnyElement = match choice {
@@ -1484,6 +1493,7 @@ impl SettingsView {
                                 .child(radio))
                     }))))
             .when_some(self.editor_error.clone(), |view, error| view.child(div().text_sm().text_color(rgb(0xf87171)).child(error)))
+            .child(self.language_servers.clone())
             .child(v_flex().gap_2()
                 .child(v_flex().gap_1()
                     .child(h_flex().gap_2().items_center().justify_between()

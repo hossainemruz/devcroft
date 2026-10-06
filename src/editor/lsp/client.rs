@@ -46,11 +46,14 @@ pub struct Client {
     last_error: Mutex<Option<String>>,
     shut_down: AtomicBool,
     _root: PathBuf,
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    watch_error: Mutex<Option<String>>,
 }
 
 impl Client {
     /// Spawn `program` rooted at `cwd`, run the `initialize` handshake, and
     /// forward `publishDiagnostics` notifications to `diagnostics`.
+    #[cfg(test)]
     pub fn start(
         program: &Path,
         cwd: &Path,
@@ -60,13 +63,142 @@ impl Client {
         Self::handshake(transport, cwd, messages, diagnostics)
     }
 
+    pub(crate) fn launch(
+        spec: super::install::Launch,
+        cwd: &Path,
+        diagnostics: async_channel::Sender<DiagnosticEvent>,
+    ) -> Result<Arc<Self>> {
+        let (transport, messages) =
+            Transport::spawn_configured(&spec.program, &spec.args, cwd, &spec.env, spec.lease)?;
+        transport.configure(spec.settings.clone(), url_of(cwd)?.to_string());
+        let log = transport.log.clone();
+        let client = Self::handshake_configured(
+            transport,
+            cwd,
+            messages,
+            diagnostics,
+            spec.initialization,
+            spec.settings,
+        )
+        .with_context(|| {
+            format!(
+                "Language server initialization failed: {}",
+                super::process::log_text(&log)
+            )
+        })?;
+        client.watch_project(cwd);
+        Ok(client)
+    }
+
+    /// Batch OS events so checkout changes cannot flood the protocol writer.
+    /// Both workers hold weak references; callbacks never block on protocol I/O.
+    fn watch_project(self: &Arc<Self>, root: &Path) {
+        use notify::Watcher;
+        let weak = Arc::downgrade(self);
+        let root = root.to_owned();
+        let watched_root = root.clone();
+        let pending = Arc::new(Mutex::new((Vec::<Value>::new(), None::<String>)));
+        let queued = pending.clone();
+        let result = (|| -> anyhow::Result<notify::RecommendedWatcher> {
+            let mut watcher = notify::recommended_watcher(
+                move |event: notify::Result<notify::Event>| {
+                    let mut pending = queued.lock().unwrap();
+                    match event {
+                        Ok(event) => {
+                            let changes = watched_changes(&watched_root, &event);
+                            if pending.0.len() + changes.len() <= 4096 {
+                                pending.0.extend(changes);
+                            } else {
+                                pending.1 = Some("Project changed too quickly to track; restart language support".into());
+                            }
+                        }
+                        Err(error) => {
+                            pending.1 = Some(format!(
+                                "Project file watching failed: {error}; restart after external changes"
+                            ))
+                        }
+                    }
+                },
+            )?;
+            watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+            Ok(watcher)
+        })();
+        match result {
+            Ok(watcher) => {
+                *self.watcher.lock().unwrap() = Some(watcher);
+                thread::spawn(move || {
+                    loop {
+                        thread::sleep(Duration::from_millis(250));
+                        let Some(client) = weak.upgrade() else {
+                            break;
+                        };
+                        if !client.is_alive() {
+                            break;
+                        }
+                        let (changes, error) = std::mem::take(&mut *pending.lock().unwrap());
+                        if !changes.is_empty()
+                            && let Err(error) = client.transport.notify(
+                                "workspace/didChangeWatchedFiles",
+                                serde_json::json!({"changes":changes}),
+                            )
+                        {
+                            client.record_error(&error);
+                        }
+                        if let Some(error) = error {
+                            *client.watch_error.lock().unwrap() = Some(error);
+                        }
+                    }
+                });
+            }
+            Err(error) => {
+                *self.watch_error.lock().unwrap() = Some(format!(
+                    "Project file watching unavailable: {error}; restart after external changes"
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn logs(&self) -> String {
+        super::process::log_text(&self.transport.log)
+    }
+    pub(crate) fn completion_trigger(&self, text: &str) -> bool {
+        self.capabilities
+            .pointer("/completionProvider/triggerCharacters")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|s| !s.is_empty() && text.ends_with(s))
+            })
+    }
+
     /// Test seam: run the handshake over an already-open transport (channel
     /// adapters plus a stub server) instead of spawning a binary.
+    #[cfg(test)]
     pub(crate) fn handshake(
         transport: Arc<Transport>,
         cwd: &Path,
         messages: mpsc::Receiver<ServerMessage>,
         diagnostics: async_channel::Sender<DiagnosticEvent>,
+    ) -> Result<Arc<Self>> {
+        Self::handshake_configured(
+            transport,
+            cwd,
+            messages,
+            diagnostics,
+            super::catalog::ServerId::Rust.initialization(),
+            Value::Null,
+        )
+    }
+
+    fn handshake_configured(
+        transport: Arc<Transport>,
+        cwd: &Path,
+        messages: mpsc::Receiver<ServerMessage>,
+        diagnostics: async_channel::Sender<DiagnosticEvent>,
+        initialization: Value,
+        settings: Value,
     ) -> Result<Arc<Self>> {
         let root_uri = url_of(cwd)?;
         let response = transport.request(
@@ -74,9 +206,11 @@ impl Client {
             serde_json::json!({
                 "processId": std::process::id(),
                 "rootUri": root_uri,
-                "initializationOptions": {"checkOnSave": false, "cargo": {"buildScripts": {"enable": false}}, "procMacro": {"enable": false}},
+                "initializationOptions": initialization,
+                "workspaceFolders": [{"uri":root_uri,"name":cwd.file_name().unwrap_or_default().to_string_lossy()}],
                 "capabilities": {
                     "general": {"positionEncodings": ["utf-16"]},
+                    "workspace": {"configuration":true,"workspaceFolders":true},
                     "textDocument": {
                         "synchronization": {"didSave": true},
                         "completion": {},
@@ -104,6 +238,12 @@ impl Client {
         );
         let capabilities = response.get("capabilities").cloned().unwrap_or(Value::Null);
         transport.notify("initialized", serde_json::json!({}))?;
+        if !settings.is_null() {
+            transport.notify(
+                "workspace/didChangeConfiguration",
+                serde_json::json!({"settings":settings}),
+            )?;
+        }
 
         let client = Arc::new(Self {
             transport,
@@ -114,6 +254,8 @@ impl Client {
             last_error: Mutex::new(None),
             shut_down: AtomicBool::new(false),
             _root: cwd.to_owned(),
+            watcher: Mutex::new(None),
+            watch_error: Mutex::new(None),
         });
         thread::Builder::new()
             .name("lsp-diagnostics".to_owned())
@@ -142,7 +284,11 @@ impl Client {
     /// Latest transport-level failure, for status surfaces and tests.
     /// Plain editing stays available while the status surface reports failures.
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().expect("LSP state poisoned").clone()
+        self.last_error
+            .lock()
+            .expect("LSP state poisoned")
+            .clone()
+            .or_else(|| self.watch_error.lock().unwrap().clone())
     }
 
     /// Whether the server connection is still up. A crashed server keeps
@@ -195,6 +341,11 @@ impl Client {
             return Ok(());
         }
         let version = self.next_version.fetch_add(1, Ordering::SeqCst);
+        if self.open_close() {
+            self.transport.notify("textDocument/didOpen", serde_json::json!({
+                "textDocument": { "uri":uri, "languageId":language_id, "version":version, "text":text }
+            })).inspect_err(|e| self.record_error(e))?;
+        }
         docs.insert(
             uri.to_string(),
             DocState {
@@ -202,11 +353,6 @@ impl Client {
                 text: text.to_owned(),
             },
         );
-        if self.open_close() {
-            self.transport.notify("textDocument/didOpen", serde_json::json!({
-                "textDocument": { "uri":uri, "languageId":language_id, "version":version, "text":text }
-            })).inspect_err(|e| self.record_error(e))?;
-        }
         Ok(())
     }
 
@@ -409,6 +555,10 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        // Watcher teardown can wait for its OS worker, so keep it off the UI thread.
+        if let Some(watcher) = self.watcher.get_mut().unwrap().take() {
+            thread::spawn(move || drop(watcher));
+        }
         if !self.shut_down.swap(true, Ordering::SeqCst) {
             let transport = self.transport.clone();
             thread::spawn(move || {
@@ -417,6 +567,50 @@ impl Drop for Client {
             });
         }
     }
+}
+
+fn watched_changes(root: &Path, event: &notify::Event) -> Vec<Value> {
+    use notify::event::{EventKind, ModifyKind, RenameMode};
+    let kind = match event.kind {
+        EventKind::Create(_) => 1,
+        EventKind::Remove(_) => 3,
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => 3,
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => 1,
+        EventKind::Modify(_) => 2,
+        _ => return vec![],
+    };
+    event
+        .paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| {
+            let relative = path.strip_prefix(root).ok()?;
+            if relative.components().any(|c| {
+                matches!(
+                    c.as_os_str().to_str(),
+                    Some(".git" | "node_modules" | "target" | ".venv" | "__pycache__")
+                )
+            }) {
+                return None;
+            }
+            // Existing links and deleted entries whose parent escapes are not project files.
+            let resolved = path
+                .canonicalize()
+                .or_else(|_| path.parent().unwrap_or(root).canonicalize());
+            if !resolved.ok()?.starts_with(root) {
+                return None;
+            }
+            let kind = if matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+            ) {
+                if index == 0 { 3 } else { 1 }
+            } else {
+                kind
+            };
+            Some(serde_json::json!({"uri":url_of(path).ok()?,"type":kind}))
+        })
+        .collect()
 }
 
 fn end_position(text: &str) -> lsp_types::Position {
@@ -451,6 +645,38 @@ mod tests {
     use super::super::transport::test_util::*;
     use super::*;
     use std::io::{BufReader, Write as _};
+
+    #[test]
+    fn watched_files_report_renames_and_exclude_generated_or_escaping_paths() {
+        use notify::{
+            Event, EventKind,
+            event::{CreateKind, ModifyKind, RenameMode},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let from = root.join("old.go");
+        let to = root.join("new.go");
+        std::fs::write(&to, "package main").unwrap();
+        let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(from)
+            .add_path(to);
+        let changes = watched_changes(&root, &rename);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0]["type"], 3);
+        assert_eq!(changes[1]["type"], 1);
+        let ignored = Event::new(EventKind::Create(CreateKind::File))
+            .add_path(root.join("target/generated.rs"))
+            .add_path(root.parent().unwrap().join("outside.py"));
+        assert!(watched_changes(&root, &ignored).is_empty());
+        #[cfg(unix)]
+        {
+            let other = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(other.path(), root.join("escape")).unwrap();
+            let event = Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join("escape/deleted.py"));
+            assert!(watched_changes(&root, &event).is_empty());
+        }
+    }
 
     /// A scripted fake language server: answers `initialize` with UTF-16
     /// capabilities, records every method it sees, serves one hover and one

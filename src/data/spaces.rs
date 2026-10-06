@@ -860,12 +860,14 @@ mod tests {
 
     #[test]
     fn aggregate_selection_is_distinct_from_a_space_named_all_and_survives_catalog_changes() {
-        let mut catalog = Spaces::default();
-        catalog.spaces = vec![
-            Space::new("Personal"),
-            Space::new("Work"),
-            Space::new("All"),
-        ];
+        let mut catalog = Spaces {
+            spaces: vec![
+                Space::new("Personal"),
+                Space::new("Work"),
+                Space::new("All"),
+            ],
+            ..Default::default()
+        };
         let aggregate = catalog.selection(Some("Work"), true);
         assert_eq!(aggregate, SpaceSelection::All);
         for name in ["Personal", "Work", "All", "Unknown"] {

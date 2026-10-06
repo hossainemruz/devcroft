@@ -21,7 +21,8 @@ use std::{
 
 use super::drafts::{self, Draft, Journal};
 use super::finder::{self, Finder};
-use super::lsp::{Client, DiagnosticEvent, LspProviders, discover_rust_analyzer, file_uri};
+use super::lsp::{Client, DiagnosticEvent, LspProviders, file_uri};
+use super::lsp::{catalog::ServerId, install, manager::Manager};
 use super::project::{self, ProjectFile, TextMatch};
 use crate::editor::{ExternalEditor, ExternalEditorKind};
 use anyhow::{Context as _, Result, bail};
@@ -63,10 +64,11 @@ pub(crate) struct NativeEditor {
     pending_lsp_position: Option<lsp_types::Position>,
     external_editors: HashMap<String, bool>,
     lsp: Option<LspSession>,
-    workspace_lsp: Option<Arc<Client>>,
-    lsp_starting: bool,
+    language_servers: Manager,
+    lsp_data_root: Option<PathBuf>,
+    lsp_packages: HashMap<ServerId, Option<String>>,
+    lsp_dismissed: HashSet<ServerId>,
     lsp_trusted: bool,
-    lsp_generation: u64,
     lsp_status: String,
     /// Origins of follow-definition jumps (engine positions), newest last.
     /// Pushed by the `show_document` hook before the engine jumps.
@@ -484,11 +486,12 @@ impl NativeEditor {
             pending_lsp_position: None,
             external_editors,
             lsp: None,
-            workspace_lsp: None,
-            lsp_starting: false,
+            language_servers: Manager::default(),
+            lsp_data_root: data_root.map(Path::to_owned),
+            lsp_packages: HashMap::new(),
+            lsp_dismissed: HashSet::new(),
             lsp_trusted: false,
-            lsp_generation: 0,
-            lsp_status: "Rust: disabled — click to trust this checkout and enable tooling".into(),
+            lsp_status: "Language servers".into(),
             jump_back: Rc::new(RefCell::new(Vec::new())),
             disk_seen: None,
             conflict: false,
@@ -1104,7 +1107,7 @@ impl NativeEditor {
                     }
                 }
                 if self.path.as_ref() != Some(&path)
-                    && let Some(client) = &self.workspace_lsp
+                    && let Some(client) = self.language_servers.client(&path)
                     && let Ok(uri) = file_uri(&path)
                 {
                     let _ = client.did_save(uri.as_str());
@@ -1116,11 +1119,7 @@ impl NativeEditor {
     }
 
     fn finish_close(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(client) = &self.workspace_lsp
-            && let Ok(uri) = file_uri(path)
-        {
-            client.did_close(uri.as_str());
-        }
+        self.language_servers.close(path);
         self.tabs.retain(|tab| tab != path);
         if self.path.as_deref() == Some(path) {
             self.disk_comparison = None;
@@ -1206,18 +1205,54 @@ impl NativeEditor {
     /// One disk-poll step: detect an external change and apply it. The timer
     /// loop calls this every `DISK_POLL_INTERVAL`; tests call it directly.
     fn check_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(client) = &self.workspace_lsp {
-            let status = if !client.is_alive() {
-                "Rust: server stopped — Restart language server".into()
-            } else if let Some(error) = client.last_error() {
-                format!("Rust: {error} — Restart language server")
-            } else {
-                "rust-analyzer: ready".into()
-            };
-            if self.lsp_status != status {
-                self.lsp_status = status;
-                cx.notify();
+        self.language_servers.prune();
+        let mut restart_active = false;
+        for server in ServerId::ALL {
+            let pref = install::preferences(self.lsp_data_root.as_deref(), server);
+            let package = self
+                .lsp_data_root
+                .as_deref()
+                .and_then(|r| install::installed(r, server).ok().flatten());
+            let changed_package = self
+                .lsp_packages
+                .get(&server)
+                .is_some_and(|old| *old != package);
+            self.lsp_packages.insert(server, package);
+            let changed: Vec<_> = self
+                .language_servers
+                .slots
+                .iter()
+                .filter(|(key, slot)| {
+                    key.server == server
+                        && (slot.preference != pref || (changed_package && slot.client.is_none()))
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in changed {
+                if self
+                    .path
+                    .as_ref()
+                    .and_then(|p| self.language_servers.documents.get(p))
+                    == Some(&key)
+                {
+                    restart_active = true;
+                }
+                self.language_servers.slots.remove(&key);
             }
+        }
+        if restart_active {
+            self.restart_language_server(window, cx);
+        }
+        if let Some(path) = self.path.clone() {
+            let retry = self
+                .language_servers
+                .client(&path)
+                .is_some_and(|c| !c.is_alive());
+            if retry {
+                self.restart_lsp(&path, language_for(&path), window, cx);
+            }
+            self.refresh_lsp_status();
+            cx.notify();
         }
         if let Some(change) = self.detect_disk_change(cx) {
             self.apply_disk_change(change, window, cx);
@@ -1451,99 +1486,155 @@ impl NativeEditor {
         let _ = session.client.did_change(&session.uri, &text);
     }
 
-    /// Bind a Rust document to the checkout client, starting it asynchronously
-    /// after the explicit trust decision. Failures preserve plain editing.
+    fn refresh_lsp_status(&mut self) {
+        let Some(path) = &self.path else {
+            self.lsp_status = "Language servers".into();
+            return;
+        };
+        let Some(server) = super::languages::detect(path).server else {
+            self.lsp_status = "Syntax highlighting".into();
+            return;
+        };
+        if !self.lsp_trusted {
+            self.lsp_status = format!("{}: click to enable language support", server.label());
+            return;
+        }
+        self.lsp_status = self
+            .language_servers
+            .documents
+            .get(path)
+            .and_then(|key| self.language_servers.slots.get(key))
+            .map(|slot| {
+                if let Some(client) = &slot.client {
+                    if !client.is_alive() {
+                        format!("{}: stopped — click to restart", server.id())
+                    } else if let Some(e) = client.last_error() {
+                        format!("{}: {e}", server.id())
+                    } else {
+                        format!("{}: ready", server.id())
+                    }
+                } else {
+                    format!("{}: {}", server.id(), slot.status)
+                }
+            })
+            .unwrap_or_else(|| format!("{}: click to configure", server.label()));
+    }
+
     fn restart_lsp(
         &mut self,
         path: &Path,
-        language: &str,
+        _language: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.clear_lsp_providers(cx);
         self.lsp = None;
-        if language != "rust" {
-            return;
-        }
-        if !self.lsp_trusted {
-            self.lsp_status =
-                "Rust: disabled — click to trust this checkout and enable tooling".into();
-            return;
-        }
-        let Ok(uri) = file_uri(path) else {
+        let language = super::languages::detect(path);
+        let Some(server) = language.server else {
+            self.refresh_lsp_status();
             return;
         };
-        if let Some(client) = self.workspace_lsp.clone().filter(|c| c.is_alive()) {
-            if client
-                .did_open(&uri, "rust", self.editor.read(cx).value().as_ref())
-                .is_ok()
+        if !self.lsp_trusted {
+            self.refresh_lsp_status();
+            return;
+        }
+        let pref = install::preferences(self.lsp_data_root.as_deref(), server);
+        let key = Manager::key(server, path, &self.canonical_root, &pref);
+        self.language_servers.bind(path.to_owned(), key.clone());
+        if let Some(slot) = self.language_servers.slots.get(&key) {
+            let retry = slot.client.as_ref().is_some_and(|c| !c.is_alive())
+                && slot.attempts < 3
+                && slot.started.elapsed() > Duration::from_secs(3 * u64::from(slot.attempts));
+            if let Some(client) = slot.client.clone().filter(|c| c.is_alive())
+                && let Ok(uri) = file_uri(path)
             {
+                let _ = client.did_open(&uri, language.id, self.editor.read(cx).value().as_ref());
                 self.attach_lsp(client, uri, cx);
             }
+            if !retry {
+                self.refresh_lsp_status();
+                return;
+            }
+        }
+        self.lsp_packages.entry(server).or_insert_with(|| {
+            self.lsp_data_root
+                .as_deref()
+                .and_then(|r| install::installed(r, server).ok().flatten())
+        });
+        let generation = self.language_servers.start(key.clone(), pref.clone());
+        if pref.disabled {
+            let slot = self.language_servers.slots.get_mut(&key).unwrap();
+            slot.starting = false;
+            slot.status = "Disabled".into();
+            self.refresh_lsp_status();
             return;
         }
-        if self.lsp_starting {
-            return;
-        }
-        self.workspace_lsp = None;
-        let Some(program) = discover_rust_analyzer(None).filter(|program| {
-            program.is_absolute()
-                && program
-                    .canonicalize()
-                    .is_ok_and(|path| !path.starts_with(&self.canonical_root))
-        }) else {
-            self.lsp_status =
-                "Rust: rust-analyzer unavailable — install it, then Restart language server".into();
-            return;
-        };
-        self.lsp_starting = true;
-        self.lsp_generation += 1;
-        let generation = self.lsp_generation;
-        self.lsp_status = "Rust: starting rust-analyzer…".into();
-        let root = self.canonical_root.clone();
-        let (diagnostics_tx, diagnostics_rx) = async_channel::unbounded();
+        self.refresh_lsp_status();
+        let checkout = self.canonical_root.clone();
+        let data_root = self.lsp_data_root.clone();
+        let launch_key = key.clone();
+        let (tx, rx) = async_channel::bounded(128);
         cx.spawn_in(window, async move |view, cx| {
             let result = cx
-                .background_spawn(async move { Client::start(&program, &root, diagnostics_tx) })
+                .background_spawn(async move {
+                    let spec = install::resolve(data_root.as_deref(), &checkout, server, &pref)?;
+                    let description = spec.description.clone();
+                    Client::launch(spec, &launch_key.root, tx).map(|client| (client, description))
+                })
                 .await;
             let accepted = view
                 .update_in(cx, |this, _, cx| {
-                    if this.lsp_generation != generation {
+                    if !this.language_servers.accepts(&key, generation) {
                         return false;
                     }
-                    this.lsp_starting = false;
+                    let slot = this.language_servers.slots.get_mut(&key).unwrap();
+                    slot.starting = false;
                     match result {
-                        Err(error) => {
-                            this.lsp_status = format!("Rust: {error:#} — Restart language server");
+                        Err(e) => {
+                            slot.status = format!("{e:#}");
+                            this.refresh_lsp_status();
                             cx.notify();
                             false
                         }
-                        Ok(client) => {
-                            // Rehydrate every Rust tab, including unsaved inactive buffers.
-                            for (path, doc) in &this.inactive_documents {
-                                if language_for(path) == "rust"
-                                    && let Ok(uri) = file_uri(path)
+                        Ok((client, description)) => {
+                            slot.status = description;
+                            slot.client = Some(client.clone());
+                            // Replay all matching drafts; a tab switch while starting must not lose didOpen.
+                            let preference = slot.preference.clone();
+                            let paths = this.tabs.clone();
+                            for path in paths {
+                                if super::languages::detect(&path).server != Some(server)
+                                    || Manager::key(
+                                        server,
+                                        &path,
+                                        &this.canonical_root,
+                                        &preference,
+                                    ) != key
                                 {
+                                    continue;
+                                }
+                                let text = if this.path.as_ref() == Some(&path) {
+                                    Some(this.editor.read(cx).value().to_string())
+                                } else {
+                                    this.inactive_documents
+                                        .get(&path)
+                                        .map(|doc| doc.editor.read(cx).value().to_string())
+                                };
+                                if let Some(text) = text
+                                    && let Ok(uri) = file_uri(&path)
+                                {
+                                    this.language_servers.bind(path.clone(), key.clone());
                                     let _ = client.did_open(
                                         &uri,
-                                        "rust",
-                                        doc.editor.read(cx).value().as_ref(),
+                                        super::languages::detect(&path).id,
+                                        &text,
                                     );
+                                    if this.path.as_ref() == Some(&path) {
+                                        this.attach_lsp(client.clone(), uri, cx);
+                                    }
                                 }
                             }
-                            this.workspace_lsp = Some(client.clone());
-                            this.lsp_status = "rust-analyzer: ready".into();
-                            if let Some(path) =
-                                this.path.as_ref().filter(|p| language_for(p) == "rust")
-                                && let Ok(uri) = file_uri(path)
-                            {
-                                let _ = client.did_open(
-                                    &uri,
-                                    "rust",
-                                    this.editor.read(cx).value().as_ref(),
-                                );
-                                this.attach_lsp(client, uri, cx);
-                            }
+                            this.refresh_lsp_status();
                             cx.notify();
                             true
                         }
@@ -1553,13 +1644,23 @@ impl NativeEditor {
             if !accepted {
                 return;
             }
-            while let Ok(event) = diagnostics_rx.recv().await {
+            while let Ok(event) = rx.recv().await {
                 let active = view
                     .update(cx, |this, cx| {
-                        if this.lsp_generation != generation {
+                        if !this.language_servers.accepts(&key, generation) {
                             return false;
                         }
-                        this.apply_diagnostics(&event, cx);
+                        let event_path = event
+                            .uri
+                            .parse::<lsp_types::Uri>()
+                            .ok()
+                            .and_then(|uri| super::lsp::path_from_uri(&uri).ok());
+                        if event_path.as_deref().is_some_and(|path| {
+                            this.language_servers
+                                .accepts_document(&key, generation, path)
+                        }) {
+                            this.apply_diagnostics(&event, cx);
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -1569,6 +1670,81 @@ impl NativeEditor {
             }
         })
         .detach();
+    }
+
+    fn installation_offer(&self) -> Option<ServerId> {
+        let path = self.path.as_ref()?;
+        let server = super::languages::detect(path).server?;
+        if self.lsp_dismissed.contains(&server) || self.lsp_data_root.is_none() {
+            return None;
+        }
+        let slot = self
+            .language_servers
+            .documents
+            .get(path)
+            .and_then(|key| self.language_servers.slots.get(key))?;
+        (slot.client.is_none() && !slot.starting && slot.status.contains("is not installed"))
+            .then_some(server)
+    }
+
+    fn open_language_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = cx.new(|cx| {
+            super::lsp::settings::LanguageServers::new(
+                self.lsp_data_root.clone(),
+                Some(self.canonical_root.clone()),
+                window,
+                cx,
+            )
+        });
+        let details = self
+            .path
+            .as_ref()
+            .and_then(|p| self.language_servers.documents.get(p))
+            .and_then(|k| {
+                self.language_servers.slots.get(k).map(|s| {
+                    format!(
+                        "Root: {}\n{}\n{}",
+                        k.root.display(),
+                        s.status,
+                        s.client.as_ref().map(|c| c.logs()).unwrap_or_default()
+                    )
+                })
+            })
+            .unwrap_or_default();
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title("Language servers")
+                .w(px(720.))
+                .child(panel.clone())
+                .child(
+                    div()
+                        .id("language-server-runtime-log")
+                        .max_h(px(100.))
+                        .overflow_y_scroll()
+                        .text_xs()
+                        .child(details.clone()),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("restart-active-language-server")
+                                .label("Restart active server")
+                                .on_click(move |_, window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.restart_language_server(window, cx)
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("close-language-servers")
+                                .label("Done")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                )
+        });
     }
 
     fn attach_lsp(&mut self, client: Arc<Client>, uri: lsp_types::Uri, cx: &mut Context<Self>) {
@@ -1630,10 +1806,20 @@ impl NativeEditor {
     }
 
     fn apply_diagnostics(&mut self, event: &DiagnosticEvent, cx: &mut Context<Self>) {
-        let client = self
-            .workspace_lsp
-            .as_ref()
-            .or_else(|| self.lsp.as_ref().map(|s| &s.client));
+        let path = event
+            .uri
+            .parse::<lsp_types::Uri>()
+            .ok()
+            .and_then(|u| super::lsp::path_from_uri(&u).ok());
+        let client = path
+            .as_deref()
+            .and_then(|p| self.language_servers.client(p))
+            .or_else(|| {
+                self.lsp
+                    .as_ref()
+                    .filter(|s| s.uri == event.uri)
+                    .map(|s| &s.client)
+            });
         let Some(client) = client else {
             return;
         };
@@ -1841,7 +2027,7 @@ impl NativeEditor {
         row.into_any_element()
     }
 
-    /// Grant trust for this checkout and start Rust tooling. Only reachable
+    /// Grant trust for this checkout and start language tooling. Only reachable
     /// through the status-bar trust dialog: trusting may run project tools,
     /// so it asks for explicit confirmation instead of living in the menu.
     fn trust_checkout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1855,9 +2041,11 @@ impl NativeEditor {
     /// Drop the current language-server state and start over. Used by the
     /// editor menu's Restart entry; restarting never changes trust.
     fn restart_language_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.lsp_generation += 1;
-        self.lsp_starting = false;
-        self.workspace_lsp = None;
+        if let Some(path) = &self.path
+            && let Some(key) = self.language_servers.documents.get(path).cloned()
+        {
+            self.language_servers.slots.remove(&key);
+        }
         self.lsp = None;
         if let Some(path) = self.path.clone() {
             self.restart_lsp(&path, language_for(&path), window, cx);
@@ -1876,7 +2064,7 @@ impl NativeEditor {
             let view = view.clone();
             dialog
                 .title("Trust this checkout?")
-                .child("Trusting enables Rust tooling with rust-analyzer and may run project tools in this checkout. This lasts for the editor workspace's lifetime.")
+                .child("Trusting enables language servers and may run project tools in this checkout. This lasts for the editor workspace's lifetime.")
                 .footer(
                     DialogFooter::new()
                         .child(
@@ -2164,29 +2352,7 @@ impl NativeEditor {
 }
 
 fn language_for(path: &Path) -> &'static str {
-    if path.file_name().is_some_and(|name| name == "Cargo.lock") {
-        return "toml";
-    }
-    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
-        "rs" => "rust",
-        "toml" => "toml",
-        "py" => "python",
-        "js" | "jsx" => "javascript",
-        "ts" => "typescript",
-        "tsx" => "tsx",
-        "go" => "go",
-        "sh" => "bash",
-        "md" => "markdown",
-        "html" => "html",
-        "css" => "css",
-        "json" => "json",
-        "yml" | "yaml" => "yaml",
-        "c" | "h" => "c",
-        "cc" | "cpp" | "hpp" => "cpp",
-        "java" => "java",
-        "rb" => "ruby",
-        _ => "",
-    }
+    super::languages::detect(path).grammar
 }
 
 /// Read a file the editor can represent: a regular file, at most
@@ -2364,140 +2530,194 @@ impl Render for NativeEditor {
         let browser = self.render_browser(window, cx);
         let tabs = self.render_tabs(cx);
         let actions = self.render_editor_menu(cx).into_any_element();
-        let code = v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .min_h_0()
-            .overflow_hidden()
-            .bg(rgb(0x0c0e10))
-            .child(
-                h_flex()
-                    .debug_selector(|| "native-toolbar".into())
-                    .h(px(44.))
-                    .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(rgb(0x202328))
-                    .child(tabs)
-                    .child(actions),
-            )
-            .when_some(self.close_pending.clone(), |view, path| {
-                view.child(
+        let code =
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .min_h_0()
+                .overflow_hidden()
+                .bg(rgb(0x0c0e10))
+                .child(
                     h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_sm().child(format!(
-                            "Save changes to {} before closing?",
-                            path.display()
-                        )))
-                        .child(
-                            Button::new("native-close-save")
-                                .label("Save")
-                                .primary()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.confirm_close(CloseChoice::Save, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("native-close-discard")
-                                .label("Discard")
-                                .outline()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.confirm_close(CloseChoice::Discard, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("native-close-cancel")
-                                .label("Cancel")
-                                .ghost()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.confirm_close(CloseChoice::Cancel, window, cx)
-                                })),
-                        ),
+                        .debug_selector(|| "native-toolbar".into())
+                        .h(px(44.))
+                        .flex_shrink_0()
+                        .border_b_1()
+                        .border_color(rgb(0x202328))
+                        .child(tabs)
+                        .child(actions),
                 )
-            })
-            .when_some(self.error.clone(), |view, error| {
-                view.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
-            })
-            .when_some(self.disk_notice.clone(), |view, notice| {
-                view.child(div().text_sm().text_color(rgb(0x60a5fa)).child(notice))
-            })
-            .when(self.conflict, |view| {
-                view.child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div().text_sm().text_color(rgb(0xfbbf24)).child(
-                                "This file changed on disk and the buffer has unsaved changes.",
+                .when_some(self.close_pending.clone(), |view, path| {
+                    view.child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().child(format!(
+                                "Save changes to {} before closing?",
+                                path.display()
+                            )))
+                            .child(
+                                Button::new("native-close-save")
+                                    .label("Save")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_close(CloseChoice::Save, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("native-close-discard")
+                                    .label("Discard")
+                                    .outline()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_close(CloseChoice::Discard, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("native-close-cancel")
+                                    .label("Cancel")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_close(CloseChoice::Cancel, window, cx)
+                                    })),
                             ),
-                        )
-                        .child(
-                            Button::new("native-reload-file")
-                                .label("Reload from disk")
-                                .outline()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.reload_from_disk(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("native-compare-file")
-                                .label("Compare")
-                                .outline()
-                                .on_click(cx.listener(|this, _, _, cx| this.compare_with_disk(cx))),
-                        ),
+                    )
+                })
+                .when_some(self.error.clone(), |view, error| {
+                    view.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                })
+                .when_some(self.disk_notice.clone(), |view, notice| {
+                    view.child(div().text_sm().text_color(rgb(0x60a5fa)).child(notice))
+                })
+                .when(self.conflict, |view| {
+                    view.child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().text_color(rgb(0xfbbf24)).child(
+                                "This file changed on disk and the buffer has unsaved changes.",
+                            ))
+                            .child(
+                                Button::new("native-reload-file")
+                                    .label("Reload from disk")
+                                    .outline()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reload_from_disk(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("native-compare-file")
+                                    .label("Compare")
+                                    .outline()
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.compare_with_disk(cx)),
+                                    ),
+                            ),
+                    )
+                })
+                .when_some(self.disk_comparison.clone(), |view, comparison| {
+                    view.child(
+                        v_flex()
+                            .max_h(px(220.))
+                            .overflow_y_scrollbar()
+                            .p_2()
+                            .border_1()
+                            .border_color(rgb(0x454545))
+                            .child(div().text_sm().child("Disk → draft"))
+                            .child(div().text_xs().child(comparison)),
+                    )
+                })
+                .child(
+                    div()
+                        .debug_selector(|| "native-code-pane".into())
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .pt_2()
+                        .child(Editor::new(&self.editor).h_full().appearance(false)),
                 )
-            })
-            .when_some(self.disk_comparison.clone(), |view, comparison| {
-                view.child(
-                    v_flex()
-                        .max_h(px(220.))
-                        .overflow_y_scrollbar()
-                        .p_2()
-                        .border_1()
-                        .border_color(rgb(0x454545))
-                        .child(div().text_sm().child("Disk → draft"))
-                        .child(div().text_xs().child(comparison)),
-                )
-            })
-            .child(
-                div()
-                    .debug_selector(|| "native-code-pane".into())
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .pt_2()
-                    .child(Editor::new(&self.editor).h_full().appearance(false)),
-            )
-            .child(
-                h_flex()
-                    .h(px(24.))
-                    .flex_shrink_0()
-                    .px_3()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(rgb(0x727985))
-                    .border_t_1()
-                    .border_color(rgb(0x202328))
-                    .child(div().flex_1().min_w_0().overflow_hidden().child(label))
-                    .when(self.dirty, |row| row.child("Modified"))
-                    .child(
-                        div()
-                            .max_w(px(420.))
-                            .text_ellipsis()
-                            .when(!self.lsp_trusted, |status| {
-                                status.cursor_pointer().on_mouse_down(
+                .when_some(self.installation_offer(), |v, server| {
+                    let job = self
+                        .lsp_data_root
+                        .as_deref()
+                        .and_then(|r| install::job(r, server));
+                    let busy = job.as_ref().is_some_and(|j| j.busy);
+                    v.child(
+                        h_flex()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .child(div().text_xs().child(job.map(|j| j.status).unwrap_or_else(
+                                || format!("Add {} completion and diagnostics?", server.label()),
+                            )))
+                            .child(
+                                Button::new("install-language-server")
+                                    .small()
+                                    .label(if busy { "Installing…" } else { "Install" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(root) = this.lsp_data_root.clone() {
+                                            install::begin(root, server, install::Action::Install);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("use-existing-language-server")
+                                    .small()
+                                    .ghost()
+                                    .label("Use existing")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_language_servers(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("dismiss-language-server")
+                                    .small()
+                                    .ghost()
+                                    .label("Not now")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.lsp_dismissed.insert(server);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .h(px(24.))
+                        .flex_shrink_0()
+                        .px_3()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(rgb(0x727985))
+                        .border_t_1()
+                        .border_color(rgb(0x202328))
+                        .child(div().flex_1().min_w_0().overflow_hidden().child(label))
+                        .when(self.dirty, |row| row.child("Modified"))
+                        .child(
+                            div()
+                                .max_w(px(420.))
+                                .text_ellipsis()
+                                .cursor_pointer()
+                                .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
-                                        this.open_trust_dialog(window, cx)
+                                        if !this.lsp_trusted
+                                            && this.path.as_ref().is_some_and(|p| {
+                                                super::languages::detect(p).server.is_some()
+                                            })
+                                        {
+                                            this.open_trust_dialog(window, cx);
+                                        } else {
+                                            this.open_language_servers(window, cx);
+                                        }
                                     }),
                                 )
-                            })
-                            .child(self.lsp_status.clone()),
-                    )
-                    .child("UTF-8"),
-            );
+                                .child(self.lsp_status.clone()),
+                        )
+                        .child("UTF-8"),
+                );
         let finder = self.render_file_finder(cx);
         h_flex()
             .relative()
@@ -2762,7 +2982,7 @@ mod tests {
             assert!(
                 view.inactive_documents
                     .values()
-                    .any(|doc| doc.editor.read(cx).text().to_string() == "draft")
+                    .any(|doc| doc.editor.read(cx).text() == "draft")
             );
             for _ in 0..110 {
                 view.move_navigation_item(0, true, window, cx);
@@ -3660,9 +3880,18 @@ mod tests {
         view.downgrade()
             .update_in(test_cx, |view, window, cx| {
                 view.open(&first, None, window, cx).unwrap();
-                assert!(!view.lsp_trusted && !view.lsp_starting && view.workspace_lsp.is_none());
+                assert!(!view.lsp_trusted && view.language_servers.slots.is_empty());
                 view.lsp_trusted = true;
-                view.workspace_lsp = Some(client.clone());
+                let key = Manager::key(
+                    ServerId::Rust,
+                    &view.canonical_root.join("main.rs"),
+                    &view.canonical_root,
+                    &Default::default(),
+                );
+                view.language_servers.start(key.clone(), Default::default());
+                let slot = view.language_servers.slots.get_mut(&key).unwrap();
+                slot.client = Some(client.clone());
+                slot.starting = false;
                 view.open(&first, None, window, cx).unwrap();
                 view.open(&second, None, window, cx).unwrap();
                 assert!(Arc::ptr_eq(&view.lsp.as_ref().unwrap().client, &client));
@@ -3673,6 +3902,76 @@ mod tests {
                 view.finish_close(&second.canonicalize().unwrap(), window, cx);
                 assert_eq!(client.doc_version(second_uri.as_str()), 0);
                 assert!(client.doc_version(first_uri.as_str()) > 0);
+            })
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn mixed_language_roots_keep_clients_and_drafts_independent(cx: &mut gpui_kit::TestAppContext) {
+        use crate::editor::lsp::transport::{Transport, test_util::stub_server};
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        for folder in ["a", "b", "go"] {
+            fs::create_dir(dir.path().join(folder)).unwrap();
+        }
+        for folder in ["a", "b"] {
+            fs::write(
+                dir.path().join(folder).join("Cargo.toml"),
+                format!("[package]\nname='{folder}'\nversion='0.1.0'\n"),
+            )
+            .unwrap();
+            fs::write(dir.path().join(folder).join("main.rs"), "fn main() {}\n").unwrap();
+        }
+        fs::write(
+            dir.path().join("go/go.mod"),
+            "module example.test/fixture\ngo 1.23\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("go/main.go"), "package main\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                let mut clients = vec![];
+                for (relative, server) in [
+                    ("a/main.rs", ServerId::Rust),
+                    ("b/main.rs", ServerId::Rust),
+                    ("go/main.go", ServerId::Go),
+                ] {
+                    let path = view.canonical_root.join(relative);
+                    let key =
+                        Manager::key(server, &path, &view.canonical_root, &Default::default());
+                    let (reader, writer) = stub_server();
+                    let (transport, messages) = Transport::new(reader, writer);
+                    let (tx, _) = async_channel::unbounded();
+                    let client = Client::handshake(transport, &key.root, messages, tx).unwrap();
+                    view.language_servers.start(key.clone(), Default::default());
+                    let slot = view.language_servers.slots.get_mut(&key).unwrap();
+                    slot.starting = false;
+                    slot.client = Some(client.clone());
+                    clients.push((path, key, client));
+                }
+                view.lsp_trusted = true;
+                for (path, _, client) in &clients {
+                    view.open(path, None, window, cx).unwrap();
+                    assert!(Arc::ptr_eq(&view.lsp.as_ref().unwrap().client, client));
+                    view.editor.update(cx, |editor, cx| {
+                        editor.set_value("unsaved draft", window, cx)
+                    });
+                }
+                assert_eq!(view.language_servers.slots.len(), 3);
+                view.language_servers.slots.remove(&clients[1].1);
+                view.open(&clients[0].0, None, window, cx).unwrap();
+                assert_eq!(view.editor.read(cx).value().as_ref(), "unsaved draft");
+                assert!(Arc::ptr_eq(
+                    &view.lsp.as_ref().unwrap().client,
+                    &clients[0].2
+                ));
+                view.open(&clients[2].0, None, window, cx).unwrap();
+                assert_eq!(view.editor.read(cx).value().as_ref(), "unsaved draft");
+                assert!(Arc::ptr_eq(
+                    &view.lsp.as_ref().unwrap().client,
+                    &clients[2].2
+                ));
             })
             .unwrap();
     }
@@ -3726,7 +4025,16 @@ mod tests {
         view.downgrade()
             .update_in(test_cx, |view, window, cx| {
                 view.lsp_trusted = true;
-                view.workspace_lsp = Some(client.clone());
+                let key = Manager::key(
+                    ServerId::Rust,
+                    &view.canonical_root.join("main.rs"),
+                    &view.canonical_root,
+                    &Default::default(),
+                );
+                view.language_servers.start(key.clone(), Default::default());
+                let slot = view.language_servers.slots.get_mut(&key).unwrap();
+                slot.client = Some(client.clone());
+                slot.starting = false;
                 view.lsp = Some(LspSession {
                     client: Arc::clone(&client),
                     uri: uri.to_string(),

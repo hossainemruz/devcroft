@@ -61,23 +61,39 @@ pub struct Transport {
     protocol_errors: AtomicU64,
     exited: AtomicBool,
     _child: Option<WatchedChild>,
+    configuration: Mutex<Value>,
+    workspace_root: Mutex<Option<String>>,
+    pub(crate) log: super::process::Log,
+    _lease: Mutex<Option<Arc<std::fs::File>>>,
 }
 
 impl Transport {
     /// Spawn `program` rooted at `cwd` and take over its piped stdio. The
     /// server's stderr is discarded; servers report work through the protocol.
+    #[cfg(test)]
     pub fn spawn(
         program: &Path,
         args: &[OsString],
         cwd: &Path,
     ) -> Result<(Arc<Self>, mpsc::Receiver<ServerMessage>)> {
+        Self::spawn_configured(program, args, cwd, &[], None)
+    }
+
+    pub(crate) fn spawn_configured(
+        program: &Path,
+        args: &[OsString],
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        lease: Option<Arc<std::fs::File>>,
+    ) -> Result<(Arc<Self>, mpsc::Receiver<ServerMessage>)> {
         let mut command = Command::new(program);
         command
             .args(args)
+            .envs(env.iter().cloned())
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -98,7 +114,13 @@ impl Transport {
             .stdin
             .take()
             .context("Language server stdin unavailable")?;
-        Ok(Self::start(stdout, stdin, Some(child)))
+        let stderr = child.0.stderr.take();
+        let (transport, messages) = Self::start(stdout, stdin, Some(child));
+        *transport._lease.lock().unwrap() = lease;
+        if let Some(stderr) = stderr {
+            super::process::drain(stderr, transport.log.clone());
+        }
+        Ok((transport, messages))
     }
 
     /// Wire an already-open byte-stream pair. Production uses [`Self::spawn`];
@@ -125,6 +147,10 @@ impl Transport {
             protocol_errors: AtomicU64::new(0),
             exited: AtomicBool::new(false),
             _child: child,
+            configuration: Mutex::new(Value::Null),
+            workspace_root: Mutex::new(None),
+            log: Default::default(),
+            _lease: Mutex::new(None),
         });
         let (tx, rx) = mpsc::channel();
         let reader_side = Arc::downgrade(&transport);
@@ -178,6 +204,43 @@ impl Transport {
             })
             .expect("Could not start LSP writer thread");
         (transport, rx)
+    }
+
+    pub(crate) fn configure(&self, settings: Value, root: String) {
+        *self.configuration.lock().unwrap() = settings;
+        *self.workspace_root.lock().unwrap() = Some(root);
+    }
+
+    fn configuration_values(&self, params: &Value) -> Vec<Value> {
+        let settings = self.configuration.lock().unwrap();
+        let root = self.workspace_root.lock().unwrap();
+        params
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                if let Some(scope) = item.get("scopeUri").and_then(Value::as_str)
+                    && let Some(root) = root.as_ref()
+                    && scope != root
+                    && !scope.starts_with(&format!("{}/", root.trim_end_matches('/')))
+                {
+                    return Value::Null;
+                }
+                let section = item.get("section").and_then(Value::as_str).unwrap_or("");
+                if section.is_empty() {
+                    return settings.clone();
+                }
+                if let Some(value) = settings.get(section) {
+                    return value.clone();
+                }
+                section
+                    .split('.')
+                    .try_fold(&*settings, |v, part| v.get(part))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            })
+            .collect()
     }
 
     /// Whether the reader thread is still running. Set when the server's
@@ -317,7 +380,11 @@ impl Transport {
         {
             let response = match method {
                 "workspace/configuration" => {
-                    serde_json::json!({"jsonrpc":"2.0","id":id,"result": value.pointer("/params/items").and_then(Value::as_array).map(|items| vec![Value::Null; items.len()]).unwrap_or_default()})
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result": self.configuration_values(&value["params"])})
+                }
+                "workspace/workspaceFolders" => {
+                    let root = self.workspace_root.lock().unwrap().clone();
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":root.map(|uri| vec![serde_json::json!({"uri":uri,"name":"Workspace"})])})
                 }
                 "window/workDoneProgress/create" => {
                     serde_json::json!({"jsonrpc":"2.0","id":id,"result":null})
@@ -368,7 +435,11 @@ impl Transport {
 impl Drop for Transport {
     fn drop(&mut self) {
         if let Some(child) = self._child.take() {
-            thread::spawn(move || drop(child));
+            let lease = self._lease.lock().unwrap().take();
+            thread::spawn(move || {
+                drop(child);
+                drop(lease);
+            });
         }
     }
 }
@@ -592,6 +663,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn configuration_respects_sections_and_document_scope() {
+        let (reader, writer) = test_util::stub_server();
+        let (transport, _) = Transport::new(reader, writer);
+        transport.configure(serde_json::json!({"python":{"pythonPath":"/env/python"},"basedpyright":{"analysis":{"typeCheckingMode":"standard"}}}),"file:///workspace".into());
+        let values = transport.configuration_values(&serde_json::json!({"items":[
+            {"section":"python","scopeUri":"file:///workspace/main.py"},
+            {"section":"basedpyright.analysis"},
+            {"section":"python","scopeUri":"file:///workspace-other/main.py"},
+            {"section":"missing"}
+        ]}));
+        assert_eq!(values[0]["pythonPath"], "/env/python");
+        assert_eq!(values[1]["typeCheckingMode"], "standard");
+        assert!(values[2].is_null() && values[3].is_null());
+    }
+
     #[test]
     fn dropping_transport_kills_and_reaps_its_process() {
         let (transport, _) = Transport::spawn(

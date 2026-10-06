@@ -3359,11 +3359,7 @@ impl Workspace {
                             } else {
                                 row.label
                             };
-                            shortcut(
-                                row.key_label(),
-                                label.to_owned(),
-                                tab_width,
-                            )
+                            shortcut(row.key_label(), label.to_owned(), tab_width)
                         }))
                     })),
             ));
@@ -3417,15 +3413,13 @@ impl Workspace {
                     .border_color(rgb(0x2a3138))
                     .bg(rgb(0x12161c))
                     .shadow_md()
-                    .child(
-                        div().text_xs().text_color(rgb(0x6b7480)).child(
-                            if context_title == pane {
-                                format!("Navigation · {context_title}")
-                            } else {
-                                format!("Navigation · {context_title} · {pane}")
-                            },
-                        ),
-                    )
+                    .child(div().text_xs().text_color(rgb(0x6b7480)).child(
+                        if context_title == pane {
+                            format!("Navigation · {context_title}")
+                        } else {
+                            format!("Navigation · {context_title} · {pane}")
+                        },
+                    ))
                     .child(sections),
             )
             .into_any_element()

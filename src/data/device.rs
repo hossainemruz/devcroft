@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
@@ -85,6 +86,9 @@ pub(crate) struct DeviceState {
     /// Optional external launchers. Missing entries preserve enabled defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) external_editors: Option<HashMap<String, bool>>,
+    /// Language-server preferences are machine-local, including executable paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) language_servers: Option<HashMap<String, crate::editor::lsp::catalog::Preference>>,
     /// Machine-local checkout bindings by repository key: the linked local
     /// checkout plus remote alias. Portable metadata lives in
     /// `portable/repositories/<key>/repository.json`; only the binding that
@@ -188,11 +192,11 @@ impl DeviceState {
     }
 }
 
-/// `device.json` store with atomic writes serialized per path. Share one
-/// instance per process so concurrent `update` calls serialize.
+/// `device.json` store with atomic writes serialized per path.
+/// Instances for the same path share an in-process update lock.
 pub(crate) struct DeviceStore {
     path: PathBuf,
-    lock: Mutex<()>,
+    lock: Arc<Mutex<()>>,
 }
 
 impl DeviceStore {
@@ -228,10 +232,19 @@ impl DeviceStore {
     }
 
     pub(crate) fn new(root: &DataRoot) -> Self {
-        Self {
-            path: root.device_path(),
-            lock: Mutex::new(()),
-        }
+        static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+        let path = root
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| root.root().to_owned())
+            .join("device.json");
+        let mut locks = LOCKS.get_or_init(Mutex::default).lock();
+        let lock = locks.get(&path).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(path.clone(), Arc::downgrade(&lock));
+            lock
+        });
+        Self { path, lock }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -629,10 +642,10 @@ mod tests {
     #[test]
     fn concurrent_updates_serialize_without_loss() {
         let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(store_in(dir.path()));
+        let store = store_in(dir.path());
         let mut handles = Vec::new();
         for _ in 0..8 {
-            let store = store.clone();
+            let store = store_in(dir.path());
             handles.push(std::thread::spawn(move || {
                 for _ in 0..25 {
                     store

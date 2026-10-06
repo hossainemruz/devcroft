@@ -59,6 +59,11 @@ tempfile = "3.27.0"
 fff-search = { version = "0.11.0", default-features = false, features = ["ripgrep"] }
 fff-grep = "0.11.0"
 regex = "1.12"
+flate2 = "1.1.10"
+sha2 = "0.10.9"
+toml = "0.8.23"
+globset = "0.4.20"
+notify = "7.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui-wry = "=0.7.0"

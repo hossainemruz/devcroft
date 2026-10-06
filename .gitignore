@@ -3,6 +3,9 @@
 **/*.rs.bk
 *.pdb
 
+# Local design explorations and generated previews
+/output/
+
 # macOS
 .DS_Store
 .AppleDouble

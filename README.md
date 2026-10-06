@@ -168,3 +168,7 @@ bundle. Installation does not edit project instruction files or agent settings.
 
 The maintained bundle lives in `assets/skills/devcroft/` and is embedded in the
 binary, so installation requires neither network access nor a source checkout.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Third-party font and icon attributions live in [assets/](assets/) (notably assets/icons/ATTRIBUTION.md).

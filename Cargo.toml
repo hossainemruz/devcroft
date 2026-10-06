@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
+description = "GPUI desktop workspace for agent harnesses with editor, terminal, review, and repository resources"
+repository = "https://github.com/hossainemruz/devcroft"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"

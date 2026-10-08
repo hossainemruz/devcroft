@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{ScrollStrategy, relative, uniform_list};
 
 impl NativeEditor {
@@ -386,23 +387,19 @@ impl NativeEditor {
                             .debug_selector(move || id.clone())
                             .ghost()
                             .small()
-                            .h(px(30.))
+                            .h(px(28.))
                             .w_full()
                             .p_0()
                             .accessibility_label(label.clone())
-                            .when(index == this.file_selection, |row| row.bg(rgb(0x28374c)))
+                            .when(index == this.file_selection, |row| {
+                                row.bg(cx.theme().accent)
+                                    .text_color(cx.theme().accent_foreground)
+                            })
                             .child(
                                 h_flex()
                                     .w_full()
                                     .gap_2()
                                     .px_3()
-                                    .child(div().w(px(10.)).text_color(rgb(0x61afef)).child(
-                                        if index == this.file_selection {
-                                            "›"
-                                        } else {
-                                            ""
-                                        },
-                                    ))
                                     .child(this.file_icon(&file_label))
                                     .child(div().min_w_0().flex_1().text_ellipsis().child(label)),
                             )
@@ -445,12 +442,15 @@ impl NativeEditor {
                         .w(relative(0.92))
                         .h(relative(0.84))
                         .max_w(px(1200.))
+                        .max_h(px(800.))
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
                         .min_h_0()
                         .overflow_hidden()
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgb(0x3b7182))
-                        .bg(rgb(0x101419))
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
                         .shadow_lg()
                         .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                             let key = event.keystroke.key.as_str();
@@ -481,19 +481,21 @@ impl NativeEditor {
                         }))
                         .child(
                             h_flex()
-                                .h(px(40.))
+                                .h(px(36.))
                                 .flex_shrink_0()
                                 .px_3()
                                 .gap_2()
                                 .border_b_1()
-                                .border_color(rgb(0x26313b))
-                                .child(div().flex_1().text_color(rgb(0x61afef)).child(if grep {
-                                    "Live grep"
-                                } else if buffers {
-                                    "Open tabs"
-                                } else {
-                                    "Find files"
-                                }))
+                                .border_color(cx.theme().border)
+                                .child(div().flex_1().text_color(cx.theme().foreground).child(
+                                    if grep {
+                                        "Live grep"
+                                    } else if buffers {
+                                        "Open tabs"
+                                    } else {
+                                        "Find files"
+                                    },
+                                ))
                                 .child(
                                     Button::new("native-finder-refresh")
                                         .label("Refresh")
@@ -514,13 +516,29 @@ impl NativeEditor {
                                 ),
                         )
                         .child(
+                            div()
+                                .flex_shrink_0()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    Input::new(if grep {
+                                        &self.text_query
+                                    } else {
+                                        &self.file_query
+                                    })
+                                    .small(),
+                                ),
+                        )
+                        .child(
                             h_flex()
                                 .flex_1()
                                 .min_h_0()
                                 .items_stretch()
                                 .child(
                                     v_flex()
-                                        .w(relative(0.5))
+                                        .w(relative(0.44))
                                         .min_w_0()
                                         .min_h_0()
                                         .child(
@@ -528,32 +546,10 @@ impl NativeEditor {
                                                 .px_3()
                                                 .py_2()
                                                 .text_xs()
-                                                .text_color(rgb(0x8fa5b8))
-                                                .child("RESULTS"),
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Results"),
                                         )
-                                        .child(results)
-                                        .child(
-                                            v_flex()
-                                                .flex_shrink_0()
-                                                .p_2()
-                                                .gap_1()
-                                                .border_t_1()
-                                                .border_color(rgb(0xb38255))
-                                                .child(
-                                                    Input::new(if grep {
-                                                        &self.text_query
-                                                    } else {
-                                                        &self.file_query
-                                                    })
-                                                    .small(),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(0x8794a2))
-                                                        .child(status),
-                                                ),
-                                        ),
+                                        .child(results),
                                 )
                                 .child(
                                     v_flex()
@@ -561,14 +557,14 @@ impl NativeEditor {
                                         .min_w_0()
                                         .min_h_0()
                                         .border_l_1()
-                                        .border_color(rgb(0x3b7182))
+                                        .border_color(cx.theme().border)
                                         .child(
                                             div()
                                                 .px_3()
                                                 .py_2()
                                                 .text_xs()
                                                 .text_ellipsis()
-                                                .text_color(rgb(0x8fa5b8))
+                                                .text_color(cx.theme().muted_foreground)
                                                 .child(
                                                     selected
                                                         .map(|(file, line)| match line {
@@ -580,7 +576,7 @@ impl NativeEditor {
                                                             ),
                                                             None => file.label,
                                                         })
-                                                        .unwrap_or("PREVIEW".into()),
+                                                        .unwrap_or("Preview".into()),
                                                 ),
                                         )
                                         .child(
@@ -596,13 +592,17 @@ impl NativeEditor {
                                 ),
                         )
                         .child(
-                            div()
+                            h_flex()
+                                .h(px(30.))
                                 .px_3()
-                                .py_2()
+                                .gap_3()
+                                .border_t_1()
+                                .border_color(cx.theme().border)
                                 .flex_shrink_0()
                                 .text_xs()
-                                .text_color(rgb(0x8794a2))
-                                .child("↑ ↓ / Ctrl+N P  select     Enter  open     Esc  close"),
+                                .text_color(cx.theme().muted_foreground)
+                                .child(div().flex_1().min_w_0().text_ellipsis().child(status))
+                                .child("↑ ↓ select · Enter open · Esc close"),
                         ),
                 )
                 .into_any_element(),

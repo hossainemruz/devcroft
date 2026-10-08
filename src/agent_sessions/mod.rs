@@ -190,12 +190,16 @@ mod tests {
     }
     #[test]
     fn checkout_matching_respects_components_and_nested_repos() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
+        let guard = tempfile::tempdir().unwrap();
+        // On macOS the tempdir path runs through the `/var` -> `/private/var`
+        // symlink while `checkout_for` canonicalizes, so compare against the
+        // canonical root (the guard still owns cleanup).
+        let root = guard.path().canonicalize().unwrap();
+        let repo = root.join("repo");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::create_dir(repo.join(".git")).unwrap();
         assert_eq!(model::checkout_for(&repo.join("src")), repo);
-        assert_ne!(model::checkout_for(&root.path().join("repository")), repo);
+        assert_ne!(model::checkout_for(&root.join("repository")), repo);
         fs::create_dir(repo.join("src/.git")).unwrap();
         assert_eq!(model::checkout_for(&repo.join("src")), repo.join("src"));
     }

@@ -2966,10 +2966,10 @@ impl Workspace {
                 }
             }
             NavigationCommand::ToggleMarkdownPreview => {
-                if self.editor_instance == Some(EditorChoice::BuiltIn) {
-                    if let Some(editor) = &self.native_editor {
-                        editor.update(cx, |editor, cx| editor.toggle_markdown_preview(window, cx));
-                    }
+                if self.editor_instance == Some(EditorChoice::BuiltIn)
+                    && let Some(editor) = &self.native_editor
+                {
+                    editor.update(cx, |editor, cx| editor.toggle_markdown_preview(window, cx));
                 }
             }
             NavigationCommand::NewSession => self.prompt_new_agent_session(window, cx),

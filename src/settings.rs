@@ -22,7 +22,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -90,12 +90,12 @@ impl SettingsSection {
 
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Self::General => "App-wide appearance.",
-            Self::Spaces => "Isolation profiles for repositories, Home, and artifacts.",
-            Self::Sync => "Portable data Git sync.",
-            Self::Agent => "Agent pane preferences.",
+            Self::General => "Appearance and terminal behavior.",
+            Self::Spaces => "Keep work and personal projects separate.",
+            Self::Sync => "Back up and sync between devices.",
+            Self::Agent => "Available agents, sessions, and skills.",
             Self::Editor => "Default editor and external launchers.",
-            Self::Keybindings => "Current shortcuts.",
+            Self::Keybindings => "Shortcuts and navigation mode.",
         }
     }
 }
@@ -1131,26 +1131,29 @@ impl SettingsView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // No sidebar title: the dialog already carries a "Settings" title.
         v_flex()
-            .w(px(200.))
+            .w(px(154.))
             .flex_none()
             .h_full()
-            .py_3()
+            .py_2()
             .px_2()
             .gap_1()
             .border_r_1()
-            .border_color(rgb(0x292b2b))
+            .border_color(cx.theme().border)
             .children(SettingsSection::ALL.into_iter().map(|section| {
                 let selected = section == self.active_section;
                 div()
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .rounded_md()
                     .text_sm()
                     .cursor_pointer()
                     .when(selected, |this| {
-                        this.bg(rgb(0x1d1f1f)).text_color(rgb(0xe7e7e7))
+                        this.bg(cx.theme().accent)
+                            .text_color(cx.theme().accent_foreground)
                     })
-                    .when(!selected, |this| this.text_color(rgb(0x858989)))
+                    .when(!selected, |this| {
+                        this.text_color(cx.theme().muted_foreground)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.select_section(section, cx)),
@@ -1159,23 +1162,21 @@ impl SettingsView {
             }))
     }
 
-    fn render_header(&self) -> impl IntoElement {
-        v_flex()
-            .gap_1()
-            .pb_4()
-            .border_b_1()
-            .border_color(rgb(0x292b2b))
+    fn render_header(&self, cx: &App) -> impl IntoElement {
+        h_flex()
+            .gap_3()
+            .items_baseline()
+            .flex_wrap()
             .child(
                 div()
-                    .text_size(px(18.))
+                    .text_size(px(16.))
                     .font_semibold()
-                    .text_color(rgb(0xe7e7e7))
                     .child(self.active_section.label()),
             )
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(0x858989))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
                     .child(self.active_section.description()),
             )
     }
@@ -1189,7 +1190,14 @@ impl SettingsView {
             .min_w_0()
             .h_full()
             .overflow_hidden()
-            .child(div().px_6().pt_5().child(self.render_header()))
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(self.render_header(cx)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1199,10 +1207,10 @@ impl SettingsView {
                     .child(
                         v_flex()
                             .gap_4()
-                            .px_6()
-                            .py_5()
+                            .px_4()
+                            .py_3()
                             .w_full()
-                            .max_w(px(680.))
+                            .max_w(px(760.))
                             .child(match self.active_section {
                                 SettingsSection::General => {
                                     self.render_general(cx).into_any_element()
@@ -1216,7 +1224,7 @@ impl SettingsView {
                                     self.render_editor(cx).into_any_element()
                                 }
                                 SettingsSection::Keybindings => {
-                                    self.render_keybindings().into_any_element()
+                                    self.render_keybindings(cx).into_any_element()
                                 }
                             }),
                     ),
@@ -1231,17 +1239,17 @@ impl SettingsView {
         v_flex()
             .gap_4()
             .child(
-                group(
-                    "Spaces",
-                    Some("Repositories, Home items, and artifacts are isolated per space; agent sessions follow their repository. Switch spaces from the Home titlebar, or press s in navigation mode."),
+                group(cx,
+                    "Manage spaces",
+                    Some("Each space has its own repositories and artifacts. Switch from Home or press s in navigation mode."),
                 )
                 .child(
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(div().flex_1().min_w_0().child(Input::new(&self.space_input)))
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.space_input).small()))
                         .child(
-                            Button::new("add-space")
+                            Button::new("add-space").small()
                                 .primary()
                                 .label("Add space")
                                 .on_click(cx.listener(|this, _, window, cx| this.add_space(window, cx))),
@@ -1257,16 +1265,16 @@ impl SettingsView {
                 }),
             )
             .when_some(self.spaces_error.clone(), |this, error| {
-                this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                this.child(div().text_sm().text_color(cx.theme().danger).child(error))
             })
             .when_some(self.spaces_notice.clone(), |this, notice| {
-                this.child(div().text_sm().text_color(rgb(0x858989)).child(notice))
+                this.child(div().text_sm().text_color(cx.theme().muted_foreground).child(notice))
             })
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x737878))
-                    .child("Renaming rewrites every record that uses the space. Deleting moves its records to the destination you pick; at least one space must remain. Save or cancel unsaved artifact drafts before renaming or deleting a space."),
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Deleting moves records to another space. Keep at least one space, and save artifact drafts before renaming or deleting."),
             )
     }
 
@@ -1281,16 +1289,18 @@ impl SettingsView {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(Input::new(&self.space_rename_input)),
+                        .child(Input::new(&self.space_rename_input).small()),
                 )
                 .child(
                     Button::new("save-space-rename")
+                        .small()
                         .primary()
                         .label("Rename")
                         .on_click(cx.listener(|this, _, _, cx| this.save_space_rename(cx))),
                 )
                 .child(
                     Button::new("cancel-space-rename")
+                        .small()
                         .ghost()
                         .label("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_space_edit(cx))),
@@ -1315,11 +1325,12 @@ impl SettingsView {
                             .flex_1()
                             .min_w_0()
                             .text_sm()
-                            .text_color(rgb(0xe7e7e7))
+                            .text_color(cx.theme().foreground)
                             .child(format!("Move everything in {name:?} to")),
                     )
                     .child(
                         Button::new("delete-space-destination")
+                            .small()
                             .outline()
                             .label(destination.clone())
                             .dropdown_menu(move |mut menu, _, _| {
@@ -1350,12 +1361,14 @@ impl SettingsView {
                     )
                     .child(
                         Button::new("confirm-space-delete")
+                            .small()
                             .danger()
                             .label("Delete space")
                             .on_click(cx.listener(|this, _, _, cx| this.confirm_space_delete(cx))),
                     )
                     .child(
                         Button::new("cancel-space-delete")
+                            .small()
                             .ghost()
                             .label("Cancel")
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_space_edit(cx))),
@@ -1373,7 +1386,7 @@ impl SettingsView {
                             .flex_1()
                             .min_w_0()
                             .text_sm()
-                            .text_color(rgb(0xe7e7e7))
+                            .text_color(cx.theme().foreground)
                             .child(name.to_owned()),
                     )
                     .child(
@@ -1409,10 +1422,10 @@ impl SettingsView {
             .child(v_flex().gap_2()
                 .child(v_flex().gap_1()
                     .child(h_flex().gap_2().items_center().justify_between()
-                        .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child("Default editor"))
-                        .child(Button::new("check-neovim").label("Refresh").small().ghost().disabled(self.neovim_checking)
+                        .child(div().text_sm().font_semibold().text_color(cx.theme().foreground).child("Default editor"))
+                        .child(Button::new("check-neovim").small().label("Refresh").ghost().disabled(self.neovim_checking)
                             .on_click(cx.listener(|this, _, _, cx| this.check_neovim(cx)))))
-                    .child(div().text_xs().text_color(rgb(0x737878)).child("Choose how project files open. Switching keeps existing editor sessions and unsaved drafts available.")))
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Choose how project files open. Existing sessions and unsaved drafts are preserved.")))
                 .child(gpui_kit::base::RadioGroup::new("default-editor-cards")
                     .axis(gpui_kit::Axis::Horizontal).flex().flex_row().items_stretch().gap_3().w_full()
                     .children([EditorChoice::BuiltIn, EditorChoice::Neovim].into_iter().enumerate().map(|(index, choice)| {
@@ -1423,8 +1436,8 @@ impl SettingsView {
                         let title = choice.label();
                         let tiles = editor_tiles.clone();
                         let description = match choice {
-                            EditorChoice::BuiltIn => "File tabs, project search, syntax highlighting, and optional language servers. Ready to use.",
-                            EditorChoice::Neovim => "Your configuration, plugins, and modal keyboard workflow in a terminal.",
+                            EditorChoice::BuiltIn => "File tabs, search, Markdown preview, and language support.",
+                            EditorChoice::Neovim => "Your Neovim configuration and plugins in a terminal.",
                         };
                         let icon: AnyElement = match choice {
                             EditorChoice::BuiltIn => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Devcroft, &tiles, crate::editor_icons::ICON_PX),
@@ -1465,8 +1478,8 @@ impl SettingsView {
                             .child(v_flex().gap_1().flex_1().min_w_0()
                                 .child(h_flex().items_center().gap_2()
                                     .child(icon)
-                                    .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child(title)))
-                                .child(div().text_xs().text_color(rgb(0x999fa8)).child(description))
+                                    .child(div().text_sm().font_semibold().text_color(cx.theme().foreground).child(title)))
+                                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(description))
                                 .when(choice == EditorChoice::Neovim, |card| {
                                     let status = if self.neovim_checking {
                                         "Checking for Neovim…".to_owned()
@@ -1478,29 +1491,29 @@ impl SettingsView {
                                         "Neovim was not found. Install nvim and make it available on PATH.".to_owned()
                                     };
                                     let status_color = if self.neovim_checking {
-                                        rgb(0x858989)
+                                        cx.theme().muted_foreground
                                     } else if self.neovim_check_error.is_some() || !self.neovim_available {
-                                        rgb(0xf87171)
+                                        cx.theme().danger
                                     } else {
-                                        rgb(0x4ade80)
+                                        cx.theme().success
                                     };
                                     card.child(div().text_xs().text_color(status_color).child(status))
                                 }))
                             .on_change(move |_, _, window, cx| { let _ = view.update(cx, |this, cx| this.set_editor_choice(choice, window, cx)); })
                             .map(|radio| v_flex().flex_1().min_w_0().rounded_md().border_1()
-                                .border_color(rgb(if selected { 0x61afef } else { 0x30343a }))
-                                .bg(rgb(if selected { 0x172331 } else { 0x111416 }))
+                                .border_color(if selected { cx.theme().ring } else { cx.theme().border })
+                                .bg(if selected { cx.theme().accent } else { cx.theme().background })
                                 .child(radio))
                     }))))
-            .when_some(self.editor_error.clone(), |view, error| view.child(div().text_sm().text_color(rgb(0xf87171)).child(error)))
+            .when_some(self.editor_error.clone(), |view, error| view.child(div().text_sm().text_color(cx.theme().danger).child(error)))
             .child(self.language_servers.clone())
             .child(v_flex().gap_2()
                 .child(v_flex().gap_1()
                     .child(h_flex().gap_2().items_center().justify_between()
-                        .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child("External editors"))
-                        .child(Button::new("check-external-editors").label("Refresh").small().ghost().disabled(self.external_checking)
+                        .child(div().text_sm().font_semibold().text_color(cx.theme().foreground).child("External editors"))
+                        .child(Button::new("check-external-editors").small().label("Refresh").ghost().disabled(self.external_checking)
                             .on_click(cx.listener(|this, _, _, cx| this.check_external_editors(cx)))))
-                    .child(div().text_xs().text_color(rgb(0x737878)).child("Choose which applications appear in the editor’s Open in menu.")))
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Choose which applications appear in the editor’s Open in menu.")))
                 .children(ExternalEditorKind::ALL.into_iter().map(|kind| {
                     let installed = self.installed_editors.get(kind.id()).copied().unwrap_or(false);
                     let enabled = self.external_editors.get(kind.id()).copied().unwrap_or(true);
@@ -1509,13 +1522,13 @@ impl SettingsView {
                         ExternalEditorKind::Zed => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Zed, &editor_tiles, crate::editor_icons::ICON_PX),
                         ExternalEditorKind::VsCode => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::VsCode, &editor_tiles, crate::editor_icons::ICON_PX),
                     };
-                    div().px_3().py_2().rounded_md().border_1().border_color(rgb(0x30343a)).bg(rgb(0x111416))
+                    div().px_3().py_2().rounded_md().border_1().border_color(cx.theme().border).bg(cx.theme().background)
                         .child(h_flex().gap_3().items_center().justify_between()
                             .child(h_flex().gap_2().items_center().flex_1().min_w_0()
                                 .child(icon)
                                 .child(v_flex().gap_0().flex_1().min_w_0()
-                                    .child(div().text_sm().font_semibold().text_color(rgb(0xe7e7e7)).child(kind.label()))
-                                    .child(div().text_xs().text_color(if self.external_checking { rgb(0x999fa8) } else if installed { rgb(0x4ade80) } else { rgb(0xf87171) })
+                                    .child(div().text_sm().font_semibold().text_color(cx.theme().foreground).child(kind.label()))
+                                    .child(div().text_xs().text_color(if self.external_checking { cx.theme().muted_foreground } else if installed { cx.theme().success } else { cx.theme().danger })
                                         .child(if self.external_checking { "Checking installation…" } else if installed { "Installed · Available from the editor’s Open in menu." } else { "Not found. Install the application or its command-line launcher." }))))
                             .child(Switch::new(format!("external-editor-{}", kind.id())).checked(enabled && installed).disabled(!installed || self.external_checking)
                                 .on_change(move |enabled, _, cx| { let _ = view.update(cx, |this, cx| this.set_external_editor_enabled(kind, *enabled, cx)); }))
@@ -1529,7 +1542,7 @@ impl SettingsView {
         let is_default = (size - DEFAULT_APP_FONT_SIZE).abs() < f32::EPSILON;
         v_flex()
             .gap_4()
-            .child(group("Terminal", None).child(live_row(
+            .child(group(cx, "Terminal", None).child(live_row(cx,
                 "Copy on select",
                 "Automatically copy selected terminal text. Hold Shift to select inside mouse-aware applications. Explicit copy: Ctrl+Shift+C (Cmd+C on macOS).",
                 Switch::new("terminal-copy-on-select")
@@ -1539,16 +1552,16 @@ impl SettingsView {
                     }),
             )))
             .when_some(self.terminal_preferences_error.clone(), |this, error| {
-                this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                this.child(div().text_sm().text_color(cx.theme().danger).child(error))
             })
             .child(
-                group("Appearance", None).child(live_row(
+                group(cx, "Appearance", None).child(live_row(cx,
                     "App font size",
                     "Applies to the Agent, Editor, Terminal, and Review panes.",
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(step_button(
+                        .child(step_button(cx,
                             "-",
                             cx.listener(move |this, _, _, cx| {
                                 this.set_font_size(SettingsView::stepped_font_size(size, -1.0), cx)
@@ -1559,16 +1572,16 @@ impl SettingsView {
                                 .w(px(64.))
                                 .text_center()
                                 .text_sm()
-                                .text_color(rgb(0xe7e7e7))
+                                .text_color(cx.theme().foreground)
                                 .child(format_font_size(size)),
                         )
-                        .child(step_button(
+                        .child(step_button(cx,
                             "+",
                             cx.listener(move |this, _, _, cx| {
                                 this.set_font_size(SettingsView::stepped_font_size(size, 1.0), cx)
                             }),
                         ))
-                        .child(div().text_xs().text_color(rgb(0x555a5a)).child(format!(
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!(
                             "{}–{} px",
                             MIN_APP_FONT_SIZE as u32, MAX_APP_FONT_SIZE as u32
                         )))
@@ -1579,7 +1592,7 @@ impl SettingsView {
                                     .py_1()
                                     .rounded_md()
                                     .text_xs()
-                                    .text_color(rgb(0x858989))
+                                    .text_color(cx.theme().muted_foreground)
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -1598,23 +1611,23 @@ impl SettingsView {
             .child(
                 v_flex()
                     .gap_2()
-                    .p_4()
+                    .p_3()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x292b2b))
-                    .bg(rgb(0x0e0f0f))
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
                     .child(
                         div()
                             .font_family(TERMINAL_FONT_FAMILY)
                             .text_size(px(size))
-                            .text_color(rgb(0xe7e7e7))
+                            .text_color(cx.theme().foreground)
                             .child("The quick brown fox jumps over the lazy dog 0123456789"),
                     )
                     .child(
                         div()
                             .font_family(TERMINAL_FONT_FAMILY)
                             .text_size(px(review_font_size()))
-                            .text_color(rgb(0x858989))
+                            .text_color(cx.theme().muted_foreground)
                             .child("Review diffs render proportionally smaller  +12 −34"),
                     ),
             )
@@ -1649,9 +1662,9 @@ impl SettingsView {
         v_flex()
             .gap_4()
             .child(
-                group(
+                group(cx,
                     "Remote",
-                    Some("Git remote for portable data. Only portable/ is ever synced; device.json stays on this machine."),
+                    Some("Sync repositories, artifacts, and spaces through Git. Device preferences stay local."),
                 )
                 .child(
                     v_flex()
@@ -1659,7 +1672,7 @@ impl SettingsView {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x858989))
+                                .text_color(cx.theme().muted_foreground)
                                 .child("Origin URL"),
                         )
                         .child(
@@ -1674,14 +1687,14 @@ impl SettingsView {
                                     MouseButton::Left,
                                     cx.listener(|_, _, _, cx| cx.stop_propagation()),
                                 )
-                                .child(Input::new(&self.origin_input)),
+                                .child(Input::new(&self.origin_input).small()),
                         )
                         .child(
                             h_flex()
                                 .gap_2()
                                 .items_center()
                                 .child(
-                                    Button::new("sync-save-origin")
+                                    Button::new("sync-save-origin").small()
                                         .label(if self.origin_busy {
                                             "Saving…"
                                         } else {
@@ -1697,7 +1710,7 @@ impl SettingsView {
                                         }),
                                 )
                                 .child(
-                                    Button::new("sync-remove-origin")
+                                    Button::new("sync-remove-origin").small()
                                         .label("Remove")
                                         .ghost()
                                         .on_click(move |_, window, cx| {
@@ -1710,15 +1723,15 @@ impl SettingsView {
                                 ),
                         )
                         .when_some(self.origin_error.clone(), |this, error| {
-                            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                            this.child(div().text_sm().text_color(cx.theme().danger).child(error))
                         })
                         .when_some(self.origin_notice.clone(), |this, notice| {
-                            this.child(div().text_sm().text_color(rgb(0x858989)).child(notice))
+                            this.child(div().text_sm().text_color(cx.theme().muted_foreground).child(notice))
                         })
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x737878))
+                                .text_color(cx.theme().muted_foreground)
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
@@ -1727,7 +1740,7 @@ impl SettingsView {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x555a5a))
+                                .text_color(cx.theme().muted_foreground)
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
@@ -1736,11 +1749,11 @@ impl SettingsView {
                 ),
             )
             .child(
-                group(
+                group(cx,
                     "Branch",
                     Some("Local branch of the portable repo. Switching replaces portable files with that branch's content."),
                 )
-                .child(self.render_branch_current())
+                .child(self.render_branch_current(cx))
                 .child(
                     h_flex()
                         .gap_2()
@@ -1756,14 +1769,15 @@ impl SettingsView {
                                 .text_sm()
                                 .cursor_pointer()
                                 .when(selected, |this| {
-                                    this.border_color(rgb(0x2f81f7))
-                                        .bg(rgb(0x0e1a2b))
-                                        .text_color(rgb(0xe7e7e7))
+                                    this.border_color(cx.theme().ring)
+                                        .bg(cx.theme().accent)
+                                        .text_color(cx.theme().accent_foreground)
+                                        .text_color(cx.theme().foreground)
                                 })
                                 .when(!selected, |this| {
-                                    this.border_color(rgb(0x292b2b))
-                                        .bg(rgb(0x0e0f0f))
-                                        .text_color(rgb(0x858989))
+                                    this.border_color(cx.theme().border)
+                                        .bg(cx.theme().background)
+                                        .text_color(cx.theme().muted_foreground)
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -1785,10 +1799,10 @@ impl SettingsView {
                                     MouseButton::Left,
                                     cx.listener(|_, _, _, cx| cx.stop_propagation()),
                                 )
-                                .child(Input::new(&self.branch_input)),
+                                .child(Input::new(&self.branch_input).small()),
                         )
                         .child(
-                            Button::new("sync-checkout-branch")
+                            Button::new("sync-checkout-branch").small()
                                 .label(if self.branch_busy {
                                     "Switching…"
                                 } else {
@@ -1807,14 +1821,14 @@ impl SettingsView {
                         ),
                 )
                 .when_some(self.branch_error.clone(), |this, error| {
-                    this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                    this.child(div().text_sm().text_color(cx.theme().danger).child(error))
                 })
                 .when_some(self.branch_notice.clone(), |this, notice| {
-                    this.child(div().text_sm().text_color(rgb(0x858989)).child(notice))
+                    this.child(div().text_sm().text_color(cx.theme().muted_foreground).child(notice))
                 }),
             )
             .child(
-                group(
+                group(cx,
                     "Automatic sync",
                     Some("Sync in the background on a schedule. Manual sync is always available from the command palette."),
                 )
@@ -1836,14 +1850,15 @@ impl SettingsView {
                                     .text_sm()
                                     .cursor_pointer()
                                     .when(selected, |this| {
-                                        this.border_color(rgb(0x2f81f7))
-                                            .bg(rgb(0x0e1a2b))
-                                            .text_color(rgb(0xe7e7e7))
+                                        this.border_color(cx.theme().ring)
+                                            .bg(cx.theme().accent)
+                                        .text_color(cx.theme().accent_foreground)
+                                            .text_color(cx.theme().foreground)
                                     })
                                     .when(!selected, |this| {
-                                        this.border_color(rgb(0x292b2b))
-                                            .bg(rgb(0x0e0f0f))
-                                            .text_color(rgb(0x858989))
+                                        this.border_color(cx.theme().border)
+                                            .bg(cx.theme().background)
+                                            .text_color(cx.theme().muted_foreground)
                                     })
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -1856,14 +1871,14 @@ impl SettingsView {
                         ),
                 )
                 .when_some(custom_note, |this, note| {
-                    this.child(div().text_xs().text_color(rgb(0x858989)).child(note))
+                    this.child(div().text_xs().text_color(cx.theme().muted_foreground).child(note))
                 })
                 .when_some(self.interval_error.clone(), |this, error| {
-                    this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+                    this.child(div().text_sm().text_color(cx.theme().danger).child(error))
                 }),
             )
             .child(
-                group(
+                group(cx,
                     "Manual sync",
                     Some("Stage, commit, fetch, rebase, and push portable data now."),
                 )
@@ -1872,7 +1887,7 @@ impl SettingsView {
                         .gap_3()
                         .items_center()
                         .child(
-                            Button::new("sync-now")
+                            Button::new("sync-now").small()
                                 .label(if syncing { "Syncing…" } else { "Sync now" })
                                 .primary()
                                 .loading(syncing)
@@ -1888,9 +1903,9 @@ impl SettingsView {
                             div()
                                 .text_sm()
                                 .text_color(if status_is_error {
-                                    rgb(0xf87171)
+                                    cx.theme().danger
                                 } else {
-                                    rgb(0x858989)
+                                    cx.theme().muted_foreground
                                 })
                                 .child(status_text),
                         ),
@@ -1900,7 +1915,7 @@ impl SettingsView {
 
     /// Current-branch line for the Branch group: the checked-out branch plus
     /// what sync will push to, or the honest degraded states.
-    fn render_branch_current(&self) -> impl IntoElement {
+    fn render_branch_current(&self, cx: &App) -> impl IntoElement {
         let current = match self.current_branch.as_deref() {
             Some(branch) if !branch.is_empty() => format!("Current: {branch}"),
             _ if self.data_root.is_none() => "Portable data is unavailable.".to_owned(),
@@ -1918,9 +1933,19 @@ impl SettingsView {
         };
         v_flex()
             .gap_1()
-            .child(div().text_sm().text_color(rgb(0xe7e7e7)).child(current))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child(current),
+            )
             .when(!tracking.is_empty(), |this| {
-                this.child(div().text_xs().text_color(rgb(0x858989)).child(tracking))
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(tracking),
+                )
             })
     }
 
@@ -1977,84 +2002,94 @@ impl SettingsView {
         let view = cx.entity().downgrade();
 
         let agents = group(
+            cx,
             "Agents",
-            Some("Choose which harnesses are available. The default and New session only offer enabled agents."),
+            Some("Enabled agents appear in New session and the default-agent menu."),
         )
         .child(
             v_flex()
                 .gap_2()
-                .children(AgentKind::ALL.into_iter().enumerate().map(|(index, agent)| {
-                    let is_enabled = enabled.contains(&agent);
-                    let icon = agent_icons::agent_icon(agent, &tiles, agent_icons::ICON_PX);
-                    let toggle_view = view.clone();
-                    div()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(0x292b2b))
-                        .bg(rgb(0x0e0f0f))
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .items_center()
-                                .justify_between()
+                .children(
+                    AgentKind::ALL
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, agent)| {
+                            let is_enabled = enabled.contains(&agent);
+                            let icon = agent_icons::agent_icon(agent, &tiles, agent_icons::ICON_PX);
+                            let toggle_view = view.clone();
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().background)
                                 .child(
                                     h_flex()
-                                        .gap_2()
+                                        .gap_3()
                                         .items_center()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(icon)
+                                        .justify_between()
                                         .child(
-                                            v_flex()
-                                                .gap_0()
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
                                                 .flex_1()
                                                 .min_w_0()
+                                                .child(icon)
                                                 .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .font_semibold()
-                                                        .text_color(rgb(0xe7e7e7))
-                                                        .child(agent.label().to_owned()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(0x737878))
-                                                        .child(agent.description().to_owned()),
+                                                    v_flex()
+                                                        .gap_0()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_semibold()
+                                                                .text_color(cx.theme().foreground)
+                                                                .child(agent.label().to_owned()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(
+                                                                    agent.description().to_owned(),
+                                                                ),
+                                                        ),
                                                 ),
+                                        )
+                                        .child(
+                                            Switch::new(("agent-enabled", index))
+                                                .checked(is_enabled)
+                                                .on_change(move |next, _, cx| {
+                                                    toggle_view
+                                                        .update(cx, |this, cx| {
+                                                            this.set_agent_enabled(agent, *next, cx)
+                                                        })
+                                                        .ok();
+                                                }),
                                         ),
                                 )
-                                .child(
-                                    Switch::new(("agent-enabled", index))
-                                        .checked(is_enabled)
-                                        .on_change(move |next, _, cx| {
-                                            toggle_view
-                                                .update(cx, |this, cx| {
-                                                    this.set_agent_enabled(agent, *next, cx)
-                                                })
-                                                .ok();
-                                        }),
-                                ),
-                        )
-                })),
+                        }),
+                ),
         )
         .when_some(self.enabled_agents_error.clone(), |this, error| {
-            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+            this.child(div().text_sm().text_color(cx.theme().danger).child(error))
         });
 
         let dropdown_view = view.clone();
         let dropdown_enabled = enabled.clone();
         let dropdown_tiles = tiles.clone();
         let current_icon = agent_icons::agent_icon(current, &tiles, agent_icons::ICON_PX);
-        let default = group(
+        let default = group(cx,
             "Default agent",
             Some("Launched when the Agent tab opens without history, and pre-selected in New session. Open sessions keep running."),
         )
         .child(
             h_flex().gap_2().items_center().child(
-                Button::new("default-agent")
+                Button::new("default-agent").small()
                     .accessibility_label(current.label().to_owned())
                     .outline()
                     .dropdown_caret(true)
@@ -2096,12 +2131,12 @@ impl SettingsView {
             ),
         )
         .when_some(self.default_agent_error.clone(), |this, error| {
-            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+            this.child(div().text_sm().text_color(cx.theme().danger).child(error))
         });
 
         let limit = self.session_limit;
         let is_default = limit == DEFAULT_SIDEBAR_LIMIT;
-        let sessions = group(
+        let sessions = group(cx,
             "Sessions",
             Some("How many recent sessions the Agent sidebar lists per repository."),
         )
@@ -2123,7 +2158,7 @@ impl SettingsView {
                                 .w(px(48.))
                                 .text_center()
                                 .text_sm()
-                                .text_color(rgb(0xe7e7e7))
+                                .text_color(cx.theme().foreground)
                                 .child(format!("{limit}")),
                         ),
                 )
@@ -2132,7 +2167,7 @@ impl SettingsView {
                         .gap_2()
                         .items_center()
                         .justify_between()
-                        .child(div().text_xs().text_color(rgb(0x555a5a)).child(format!(
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!(
                             "{MIN_SIDEBAR_LIMIT}–{MAX_SIDEBAR_LIMIT} · step {SIDEBAR_LIMIT_STEP}"
                         )))
                         .when(!is_default, |this| {
@@ -2142,7 +2177,7 @@ impl SettingsView {
                                     .py_1()
                                     .rounded_md()
                                     .text_xs()
-                                    .text_color(rgb(0x858989))
+                                    .text_color(cx.theme().muted_foreground)
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -2157,7 +2192,7 @@ impl SettingsView {
                 ),
         )
         .when_some(self.session_limit_error.clone(), |this, error| {
-            this.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+            this.child(div().text_sm().text_color(cx.theme().danger).child(error))
         });
 
         let skill_header = v_flex().gap_1().child(
@@ -2169,12 +2204,12 @@ impl SettingsView {
                     div()
                         .text_sm()
                         .font_semibold()
-                        .text_color(rgb(0xe7e7e7))
+                        .text_color(cx.theme().foreground)
                         .child("Devcroft skill".to_owned()),
                 )
                 .child(
                     div().flex_none().child(
-                        Button::new("skill-status")
+                        Button::new("skill-status").small()
                             .label(if busy { "Working…" } else { "Refresh" })
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -2186,7 +2221,7 @@ impl SettingsView {
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x737878))
+                .text_color(cx.theme().muted_foreground)
                 .child(
                     "Teach agents to use repository artifacts and artifact/review comments. OpenCode also reads these skill locations."
                         .to_owned(),
@@ -2208,8 +2243,8 @@ impl SettingsView {
                     .py_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x292b2b))
-                    .bg(rgb(0x0e0f0f))
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
                     .child(
                         v_flex()
                             .gap_2()
@@ -2227,19 +2262,19 @@ impl SettingsView {
                                                 div()
                                                     .text_sm()
                                                     .font_semibold()
-                                                    .text_color(rgb(0xe7e7e7))
+                                                    .text_color(cx.theme().foreground)
                                                     .child(target.label().to_owned()),
                                             )
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0x737878))
+                                                    .text_color(cx.theme().muted_foreground)
                                                     .child(target.description().to_owned()),
                                             )
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0x555a5a))
+                                                    .text_color(cx.theme().muted_foreground)
                                                     .child(target.location_label().to_owned()),
                                             ),
                                     )
@@ -2284,14 +2319,14 @@ impl SettingsView {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0x858989))
+                                            .text_color(cx.theme().muted_foreground)
                                             .child(status_line),
                                     )
                                     .when(!path_line.is_empty(), |this| {
                                         this.child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x555a5a))
+                                                .text_color(cx.theme().muted_foreground)
                                                 .child(path_line),
                                         )
                                     }),
@@ -2306,13 +2341,13 @@ impl SettingsView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x858989))
+                    .text_color(cx.theme().muted_foreground)
                     .child(self.skill_environment.clone()),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x858989))
+                    .text_color(cx.theme().muted_foreground)
                     .child("Updates and removal preserve modified or unmanaged skill folders."),
             );
         v_flex()
@@ -2323,36 +2358,20 @@ impl SettingsView {
             .child(skill)
     }
 
-    fn render_keybindings(&self) -> impl IntoElement {
-        v_flex().gap_4().child(
-            group(
-                "Keyboard",
-                Some("These shortcuts work everywhere, including inside terminals."),
-            )
-            .child(live_row(
-                "Toggle actions palette",
-                "Search tabs, settings, and sync.",
-                if cfg!(target_os = "macos") {
-                    kbd("⌘K")
-                } else {
-                    kbd("Ctrl+K")
-                },
-            ))
-            .child(live_row(
-                "Toggle projects palette",
-                "Switch between recent repositories.",
-                if cfg!(target_os = "macos") {
-                    kbd("⌘P")
-                } else {
-                    kbd("Ctrl+P")
-                },
-            ))
-            .child(live_row(
-                "Close palette or form dialog",
-                "Git changes sends Esc to lazygit; use Shift+Esc or the close button.",
-                kbd("Esc"),
-            )),
-        )
+    fn render_keybindings(&self, cx: &App) -> impl IntoElement {
+        v_flex().gap_4()
+            .child(group(cx, "Global shortcuts", Some("Available everywhere, including terminals."))
+                .child(live_row(cx, "Actions palette", "Find commands, settings, and sync.", kbd(cx, if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+K" })))
+                .child(live_row(cx, "Projects palette", "Switch between recent repositories.", kbd(cx, if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+P" })))
+                .child(live_row(cx, "Navigation mode", "Show shortcuts for the current tab.", kbd(cx, if cfg!(target_os = "macos") { "⌘J" } else { "Ctrl+J" })))
+                .child(live_row(cx, "Close dialog or palette", "For Git changes, use Shift+Esc or the close button.", kbd(cx, "Esc"))))
+            .child(group(cx, "In navigation mode", Some("Press a key after opening navigation mode. Available actions appear in the overlay."))
+                .child(live_row(cx, "Switch tab", "Agent · Editor · Terminal · Review · Resources", kbd(cx, "a e t d r")))
+                .child(live_row(cx, "Change pane", "Move focus left or right.", kbd(cx, "h / l")))
+                .child(live_row(cx, "Move through items", "Move down or up in the active pane.", kbd(cx, "j / k")))
+                .child(live_row(cx, "Cycle controls", "Use Shift+Tab to move backward.", kbd(cx, "Tab")))
+                .child(live_row(cx, "Accept focus", "Open the selected item where supported.", kbd(cx, "Enter")))
+                .child(live_row(cx, "Markdown preview", "Toggle preview for a Markdown file in the built-in editor.", kbd(cx, "p"))))
     }
 }
 
@@ -2440,38 +2459,46 @@ fn space_rewrite_notice(prefix: &str, touched: &SpaceRewrite) -> String {
     notice
 }
 
-fn group(title: &str, description: Option<&str>) -> gpui_kit::Div {
-    v_flex().gap_3().child(
-        v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(rgb(0xe7e7e7))
-                    .child(title.to_owned()),
-            )
-            .when_some(description, |this, text| {
-                this.child(
+fn group(cx: &App, title: &str, description: Option<&str>) -> gpui_kit::Div {
+    v_flex()
+        .gap_2()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            v_flex()
+                .gap_1()
+                .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(0x737878))
-                        .child(text.to_owned()),
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(cx.theme().foreground)
+                        .child(title.to_owned()),
                 )
-            }),
-    )
+                .when_some(description, |this, text| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(text.to_owned()),
+                    )
+                }),
+        )
 }
 
 /// A live (interactive) setting row at full opacity.
 fn live_row(
+    cx: &App,
     title: impl Into<String>,
     description: impl Into<String>,
     control: impl IntoElement,
-) -> impl IntoElement {
+) -> gpui_kit::Div {
     h_flex()
         .justify_between()
         .items_center()
-        .gap_4()
+        .gap_3()
+        .py_1()
         .child(
             v_flex()
                 .gap_1()
@@ -2480,47 +2507,49 @@ fn live_row(
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0xe7e7e7))
+                        .text_color(cx.theme().foreground)
                         .child(title.into()),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x737878))
+                        .text_color(cx.theme().muted_foreground)
                         .child(description.into()),
                 ),
         )
-        .child(control)
+        .child(div().flex_shrink_0().child(control))
 }
 
 fn step_button(
+    cx: &App,
     label: &str,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui_kit::Div {
     div()
         .w(px(28.))
         .py_1()
         .rounded_md()
         .border_1()
-        .border_color(rgb(0x292b2b))
-        .bg(rgb(0x0e0f0f))
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
         .text_sm()
         .text_center()
-        .text_color(rgb(0xe7e7e7))
+        .text_color(cx.theme().foreground)
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label.to_owned())
 }
 
-fn kbd(label: &str) -> impl IntoElement {
+fn kbd(cx: &App, label: &str) -> gpui_kit::Div {
     div()
-        .px_1()
+        .px_2()
+        .py_1()
         .rounded_md()
         .border_1()
-        .border_color(rgb(0x292b2b))
-        .bg(rgb(0x0e0f0f))
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
         .text_xs()
-        .text_color(rgb(0x858989))
+        .text_color(cx.theme().muted_foreground)
         .child(label.to_owned())
 }
 
@@ -2536,8 +2565,8 @@ impl Render for SettingsView {
         let track = self.focus_handle.clone();
         h_flex()
             .size_full()
-            .bg(rgb(0x090a0a))
-            .text_color(rgb(0xe7e7e7))
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .track_focus(&track)
             .on_mouse_down(
                 MouseButton::Left,

@@ -4,7 +4,7 @@ use super::{
     install::{self, Action},
 };
 use gpui_kit::base::StyledExt as _;
-use gpui_kit::component::Disableable as _;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _};
 use gpui_kit::component::{
     Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -15,7 +15,6 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div, px,
-    rgb,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use std::{collections::HashMap, path::PathBuf, sync::atomic::Ordering, time::Duration};
@@ -177,7 +176,7 @@ impl Render for LanguageServers {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex().id("language-server-settings").gap_3().max_h(px(560.)).overflow_y_scroll()
             .child(div().text_sm().font_semibold().child("Language servers"))
-            .child(div().text_xs().text_color(rgb(0x999fa8)).child("Install language support as needed. Managed servers are shared on this device. Existing runtimes are required."))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Install language support as needed. Managed servers are shared on this device. Existing runtimes are required."))
             .when_some(self.notice.clone(),|v,n|v.child(div().text_xs().child(n)))
             .children(ServerId::ALL.into_iter().map(|server| {
                 let pref=install::preferences(self.data.as_deref(),server);
@@ -188,14 +187,14 @@ impl Render for LanguageServers {
                     else if let Some(p)=crate::editor::find_executable(server.executable()) {format!("System · {}",p.display())}
                     else {"Not installed".into()};
                 let row=&self.rows[&server];
-                v_flex().gap_2().p_3().rounded_md().border_1().border_color(rgb(0x30343a))
+                v_flex().gap_1().px_3().py_2().rounded_md().border_1().border_color(cx.theme().border)
                     .child(h_flex().gap_2().justify_between().child(div().text_sm().child(format!("{} · {}",server.label(),server.id())))
                         .child(Button::new(format!("lsp-enable-{}",server.id())).small().ghost().label(if pref.disabled{"Enable"}else{"Disable"}).disabled(self.data.is_none()).on_click(cx.listener(move |this,_,_,cx|this.toggle(server,cx)))))
-                    .child(div().text_xs().text_color(rgb(0x999fa8)).child(status))
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(status))
                     .when_some(job.clone(),|v,j|v.child(div().text_xs().child(j.status)))
-                    .child(h_flex().gap_2()
+                    .child(h_flex().gap_2().flex_wrap()
                         .child(Button::new(format!("lsp-install-{}",server.id())).small().label(if managed.is_some(){"Check / update"}else{"Install"}).disabled(busy||self.data.is_none()).on_click(cx.listener(move |this,_,_,cx|this.action(server,Action::Install,cx))))
-                        .child(Button::new(format!("lsp-existing-{}",server.id())).small().ghost().label("Use existing / configure").on_click(cx.listener(move |this,_,_,cx|{this.rows.get_mut(&server).unwrap().expanded^=true;cx.notify();})))
+                        .child(Button::new(format!("lsp-existing-{}",server.id())).small().ghost().label("Configure").on_click(cx.listener(move |this,_,_,cx|{this.rows.get_mut(&server).unwrap().expanded^=true;cx.notify();})))
                         .when(managed.is_some(),|v|v.child(Button::new(format!("lsp-rollback-{}",server.id())).small().ghost().label("Roll back").disabled(busy).on_click(cx.listener(move |this,_,_,cx|this.action(server,Action::Rollback,cx))))
                             .child(Button::new(format!("lsp-remove-{}",server.id())).small().ghost().label("Remove").disabled(busy).on_click(cx.listener(move |this,_,_,cx|this.action(server,Action::Remove,cx)))))
                         .when(busy && job.as_ref().is_some_and(|j|j.cancellable),|v|v.child(Button::new(format!("lsp-cancel-{}",server.id())).small().ghost().label("Cancel").on_click(cx.listener(move |this,_,_,cx|{if let Some(j)=this.data.as_deref().and_then(|r|install::job(r,server)){j.cancel.store(true,Ordering::SeqCst);}cx.notify();})))))

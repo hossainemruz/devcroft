@@ -3249,53 +3249,40 @@ impl Workspace {
             self.navigation_resource_state(cx),
         );
         let panes = self.navigation_panes(cx);
-        let pane = panes
-            .get(self.navigation_pane)
-            .map(|(label, _)| *label)
-            .unwrap_or("workspace");
-        let context_title = match self.navigation_context(cx) {
-            NavigationContext::Home => "Home",
-            NavigationContext::Artifacts => "Artifacts",
-            NavigationContext::Relationships => "Relationships",
-            NavigationContext::Workspace => self.active_tab.label(),
-        };
         let viewport = window.viewport_size();
-        let hud_width = (f32::from(viewport.width) - 32.).clamp(200., 360.);
+        let hud_width = (f32::from(viewport.width) - 32.).clamp(200., 300.);
         let hud_height = (f32::from(viewport.height) - WORKSPACE_HEADER_HEIGHT - 36.).max(120.);
-        // Leave a little slack for border rounding so a full row never wraps
-        // its last cell because of a fractional pixel.
-        let content_width = hud_width - 28.;
-        let columns = if content_width >= 300. { 2 } else { 1 };
-        let cell_width = (content_width - 8. * (columns - 1) as f32) / columns as f32;
-        let shortcut = |keys: String, label: String, width: f32| {
+        let content_width = hud_width - 26.;
+        let binding = |keys: String, label: String| {
             h_flex()
-                .w(px(width))
-                .flex_shrink_0()
+                .w_full()
+                .min_h(px(28.))
                 .items_center()
-                .gap_1p5()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .px_1()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(0x2a3138))
-                        .bg(rgb(0x0d1116))
-                        .text_xs()
-                        .text_color(rgb(0x858989))
-                        .child(keys),
-                )
+                .gap_3()
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_ellipsis()
-                        .text_xs()
-                        .text_color(rgb(0x939caa))
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
                         .child(label),
                 )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .min_w(px(24.))
+                        .px_1p5()
+                        .py(px(2.))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().accent)
+                        .text_center()
+                        .text_xs()
+                        .text_color(cx.theme().accent_foreground)
+                        .child(keys),
+                )
         };
-        let binding = |keys: String, label: String| shortcut(keys, label, cell_width);
         let action = |row: &navigation::Row| {
             binding(
                 if row.key == ' ' {
@@ -3312,16 +3299,16 @@ impl Workspace {
         };
         let section = |title: &str, content: gpui_kit::Div| {
             v_flex()
-                .gap_1p5()
+                .gap_1()
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x6b7480))
+                        .text_color(cx.theme().muted_foreground)
                         .child(title.to_owned()),
                 )
                 .child(content)
         };
-        let mut sections = v_flex().gap_3();
+        let mut sections = v_flex().gap_3().w(px(content_width));
         // Keep presentation independent of key resolution: every policy row
         // appears once, while contextual actions lead and shared controls trail.
         let contextual_groups = if self.navigation_context(cx) == NavigationContext::Workspace
@@ -3336,10 +3323,8 @@ impl Workspace {
             if !contextual.is_empty() {
                 sections = sections.child(section(
                     &format!("{group} actions"),
-                    h_flex()
-                        .flex_wrap()
-                        .gap_x_2()
-                        .gap_y_1()
+                    v_flex()
+                        .gap_1()
                         .children(contextual.into_iter().map(action)),
                 ));
             }
@@ -3356,33 +3341,12 @@ impl Workspace {
         };
         let tabs: Vec<_> = rows.iter().filter(|row| is_tab(row.command)).collect();
         if !tabs.is_empty() {
-            // Split the five workspace tabs into two rows (three, then two).
-            let tab_columns = tabs.len().div_ceil(2);
-            let tab_width = (content_width - 8. * (tab_columns - 1) as f32) / tab_columns as f32;
             sections = sections.child(section(
                 "Switch tab",
-                v_flex()
-                    .gap_1()
-                    .children(tabs.chunks(tab_columns).map(|tab_row| {
-                        h_flex().gap_2().children(tab_row.iter().map(|row| {
-                            let label = if tab_width < 96. {
-                                match row.command {
-                                    NavigationCommand::Agent => "Ag",
-                                    NavigationCommand::Editor => "Ed",
-                                    NavigationCommand::Terminal => "TTY",
-                                    NavigationCommand::Review => "Rev",
-                                    NavigationCommand::Resources => "Res",
-                                    _ => row.label,
-                                }
-                            } else {
-                                row.label
-                            };
-                            shortcut(row.key_label(), label.to_owned(), tab_width)
-                        }))
-                    })),
+                v_flex().gap_1().children(tabs.into_iter().map(action)),
             ));
         }
-        let mut common = h_flex().flex_wrap().gap_x_2().gap_y_1().children(
+        let mut common = v_flex().gap_1().children(
             rows.iter()
                 .filter(|row| row.group == "Navigate" && !is_tab(row.command))
                 .map(action),
@@ -3418,7 +3382,6 @@ impl Workspace {
             .absolute()
             .bottom(px(12.))
             .right(px(12.))
-            .opacity(0.96)
             .child(
                 v_flex()
                     .w(px(hud_width))
@@ -3428,16 +3391,9 @@ impl Workspace {
                     .gap_3()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x2a3138))
-                    .bg(rgb(0x12161c))
-                    .shadow_md()
-                    .child(div().text_xs().text_color(rgb(0x6b7480)).child(
-                        if context_title == pane {
-                            format!("Navigation · {context_title}")
-                        } else {
-                            format!("Navigation · {context_title} · {pane}")
-                        },
-                    ))
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .shadow_lg()
                     .child(sections),
             )
             .into_any_element()

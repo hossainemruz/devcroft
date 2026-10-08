@@ -27,12 +27,18 @@ The open Review tab checks for code changes automatically. Marking a file
 **Viewed** collapses it; if either side changes afterward, its viewed mark is
 cleared and the file expands. Unchanged files keep their review progress,
 including across new commits on the same branch. Manual collapse controls
-remain independent of viewed marks.
+remain independent of viewed marks. Automatic checks update the UI only when
+the displayed review changes. Automatic refreshes preserve the visible code and
+scroll offset, including when earlier files expand or lines are inserted above it.
+Returning to Review and automatic portable sync also keep the current viewport.
 
 Use **Refresh**, or return to the Review tab, after the agent changes
 comments. Unsaved drafts survive same-pair refreshes. Switching branch pairs or
-review scopes clears the editor. An edit based on an externally modified comment
-fails with a refresh message instead of overwriting it; after refreshing, click
+review scopes clears the editor. Open drafts follow unchanged code when lines
+move; drafts on removed code remain available with an outdated label. Automatic
+anchor relocation also preserves edits to saved comments. An edit based on an
+externally modified comment fails with a refresh message instead of overwriting
+it; after refreshing, click
 Edit again to use its current revision.
 
 ## Agent workflow

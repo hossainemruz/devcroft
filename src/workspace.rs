@@ -2237,9 +2237,9 @@ impl Workspace {
         }
         self.home.update(cx, |view, cx| view.reload(cx));
         self.reload_recent_repositories();
-        self.review.update(cx, |view, cx| view.reload(cx));
+        self.review.update(cx, |view, cx| view.activate(cx));
         for repository in self.inactive_repositories.values() {
-            repository.review.update(cx, |view, cx| view.reload(cx));
+            repository.review.update(cx, |view, cx| view.activate(cx));
         }
         cx.notify();
     }

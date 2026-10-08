@@ -17,7 +17,7 @@ pub(crate) enum Side {
     New,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Anchor {
     pub path: String,
     pub side: Side,
@@ -29,7 +29,7 @@ pub(crate) struct Anchor {
     pub source: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Comment {
     pub id: String,
     pub pair: String,

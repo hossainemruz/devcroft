@@ -193,6 +193,150 @@ fn rendered_review_reopens_changed_files_without_moving_the_current_file(
 }
 
 #[gpui_kit::test]
+fn returning_to_review_keeps_unchanged_rows(cx: &mut gpui_kit::TestAppContext) {
+    let (_dir, view) = setup(cx);
+    let before = view.read_with(cx, |view, _| {
+        let ReviewState::Loaded(loaded) = &view.state else {
+            unreachable!()
+        };
+        loaded.clone()
+    });
+    view.update(cx, |view, cx| {
+        view.activate(cx);
+        assert!(matches!(view.state, ReviewState::Loaded(_)));
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        let ReviewState::Loaded(loaded) = &view.state else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&before, loaded));
+    });
+}
+
+fn top_line(view: &ReviewView) -> (String, String, gpui_kit::Pixels) {
+    let ReviewState::Loaded(loaded) = &view.state else {
+        panic!("expected loaded review");
+    };
+    let top = view.list_handle.logical_scroll_top();
+    let stream::StreamRow::Line { file, hunk, line } = loaded.rows[top.item_ix] else {
+        panic!("expected visible code line: {:?}", loaded.rows[top.item_ix]);
+    };
+    let model::FileContent::Text { hunks, .. } = &loaded.diff.files[file].content else {
+        unreachable!()
+    };
+    (
+        loaded.diff.files[file].path.clone(),
+        hunks[hunk].lines[line].text.clone(),
+        top.offset_in_item,
+    )
+}
+
+#[gpui_kit::test]
+fn refresh_preserves_visible_code_when_lines_and_files_move(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    let (dir, view) = setup(cx);
+    let content = (0..150)
+        .map(|ix| format!("line {ix}\n"))
+        .collect::<String>();
+    fs::write(dir.path().join("b.txt"), &content).unwrap();
+    view.update(cx, |view, cx| view.reload(cx));
+    cx.run_until_parked();
+    let render_view = view.clone();
+    let (_, cx) = cx
+        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        view.update(cx, |view, _| {
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            view.list_handle.scroll_to(ListOffset {
+                item_ix: loaded.file_row_start[1] + 40,
+                offset_in_item: px(7.),
+            });
+        });
+        window.render_frame(cx);
+    });
+    let before = view.read_with(cx, |view, _| top_line(view));
+    for (path, value) in [
+        ("aa.txt", "new file\n".to_owned()),
+        ("a.txt", "original\n".to_owned()),
+        ("b.txt", format!("inserted\n{content}")),
+    ] {
+        fs::write(dir.path().join(path), value).unwrap();
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(top_line(view), before, "after editing {path}");
+            assert_eq!(view.last_scrolled.as_deref(), Some("b.txt"));
+            let selected = view.tree_state.read(cx).selected_entry().unwrap();
+            assert_eq!(file_path_from_id(&selected.item().id), Some("b.txt"));
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn commit_only_refresh_does_not_invalidate_the_rendered_list(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    let (dir, view) = setup(cx);
+    fs::write(dir.path().join("b.txt"), "reviewed\n".repeat(150)).unwrap();
+    view.update(cx, |view, cx| view.reload(cx));
+    cx.run_until_parked();
+    let render_view = view.clone();
+    let (_, cx) = cx
+        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        view.update(cx, |view, _| {
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            view.list_handle.scroll_to(ListOffset {
+                item_ix: loaded.file_row_start[1] + 40,
+                offset_in_item: px(7.),
+            });
+        });
+        window.render_frame(cx);
+    });
+    let (syntax, before, bounds, selection) = view.read_with(cx, |view, cx| {
+        let ReviewState::Loaded(loaded) = &view.state else {
+            unreachable!()
+        };
+        let top = view.list_handle.logical_scroll_top();
+        (
+            loaded.syntax.clone(),
+            top_line(view),
+            view.list_handle.bounds_for_item(top.item_ix).unwrap(),
+            view.tree_state.read(cx).selected_index(),
+        )
+    });
+    commit(dir.path());
+    view.update(cx, |view, cx| view.refresh(cx));
+    cx.run_until_parked();
+    // Check before rendering: a list reset would discard measured item bounds.
+    view.read_with(cx, |view, cx| {
+        let ReviewState::Loaded(loaded) = &view.state else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&syntax, &loaded.syntax));
+        assert_eq!(top_line(view), before);
+        assert_eq!(view.tree_state.read(cx).selected_index(), selection);
+        assert_eq!(
+            view.list_handle
+                .bounds_for_item(view.list_handle.logical_scroll_top().item_ix),
+            Some(bounds),
+        );
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    view.read_with(cx, |view, _| assert_eq!(top_line(view), before));
+}
+
+#[gpui_kit::test]
 fn filesystem_events_gate_refreshes_and_queue_changes_during_a_load(
     cx: &mut gpui_kit::TestAppContext,
 ) {

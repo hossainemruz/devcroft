@@ -16,6 +16,66 @@ use gpui_kit::{
 };
 use std::rc::Rc;
 
+pub(super) struct LoadedComments {
+    store: Store,
+    comments: Vec<Comment>,
+    relocated_edits: Vec<(Comment, Comment)>,
+}
+
+/// Only advance an edit's revision when this refresh relocated its anchor.
+/// Actual external body/status changes must still fail optimistic concurrency.
+pub(super) fn refresh_comments(
+    store: Store,
+    cwd: &std::path::Path,
+    diff: &super::model::ReviewDiff,
+) -> anyhow::Result<LoadedComments> {
+    let before = store.list()?;
+    let comments = store.refresh(cwd, diff)?;
+    let relocated_edits = before
+        .into_iter()
+        .filter_map(|before| {
+            let after = comments.iter().find(|c| c.id == before.id)?;
+            let moved = (
+                before.anchor.path.as_str(),
+                before.anchor.start,
+                before.anchor.end,
+                before.anchor.outdated,
+            ) != (
+                after.anchor.path.as_str(),
+                after.anchor.start,
+                after.anchor.end,
+                after.anchor.outdated,
+            );
+            (after.body == before.body
+                && after.resolved == before.resolved
+                && after.revision == before.revision + u64::from(moved))
+            .then(|| (before, after.clone()))
+        })
+        .collect();
+    Ok(LoadedComments {
+        store,
+        comments,
+        relocated_edits,
+    })
+}
+
+pub(super) fn relocate_draft(
+    cwd: &std::path::Path,
+    diff: &super::model::ReviewDiff,
+    mut anchor: Anchor,
+) -> anyhow::Result<Anchor> {
+    if let Some(file) = diff
+        .files
+        .iter()
+        .find(|file| file.old_path.as_deref() == Some(&anchor.path))
+    {
+        anchor.path = file.path.clone();
+    }
+    let source = super::git::anchor_source(cwd, diff, &anchor.path, anchor.side)?;
+    super::comments::relocate(&mut anchor, source.as_deref());
+    Ok(anchor)
+}
+
 fn anchor_end_row(loaded: &super::LoadedReview, anchor: &Anchor) -> Option<usize> {
     if anchor.outdated {
         return None;
@@ -105,6 +165,244 @@ mod tests {
         }
     }
 
+    #[gpui_kit::test]
+    fn refreshing_with_an_open_draft_does_not_scroll_back_to_the_editor(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (dir, view) = crate::review::tests::setup(cx);
+        std::fs::write(dir.path().join("b.txt"), "reviewed\n".repeat(150)).unwrap();
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        let render_view = view.clone();
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
+                view.feedback.selection = Some(Anchor {
+                    path: "a.txt".into(),
+                    side: Side::New,
+                    start: 1,
+                    end: 1,
+                    outdated: false,
+                    source: "reviewed\n".into(),
+                });
+                view.feedback.input = Some(cx.new(|cx| {
+                    let mut input = TextareaState::new(window, cx);
+                    input.set_value("Please update this", window, cx);
+                    input
+                }));
+            });
+            window.render_frame(cx);
+            view.update(cx, |view, _| {
+                let ReviewState::Loaded(loaded) = &view.state else {
+                    unreachable!()
+                };
+                view.list_handle.scroll_to(ListOffset {
+                    item_ix: loaded.file_row_start[1] + 40,
+                    offset_in_item: px(7.),
+                });
+            });
+            window.render_frame(cx);
+        });
+        let before = view.read_with(cx, |view, _| {
+            assert!(view.editor_row.get().is_some());
+            let top = view.list_handle.logical_scroll_top();
+            (top.item_ix, top.offset_in_item)
+        });
+        std::fs::write(dir.path().join("manual.txt"), "updated!\n").unwrap();
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        });
+        view.read_with(cx, |view, cx| {
+            let top = view.list_handle.logical_scroll_top();
+            assert_eq!((top.item_ix, top.offset_in_item), before);
+            assert_eq!(
+                view.feedback.input.as_ref().unwrap().read(cx).value(),
+                "Please update this",
+            );
+            assert_eq!(view.feedback.selection.as_ref().unwrap().path, "a.txt");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn activating_review_refreshes_comments_even_when_source_is_unchanged(cx: &mut TestAppContext) {
+        let (_dir, view) = crate::review::tests::setup(cx);
+        let (store, before) = view.read_with(cx, |view, _| {
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            (
+                view.feedback.store.as_ref().unwrap().clone(),
+                loaded.clone(),
+            )
+        });
+        store
+            .create(
+                Anchor {
+                    path: "a.txt".into(),
+                    side: Side::New,
+                    start: 1,
+                    end: 1,
+                    outdated: false,
+                    source: "reviewed\n".into(),
+                },
+                "Agent feedback".into(),
+            )
+            .unwrap();
+        view.update(cx, |view, cx| view.activate(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            assert!(Rc::ptr_eq(&before, loaded), "source rows stay cached");
+            assert_eq!(view.feedback.comments.len(), 1);
+            assert_eq!(view.feedback.comments[0].body, "Agent feedback");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn source_refresh_reanchors_open_drafts_and_edits_without_overwriting_external_edits(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        for (editing, external) in [(false, false), (true, false), (true, true)] {
+            let (dir, view) = crate::review::tests::setup(cx);
+            let anchor = Anchor {
+                path: "a.txt".into(),
+                side: Side::New,
+                start: 1,
+                end: 1,
+                outdated: false,
+                source: "reviewed\n".into(),
+            };
+            let store = view.read_with(cx, |view, _| view.feedback.store.as_ref().unwrap().clone());
+            if editing {
+                store
+                    .create(anchor.clone(), "Original feedback".into())
+                    .unwrap();
+                view.update(cx, |view, cx| view.activate(cx));
+                cx.run_until_parked();
+            }
+            let render_view = view.clone();
+            let (_, cx) =
+                cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+            cx.update(|window, cx| {
+                window.render_frame(cx);
+                view.update(cx, |view, cx| {
+                    if editing {
+                        view.feedback.editing = Some(view.feedback.comments[0].clone());
+                    } else {
+                        view.feedback.selection = Some(anchor);
+                    }
+                    view.feedback.input = Some(cx.new(|cx| {
+                        let mut input = TextareaState::new(window, cx);
+                        input.set_value("Draft feedback", window, cx);
+                        input
+                    }));
+                });
+                window.render_frame(cx);
+            });
+            if external {
+                store
+                    .change("c1", Some(1), Some("External feedback".into()), None, false)
+                    .unwrap();
+            }
+            std::fs::write(dir.path().join("a.txt"), "extra\nreviewed\n").unwrap();
+            view.update(cx, |view, cx| view.refresh(cx));
+            cx.run_until_parked();
+            cx.update(|window, cx| window.render_frame(cx));
+            view.read_with(cx, |view, cx| {
+                assert_eq!(
+                    view.feedback.input.as_ref().unwrap().read(cx).value(),
+                    "Draft feedback"
+                );
+                if !external {
+                    let anchor = if editing {
+                        let comment = view.feedback.editing.as_ref().unwrap();
+                        assert_eq!(comment.revision, 2);
+                        &comment.anchor
+                    } else {
+                        view.feedback.selection.as_ref().unwrap()
+                    };
+                    assert_eq!((anchor.start, anchor.end, anchor.outdated), (2, 2, false));
+                    let ReviewState::Loaded(loaded) = &view.state else {
+                        unreachable!()
+                    };
+                    let StreamRow::Line { file, hunk, line } =
+                        loaded.rows[view.inline_editor_row().unwrap()]
+                    else {
+                        panic!("editor should be anchored to code");
+                    };
+                    let FileContent::Text { hunks, .. } = &loaded.diff.files[file].content else {
+                        unreachable!()
+                    };
+                    assert_eq!(hunks[hunk].lines[line].text, "reviewed");
+                }
+            });
+            view.update(cx, |view, cx| view.save_comment(cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                let comments = store.list().unwrap();
+                assert_eq!(comments.len(), 1);
+                assert_eq!(comments[0].anchor.start, 2);
+                if external {
+                    assert_eq!(comments[0].body, "External feedback");
+                    assert!(
+                        view.feedback
+                            .error
+                            .as_deref()
+                            .unwrap()
+                            .contains("Comment changed externally")
+                    );
+                    assert!(view.feedback.input.is_some());
+                } else {
+                    assert_eq!(comments[0].body, "Draft feedback");
+                    assert!(view.feedback.error.is_none());
+                    assert!(view.feedback.input.is_none());
+                }
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn outdated_draft_remains_accessible_when_its_file_leaves_the_diff(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (dir, view) = crate::review::tests::setup(cx);
+        let render_view = view.clone();
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.feedback.selection = Some(Anchor {
+                    path: "a.txt".into(),
+                    side: Side::New,
+                    start: 1,
+                    end: 1,
+                    outdated: false,
+                    source: "reviewed\n".into(),
+                });
+                view.feedback.input = Some(cx.new(|cx| TextareaState::new(window, cx)));
+            });
+            window.render_frame(cx);
+        });
+        std::fs::write(dir.path().join("a.txt"), "original\n").unwrap();
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        view.read_with(cx, |view, _| {
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            assert!(view.feedback.selection.as_ref().unwrap().outdated);
+            assert_eq!(view.inline_editor_row(), Some(loaded.rows.len()));
+            assert!(view.feedback.input.is_some());
+        });
+    }
+
     #[::core::prelude::v1::test]
     fn editor_follows_range_end_on_each_side_and_rejects_missing_anchors() {
         let (hunks, truncated) = diff_text("first\nold\nlast\n", "first\nnew\nextra\nlast\n");
@@ -189,6 +487,26 @@ pub(super) struct Feedback {
 }
 
 impl ReviewView {
+    pub(super) fn draft_anchor(&self) -> Option<Anchor> {
+        self.feedback.input.as_ref()?;
+        if self.feedback.editing.is_some() {
+            return None;
+        }
+        self.feedback.selection.clone()
+    }
+
+    pub(super) fn apply_draft_anchor(
+        &mut self,
+        before: Option<&Anchor>,
+        after: Option<Anchor>,
+    ) -> bool {
+        if self.feedback.selection.as_ref() == before {
+            let changed = self.feedback.selection != after;
+            self.feedback.selection = after;
+            return changed;
+        }
+        false
+    }
     pub(super) fn comment_write_in_flight(&self) -> bool {
         self.feedback.busy
     }
@@ -252,7 +570,7 @@ impl ReviewView {
         let ReviewState::Loaded(loaded) = &self.state else {
             return None;
         };
-        anchor_end_row(loaded, anchor)
+        Some(thread_anchor_row(loaded, anchor))
     }
 
     pub(super) fn render_comment_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -265,10 +583,18 @@ impl ReviewView {
             .as_ref()
             .map(|c| format!("Edit {}", c.id))
             .or_else(|| {
-                self.feedback
-                    .selection
-                    .as_ref()
-                    .map(|a| format!("Comment on lines {}–{}", a.start, a.end))
+                self.feedback.selection.as_ref().map(|a| {
+                    format!(
+                        "{} {}–{}",
+                        if a.outdated {
+                            "Comment on outdated lines"
+                        } else {
+                            "Comment on lines"
+                        },
+                        a.start,
+                        a.end
+                    )
+                })
             })
             .unwrap_or_default();
         let error_message = self.feedback.error.clone().unwrap_or_default();
@@ -335,9 +661,16 @@ impl ReviewView {
             .into_any_element()
     }
 
-    pub(super) fn load_comments(&mut self, result: anyhow::Result<(Store, Vec<Comment>)>) {
+    pub(super) fn load_comments(&mut self, result: anyhow::Result<LoadedComments>) -> bool {
+        let before = self.comment_revisions();
+        let previous_error = self.feedback.error.clone();
+        let mut reset = false;
         match result {
-            Ok((store, comments)) => {
+            Ok(LoadedComments {
+                store,
+                comments,
+                relocated_edits,
+            }) => {
                 if self
                     .feedback
                     .store
@@ -345,6 +678,13 @@ impl ReviewView {
                     .is_none_or(|s| s.pair != store.pair || s.scope != store.scope)
                 {
                     self.feedback = Feedback::default();
+                    reset = true;
+                }
+                if let Some((_, after)) = relocated_edits
+                    .into_iter()
+                    .find(|(before, _)| self.feedback.editing.as_deref() == Some(before))
+                {
+                    self.feedback.editing = Some(Rc::new(after));
                 }
                 self.feedback.store = Some(store);
                 self.feedback.comments = comments.into_iter().map(Rc::new).collect();
@@ -355,6 +695,7 @@ impl ReviewView {
                 self.feedback.store = None;
             }
         }
+        reset || before != self.comment_revisions() || previous_error != self.feedback.error
     }
 
     pub(super) fn select_line(

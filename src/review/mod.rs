@@ -18,6 +18,7 @@ pub(crate) mod syntax;
 #[cfg(test)]
 mod tests;
 mod tree;
+mod viewport;
 mod watch;
 
 use std::cell::{Cell, RefCell};
@@ -74,6 +75,7 @@ enum ReviewState {
 /// tree↔stream scrolling maps between file indices and row indices. `diff`
 /// and `syntax` are shared across collapse rebuilds so toggling a file never
 /// re-clones file text or highlight spans.
+#[derive(Clone)]
 pub(crate) struct LoadedReview {
     pub(crate) diff: Rc<ReviewDiff>,
     pub(crate) rows: Vec<stream::StreamRow>,
@@ -209,7 +211,7 @@ impl ReviewView {
     }
 
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
-        self.load(false, cx);
+        self.load(false, true, cx);
     }
 
     /// Refresh in the background while Review is visible. Identical loads
@@ -221,7 +223,7 @@ impl ReviewView {
         {
             return;
         }
-        self.load(true, cx);
+        self.load(true, false, cx);
     }
 
     pub(crate) fn refresh_if_changed(&mut self, cx: &mut Context<Self>) {
@@ -244,7 +246,7 @@ impl ReviewView {
         }
     }
 
-    fn load(&mut self, background: bool, cx: &mut Context<Self>) {
+    fn load(&mut self, background: bool, refresh_comments: bool, cx: &mut Context<Self>) {
         let previous = match &self.state {
             ReviewState::Loaded(loaded) if background => Some((*loaded.diff).clone()),
             _ => None,
@@ -262,19 +264,35 @@ impl ReviewView {
         let scope = self.scope();
         let base = self.base_branch.clone();
         let remote = self.remote.clone();
+        let draft = self.draft_anchor();
+        let draft_snapshot = draft.clone();
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
                     let diff = load_review(&cwd, &scope)?;
-                    if previous.as_ref() == Some(&diff) {
+                    let unchanged = previous.as_ref() == Some(&diff);
+                    if unchanged && !refresh_comments {
                         return anyhow::Ok(None);
                     }
-                    let syntax = syntax::highlight(&diff);
+                    let source_changed = previous.as_ref().is_some_and(|previous| {
+                        previous.files != diff.files || previous.file_versions != diff.file_versions
+                    });
+                    let relocated_draft = draft_snapshot
+                        .map(|anchor| feedback::relocate_draft(&cwd, &diff, anchor))
+                        .transpose()?;
+                    let syntax = previous
+                        .as_ref()
+                        .is_none_or(|previous| previous.files != diff.files)
+                        .then(|| syntax::highlight(&diff));
                     let feedback = comments::Store::open(&cwd, &base, &remote, &scope, &diff)
-                        .and_then(|store| {
-                            store.refresh(&cwd, &diff).map(|comments| (store, comments))
-                        });
-                    anyhow::Ok(Some((diff, syntax, feedback)))
+                        .and_then(|store| feedback::refresh_comments(store, &cwd, &diff));
+                    anyhow::Ok(Some((
+                        diff,
+                        syntax,
+                        feedback,
+                        relocated_draft,
+                        source_changed,
+                    )))
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
@@ -283,9 +301,25 @@ impl ReviewView {
                 }
                 view.load_in_flight = false;
                 match loaded {
-                    Ok(Some((diff, syntax, feedback))) => {
-                        view.load_comments(feedback);
+                    Ok(Some((diff, syntax, feedback, relocated_draft, source_changed))) => {
+                        // A draft selected while loading needs its own source
+                        // snapshot. Retry rather than attaching it to stale lines.
+                        if source_changed
+                            && view.draft_anchor() != draft
+                            && view.review_key.as_deref() == Some(&view.review_identity(&diff))
+                        {
+                            view.load_comments(feedback);
+                            view.file_changes.mark_changed();
+                            view.refresh(cx);
+                            return;
+                        }
+                        let comments_changed = view.load_comments(feedback);
+                        let draft_changed =
+                            view.apply_draft_anchor(draft.as_ref(), relocated_draft);
                         view.apply_diff(diff, syntax, cx);
+                        if comments_changed || draft_changed {
+                            cx.notify();
+                        }
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -400,13 +434,18 @@ impl ReviewView {
         });
     }
 
-    /// Reload when the tab becomes visible, unless a load is in flight.
-    /// Freshness beats cached rows here: agents change the worktree under us.
+    /// Check source and comments when the tab becomes visible, keeping the
+    /// existing viewport while loading. Only initial/failed loads show a spinner.
     pub(crate) fn activate(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, ReviewState::Loading) {
-            return;
+        match self.state {
+            ReviewState::Loading => {}
+            ReviewState::Loaded(_) => {
+                if !self.load_in_flight && !self.comment_write_in_flight() {
+                    self.load(true, true, cx);
+                }
+            }
+            ReviewState::Failed(_) => self.reload(cx),
         }
-        self.reload(cx);
     }
 
     fn review_identity(&self, diff: &ReviewDiff) -> String {
@@ -423,28 +462,19 @@ impl ReviewView {
     fn apply_diff(
         &mut self,
         diff: ReviewDiff,
-        syntax: syntax::SyntaxHighlights,
+        syntax: Option<syntax::SyntaxHighlights>,
         cx: &mut Context<Self>,
     ) {
-        let viewport = match &self.state {
-            ReviewState::Loaded(loaded) => {
-                let top = self.list_handle.logical_scroll_top();
-                loaded
-                    .file_row_start
-                    .iter()
-                    .rposition(|row| *row <= top.item_ix)
-                    .map(|ix| {
-                        (
-                            loaded.diff.files[ix].path.clone(),
-                            top.item_ix - loaded.file_row_start[ix],
-                            top.offset_in_item,
-                        )
-                    })
-            }
+        let previous = match &self.state {
+            ReviewState::Loaded(loaded) => Some(loaded.clone()),
             _ => None,
         };
+        let top = self.list_handle.logical_scroll_top();
+        let previous_collapsed = self.collapsed.borrow().clone();
+        let previous_viewed = self.viewed.borrow().clone();
         let key = self.review_identity(&diff);
-        if self.review_key.as_deref() == Some(&key) {
+        let same_review = self.review_key.as_deref() == Some(&key);
+        if same_review {
             // Keep progress only for the exact source version reviewed.
             self.collapsed
                 .borrow_mut()
@@ -470,38 +500,83 @@ impl ReviewView {
             self.viewed_versions.clear();
             self.review_key = Some(key);
         }
+        if let Some(previous) = &previous
+            && same_review
+            && previous.diff.files == diff.files
+            && previous_collapsed == *self.collapsed.borrow()
+        {
+            // Commit IDs or hidden source bytes can change without changing
+            // any rendered rows. Update backing data without resetting lists,
+            // tree selection, measured heights, or the draft editor.
+            let label_changed = previous.diff.base_ref != diff.base_ref;
+            if *previous.diff != diff
+                && let ReviewState::Loaded(loaded) = &mut self.state
+            {
+                Rc::make_mut(loaded).diff = Rc::new(diff);
+            }
+            if self.editor_row.get().is_some() {
+                let editor = self.inline_editor_row();
+                let previous = self.editor_row.replace(editor);
+                if previous != editor {
+                    for ix in [previous, editor].into_iter().flatten() {
+                        self.list_handle.splice(ix..ix + 1, 1);
+                    }
+                    self.list_handle.scroll_to(top);
+                }
+            }
+            if label_changed || previous_viewed != *self.viewed.borrow() {
+                cx.notify();
+            }
+            return;
+        }
+        let editor_was_visible = self.editor_row.get().is_some();
         let (items, metas) = build_file_tree(&diff.files);
         let (rows, file_row_start) = flatten(&diff, &self.collapsed.borrow());
-        self.list_handle.reset(rows.len() + 1);
-        if let Some((path, relative_row, offset_in_item)) = viewport
-            && let Some(ix) = diff.files.iter().position(|file| file.path == path)
-        {
-            let start = file_row_start[ix];
-            let end = file_row_start.get(ix + 1).copied().unwrap_or(rows.len());
-            self.list_handle.scroll_to(ListOffset {
-                item_ix: (start + relative_row).min(end.saturating_sub(1)),
-                offset_in_item,
-            });
+        let loaded = Rc::new(LoadedReview {
+            diff: Rc::new(diff),
+            rows,
+            file_row_start,
+            syntax: syntax.map(Rc::new).unwrap_or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|loaded| loaded.syntax.clone())
+                    .unwrap_or_default()
+            }),
+        });
+        self.list_handle.reset(loaded.rows.len() + 1);
+        if same_review && let Some(previous) = &previous {
+            self.list_handle
+                .scroll_to(viewport::restore(previous, &loaded, top));
         }
-        self.editor_row.set(None);
         let mut tiles = (*self.icon_tiles).clone();
         ensure_tiles(
-            diff.files.iter().map(|file| file.path.as_str()),
+            loaded.diff.files.iter().map(|file| file.path.as_str()),
             &mut tiles,
             cx,
         );
         self.icon_tiles = Rc::new(tiles);
         self.tree_metas = Rc::new(metas);
+        let top = self.list_handle.logical_scroll_top().item_ix;
+        let selected = loaded
+            .rows
+            .get(top)
+            .map(|row| loaded.diff.files[row.file()].path.clone());
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
+            if let Some(path) = &selected {
+                let id: SharedString = file_item_id(path).into();
+                state.set_selected_index(state.index_of(&id), cx);
+            }
         });
-        self.stream_top.set(0);
-        self.state = ReviewState::Loaded(Rc::new(LoadedReview {
-            diff: Rc::new(diff),
-            rows,
-            file_row_start,
-            syntax: Rc::new(syntax),
-        }));
+        self.last_scrolled = selected;
+        self.stream_top.set(top);
+        self.state = ReviewState::Loaded(loaded);
+        // Reanchoring an existing draft is not a request to scroll to it.
+        self.editor_row.set(if same_review && editor_was_visible {
+            self.inline_editor_row()
+        } else {
+            None
+        });
         cx.notify();
     }
 
@@ -973,6 +1048,9 @@ impl ReviewView {
                                 cx,
                             ),
                         )
+                        .when(editor == Some(ix) && this.is_new_comment(), |item| {
+                            item.child(this.render_comment_editor(cx))
+                        })
                         .into_any_element()
                 });
             }

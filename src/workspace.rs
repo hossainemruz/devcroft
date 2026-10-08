@@ -2659,6 +2659,10 @@ impl Workspace {
                 WorkspaceTab::Git => None,
             },
             built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
+            markdown_file: self
+                .native_editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).supports_markdown_preview()),
             ..resource
         }
     }
@@ -2959,6 +2963,13 @@ impl Workspace {
                     self.go_home(window, cx);
                 } else {
                     self.go_back_from_artifacts(window, cx);
+                }
+            }
+            NavigationCommand::ToggleMarkdownPreview => {
+                if self.editor_instance == Some(EditorChoice::BuiltIn) {
+                    if let Some(editor) = &self.native_editor {
+                        editor.update(cx, |editor, cx| editor.toggle_markdown_preview(window, cx));
+                    }
                 }
             }
             NavigationCommand::NewSession => self.prompt_new_agent_session(window, cx),

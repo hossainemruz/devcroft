@@ -184,6 +184,7 @@ impl ArtifactBrowser {
         crate::navigation::ResourceState {
             active_tab: None,
             built_in_editor: false,
+            markdown_file: false,
             selected: self.selected.is_some(),
             drafting: self.draft.is_some(),
             saving: self.saving,

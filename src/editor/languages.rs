@@ -24,7 +24,9 @@ pub(crate) fn detect(path: &Path) -> Language {
             "py" | "pyi" => ("python", "python", Some(ServerId::Python)),
             "toml" => ("toml", "toml", None),
             "sh" | "bash" => ("bash", "shellscript", None),
-            "md" => ("markdown", "markdown", None),
+            ext if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
+                ("markdown", "markdown", None)
+            }
             "html" => ("html", "html", None),
             "css" => ("css", "css", None),
             "json" => ("json", "json", None),
@@ -56,5 +58,7 @@ mod tests {
             Some(ServerId::TypeScript)
         );
         assert!(detect(Path::new("README.md")).server.is_none());
+        assert_eq!(detect(Path::new("README.MD")).grammar, "markdown");
+        assert_eq!(detect(Path::new("notes.markdown")).grammar, "markdown");
     }
 }

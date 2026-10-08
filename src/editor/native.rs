@@ -117,6 +117,8 @@ pub(crate) struct NativeEditor {
     sidebar_focus: FocusHandle,
     tree_scroll: ScrollHandle,
     navigation_active: bool,
+    markdown_preview: Option<Entity<crate::preview::PreviewView>>,
+    markdown_preview_source: String,
     tree_cursor: Option<String>,
     disk_comparison: Option<String>,
     back_locations: Vec<HistoryLocation>,
@@ -531,6 +533,8 @@ impl NativeEditor {
             sidebar_focus: cx.focus_handle().tab_stop(true),
             tree_scroll: ScrollHandle::new(),
             navigation_active: false,
+            markdown_preview: None,
+            markdown_preview_source: String::new(),
             tree_cursor: None,
             disk_comparison: None,
             back_locations: Vec::new(),
@@ -542,8 +546,40 @@ impl NativeEditor {
         }
     }
 
+    pub(crate) fn supports_markdown_preview(&self) -> bool {
+        self.path
+            .as_ref()
+            .is_some_and(|path| language_for(path) == "markdown")
+    }
+
+    pub(crate) fn toggle_markdown_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.supports_markdown_preview() {
+            return;
+        }
+        if self.markdown_preview.take().is_none() {
+            let content = self.editor.read(cx).value().to_string();
+            self.markdown_preview_source = content.clone();
+            let preview = cx.new(|cx| crate::preview::PreviewView::for_editor(content.into(), cx));
+            cx.subscribe_in(
+                &preview,
+                window,
+                |_, _, event: &crate::preview::OpenReference, window, cx| {
+                    crate::markdown_references::open_in_workspace(event.0.clone(), window, cx);
+                },
+            )
+            .detach();
+            self.markdown_preview = Some(preview);
+        }
+        self.editor_focus(cx).focus(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn editor_focus(&self, cx: &App) -> FocusHandle {
-        self.editor.read(cx).focus_handle(cx)
+        if let Some(preview) = &self.markdown_preview {
+            preview.read(cx).focus_handle(cx)
+        } else {
+            self.editor.read(cx).focus_handle(cx)
+        }
     }
 
     pub(crate) fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
@@ -618,6 +654,10 @@ impl NativeEditor {
             .is_some_and(|(label, _)| *label == "Editor")
         {
             self.editor_focus(cx).focus(window, cx);
+            if let Some(preview) = &self.markdown_preview {
+                preview.update(cx, |preview, cx| preview.move_navigation(down, cx));
+                return;
+            }
             // Use the editor's own vertical motion so wrapped lines, folds,
             // preferred columns and scrolling behave like the arrow keys.
             if down {
@@ -962,6 +1002,9 @@ impl NativeEditor {
             position: self.editor.read(cx).cursor_position(),
         });
         if self.path.as_deref() == Some(canonical.as_path()) {
+            if line.is_some() {
+                self.markdown_preview = None;
+            }
             self.place_cursor(line, window, cx);
             if self
                 .lsp
@@ -1017,6 +1060,7 @@ impl NativeEditor {
             self.jump_back = Rc::new(RefCell::new(Vec::new()));
             self.tabs.push(canonical.clone());
         }
+        self.markdown_preview = None;
         self.path = Some(canonical.clone());
         self.place_cursor(line, window, cx);
         self.check_disk(window, cx);
@@ -1056,8 +1100,8 @@ impl NativeEditor {
                     cx,
                 );
             }
-            editor.focus(window, cx);
         });
+        self.editor_focus(cx).focus(window, cx);
     }
 
     fn close_tab(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
@@ -1124,6 +1168,7 @@ impl NativeEditor {
         if self.path.as_deref() == Some(path) {
             self.disk_comparison = None;
             self.lsp.take();
+            self.markdown_preview = None;
             self.path = None;
             self.saved = None;
             self.dirty = false;
@@ -2527,6 +2572,13 @@ impl Render for NativeEditor {
             .and_then(|path| path.strip_prefix(&self.canonical_root).ok())
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "No file open".into());
+        if let Some(preview) = &self.markdown_preview {
+            let content = self.editor.read(cx).value().to_string();
+            if content != self.markdown_preview_source {
+                self.markdown_preview_source = content.clone();
+                preview.update(cx, |preview, cx| preview.set_content(content.into(), cx));
+            }
+        }
         let browser = self.render_browser(window, cx);
         let tabs = self.render_tabs(cx);
         let actions = self.render_editor_menu(cx).into_any_element();
@@ -2546,6 +2598,25 @@ impl Render for NativeEditor {
                         .border_b_1()
                         .border_color(rgb(0x202328))
                         .child(tabs)
+                        .when(self.supports_markdown_preview(), |bar| {
+                            bar.child(
+                                Button::new("native-markdown-preview-toggle")
+                                    .debug_selector(|| "native-markdown-preview-toggle".into())
+                                    .small()
+                                    .ghost()
+                                    .label(if self.markdown_preview.is_some() {
+                                        "Code"
+                                    } else {
+                                        "Preview"
+                                    })
+                                    .accessibility_label(
+                                        "Toggle Markdown preview (navigation mode: p)",
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_markdown_preview(window, cx)
+                                    })),
+                            )
+                        })
                         .child(actions),
                 )
                 .when_some(self.close_pending.clone(), |view, path| {
@@ -2634,8 +2705,15 @@ impl Render for NativeEditor {
                         .min_h_0()
                         .min_w_0()
                         .overflow_hidden()
-                        .pt_2()
-                        .child(Editor::new(&self.editor).h_full().appearance(false)),
+                        .when(self.markdown_preview.is_none(), |pane| pane.pt_2())
+                        .child(if let Some(preview) = &self.markdown_preview {
+                            preview.clone().into_any_element()
+                        } else {
+                            Editor::new(&self.editor)
+                                .h_full()
+                                .appearance(false)
+                                .into_any_element()
+                        }),
                 )
                 .when_some(self.installation_offer(), |v, server| {
                     let job = self
@@ -3108,6 +3186,100 @@ mod tests {
         test_cx.run_until_parked();
         view.read_with(test_cx, |view, cx| {
             assert_eq!(view.editor.read(cx).cursor_position().line, 1)
+        });
+    }
+
+    #[gpui_kit::test]
+    fn markdown_preview_uses_draft_and_preserves_code_state(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let markdown = dir.path().join("notes.md");
+        let plain = dir.path().join("notes.txt");
+        fs::write(&markdown, "# Saved\n").unwrap();
+        fs::write(&plain, "plain\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&markdown, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value("# Unsaved\n\nDraft body\n", window, cx);
+                editor.set_cursor_position(Position::new(2, 3), window, cx);
+            });
+            view.dirty = true;
+        });
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            let editor = view.editor.clone();
+            let cursor = editor.read(cx).cursor_position();
+            assert!(view.dirty);
+            view.toggle_markdown_preview(window, cx);
+            assert_eq!(view.markdown_preview_source, "# Unsaved\n\nDraft body\n");
+            assert_eq!(
+                view.markdown_preview
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .toc_snapshot()
+                    .0[0]
+                    .title,
+                "Unsaved"
+            );
+            view.move_navigation_item(1, true, window, cx);
+            assert_eq!(editor.read(cx).cursor_position(), cursor);
+            view.toggle_markdown_preview(window, cx);
+            assert!(view.markdown_preview.is_none());
+            assert_eq!(view.editor.entity_id(), editor.entity_id());
+            assert_eq!(editor.read(cx).cursor_position(), cursor);
+            assert!(view.dirty);
+            assert_eq!(fs::read_to_string(&markdown).unwrap(), "# Saved\n");
+            view.toggle_markdown_preview(window, cx);
+            view.open(&plain, None, window, cx).unwrap();
+            assert!(!view.supports_markdown_preview());
+            assert!(view.markdown_preview.is_none());
+            view.toggle_markdown_preview(window, cx);
+            assert!(view.markdown_preview.is_none());
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("native-markdown-preview-toggle").is_none());
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&markdown, None, window, cx).unwrap()
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-markdown-preview-toggle").visible());
+            window.click("native-markdown-preview-toggle", cx);
+        });
+        view.read_with(test_cx, |view, _| assert!(view.markdown_preview.is_some()));
+        view.update_in(test_cx, |view, window, cx| {
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value(
+                    format!("# First\n\n{}## Destination\n", "Paragraph.\n\n".repeat(50)),
+                    window,
+                    cx,
+                );
+            });
+            cx.notify();
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("editor-preview-outline").visible());
+            assert!(window.find(("editor-preview-heading", 1usize)).visible());
+            assert!(window.try_find(("block-comments", 0usize)).is_none());
+            window.click(("editor-preview-heading", 1usize), cx);
+        });
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(
+                view.markdown_preview
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .toc_snapshot()
+                    .1,
+                1
+            );
         });
     }
 

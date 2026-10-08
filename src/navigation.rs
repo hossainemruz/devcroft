@@ -17,6 +17,7 @@ pub(crate) struct ResourceState {
     /// Present only while a repository workspace tab is visible.
     pub active_tab: Option<Tab>,
     pub built_in_editor: bool,
+    pub markdown_file: bool,
     pub selected: bool,
     pub drafting: bool,
     pub saving: bool,
@@ -51,6 +52,7 @@ pub(crate) enum Command {
     OpenFile,
     SwitchBuffer,
     SearchProject,
+    ToggleMarkdownPreview,
     EditMarkdown,
     AddComment,
     SaveDraft,
@@ -240,6 +242,14 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
         && resource.built_in_editor
     {
         result.extend([FIND_FILE, SWITCH_BUFFER, SEARCH_PROJECT]);
+        if resource.markdown_file {
+            result.push(Row {
+                key: 'p',
+                label: "Toggle Markdown preview",
+                group: "Editor",
+                command: Command::ToggleMarkdownPreview,
+            });
+        }
     }
     let resource_context = context == Context::Artifacts
         || (context == Context::Workspace && resource.active_tab == Some(Tab::Resources));
@@ -350,6 +360,55 @@ pub(crate) fn move_index(index: usize, count: usize, right: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_preview_shortcut_is_scoped_to_markdown_in_native_editor() {
+        let state = ResourceState {
+            active_tab: Some(Tab::Editor),
+            built_in_editor: true,
+            markdown_file: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(Context::Workspace, state, 'p'),
+            Some(Command::ToggleMarkdownPreview)
+        );
+        assert_eq!(
+            resolve(
+                Context::Workspace,
+                ResourceState {
+                    markdown_file: false,
+                    ..state
+                },
+                'p'
+            ),
+            None
+        );
+        assert_eq!(
+            resolve(
+                Context::Workspace,
+                ResourceState {
+                    built_in_editor: false,
+                    ..state
+                },
+                'p'
+            ),
+            None
+        );
+        assert_eq!(
+            resolve(
+                Context::Workspace,
+                ResourceState {
+                    active_tab: Some(Tab::Agent),
+                    ..state
+                },
+                'p'
+            ),
+            None
+        );
+        assert_eq!(resolve(Context::Home, state, 'p'), None);
+        assert!(unique_keys(&rows(Context::Workspace, state)));
+    }
 
     #[test]
     fn new_session_is_only_available_on_the_agent_tab() {

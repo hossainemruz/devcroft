@@ -32,8 +32,8 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
     Focusable, HighlightStyle, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset,
     MouseButton, Overflow, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window, div, px,
-    relative, rems,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription,
+    TestSupportExt as _, Window, div, px, relative, rems,
 };
 
 /// Shared column width for document content and resource metadata.
@@ -389,6 +389,7 @@ pub(crate) struct PreviewView {
     toc_hovered: bool,
     toc_focus: FocusHandle,
     embedded: bool,
+    editor_preview: bool,
     code_highlights: std::sync::Arc<parking_lot::Mutex<CodeHighlights>>,
     /// Open find session; `None` while the bar is closed.
     find: Option<FindState>,
@@ -460,6 +461,7 @@ impl PreviewView {
             toc_hovered: false,
             toc_focus: cx.focus_handle().tab_stop(true),
             embedded: false,
+            editor_preview: false,
             code_highlights: Default::default(),
             find: None,
         }
@@ -470,6 +472,14 @@ impl PreviewView {
         let mut view = Self::new(content.clone(), cx);
         view.resources = Some(resource_blocks::ResourceBlocks::new(content, &view.content));
         view.embedded = true;
+        view
+    }
+
+    /// Editor files use the reader without Resources' comment affordances.
+    pub(crate) fn for_editor(content: SharedString, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new(content, cx);
+        view.embedded = true;
+        view.editor_preview = true;
         view
     }
 
@@ -503,7 +513,9 @@ impl PreviewView {
     /// Unchanged Markdown never calls this, so ordinary polling preserves exact scroll.
     pub(crate) fn set_content(&mut self, content: SharedString, cx: &mut Context<Self>) {
         let heading = self.toc.get(self.active).map(|entry| entry.title.clone());
-        let mut next = if self.embedded {
+        let mut next = if self.editor_preview {
+            Self::for_editor(content, cx)
+        } else if self.embedded {
             Self::embedded(content, cx)
         } else {
             Self::new(content, cx)
@@ -542,6 +554,14 @@ impl PreviewView {
 
     /// Current outline entries plus the scrollspy-selected index, for hosts
     /// that lay out their own outline panel beside the document.
+    pub(crate) fn move_navigation(&mut self, down: bool, cx: &mut Context<Self>) {
+        self.state
+            .read(cx)
+            .list_state()
+            .scroll_by(px(if down { 40. } else { -40. }));
+        cx.notify();
+    }
+
     pub(crate) fn toc_snapshot(&self) -> (Vec<TocEntry>, usize) {
         (self.toc.clone(), self.active)
     }
@@ -785,6 +805,68 @@ impl PreviewView {
 
     /// The outline overlays the document rather than changing its wrapping.
     /// Focus expands it too; arrow keys navigate and Escape returns to reading.
+    fn render_editor_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .id("editor-preview-outline")
+            .test_support()
+            .debug_selector(|| "editor-preview-outline".into())
+            .track_focus(&self.toc_focus)
+            .w(px(240.))
+            .max_w(relative(0.3))
+            .flex_shrink_0()
+            .h_full()
+            .min_h_0()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .child(div().px_3().py_2().text_sm().child("On this page"))
+            .child(
+                v_flex()
+                    .id("editor-preview-outline-entries")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pb_4()
+                    .gap_1()
+                    .when(self.toc.is_empty(), |outline| {
+                        outline.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("No headings on this page"),
+                        )
+                    })
+                    .children(self.toc.iter().enumerate().map(|(index, entry)| {
+                        div()
+                            .id(("editor-preview-heading", index))
+                            .test_support()
+                            .debug_selector(move || format!("editor-preview-heading-{index}"))
+                            .flex_none()
+                            .w_full()
+                            .py(px(6.))
+                            .pl(px(8. + f32::from(entry.level.saturating_sub(1)) * 12.))
+                            .pr(px(8.))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_ellipsis()
+                            .text_sm()
+                            .when(index == self.active, |row| {
+                                row.bg(cx.theme().accent)
+                                    .text_color(cx.theme().accent_foreground)
+                            })
+                            .when(index != self.active, |row| {
+                                row.text_color(cx.theme().muted_foreground)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.on_toc_click(index, cx)),
+                            )
+                            .child(entry.title.clone())
+                    })),
+            )
+    }
+
     fn render_toc(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
         let expanded = self.toc_hovered || self.toc_focus.is_focused(window);
@@ -954,7 +1036,7 @@ impl Render for PreviewView {
         // Both hosts use a bounded reading column. Embedded width must follow
         // the pane rather than the window (Resources can have side rails).
         let find_bar = self.find.is_some().then(|| self.render_find_bar(cx));
-        h_flex()
+        let reader = h_flex()
             .id("preview-reader")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1074,13 +1156,47 @@ impl Render for PreviewView {
                         .justify_center()
                         .child(self.render_toc(window, cx)),
                 )
-            })
+            });
+        if self.editor_preview {
+            h_flex()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .items_stretch()
+                .child(div().flex_1().min_w_0().h_full().child(reader))
+                .child(self.render_editor_outline(cx))
+                .into_any_element()
+        } else {
+            reader.into_any_element()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn editor_preview_stays_comment_free_after_content_updates(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let preview = cx.new(|cx| PreviewView::for_editor("# First\n\nText\n".into(), cx));
+        preview.update(cx, |view, cx| {
+            assert!(view.resources.is_none());
+            assert!(view.editor_preview);
+            view.set_content("# Updated\n\n## Section\n".into(), cx);
+            assert!(view.resources.is_none());
+            assert!(view.editor_preview);
+            assert_eq!(view.toc_snapshot().0.len(), 2);
+            assert_eq!(view.toc_snapshot().0[0].title, "Updated");
+        });
+        let resources = cx.new(|cx| PreviewView::embedded("# Resource\n".into(), cx));
+        resources.update(cx, |view, cx| {
+            assert!(view.resources.is_some());
+            view.set_content("# Updated resource\n".into(), cx);
+            assert!(view.resources.is_some());
+            assert!(!view.editor_preview);
+        });
+    }
 
     #[test]
     fn both_hosts_reserve_space_for_wrapped_headings() {

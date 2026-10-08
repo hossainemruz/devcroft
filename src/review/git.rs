@@ -19,6 +19,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use sha2::{Digest as _, Sha256};
 
 use super::model::{
     ChangedFile, FileContent, FileStatus, ReviewDiff, UnavailableReason, compare_review_paths,
@@ -305,6 +306,7 @@ enum WorkContent {
 
 #[cfg(not(unix))]
 fn read_worktree(root: &Path, name: &str) -> WorkContent {
+    use std::io::Read as _;
     // Never traverse a PR-controlled directory link while capturing local
     // source. A link at the leaf is captured as its target text, not followed.
     let mut path = root.to_path_buf();
@@ -334,12 +336,27 @@ fn read_worktree(root: &Path, name: &str) -> WorkContent {
             Err(_) => WorkContent::Gone,
         };
     }
+    let Some(file) = open_worktree_file(root, name) else {
+        return WorkContent::Gone;
+    };
+    let Ok(meta) = file.metadata() else {
+        return WorkContent::Gone;
+    };
     if meta.len() > MAX_FILE_BYTES {
         return WorkContent::TooLarge;
     }
-    match std::fs::read(path) {
-        Ok(bytes) => WorkContent::Bytes(bytes),
-        Err(_) => WorkContent::Gone,
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return WorkContent::Gone;
+    }
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        WorkContent::TooLarge
+    } else {
+        WorkContent::Bytes(bytes)
     }
 }
 
@@ -466,16 +483,24 @@ fn assemble(
     let untracked = discover_untracked(&workdir, &base_entries);
 
     let mut files: Vec<ChangedFile> = Vec::new();
+    let mut work_versions = HashMap::new();
     // Deleted/added byte payloads awaiting exact-content rename pairing.
     let mut deleted: Vec<(String, Vec<u8>)> = Vec::new();
     let mut added: Vec<(String, Vec<u8>)> = Vec::new();
 
     for (path, entry) in &base_entries {
         let work = read_worktree(&workdir, path);
+        if let Some(version) = worktree_version(&workdir, path, &work) {
+            work_versions.insert(path.clone(), version);
+        }
         classify_tracked(repo, path, entry, work, &mut files, &mut deleted);
     }
     for path in untracked {
-        match read_worktree(&workdir, &path) {
+        let work = read_worktree(&workdir, &path);
+        if let Some(version) = worktree_version(&workdir, &path, &work) {
+            work_versions.insert(path.clone(), version);
+        }
+        match work {
             WorkContent::Bytes(bytes) | WorkContent::Symlink(bytes) => {
                 added.push((path, bytes));
             }
@@ -506,13 +531,150 @@ fn assemble(
     // pre-order exactly (see `compare_review_paths`).
     files.sort_by(|a, b| compare_review_paths(&a.path, &b.path));
 
+    let file_versions = files
+        .iter()
+        .filter_map(|file| {
+            let work = work_versions.get(&file.path)?;
+            let mut hash = Sha256::new();
+            hash.update(work);
+            let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+            hash.update(old_path.as_bytes());
+            if let Some(base) = base_entries.get(old_path) {
+                hash.update(base.oid.as_bytes());
+                hash.update(base.mode.value().to_le_bytes());
+            }
+            Some((file.path.clone(), hash.finalize().into()))
+        })
+        .collect();
+
     Ok(ReviewDiff {
         files,
+        file_versions,
         base_commit: base_commit.to_hex().to_string(),
         head_commit: head.to_hex().to_string(),
         base_ref,
         head_branch,
     })
+}
+
+/// Hash the source captured for this load, rather than just rendered hunks.
+/// Binary files and edits beyond the hunk cap must also invalidate progress.
+fn worktree_version(root: &Path, path: &str, work: &WorkContent) -> Option<[u8; 32]> {
+    let mut hash = Sha256::new();
+    match work {
+        WorkContent::Bytes(bytes) => {
+            hash.update(b"file");
+            hash.update(bytes);
+        }
+        WorkContent::Symlink(bytes) => {
+            hash.update(b"link");
+            hash.update(bytes);
+        }
+        WorkContent::TooLarge => {
+            // Stream oversized files without lifting the rendering memory cap.
+            #[cfg(unix)]
+            {
+                use std::io::Read as _;
+                let WorkEntry::File(mut file) = open_worktree(root, path) else {
+                    return None;
+                };
+                hash.update(b"file");
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let count = file.read(&mut buffer).ok()?;
+                    if count == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..count]);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                use std::io::Read as _;
+                let mut file = open_worktree_file(root, path)?;
+                hash.update(b"file");
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let count = file.read(&mut buffer).ok()?;
+                    if count == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..count]);
+                }
+            }
+        }
+        WorkContent::Dir => {
+            hash.update(b"directory");
+            if let Ok(sub) = gix::discover(root.join(path))
+                && let Ok(head) = sub.head_id()
+            {
+                hash.update(head.as_bytes());
+            }
+        }
+        WorkContent::Gone => hash.update(b"absent"),
+    }
+    #[cfg(unix)]
+    if matches!(work, WorkContent::Bytes(_) | WorkContent::TooLarge) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let WorkEntry::File(file) = open_worktree(root, path) else {
+            return None;
+        };
+        hash.update([u8::from(
+            file.metadata().ok()?.permissions().mode() & 0o111 != 0,
+        )]);
+    }
+    Some(hash.finalize().into())
+}
+
+/// Validate the opened handle before reading any bytes. Checking components
+/// alone leaves a race where an ancestor can be replaced with a directory link.
+#[cfg(windows)]
+fn open_worktree_file(root: &Path, path: &str) -> Option<std::fs::File> {
+    use std::os::windows::{ffi::OsStringExt as _, fs::OpenOptionsExt as _, io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, GetFinalPathNameByHandleW,
+    };
+
+    if Path::new(path)
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root.join(path))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    // SAFETY: the owned file keeps this handle live; the first call only queries
+    // the required UTF-16 buffer length, and the second has that full capacity.
+    let size =
+        unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), std::ptr::null_mut(), 0, 0) };
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u16; size as usize];
+    let written =
+        unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), size, 0) };
+    if written == 0 || written >= size {
+        return None;
+    }
+    buffer.truncate(written as usize);
+    let opened_path = PathBuf::from(std::ffi::OsString::from_wide(&buffer));
+    // `root` was canonicalized at load start. Both it and the handle path use
+    // Windows' extended absolute form; validate the actual opened file, rather
+    // than resolving the mutable pathname again.
+    opened_path.starts_with(root).then_some(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_worktree_file(_: &Path, _: &str) -> Option<std::fs::File> {
+    // A platform without a handle-bound containment check cannot retain a mark.
+    None
 }
 
 /// A tracked path (present in the base tree) compared against the worktree.
@@ -1046,6 +1208,73 @@ mod tests {
             .iter()
             .find(|file| file.path == path)
             .unwrap_or_else(|| panic!("expected {path} in diff"))
+    }
+
+    #[test]
+    fn file_versions_detect_changes_hidden_by_rendering_limits() {
+        let dir = init_repo();
+        let large = vec![b'a'; MAX_FILE_BYTES as usize + 1];
+        write(dir.path(), "binary.bin", &[0, 1]);
+        write(dir.path(), "large.txt", &large);
+        write(dir.path(), "truncated.txt", "old\n".repeat(2500).as_bytes());
+        commit_all(dir.path(), "base");
+        write(dir.path(), "binary.bin", &[0, 2]);
+        let mut large = vec![b'b'; MAX_FILE_BYTES as usize + 1];
+        write(dir.path(), "large.txt", &large);
+        let mut text = "new\n".repeat(2500);
+        write(dir.path(), "truncated.txt", text.as_bytes());
+        let before = load_review(dir.path(), &uncommitted()).unwrap();
+        assert_eq!(before.file_versions.len(), 3);
+        assert_eq!(before, load_review(dir.path(), &uncommitted()).unwrap());
+        write(dir.path(), "binary.bin", &[0, 3]);
+        *large.last_mut().unwrap() = b'c';
+        let modified = fs::metadata(dir.path().join("large.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        write(dir.path(), "large.txt", &large);
+        fs::File::options()
+            .write(true)
+            .open(dir.path().join("large.txt"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        text.truncate(text.len() - "new\n".len());
+        text.push_str("last edit\n");
+        write(dir.path(), "truncated.txt", text.as_bytes());
+        let after = load_review(dir.path(), &uncommitted()).unwrap();
+        for path in ["binary.bin", "large.txt", "truncated.txt"] {
+            assert_eq!(
+                find(&before, path),
+                find(&after, path),
+                "rendered diff is identical"
+            );
+            assert_ne!(
+                before.file_versions[path], after.file_versions[path],
+                "source version changed: {path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_versions_include_executable_mode_changes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = init_repo();
+        write(dir.path(), "script.sh", b"original\n");
+        commit_all(dir.path(), "base");
+        write(dir.path(), "script.sh", b"modified\n");
+        let before = load_review(dir.path(), &uncommitted()).unwrap();
+        let path = dir.path().join("script.sh");
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(permissions.mode() ^ 0o111);
+        fs::set_permissions(path, permissions).unwrap();
+        let after = load_review(dir.path(), &uncommitted()).unwrap();
+        assert_eq!(before.files, after.files);
+        assert_ne!(
+            before.file_versions["script.sh"],
+            after.file_versions["script.sh"]
+        );
     }
 
     #[test]

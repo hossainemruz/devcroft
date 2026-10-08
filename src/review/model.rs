@@ -6,6 +6,7 @@
 //! plain strings and fixture-free.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
@@ -24,6 +25,9 @@ pub(crate) const MAX_MERGED_LINES: usize = 20_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReviewDiff {
     pub(crate) files: Vec<ChangedFile>,
+    /// Versions of both sides, independent of the visible hunk/rendering cap.
+    /// Missing versions represent failed reads and cannot preserve viewed marks.
+    pub(crate) file_versions: HashMap<String, [u8; 32]>,
     pub(crate) base_commit: String,
     pub(crate) head_commit: String,
     /// Resolved base ref (e.g. `origin/main`), if the base came from a ref.

@@ -528,6 +528,13 @@ impl Workspace {
                         if this.git_poll.commit(generation, status) {
                             cx.notify();
                         }
+                        if !this.home_visible
+                            && !this.relationships_visible
+                            && this.active_tab == WorkspaceTab::Review
+                        {
+                            this.review
+                                .update(cx, |view, cx| view.refresh_if_changed(cx));
+                        }
                     })
                     .is_err();
                 if dropped {

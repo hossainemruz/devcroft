@@ -23,7 +23,13 @@ retain their saved code excerpts. All controls remain available there, even when
 the diff is empty. Delete permanently removes that
 comment, including its body and anchor; resolve retains it for later review.
 
-Use **Refresh**, or return to the Review tab, after the agent changes code or
+The open Review tab checks for code changes automatically. Marking a file
+**Viewed** collapses it; if either side changes afterward, its viewed mark is
+cleared and the file expands. Unchanged files keep their review progress,
+including across new commits on the same branch. Manual collapse controls
+remain independent of viewed marks.
+
+Use **Refresh**, or return to the Review tab, after the agent changes
 comments. Unsaved drafts survive same-pair refreshes. Switching branch pairs or
 review scopes clears the editor. An edit based on an externally modified comment
 fails with a refresh message instead of overwriting it; after refreshing, click

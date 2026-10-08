@@ -15,7 +15,10 @@ pub(crate) mod model;
 // the same rows and syntax machinery the review uses.
 pub(crate) mod stream;
 pub(crate) mod syntax;
+#[cfg(test)]
+mod tests;
 mod tree;
+mod watch;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -98,14 +101,17 @@ pub(crate) struct ReviewView {
     tree_state: Entity<TreeState>,
     tree_metas: Rc<HashMap<String, TreeRowMeta>>,
     viewed: Rc<RefCell<HashSet<String>>>,
+    /// Source versions captured when each file was marked viewed. Kept apart
+    /// from `state` so explicit reloads and failed loads do not lose them.
+    viewed_versions: HashMap<String, [u8; 32]>,
     /// Collapsed files by repo-relative path, GitHub PR style. Scoped to the
     /// current review (see `review_key`): survives refreshes of the same
     /// branch pair, resets on branch/scope change, and re-flattens `rows` on
     /// toggle without re-running git or syntax highlighting.
     collapsed: Rc<RefCell<HashSet<String>>>,
     /// Identifies the review that `viewed`/`collapsed` belong to
-    /// (`scope|base|head`). A branch or scope switch is a different review,
-    /// so stale marks must not leak across it.
+    /// (`scope|base|head branch`). Commits within a branch preserve progress;
+    /// a branch or scope switch must not leak stale marks across reviews.
     review_key: Option<String>,
     /// Full-color raster tiles per icon key, filled at load and shared by
     /// every row render. Rasterizing here (not per frame) keeps scrolling
@@ -119,6 +125,8 @@ pub(crate) struct ReviewView {
     last_scrolled: Option<String>,
     /// Monotonic load id; stale background loads never overwrite newer state.
     generation: u64,
+    load_in_flight: bool,
+    file_changes: watch::FileChanges,
     feedback: feedback::Feedback,
     show_comments: bool,
     open_error: Option<String>,
@@ -170,6 +178,7 @@ impl ReviewView {
             tree_state: cx.new(|cx| TreeState::new(cx)),
             tree_metas: Rc::new(HashMap::new()),
             viewed: Rc::default(),
+            viewed_versions: HashMap::new(),
             collapsed: Rc::default(),
             review_key: None,
             icon_tiles: Rc::default(),
@@ -179,6 +188,8 @@ impl ReviewView {
             stream_top: Rc::default(),
             last_scrolled: None,
             generation: 0,
+            load_in_flight: false,
+            file_changes: watch::FileChanges::new(cwd),
             feedback: feedback::Feedback::default(),
             show_comments: true,
             open_error: None,
@@ -198,11 +209,55 @@ impl ReviewView {
     }
 
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
-        self.state = ReviewState::Loading;
-        self.last_scrolled = None;
+        self.load(false, cx);
+    }
+
+    /// Refresh in the background while Review is visible. Identical loads
+    /// leave the viewport, draft editor, and virtualized rows untouched.
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.load_in_flight
+            || self.comment_write_in_flight()
+            || !matches!(self.state, ReviewState::Loaded(_))
+        {
+            return;
+        }
+        self.load(true, cx);
+    }
+
+    pub(crate) fn refresh_if_changed(&mut self, cx: &mut Context<Self>) {
+        if !self.load_in_flight
+            && !self.comment_write_in_flight()
+            && matches!(self.state, ReviewState::Loaded(_))
+            && self.file_changes.take_changed()
+        {
+            self.refresh(cx);
+        }
+    }
+
+    /// A comment write supersedes any background snapshot captured before it.
+    /// Leave the change queued so the next idle tick can refresh its anchors.
+    fn cancel_background_refresh(&mut self) {
+        if self.load_in_flight && matches!(self.state, ReviewState::Loaded(_)) {
+            self.generation += 1;
+            self.load_in_flight = false;
+            self.file_changes.mark_changed();
+        }
+    }
+
+    fn load(&mut self, background: bool, cx: &mut Context<Self>) {
+        let previous = match &self.state {
+            ReviewState::Loaded(loaded) if background => Some((*loaded.diff).clone()),
+            _ => None,
+        };
+        if !background {
+            self.state = ReviewState::Loading;
+            self.last_scrolled = None;
+            cx.notify();
+        }
+        self.load_in_flight = true;
+        self.file_changes.take_changed();
         self.generation += 1;
         let generation = self.generation;
-        cx.notify();
         let cwd = self.cwd.clone();
         let scope = self.scope();
         let base = self.base_branch.clone();
@@ -211,24 +266,35 @@ impl ReviewView {
             let loaded = cx
                 .background_spawn(async move {
                     let diff = load_review(&cwd, &scope)?;
+                    if previous.as_ref() == Some(&diff) {
+                        return anyhow::Ok(None);
+                    }
                     let syntax = syntax::highlight(&diff);
                     let feedback = comments::Store::open(&cwd, &base, &remote, &scope, &diff)
                         .and_then(|store| {
                             store.refresh(&cwd, &diff).map(|comments| (store, comments))
                         });
-                    anyhow::Ok((diff, syntax, feedback))
+                    anyhow::Ok(Some((diff, syntax, feedback)))
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.generation != generation {
                     return;
                 }
+                view.load_in_flight = false;
                 match loaded {
-                    Ok((diff, syntax, feedback)) => {
+                    Ok(Some((diff, syntax, feedback))) => {
                         view.load_comments(feedback);
                         view.apply_diff(diff, syntax, cx);
                     }
+                    Ok(None) => {}
                     Err(error) => {
+                        if background {
+                            // A transient agent write must not replace the
+                            // current diff or discard review progress.
+                            view.file_changes.mark_changed();
+                            return;
+                        }
                         view.state = ReviewState::Failed(format!("{error:#}").into());
                         cx.notify();
                     }
@@ -349,11 +415,8 @@ impl ReviewView {
             ScopeTab::Uncommitted => "uncommitted".to_owned(),
         };
         format!(
-            "{scope}|{}|{}|{}|{}",
-            diff.base_commit,
-            diff.head_commit,
-            diff.head_branch.as_deref().unwrap_or(""),
-            diff.base_ref.as_deref().unwrap_or(""),
+            "{scope}|{}",
+            diff.head_branch.as_deref().unwrap_or(&diff.head_commit),
         )
     }
 
@@ -363,26 +426,63 @@ impl ReviewView {
         syntax: syntax::SyntaxHighlights,
         cx: &mut Context<Self>,
     ) {
+        let viewport = match &self.state {
+            ReviewState::Loaded(loaded) => {
+                let top = self.list_handle.logical_scroll_top();
+                loaded
+                    .file_row_start
+                    .iter()
+                    .rposition(|row| *row <= top.item_ix)
+                    .map(|ix| {
+                        (
+                            loaded.diff.files[ix].path.clone(),
+                            top.item_ix - loaded.file_row_start[ix],
+                            top.offset_in_item,
+                        )
+                    })
+            }
+            _ => None,
+        };
         let key = self.review_identity(&diff);
         if self.review_key.as_deref() == Some(&key) {
-            // Same review, fresh worktree content: keep progress, drop marks
-            // for files that no longer exist in the diff.
+            // Keep progress only for the exact source version reviewed.
             self.collapsed
                 .borrow_mut()
                 .retain(|path| diff.files.iter().any(|file| &file.path == path));
-            self.viewed
-                .borrow_mut()
-                .retain(|path| diff.files.iter().any(|file| &file.path == path));
+            self.viewed.borrow_mut().retain(|path| {
+                let unchanged = self
+                    .viewed_versions
+                    .get(path)
+                    .zip(diff.file_versions.get(path))
+                    .is_some_and(|(viewed, current)| viewed == current);
+                if !unchanged {
+                    self.collapsed.borrow_mut().remove(path);
+                }
+                unchanged
+            });
+            self.viewed_versions
+                .retain(|path, _| self.viewed.borrow().contains(path));
         } else {
-            // Branch, base, or scope changed: a different review, so stale
+            // Branch, base selection, or scope changed: a different review, so stale
             // viewed/collapsed marks must not leak across it.
             self.collapsed.borrow_mut().clear();
             self.viewed.borrow_mut().clear();
+            self.viewed_versions.clear();
             self.review_key = Some(key);
         }
         let (items, metas) = build_file_tree(&diff.files);
         let (rows, file_row_start) = flatten(&diff, &self.collapsed.borrow());
         self.list_handle.reset(rows.len() + 1);
+        if let Some((path, relative_row, offset_in_item)) = viewport
+            && let Some(ix) = diff.files.iter().position(|file| file.path == path)
+        {
+            let start = file_row_start[ix];
+            let end = file_row_start.get(ix + 1).copied().unwrap_or(rows.len());
+            self.list_handle.scroll_to(ListOffset {
+                item_ix: (start + relative_row).min(end.saturating_sub(1)),
+                offset_in_item,
+            });
+        }
         self.editor_row.set(None);
         let mut tiles = (*self.icon_tiles).clone();
         ensure_tiles(
@@ -415,6 +515,15 @@ impl ReviewView {
                 true
             }
         };
+        if now_viewed {
+            if let ReviewState::Loaded(loaded) = &self.state
+                && let Some(version) = loaded.diff.file_versions.get(path)
+            {
+                self.viewed_versions.insert(path.to_owned(), *version);
+            }
+        } else {
+            self.viewed_versions.remove(path);
+        }
         // GitHub PR behavior: marking a file viewed collapses it;
         // unmarking expands it again. A manual chevron toggle stays
         // independent (it only touches `collapsed`, never `viewed`).

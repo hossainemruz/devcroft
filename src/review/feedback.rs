@@ -45,6 +45,65 @@ mod tests {
         model::{ChangedFile, FileStatus, ReviewDiff, diff_text},
         stream::flatten,
     };
+    use ::core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn background_refresh_cannot_interrupt_or_overwrite_a_comment_save(cx: &mut TestAppContext) {
+        for refresh_first in [false, true] {
+            let (_dir, view) = crate::review::tests::setup(cx);
+            let render_view = view.clone();
+            let (_, cx) =
+                cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    if refresh_first {
+                        view.refresh(cx);
+                    }
+                    view.feedback.selection = Some(Anchor {
+                        path: "a.txt".into(),
+                        side: Side::New,
+                        start: 1,
+                        end: 1,
+                        outdated: false,
+                        source: "reviewed\n".into(),
+                    });
+                    view.feedback.input = Some(cx.new(|cx| {
+                        let mut input = TextareaState::new(window, cx);
+                        input.set_value("Please update this", window, cx);
+                        input
+                    }));
+                    view.save_comment(cx);
+                    let generation = view.generation;
+                    view.refresh(cx);
+                    view.file_changes.mark_changed();
+                    view.refresh_if_changed(cx);
+                    assert_eq!(view.generation, generation, "refresh waits for the write");
+                });
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(!view.feedback.busy);
+                assert!(view.feedback.input.is_none(), "saved editor closes");
+                assert!(view.feedback.selection.is_none());
+                assert_eq!(view.feedback.comments.len(), 1);
+                assert_eq!(
+                    view.feedback.store.as_ref().unwrap().list().unwrap().len(),
+                    1
+                );
+                assert!(view.feedback.error.is_none());
+            });
+            view.update(cx, |view, cx| view.refresh_if_changed(cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.feedback.comments.len(),
+                    1,
+                    "no stale snapshot replaces the saved thread"
+                );
+                assert!(view.feedback.input.is_none());
+            });
+        }
+    }
 
     #[::core::prelude::v1::test]
     fn editor_follows_range_end_on_each_side_and_rejects_missing_anchors() {
@@ -58,6 +117,7 @@ mod tests {
                 deletions: 1,
                 content: FileContent::Text { hunks, truncated },
             }],
+            file_versions: Default::default(),
             base_commit: "base".into(),
             head_commit: "head".into(),
             base_ref: None,
@@ -129,6 +189,9 @@ pub(super) struct Feedback {
 }
 
 impl ReviewView {
+    pub(super) fn comment_write_in_flight(&self) -> bool {
+        self.feedback.busy
+    }
     pub(super) fn comment_count(&self) -> usize {
         self.feedback.comments.len()
     }
@@ -496,6 +559,7 @@ impl ReviewView {
         action: impl FnOnce(&Store) -> anyhow::Result<Option<String>> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_background_refresh();
         self.feedback.busy = true;
         if let Some(input) = &self.feedback.input {
             input.update(cx, |input, cx| input.set_disabled(true, cx));

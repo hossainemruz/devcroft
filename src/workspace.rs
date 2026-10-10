@@ -43,7 +43,7 @@ use crate::command_palette::{
     GoToAgent, GoToEditor, GoToResources, GoToReview, GoToTerminal, NewAgentSession,
     PaletteCommand, PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette,
     ToggleProjectsPalette, is_primary_modifier, is_quit_shortcut, item_at,
-    palette_mode_for_shortcut, palette_sections_for_mode,
+    palette_mode_for_shortcut, palette_sections_for_mode, query_has_terms,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SpaceSelection, Spaces, SyncStatus, SyncTracker,
@@ -264,6 +264,11 @@ pub(crate) struct Workspace {
     /// mode switches while open); the render model follows it, so confirmations
     /// always resolve against the visible rows.
     palette_mode: PaletteMode,
+    /// Whether the open palette holds a non-blank query. The empty actions
+    /// view omits the workspace tab jumps (they duplicate the tab bar and
+    /// navigation-mode keys); typing reveals them while keeping every other
+    /// row. Reset on every opening and mode switch alongside the query itself.
+    palette_has_query: bool,
     /// The attention indicator reuses Projects mode interaction while
     /// projecting only blocked agent rows and omitting Add repository.
     attention_only: bool,
@@ -814,6 +819,7 @@ impl Workspace {
             git_dialog_status: None,
             command_open: false,
             palette_mode: PaletteMode::Actions,
+            palette_has_query: false,
             attention_only: false,
             command_state,
             agent_activity,
@@ -1064,6 +1070,7 @@ impl Workspace {
                 self.close_command_palette(window, cx);
             } else {
                 self.palette_mode = mode;
+                self.palette_has_query = false;
                 self.reload_recent_repositories();
                 self.command_state.update(cx, |state, cx| {
                     state.set_query("", window, cx);
@@ -1092,6 +1099,7 @@ impl Workspace {
         self.command_open = true;
         self.attention_only = false;
         self.palette_mode = mode;
+        self.palette_has_query = false;
         self.sync_tutorial_palette(cx);
         // A few small JSON reads per opening — not per render — so the
         // switcher always reflects recent adds and switches.
@@ -2340,9 +2348,19 @@ impl Workspace {
     fn render_command_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let workspace = cx.entity().downgrade();
         let confirm_workspace = workspace.clone();
+        let query_workspace = workspace.clone();
         let attention_only = self.attention_only;
         let mut command = Command::new(&self.command_state)
             .placeholder(self.palette_mode.placeholder())
+            .on_query(move |query, _window, cx| {
+                let has_query = query_has_terms(query);
+                let _ = query_workspace.update(cx, |this, cx| {
+                    if this.palette_has_query != has_query {
+                        this.palette_has_query = has_query;
+                        cx.notify();
+                    }
+                });
+            })
             .on_confirm(move |index, window, cx| {
                 confirm_workspace
                     .update(cx, |this, cx| this.on_palette_confirm(index, window, cx))
@@ -2429,6 +2447,7 @@ impl Workspace {
                 &visible_repositories,
                 self.palette_mode,
                 self.home_visible,
+                self.palette_has_query,
             );
             if self.palette_mode == PaletteMode::Projects && !open_checkouts.is_empty() {
                 sections.push(PaletteSection {

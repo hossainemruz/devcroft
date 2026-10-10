@@ -65,6 +65,13 @@ pub(crate) fn is_primary_modifier(platform: bool, control: bool) -> bool {
     }
 }
 
+/// Whether a palette query counts as typed: any non-blank text. Whitespace
+/// alone keeps the empty view (tab jumps hidden); this mirrors the widget's
+/// own `trim` before matching, so a single space never reveals tabs.
+pub(crate) fn query_has_terms(query: &str) -> bool {
+    !query.trim().is_empty()
+}
+
 /// Match the command-bar shortcuts from a raw keystroke: `cmd-k` on macOS
 /// (`ctrl-k` elsewhere) opens actions, `cmd-p` on macOS (`ctrl-p`
 /// elsewhere) opens projects. Pure over the
@@ -347,12 +354,17 @@ pub(crate) fn palette_sections(recents: &[RecentRepository]) -> Vec<PaletteSecti
 /// Home (`home_visible`) the workspace tab jumps are omitted — they select a
 /// repository tab, so offering them there would silently change `active_tab`
 /// behind the still-visible Home. Tools stay available on Home: they belong
-/// to no repository. Confirmations resolve against exactly this
+/// to no repository. With an empty query (`has_query == false`) the workspace
+/// tab jumps are also omitted outside Home: they duplicate the clickable tab
+/// bar and navigation-mode keys, so the default view stays scannable while
+/// every destination remains searchable once the user types. Confirmations
+/// resolve against exactly this
 /// model, same contract as [`palette_sections`].
 pub(crate) fn palette_sections_for_mode(
     recents: &[RecentRepository],
     mode: PaletteMode,
     home_visible: bool,
+    has_query: bool,
 ) -> Vec<PaletteSection> {
     match mode {
         PaletteMode::Actions => {
@@ -362,6 +374,10 @@ pub(crate) fn palette_sections_for_mode(
                     !matches!(item, PaletteItem::Command(command) if command.is_workspace_tab())
                         && !matches!(item, PaletteItem::Command(PaletteCommand::EditorGoBack))
                         && !matches!(item, PaletteItem::Command(PaletteCommand::OpenGit))
+                });
+            } else if !has_query {
+                go_to.retain(|item| {
+                    !matches!(item, PaletteItem::Command(command) if command.is_workspace_tab())
                 });
             }
             vec![
@@ -563,7 +579,8 @@ mod tests {
 
     #[test]
     fn actions_mode_holds_every_command_but_add_repository() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false, true);
         assert_eq!(sections.len(), 4);
         assert_eq!(sections[0].heading, "Go to");
         assert_eq!(sections[1].heading, "Tools");
@@ -600,7 +617,8 @@ mod tests {
 
     #[test]
     fn home_hides_workspace_tab_jumps_but_keeps_home_destinations() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true, true);
         assert_eq!(sections.len(), 4);
         assert_eq!(sections[0].heading, "Go to");
         let commands: Vec<PaletteCommand> = sections[0]
@@ -644,15 +662,98 @@ mod tests {
         );
         // Projects mode is page-agnostic: switching checkouts is how you
         // leave Home, so recents stay put there too.
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, true);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, true, true);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].heading, "Repositories");
         assert_eq!(sections[0].items.len(), 3);
     }
 
     #[test]
+    fn empty_query_hides_workspace_tabs_but_keeps_them_searchable() {
+        let go_to_commands = |has_query: bool| {
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false, has_query)[0]
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    PaletteItem::Command(command) => Some(*command),
+                    PaletteItem::Tool(_)
+                    | PaletteItem::SwitchRepository { .. }
+                    | PaletteItem::OpenCheckout { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            go_to_commands(false),
+            vec![
+                PaletteCommand::OpenGit,
+                PaletteCommand::GoHome,
+                PaletteCommand::EditorGoBack,
+                PaletteCommand::BrowseArtifacts,
+                PaletteCommand::RepositoryRelationships,
+            ]
+        );
+        assert_eq!(
+            go_to_commands(true).len(),
+            GO_TO_COMMANDS.len(),
+            "typing must reveal the full Go to section"
+        );
+        for tab in [
+            PaletteCommand::GoAgent,
+            PaletteCommand::GoEditor,
+            PaletteCommand::GoTerminal,
+            PaletteCommand::GoReview,
+            PaletteCommand::GoResources,
+        ] {
+            assert!(go_to_commands(true).contains(&tab));
+        }
+        // Home never reveals tabs, even once the user types: selecting one
+        // would flip `active_tab` behind the still-visible dashboard.
+        let home_typed =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true, true)[0]
+                .items
+                .clone();
+        let home_empty =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true, false)[0]
+                .items
+                .clone();
+        assert_eq!(home_typed, home_empty);
+    }
+
+    #[test]
+    fn query_terms_treat_whitespace_only_as_empty() {
+        assert!(!query_has_terms(""));
+        assert!(!query_has_terms("   "));
+        assert!(!query_has_terms("\t\n "));
+        assert!(query_has_terms("a"));
+        assert!(query_has_terms(" go "));
+    }
+
+    #[test]
+    fn index_paths_follow_the_query_dependent_go_to_section() {
+        let empty =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false, false);
+        assert_eq!(
+            item_at(&empty, 0, 0),
+            Some(PaletteItem::Command(PaletteCommand::OpenGit))
+        );
+        let typed =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, false, true);
+        assert_eq!(
+            item_at(&typed, 0, 0),
+            Some(PaletteItem::Command(PaletteCommand::GoAgent))
+        );
+        let home = palette_sections_for_mode(&fixture_recents(), PaletteMode::Actions, true, true);
+        assert_eq!(
+            item_at(&home, 0, 0),
+            Some(PaletteItem::Command(PaletteCommand::GoHome))
+        );
+    }
+
+    #[test]
     fn projects_mode_holds_only_the_repositories_group() {
-        let sections = palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, false);
+        let sections =
+            palette_sections_for_mode(&fixture_recents(), PaletteMode::Projects, false, true);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].heading, "Repositories");
         assert_eq!(

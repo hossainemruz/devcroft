@@ -51,7 +51,7 @@ use crate::data::{
     sync_portable_with_tracker,
 };
 use crate::editor::{EditorChoice, ExternalEditorKind, native::NativeEditor};
-use crate::git::{GitDialog, SnapshotChanged};
+use crate::git::{GitDialog, OpenGitFile, SnapshotChanged};
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
@@ -1199,7 +1199,19 @@ impl Workspace {
     /// repository and avoids carrying stale selection state across checkouts.
     fn open_git_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.git_dialog_status = None;
-        let git = cx.new(|cx| GitDialog::new(self.working_directory.clone(), cx));
+        let dirty_editor_paths = self
+            .native_editor
+            .as_ref()
+            .map(|editor| editor.read(cx).dirty_paths())
+            .unwrap_or_default();
+        let git = cx.new(|cx| {
+            GitDialog::new(
+                self.working_directory.clone(),
+                dirty_editor_paths,
+                window,
+                cx,
+            )
+        });
         cx.subscribe(&git, |this, _, event: &SnapshotChanged, cx| {
             if this.working_directory == event.checkout
                 && this.git_dialog_status.as_ref() != Some(&event.status)
@@ -1207,6 +1219,10 @@ impl Workspace {
                 this.git_dialog_status = Some(event.status.clone());
                 cx.notify();
             }
+        })
+        .detach();
+        cx.subscribe_in(&git, window, |this, _, event: &OpenGitFile, window, cx| {
+            this.open_git_file(event, window, cx)
         })
         .detach();
         let dialog_git = git.clone();
@@ -1231,6 +1247,40 @@ impl Workspace {
         });
         let focus = git.focus_handle(cx);
         focus.focus(window, cx);
+    }
+
+    fn open_git_file(&mut self, event: &OpenGitFile, window: &mut Window, cx: &mut Context<Self>) {
+        if event.checkout != self.working_directory
+            || event.path.is_absolute()
+            || event
+                .path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            window.push_notification("The selected Git path is no longer valid.", cx);
+            return;
+        }
+        let file = self.working_directory.join(&event.path);
+        if !file.is_file() {
+            window.push_notification(
+                format!(
+                    "{} is unavailable in the working tree.",
+                    event.path.display()
+                ),
+                cx,
+            );
+            return;
+        }
+        self.set_editor_choice(EditorChoice::BuiltIn, window, cx);
+        if let Some(editor) = self.native_editor.as_ref() {
+            editor.update(cx, |editor, cx| editor.request_open(file, None, cx));
+            self.active_tab = WorkspaceTab::Editor;
+            self.home_visible = false;
+            self.focus_active_pane(window, cx);
+            cx.notify();
+        } else {
+            window.push_notification("The built-in editor is not ready yet.", cx);
+        }
     }
 
     /// Run the confirmed palette entry. `index` addresses the model installed

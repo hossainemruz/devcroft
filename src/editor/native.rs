@@ -976,6 +976,24 @@ impl NativeEditor {
         cx.notify();
     }
 
+    /// Absolute paths whose built-in editor buffers contain unsaved text.
+    /// Git uses this snapshot while its modal is open to block operations
+    /// that would replace or remove a working-tree file.
+    pub(crate) fn dirty_paths(&self) -> HashSet<PathBuf> {
+        let mut paths = self
+            .inactive_documents
+            .iter()
+            .filter(|(_, document)| document.dirty)
+            .map(|(path, _)| path.clone())
+            .collect::<HashSet<_>>();
+        if self.dirty
+            && let Some(path) = &self.path
+        {
+            paths.insert(path.clone());
+        }
+        paths
+    }
+
     fn open(
         &mut self,
         path: &Path,

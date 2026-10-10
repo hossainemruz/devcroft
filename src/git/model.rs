@@ -51,6 +51,11 @@ pub(crate) struct Change {
     pub(crate) path: PathBuf,
     pub(crate) original_path: Option<PathBuf>,
     pub(crate) kind: ChangeKind,
+    /// The exact index entry used to produce an unstaged diff. Keeping both
+    /// fields on every tracked change also makes a refreshed status unequal
+    /// when another Git client replaces the index content or file mode.
+    pub(crate) index_mode: Option<String>,
+    pub(crate) index_oid: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

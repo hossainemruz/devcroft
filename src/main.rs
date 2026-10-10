@@ -17,6 +17,7 @@ mod commands;
 /// surface is allow-listed until then — tests cover it now.
 #[allow(dead_code, unused_imports)]
 mod data;
+mod diff;
 mod editor;
 mod editor_icons;
 mod empty_state;

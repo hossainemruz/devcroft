@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    io::Read as _,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     time::{Duration, Instant},
@@ -23,11 +23,11 @@ const REPOSITORY_ENVIRONMENT: [&str; 9] = [
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 ];
 
-struct CommandOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    stdout_truncated: bool,
+pub(super) struct CommandOutput {
+    pub(super) status: ExitStatus,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    pub(super) stdout_truncated: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,9 +69,34 @@ pub(crate) fn load_snapshot(root: &Path) -> Result<RepositorySnapshot, LoadError
 }
 
 fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<CommandOutput, LoadError> {
+    run_git_args(
+        root,
+        args.into_iter().map(OsString::from).collect(),
+        None,
+        COMMAND_TIMEOUT,
+        MAX_STATUS_BYTES,
+        MAX_ERROR_BYTES,
+    )
+}
+
+/// Run one checkout-scoped Git process with bounded, concurrently drained
+/// output. Mutations and file-diff reads share this boundary so inherited
+/// repository-selection variables cannot redirect either class of command.
+pub(super) fn run_git_args(
+    root: &Path,
+    args: Vec<OsString>,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<CommandOutput, LoadError> {
     let mut child = git_command(root)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -82,6 +107,15 @@ fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<CommandOutput
                 LoadError::Failed(error.to_string())
             }
         })?;
+    if let Some(input) = stdin {
+        let mut stream = child
+            .stdin
+            .take()
+            .ok_or_else(|| LoadError::Failed("Could not write Git input".to_owned()))?;
+        stream
+            .write_all(&input)
+            .map_err(|error| LoadError::Failed(error.to_string()))?;
+    }
     let stdout = child
         .stdout
         .take()
@@ -90,9 +124,9 @@ fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<CommandOutput
         .stderr
         .take()
         .ok_or_else(|| LoadError::Failed("Could not read Git output".to_owned()))?;
-    let stdout = read_stream(stdout, MAX_STATUS_BYTES);
-    let stderr = read_stream(stderr, MAX_ERROR_BYTES);
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let stdout = read_stream(stdout, stdout_limit);
+    let stderr = read_stream(stderr, stderr_limit);
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -124,7 +158,7 @@ fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<CommandOutput
 /// Build a checkout-scoped Git process. Repository selection must come from
 /// `root`, even when Devcroft itself was launched by a Git hook or wrapper
 /// that exported variables for another checkout.
-fn git_command(root: &Path) -> Command {
+pub(super) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     configure_git_command(&mut command, root);
     command
@@ -201,7 +235,7 @@ fn detect_operation(root: &Path) -> Option<OperationState> {
     }
 }
 
-fn stderr_message(output: &CommandOutput) -> String {
+pub(super) fn stderr_message(output: &CommandOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let message = stderr.trim();
     if message.is_empty() {
@@ -242,7 +276,14 @@ fn parse_status(bytes: &[u8]) -> Result<RepositorySnapshot, LoadError> {
             }
         } else if record.starts_with(b"1 ") {
             let fields = split_fields(record, 9)?;
-            push_tracked(&mut snapshot, fields[1], raw_path(fields[8]), None);
+            push_tracked(
+                &mut snapshot,
+                fields[1],
+                raw_path(fields[8]),
+                None,
+                fields[4],
+                fields[7],
+            );
         } else if record.starts_with(b"2 ") {
             let fields = split_fields(record, 10)?;
             let original = records
@@ -253,6 +294,8 @@ fn parse_status(bytes: &[u8]) -> Result<RepositorySnapshot, LoadError> {
                 fields[1],
                 raw_path(fields[9]),
                 Some(raw_path(original)),
+                fields[4],
+                fields[7],
             );
         } else if record.starts_with(b"u ") {
             let fields = split_fields(record, 11)?;
@@ -260,12 +303,16 @@ fn parse_status(bytes: &[u8]) -> Result<RepositorySnapshot, LoadError> {
                 path: raw_path(fields[10]),
                 original_path: None,
                 kind: ChangeKind::Unmerged,
+                index_mode: None,
+                index_oid: None,
             });
         } else if let Some(path) = record.strip_prefix(b"? ") {
             snapshot.untracked.push(Change {
                 path: raw_path(path),
                 original_path: None,
                 kind: ChangeKind::Untracked,
+                index_mode: None,
+                index_oid: None,
             });
         } else if record.starts_with(b"! ") {
             // Ignored entries only appear when explicitly requested; this
@@ -293,23 +340,37 @@ fn push_tracked(
     xy: &[u8],
     path: PathBuf,
     original_path: Option<PathBuf>,
+    index_mode: &[u8],
+    index_oid: &[u8],
 ) {
+    let index_mode = Some(String::from_utf8_lossy(index_mode).into_owned());
+    let index_oid = Some(String::from_utf8_lossy(index_oid).into_owned());
     let index = xy.first().copied().and_then(ChangeKind::from_status);
     let worktree = xy.get(1).copied().and_then(ChangeKind::from_status);
     if let Some(kind) = index {
         snapshot.staged.push(Change {
             path: path.clone(),
-            original_path: original_path.clone(),
+            original_path: rename_origin(kind, &original_path),
             kind,
+            index_mode: index_mode.clone(),
+            index_oid: index_oid.clone(),
         });
     }
     if let Some(kind) = worktree {
         snapshot.unstaged.push(Change {
             path,
-            original_path,
+            original_path: rename_origin(kind, &original_path),
             kind,
+            index_mode,
+            index_oid,
         });
     }
+}
+
+fn rename_origin(kind: ChangeKind, original_path: &Option<PathBuf>) -> Option<PathBuf> {
+    matches!(kind, ChangeKind::Renamed | ChangeKind::Copied)
+        .then(|| original_path.clone())
+        .flatten()
 }
 
 fn malformed(detail: &str) -> LoadError {
@@ -356,11 +417,37 @@ mod tests {
         assert_eq!(snapshot.staged.len(), 2);
         assert_eq!(snapshot.unstaged.len(), 1);
         assert_eq!(snapshot.untracked.len(), 1);
+        assert_eq!(snapshot.staged[0].index_mode.as_deref(), Some("100644"));
+        assert_eq!(snapshot.staged[0].index_oid.as_deref(), Some("b"));
+        assert_eq!(snapshot.unstaged[0].index_mode.as_deref(), Some("100644"));
+        assert_eq!(snapshot.unstaged[0].index_oid.as_deref(), Some("b"));
         assert_eq!(snapshot.staged[1].path, PathBuf::from("renamed.txt"));
         assert_eq!(
             snapshot.staged[1].original_path.as_deref(),
             Some(Path::new("old name.txt"))
         );
+    }
+
+    #[test]
+    fn a_worktree_edit_after_a_staged_rename_has_no_worktree_rename_origin() {
+        let status = b"2 RM N... 100644 100644 100644 a b R100 new.txt\x00old.txt\x00";
+        let snapshot = parse_status(status).expect("valid porcelain");
+
+        assert_eq!(snapshot.staged.len(), 1);
+        assert_eq!(snapshot.staged[0].kind, ChangeKind::Renamed);
+        assert_eq!(
+            snapshot.staged[0].original_path.as_deref(),
+            Some(Path::new("old.txt"))
+        );
+        assert_eq!(snapshot.unstaged.len(), 1);
+        assert_eq!(snapshot.unstaged[0].kind, ChangeKind::Modified);
+        assert_eq!(snapshot.unstaged[0].path, PathBuf::from("new.txt"));
+        assert!(snapshot.unstaged[0].original_path.is_none());
+        assert_eq!(
+            snapshot.staged[0].index_mode,
+            snapshot.unstaged[0].index_mode
+        );
+        assert_eq!(snapshot.staged[0].index_oid, snapshot.unstaged[0].index_oid);
     }
 
     #[cfg(unix)]
@@ -429,6 +516,10 @@ mod tests {
             rename.original_path.as_deref(),
             Some(Path::new("tracked.txt"))
         );
+        assert_eq!(snapshot.unstaged[0].path, PathBuf::from("renamed.txt"));
+        assert!(snapshot.unstaged[0].original_path.is_none());
+        assert_eq!(rename.index_mode, snapshot.unstaged[0].index_mode);
+        assert_eq!(rename.index_oid, snapshot.unstaged[0].index_oid);
     }
 
     #[test]

@@ -1,0 +1,199 @@
+# Required CI gate (Phase 1 of art-bstdamx6).
+#
+# Triggers: pull_request targeting main, push to main, manual dispatch.
+# Fork and Dependabot PRs run without secrets (pull_request, read-only
+# contents, no signing/publishing credentials).
+#
+# Jobs: style, dependencies, secrets, native (3-target matrix), required.
+# The branch rule must require the single stable `required` check, not the
+# individual jobs. No tool/build caching in Phase 1 (cold-run baseline);
+# cache/time budgets, security.yml, integration.yml, release.yml, and
+# Dependabot arrive in Phases 2-3.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  MISE_ENV: ci
+  CARGO_TERM_COLOR: always
+
+jobs:
+  style:
+    name: style
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Setup mise (no cache)
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.7
+          install: true
+          cache: false
+      - name: cargo fmt
+        run: mise exec -- cargo fmt --all -- --check
+      - name: actionlint
+        run: mise exec -- actionlint
+      - name: shellcheck
+        run: mise exec -- shellcheck scripts/install-app.sh scripts/ci/*.sh
+      - name: Summary
+        run: |
+          {
+            echo "## style"
+            echo "- cargo-fmt: $(mise exec -- cargo fmt --version)"
+            echo "- actionlint: $(mise exec -- actionlint -version)"
+            echo "- shellcheck: $(mise exec -- shellcheck --version | head -n 1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dependencies:
+    name: dependencies
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Setup mise (no cache)
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.7
+          install: true
+          cache: false
+      - name: cargo-deny
+        run: mise exec -- cargo deny --locked check advisories licenses sources bans
+      - name: npm audit (shipped lockfiles)
+        run: mise exec -- ./scripts/ci/npm-audit.sh
+      - name: Summary
+        run: |
+          {
+            echo "## dependencies"
+            echo "- cargo-deny: $(mise exec -- cargo deny --version)"
+            echo "- node: $(mise exec -- node --version)"
+            echo "- npm: $(mise exec -- npm --version)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history for secret scan)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup mise (no cache)
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.7
+          install: true
+          cache: false
+      - name: gitleaks
+        run: mise exec -- gitleaks git --redact --verbose -- .
+      - name: Summary
+        run: |
+          {
+            echo "## secrets"
+            echo "- gitleaks: $(mise exec -- gitleaks version)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  native:
+    name: native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install Linux prerequisites
+        if: runner.os == 'Linux'
+        run: ./scripts/ci/install-linux-deps.sh
+      - name: Setup mise (no cache)
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.10.7
+          install: true
+          cache: false
+      - name: Record toolchain versions
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          {
+            echo "## native ($MATRIX_OS)"
+            echo "- target: $MATRIX_TARGET"
+            echo "- arch: $(uname -m)"
+            echo "- image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo "- rustc: $(mise exec -- rustc --version)"
+            echo "- cargo: $(mise exec -- cargo --version)"
+            echo "- zig: $(mise exec -- zig version)"
+            if command -v xcode-select >/dev/null; then echo "- xcode-select: $(xcode-select -p)"; fi
+            if command -v xcodebuild >/dev/null; then xcodebuild -version 2>&1 | head -n 2 || true; fi
+            if command -v sw_vers >/dev/null; then sw_vers; fi
+            if command -v lsb_release >/dev/null; then lsb_release -a; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: clippy
+        run: mise exec -- cargo clippy --locked --all-targets -- -D warnings
+      - name: test (serial, locked)
+        run: |
+          set -o pipefail
+          mise exec -- cargo test --locked --all-targets -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
+      - name: Test summary (counts)
+        if: always()
+        run: |
+          {
+            echo "## test counts"
+            grep -E "^test result:" "$RUNNER_TEMP/cargo-test.log" || echo "no test-result lines found"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  required:
+    name: required
+    needs: [style, dependencies, secrets, native]
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify all required jobs succeeded
+        env:
+          STYLE: ${{ needs.style.result }}
+          DEPENDENCIES: ${{ needs.dependencies.result }}
+          SECRETS: ${{ needs.secrets.result }}
+          NATIVE: ${{ needs.native.result }}
+        run: |
+          echo "style=$STYLE dependencies=$DEPENDENCIES secrets=$SECRETS native=$NATIVE"
+          if [ "$STYLE" != "success" ] || [ "$DEPENDENCIES" != "success" ] || [ "$SECRETS" != "success" ] || [ "$NATIVE" != "success" ]; then
+            echo "Required check failed: one or more jobs did not succeed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All required jobs succeeded." >> "$GITHUB_STEP_SUMMARY"

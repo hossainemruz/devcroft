@@ -132,7 +132,7 @@ const WORKSPACE: [Row; 7] = [
     },
     Row {
         key: 'g',
-        label: "Git changes (lazygit)",
+        label: "Git",
         group: "Navigate",
         command: Command::GitChanges,
     },

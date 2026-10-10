@@ -25,7 +25,7 @@ can scroll the overlay. Very narrow tab rows use abbreviated names
 - `Cmd+P` on macOS (`Ctrl+P` on Linux/Windows): projects palette
 - `Cmd+Q` on macOS (`Ctrl+Q` on Linux/Windows): quit (works even with a terminal focused or navigation mode open; never sent to the pty)
 
-These three also work inside navigation mode: the palettes exit to normal mode and open, while quit closes navigation and quits. There are no other global direct shortcuts — tab jumps, session creation, and settings live in navigation mode and the palettes. In normal mode **Tab** and **Shift+Tab** belong to the focused component: terminal panes send them to the pty (agent harnesses such as opencode switch agents/models/modes with them), inputs and lists keep them, and nothing moves focus. Form dialogs keep gpui-kit's Tab traversal; the Git changes dialog passes Tab to lazygit instead.
+These three also work inside navigation mode: the palettes exit to normal mode and open, while quit closes navigation and quits. There are no other global direct shortcuts — tab jumps, session creation, and settings live in navigation mode and the palettes. In normal mode **Tab** and **Shift+Tab** belong to the focused component: terminal panes send them to the pty (agent harnesses such as opencode switch agents/models/modes with them), inputs and lists keep them, and nothing moves focus. Dialogs, including Git, use gpui-kit's normal Tab traversal.
 
 ## While navigation mode is open
 
@@ -47,7 +47,7 @@ These three also work inside navigation mode: the palettes exit to normal mode a
 | Everywhere in navigation mode | `Tab` Next focusable component, `Shift+Tab` Previous focusable component (mode stays open) |
 | Home dashboard | `a` Add repository, `r` Browse artifacts, `s` Switch space |
 | Space switcher (open) | `↑`/`↓` Highlight a space, `Enter` switch to it, `Escape` close |
-| Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Git changes, `Space` Home |
+| Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Git, `Space` Home |
 | Editor tab (Built-in selected) | `f` Find project file, `b` Switch open tab, `w` Search project |
 | Agent tab | `n` New agent session |
 | Global Artifacts page | `Space` Home, `b` Back to origin, `s` Switch space, plus artifact actions below when available |
@@ -70,7 +70,7 @@ With navigation mode open, `h` / `l` (or `←` / `→`) move between the visible
 
 On the Editor tab with Built-in selected, `Cmd+J`, then `f` on macOS (`Ctrl+J`, then `f` on Linux/Windows) focuses the checkout file finder. Type a partial path, use `↑`/`↓` to select a result, and press `Enter` to open it. The sidebar search icon also opens the finder. `Cmd+J`, then `b` (`Ctrl+J`, then `b` elsewhere) opens the same finder with only open tabs. Its preview includes unsaved edits; Enter switches tabs while preserving their buffers and cursor positions. `Cmd+J`, then `w` (`Ctrl+J`, then `w` elsewhere) opens live grep in the same popup. On the Resources tab, `w` saves an open resource draft. Results update as you type; Enter opens the selected file at the matching line. The **…** editor actions menu offers Search project, Go to line, Find in file, Replace in file, and Refresh files. `Cmd+S` / `Ctrl+S` saves the active file. **… → Go back / Go forward** follows file and line navigation. The editor's normal selection, clipboard, undo, and redo shortcuts remain available while it has focus.
 
-Git changes opens a near-window-sized terminal dialog running `lazygit` in the current checkout. Enter, plain Escape, and Tab belong to lazygit, not the dialog; press **Shift+Esc** while the terminal is focused to close it (the shortcut is shown in the dialog title). The ✕ button or navigation toggle (`Cmd+J` / `Ctrl+J`) also closes it. Each opening starts a new lazygit session in the current checkout.
+Git opens a near-window-sized native dialog for the current checkout. The first phase shows live staged, unstaged, untracked, and conflicted files plus branch, upstream, remote, and HEAD details. Open it with `Cmd+J`, then `g` on macOS (`Ctrl+J`, then `g` elsewhere), or choose **Open Git** from the actions palette. Tab and Shift+Tab move through its controls; Escape or the ✕ button closes it. Each opening reloads the current checkout.
 
 ## Preview window
 

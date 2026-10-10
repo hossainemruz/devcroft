@@ -126,6 +126,7 @@ pub(crate) enum PaletteCommand {
     GoTerminal,
     GoReview,
     GoResources,
+    OpenGit,
     GoHome,
     EditorGoBack,
     BrowseArtifacts,
@@ -146,12 +147,13 @@ impl PaletteCommand {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::GoAgent,
         Self::GoEditor,
         Self::GoTerminal,
         Self::GoReview,
         Self::GoResources,
+        Self::OpenGit,
         Self::GoHome,
         Self::EditorGoBack,
         Self::BrowseArtifacts,
@@ -168,6 +170,7 @@ impl PaletteCommand {
             Self::GoTerminal => "Go to Terminal",
             Self::GoReview => "Go to Review",
             Self::GoResources => "Go to Resources",
+            Self::OpenGit => "Open Git",
             Self::GoHome => "Go to Home",
             Self::EditorGoBack => "Editor: Go Back",
             Self::BrowseArtifacts => "Browse artifacts",
@@ -188,6 +191,7 @@ impl PaletteCommand {
             Self::GoTerminal => &["tab", "terminal", "shell"],
             Self::GoReview => &["tab", "review", "diff"],
             Self::GoResources => &["tab", "resources", "artifacts"],
+            Self::OpenGit => &["git", "source control", "changes", "branches", "history"],
             Self::GoHome => &["tab", "home", "dashboard"],
             Self::EditorGoBack => &["editor", "back", "definition", "jump"],
             Self::RepositoryRelationships => {
@@ -357,6 +361,7 @@ pub(crate) fn palette_sections_for_mode(
                 go_to.retain(|item| {
                     !matches!(item, PaletteItem::Command(command) if command.is_workspace_tab())
                         && !matches!(item, PaletteItem::Command(PaletteCommand::EditorGoBack))
+                        && !matches!(item, PaletteItem::Command(PaletteCommand::OpenGit))
                 });
             }
             vec![
@@ -414,12 +419,13 @@ pub(crate) fn item_at(
     sections.get(section)?.items.get(row).cloned()
 }
 
-const GO_TO_COMMANDS: [PaletteCommand; 9] = [
+const GO_TO_COMMANDS: [PaletteCommand; 10] = [
     PaletteCommand::GoAgent,
     PaletteCommand::GoEditor,
     PaletteCommand::GoTerminal,
     PaletteCommand::GoReview,
     PaletteCommand::GoResources,
+    PaletteCommand::OpenGit,
     PaletteCommand::GoHome,
     PaletteCommand::EditorGoBack,
     PaletteCommand::BrowseArtifacts,
@@ -774,18 +780,22 @@ mod tests {
         );
         assert_eq!(
             item_at(&sections, 0, 5),
-            Some(PaletteItem::Command(PaletteCommand::GoHome))
+            Some(PaletteItem::Command(PaletteCommand::OpenGit))
         );
         assert_eq!(
             item_at(&sections, 0, 6),
-            Some(PaletteItem::Command(PaletteCommand::EditorGoBack))
+            Some(PaletteItem::Command(PaletteCommand::GoHome))
         );
         assert_eq!(
             item_at(&sections, 0, 7),
-            Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+            Some(PaletteItem::Command(PaletteCommand::EditorGoBack))
         );
         assert_eq!(
             item_at(&sections, 0, 8),
+            Some(PaletteItem::Command(PaletteCommand::BrowseArtifacts))
+        );
+        assert_eq!(
+            item_at(&sections, 0, 9),
             Some(PaletteItem::Command(
                 PaletteCommand::RepositoryRelationships
             ))
@@ -817,7 +827,7 @@ mod tests {
             item_at(&sections, 4, 0),
             Some(PaletteItem::Command(PaletteCommand::SyncPortable))
         );
-        assert_eq!(item_at(&sections, 0, 9), None);
+        assert_eq!(item_at(&sections, 0, 10), None);
         assert_eq!(item_at(&sections, 1, ToolKind::ALL.len()), None);
         assert_eq!(item_at(&sections, 5, 0), None);
     }
@@ -826,8 +836,8 @@ mod tests {
     fn empty_query_returns_everything_in_order() {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
-        // 9 go-to + all tools + 2 switch + 1 add + 1 settings + 1 sync.
-        let expected = 14 + ToolKind::ALL.len();
+        // 10 go-to + all tools + 2 switch + 1 add + 1 settings + 1 sync.
+        let expected = 15 + ToolKind::ALL.len();
         assert_eq!(all.len(), expected);
         assert_eq!(filter_items(&sections, "   ").len(), expected);
     }

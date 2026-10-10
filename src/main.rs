@@ -21,6 +21,7 @@ mod editor;
 mod editor_icons;
 mod empty_state;
 mod fonts;
+mod git;
 mod git_status;
 mod home;
 mod keys;

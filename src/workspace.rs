@@ -51,6 +51,7 @@ use crate::data::{
     sync_portable_with_tracker,
 };
 use crate::editor::{EditorChoice, ExternalEditorKind, native::NativeEditor};
+use crate::git::{GitDialog, SnapshotChanged};
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
@@ -196,6 +197,13 @@ impl GitPoll {
     }
 }
 
+fn visible_git_status<'a>(
+    dialog_status: Option<&'a GitStatus>,
+    polled_status: &'a GitStatus,
+) -> &'a GitStatus {
+    dialog_status.unwrap_or(polled_status)
+}
+
 pub(crate) struct Workspace {
     resources: Entity<crate::artifacts::ArtifactBrowser>,
     home: Entity<HomeView>,
@@ -247,6 +255,10 @@ pub(crate) struct Workspace {
     tool_views: HashMap<ToolKind, Entity<ToolView>>,
     project_name: SharedString,
     git_poll: GitPoll,
+    /// While the native Git dialog is open, its repository snapshot owns the
+    /// header projection so the independent lightweight poll cannot replace
+    /// it with facts computed under different Git configuration.
+    git_dialog_status: Option<GitStatus>,
     command_open: bool,
     /// Which filtered view the open bar shows. Set on every opening (and on
     /// mode switches while open); the render model follows it, so confirmations
@@ -799,6 +811,7 @@ impl Workspace {
             tool_views: HashMap::new(),
             project_name: project_name.into(),
             git_poll: GitPoll::default(),
+            git_dialog_status: None,
             command_open: false,
             palette_mode: PaletteMode::Actions,
             attention_only: false,
@@ -1181,48 +1194,42 @@ impl Workspace {
         ToolView::open_dialog(view, window, cx);
     }
 
-    /// A window-sized, minimally framed terminal dialog running lazygit in the
-    /// current checkout. Each opening starts a new session, so quitting
-    /// lazygit never leaves a stale shell prompt on the next opening.
-    fn open_git_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = cx.new(|cx| {
-            TerminalPane::new(
-                WorkspaceTab::Git,
-                &self.working_directory,
-                self.default_agent,
-                &self.agent_activity,
-                cx,
-            )
-        });
-        let dialog_pane = pane.clone();
+    /// Open a fresh native Git projection for the current checkout. Keeping
+    /// the entity scoped to the dialog makes every opening re-read the
+    /// repository and avoids carrying stale selection state across checkouts.
+    fn open_git_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.git_dialog_status = None;
+        let git = cx.new(|cx| GitDialog::new(self.working_directory.clone(), cx));
+        cx.subscribe(&git, |this, _, event: &SnapshotChanged, cx| {
+            if this.working_directory == event.checkout
+                && this.git_dialog_status.as_ref() != Some(&event.status)
+            {
+                this.git_dialog_status = Some(event.status.clone());
+                cx.notify();
+            }
+        })
+        .detach();
+        let dialog_git = git.clone();
+        let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, window, _| {
             dialog
-                .title(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .pr(px(40.))
-                        .child("Git changes")
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x808888))
-                                .child("Shift+Esc to close"),
-                        ),
-                )
-                // The dialog component clamps to a small safety inset; ask
-                // for the whole viewport and let it take everything it can.
+                .title("Git")
                 .w(window.viewport_size().width)
                 .h(window.viewport_size().height)
                 .margin_top(px(0.))
                 .p(px(8.))
-                // Enter and Escape must reach lazygit, not confirm/dismiss
-                // the dialog. Shift+Esc, Cmd/Ctrl+J, and the close button do.
-                .keyboard(false)
-                .child(dialog_pane.clone().into_any_element())
+                .on_close({
+                    let workspace = workspace.clone();
+                    move |_, _, cx| {
+                        let _ = workspace.update(cx, |this, cx| {
+                            this.git_dialog_status = None;
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(dialog_git.clone().into_any_element())
         });
-        let focus = pane.read(cx).focus_handle.clone();
+        let focus = git.focus_handle(cx);
         focus.focus(window, cx);
     }
 
@@ -1267,6 +1274,7 @@ impl Workspace {
                 PaletteCommand::GoTerminal => self.select_tab(2, window, cx),
                 PaletteCommand::GoReview => self.select_tab(3, window, cx),
                 PaletteCommand::GoResources => self.select_tab(4, window, cx),
+                PaletteCommand::OpenGit => self.open_git_dialog(window, cx),
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::EditorGoBack => self.editor_go_back(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
@@ -1619,6 +1627,7 @@ impl Workspace {
         if self.working_directory == checkout {
             return;
         }
+        self.git_dialog_status = None;
         // Restored tabs keep their running session; unseen checkouts start
         // fresh and resolve to the global default on entry.
         let next = self
@@ -2947,7 +2956,7 @@ impl Workspace {
             NavigationCommand::Resources => {
                 self.select_tab(WorkspaceTab::Resources as usize, window, cx)
             }
-            NavigationCommand::GitChanges => self.open_git_changes(window, cx),
+            NavigationCommand::GitChanges => self.open_git_dialog(window, cx),
             NavigationCommand::Home => self.go_home(window, cx),
             NavigationCommand::Back => {
                 if self.relationships_visible {
@@ -3291,7 +3300,7 @@ impl Workspace {
                     row.key_label()
                 },
                 if row.command == NavigationCommand::GitChanges {
-                    "Git changes".to_owned()
+                    "Git".to_owned()
                 } else {
                     row.label.to_owned()
                 },
@@ -3438,8 +3447,8 @@ impl Workspace {
 
     /// Branch pill with a commit icon for detached HEADs. Long names truncate
     /// instead of pushing the command bar aside.
-    fn render_branch_pill(&self, branch: SharedString) -> impl IntoElement {
-        let icon = if self.git_poll.status().detached {
+    fn render_branch_pill(&self, branch: SharedString, detached: bool) -> impl IntoElement {
+        let icon = if detached {
             gpui_kit::assets::IconName::GitCommitHorizontal
         } else {
             gpui_kit::assets::IconName::GitBranch
@@ -3482,6 +3491,7 @@ fn palette_icon(command: PaletteCommand) -> IconName {
         PaletteCommand::GoTerminal => IconName::SquareTerminal,
         PaletteCommand::GoReview => IconName::Eye,
         PaletteCommand::GoResources => IconName::CircleCheck,
+        PaletteCommand::OpenGit => IconName::Github,
         PaletteCommand::GoHome => IconName::LayoutDashboard,
         PaletteCommand::BrowseArtifacts => IconName::BookOpen,
         PaletteCommand::RepositoryRelationships => IconName::LayoutDashboard,
@@ -3562,6 +3572,8 @@ impl Render for Workspace {
         };
         let center_command = window.viewport_size().width >= px(centered_min_width);
         let command_left = (window.viewport_size().width - px(command_width)) / 2.;
+        let git_status =
+            visible_git_status(self.git_dialog_status.as_ref(), self.git_poll.status()).clone();
 
         v_flex()
             .relative()
@@ -3768,28 +3780,27 @@ impl Render for Workspace {
                                         .font_semibold()
                                         .child(self.project_name.clone()),
                                 )
-                                .when_some(self.git_poll.status().branch.clone(), |this, branch| {
-                                    this.child(self.render_branch_pill(branch.into()))
+                                .when_some(git_status.branch.clone(), |this, branch| {
+                                    this.child(
+                                        self.render_branch_pill(branch.into(), git_status.detached),
+                                    )
                                 })
                                 // Amber dot while staged, unstaged, or untracked
                                 // changes exist; hidden when clean so the steady
                                 // state stays quiet.
-                                .when(self.git_poll.status().dirty, |this| {
+                                .when(git_status.dirty, |this| {
                                     this.child(div().text_xs().text_color(rgb(0xeab308)).child("●"))
                                 })
-                                .when_some(self.git_poll.status().ahead_label(), |this, ahead| {
+                                .when_some(git_status.ahead_label(), |this, ahead| {
                                     this.child(
                                         div().text_xs().text_color(rgb(0x858989)).child(ahead),
                                     )
                                 })
-                                .when_some(
-                                    self.git_poll.status().behind_label(),
-                                    |this, behind| {
-                                        this.child(
-                                            div().text_xs().text_color(rgb(0x858989)).child(behind),
-                                        )
-                                    },
-                                ),
+                                .when_some(git_status.behind_label(), |this, behind| {
+                                    this.child(
+                                        div().text_xs().text_color(rgb(0x858989)).child(behind),
+                                    )
+                                }),
                         )
                     })
                     .when(center_command, |header| header.child(div().flex_1()))
@@ -4955,6 +4966,19 @@ mod tests {
             dirty: true,
             ..GitStatus::default()
         }
+    }
+
+    #[test]
+    fn dialog_snapshot_owns_header_status_until_close() {
+        let polled = GitStatus {
+            branch: Some("main".to_owned()),
+            dirty: false,
+            ..GitStatus::default()
+        };
+        let dialog = dirty_status();
+
+        assert_eq!(visible_git_status(Some(&dialog), &polled), &dialog);
+        assert_eq!(visible_git_status(None, &polled), &polled);
     }
 
     #[test]

@@ -2364,7 +2364,7 @@ impl SettingsView {
                 .child(live_row(cx, "Actions palette", "Find commands, settings, and sync.", kbd(cx, if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+K" })))
                 .child(live_row(cx, "Projects palette", "Switch between recent repositories.", kbd(cx, if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+P" })))
                 .child(live_row(cx, "Navigation mode", "Show shortcuts for the current tab.", kbd(cx, if cfg!(target_os = "macos") { "⌘J" } else { "Ctrl+J" })))
-                .child(live_row(cx, "Close dialog or palette", "For Git changes, use Shift+Esc or the close button.", kbd(cx, "Esc"))))
+                .child(live_row(cx, "Close dialog or palette", "Git and other dialogs use the standard close behavior.", kbd(cx, "Esc"))))
             .child(group(cx, "In navigation mode", Some("Press a key after opening navigation mode. Available actions appear in the overlay."))
                 .child(live_row(cx, "Switch tab", "Agent · Editor · Terminal · Review · Resources", kbd(cx, "a e t d r")))
                 .child(live_row(cx, "Change pane", "Move focus left or right.", kbd(cx, "h / l")))

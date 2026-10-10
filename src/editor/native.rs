@@ -2414,8 +2414,14 @@ impl NativeEditor {
     }
 }
 
-fn language_for(path: &Path) -> &'static str {
-    super::languages::detect(path).grammar
+/// The tree-sitter grammar for `path`, with any vendored highlight query for
+/// it installed first: every native-editor highlighter is created from this
+/// name, so installing here means none is built before its query exists (see
+/// `super::highlighting`).
+pub(crate) fn language_for(path: &Path) -> &'static str {
+    let grammar = super::languages::detect(path).grammar;
+    super::highlighting::ensure_for(grammar);
+    grammar
 }
 
 /// Read a file the editor can represent: a regular file, at most

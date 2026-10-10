@@ -38,6 +38,7 @@ gpui-kit = { version = "0.7.1", features = [
   "tree-sitter-make",
   "tree-sitter-markdown",
   "tree-sitter-php",
+  "tree-sitter-proto",
   "tree-sitter-python",
   "tree-sitter-ruby",
   "tree-sitter-rust",

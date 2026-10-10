@@ -21,7 +21,7 @@ New installations start with the built-in editor. The choice is saved on this de
 
 ## Language features
 
-Syntax highlighting covers Rust, TOML (including Cargo.lock), Python, JavaScript/JSX, TypeScript/TSX, Go, shell, Markdown, HTML, CSS, JSON, YAML, C/C++, Java, and Ruby. Other text files remain editable without highlighting.
+Syntax highlighting covers Rust, TOML (including Cargo.lock), Python, JavaScript/JSX, TypeScript/TSX, Go, Protocol Buffers, shell, Markdown, HTML, CSS, JSON, YAML, C/C++, Java, and Ruby. Other text files remain editable without highlighting.
 
 Completion, hover, definitions, and diagnostics support Rust, Go, JavaScript/TypeScript, and Python. Trust the checkout through the editor footer; when support is missing, choose **Install**, **Use existing**, or **Not now**. Manage installations and configuration in **Settings → Editor → Language servers**. The [language support guide](language-support.md) describes prerequisites, tested platforms, roots, restart, and limitations.
 

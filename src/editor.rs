@@ -2,6 +2,7 @@
 
 mod drafts;
 mod finder;
+pub(crate) mod highlighting;
 mod languages;
 pub(crate) mod lsp;
 pub(crate) mod native;

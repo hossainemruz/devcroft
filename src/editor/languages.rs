@@ -34,6 +34,9 @@ pub(crate) fn detect(path: &Path) -> Language {
             "c" | "h" => ("c", "c", None),
             "cc" | "cpp" | "hpp" => ("cpp", "cpp", None),
             "java" => ("java", "java", None),
+            // No protobuf language server is wired, so the id is not sent
+            // anywhere yet.
+            "proto" => ("proto", "protobuf", None),
             "rb" => ("ruby", "ruby", None),
             _ => ("", "plaintext", None),
         }
@@ -60,5 +63,13 @@ mod tests {
         assert!(detect(Path::new("README.md")).server.is_none());
         assert_eq!(detect(Path::new("README.MD")).grammar, "markdown");
         assert_eq!(detect(Path::new("notes.markdown")).grammar, "markdown");
+    }
+
+    #[test]
+    fn protobuf_files_use_the_bundled_grammar() {
+        let language = detect(Path::new("proto/fleet.proto"));
+        assert_eq!(language.grammar, "proto");
+        assert_eq!(language.id, "protobuf");
+        assert!(language.server.is_none());
     }
 }

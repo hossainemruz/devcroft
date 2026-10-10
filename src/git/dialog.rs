@@ -1,14 +1,16 @@
+mod remote_ui;
+
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Textarea, TextareaState},
+    input::{Input, InputState, Textarea, TextareaState},
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
     v_flex,
@@ -46,7 +48,7 @@ enum GitMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LoadState {
     Loading,
-    Loaded(RepositorySnapshot),
+    Loaded(Box<RepositorySnapshot>),
     NotRepository,
     GitUnavailable,
     Failed(String),
@@ -66,6 +68,11 @@ pub(crate) struct OpenGitFile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirmation {
+    Remote {
+        mutation: Mutation,
+        title: String,
+        detail: String,
+    },
     Restore {
         change: Change,
         fingerprint: TargetFingerprint,
@@ -100,6 +107,14 @@ pub(crate) struct GitDialog {
     notice: Option<OperationNotice>,
     confirmation: Option<Confirmation>,
     dirty_editor_paths: HashSet<PathBuf>,
+    branch_query: Entity<InputState>,
+    branch_name: Entity<InputState>,
+    push_branch: Entity<InputState>,
+    selected_ref: Option<String>,
+    selected_remote: Option<String>,
+    remote_form: Option<remote_ui::RemoteForm>,
+    active_started: Option<Instant>,
+    check_conflicts: bool,
 }
 
 impl EventEmitter<SnapshotChanged> for GitDialog {}
@@ -118,6 +133,14 @@ impl GitDialog {
                 .placeholder("Commit message")
         });
         cx.observe(&commit_message, |_, _, cx| cx.notify()).detach();
+        let branch_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search branches…"));
+        let branch_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("New local branch name"));
+        let push_branch =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Remote branch name"));
+        for input in [&branch_query, &branch_name, &push_branch] {
+            cx.observe(input, |_, _, cx| cx.notify()).detach();
+        }
         let mut dialog = Self {
             focus_handle: cx.focus_handle(),
             file_changes: FileChanges::new(&checkout),
@@ -136,6 +159,14 @@ impl GitDialog {
             notice: None,
             confirmation: None,
             dirty_editor_paths,
+            branch_query,
+            branch_name,
+            push_branch,
+            selected_ref: None,
+            selected_remote: None,
+            remote_form: None,
+            active_started: None,
+            check_conflicts: false,
         };
         dialog.reload(false, cx);
         dialog.start_refresh_loop(cx);
@@ -158,6 +189,10 @@ impl GitDialog {
     }
 
     fn refresh_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.active_mutation.is_some() {
+            cx.notify();
+            return;
+        }
         if !self.load_in_flight && self.file_changes.take_changed() {
             self.reload(true, cx);
         }
@@ -184,10 +219,20 @@ impl GitDialog {
                 this.load_in_flight = false;
                 match result {
                     Ok(snapshot) => {
-                        let changed = !matches!(&this.state, LoadState::Loaded(current) if current == &snapshot);
+                        let changed = !matches!(&this.state, LoadState::Loaded(current) if current.as_ref() == &snapshot);
                         let status = snapshot.header_status();
+                        if this.check_conflicts {
+                            this.check_conflicts = false;
+                            if !snapshot.conflicts.is_empty() || snapshot.operation.is_some() {
+                                this.mode = GitMode::Changes;
+                                this.selection = None;
+                            }
+                        }
+                        if this.selected_ref.as_ref().is_some_and(|reference| !snapshot.branches.iter().any(|branch| &branch.reference == reference)) {
+                            this.selected_ref = None;
+                        }
                         this.selection = reconcile_selection(this.selection.take(), &snapshot);
-                        this.state = LoadState::Loaded(snapshot);
+                        this.state = LoadState::Loaded(Box::new(snapshot));
                         this.load_selected_diff(cx);
                         if changed {
                             cx.emit(SnapshotChanged {
@@ -265,6 +310,18 @@ impl GitDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Mutation::Remote { action, .. } = &mutation
+            && action.changes_worktree()
+            && !self.dirty_editor_paths.is_empty()
+        {
+            self.notice = Some(OperationNotice {
+                message: "Save or discard unsaved editor drafts before changing the working tree."
+                    .into(),
+                error: true,
+            });
+            cx.notify();
+            return;
+        }
         self.confirmation = None;
         self.mutation_queue.push_back(mutation);
         self.start_next_mutation(window, cx);
@@ -284,6 +341,7 @@ impl GitDialog {
             error: false,
         });
         self.active_mutation = Some(mutation.clone());
+        self.active_started = Some(Instant::now());
         let checkout = self.checkout.clone();
         cx.spawn_in(window, async move |this, cx| {
             let task_mutation = mutation.clone();
@@ -296,6 +354,8 @@ impl GitDialog {
                         return;
                     }
                     this.active_mutation = None;
+                    this.active_started = None;
+                    this.check_conflicts = matches!(mutation, Mutation::Remote { .. });
                     match result {
                         Ok(message) => {
                             if matches!(mutation, Mutation::Commit { .. }) {
@@ -306,8 +366,7 @@ impl GitDialog {
                                 message,
                                 error: false,
                             });
-                            this.file_changes.mark_changed();
-                            this.reload(true, cx);
+                            this.remote_form = None;
                         }
                         Err(message) => {
                             this.notice = Some(OperationNotice {
@@ -316,6 +375,9 @@ impl GitDialog {
                             });
                         }
                     }
+                    // A failed pull/rebase may still fetch refs or enter conflict state.
+                    this.file_changes.mark_changed();
+                    this.reload(true, cx);
                     this.start_next_mutation(window, cx);
                     cx.notify();
                 })
@@ -408,6 +470,7 @@ impl GitDialog {
             return;
         };
         let mutation = match confirmation {
+            Confirmation::Remote { mutation, .. } => mutation,
             Confirmation::Restore {
                 change,
                 fingerprint,
@@ -649,23 +712,6 @@ impl GitDialog {
                     .min_w_0()
                     .h_full()
                     .min_h_0()
-                    .when_some(self.confirmation.as_ref(), |view, confirmation| {
-                        view.child(self.render_confirmation(confirmation, cx))
-                    })
-                    .when_some(self.notice.as_ref(), |view, notice| {
-                        view.child(
-                            h_flex()
-                                .flex_none()
-                                .min_h(px(36.))
-                                .px_3()
-                                .py_2()
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .text_xs()
-                                .text_color(rgb(if notice.error { 0xf87171 } else { 0x858989 }))
-                                .child(notice.message.clone()),
-                        )
-                    })
                     .child(self.render_diff_header(cx))
                     .child(
                         div()
@@ -920,6 +966,9 @@ impl GitDialog {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (title, detail, action) = match confirmation {
+            Confirmation::Remote { title, detail, .. } => {
+                (title.clone(), detail.as_str(), "Confirm")
+            }
             Confirmation::Restore { change, .. } => {
                 let renamed = change.original_path.is_some();
                 (
@@ -957,7 +1006,7 @@ impl GitDialog {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(detail),
+                            .child(detail.to_owned()),
                     ),
             )
             .child(
@@ -975,6 +1024,7 @@ impl GitDialog {
                     .small()
                     .danger()
                     .label(action)
+                    .disabled(self.active_mutation.is_some())
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_pending(window, cx))),
             )
             .into_any_element()
@@ -1018,26 +1068,6 @@ impl GitDialog {
                         this.open_file(path.clone(), window, cx)
                     })),
             )
-            .into_any_element()
-    }
-
-    fn render_branches(&self, snapshot: &RepositorySnapshot, cx: &mut Context<Self>) -> AnyElement {
-        let upstream = snapshot
-            .upstream
-            .as_deref()
-            .unwrap_or("No upstream configured");
-        let remotes = if snapshot.remotes.is_empty() {
-            "No remotes configured".to_owned()
-        } else {
-            snapshot.remotes.join(", ")
-        };
-        v_flex()
-            .w_full()
-            .gap_4()
-            .p_4()
-            .child(self.render_detail("Current branch", snapshot.branch_label(), cx))
-            .child(self.render_detail("Upstream", upstream.to_owned(), cx))
-            .child(self.render_detail("Remotes", remotes, cx))
             .into_any_element()
     }
 
@@ -1129,6 +1159,34 @@ impl Render for GitDialog {
             .track_focus(&self.focus_handle)
             .tab_group()
             .child(self.render_toolbar(cx))
+            .when(matches!(self.state, LoadState::Loaded(_)), |view| {
+                view.child(self.render_remote_toolbar(cx))
+            })
+            .when_some(self.confirmation.as_ref(), |view, confirmation| {
+                view.child(self.render_confirmation(confirmation, cx))
+            })
+            .when_some(self.notice.as_ref(), |view, notice| {
+                let elapsed = self
+                    .active_started
+                    .map(|started| format!(" · {}s", started.elapsed().as_secs()))
+                    .unwrap_or_default();
+                view.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .text_xs()
+                        .text_color(if notice.error {
+                            rgb(0xf87171).into()
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(format!("{}{elapsed}", notice.message)),
+                )
+            })
+            .when(self.remote_form.is_some(), |view| {
+                view.child(self.render_remote_form(cx))
+            })
             .child(div().flex_1().min_h_0().w_full().child(body))
     }
 }

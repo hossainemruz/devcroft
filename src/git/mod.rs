@@ -1,7 +1,9 @@
+mod branches;
 mod dialog;
 mod diff;
 mod model;
 mod operations;
+mod remote;
 mod repository;
 mod watch;
 

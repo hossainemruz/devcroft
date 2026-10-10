@@ -88,6 +88,7 @@ pub(crate) struct RepositorySnapshot {
     pub(crate) behind: usize,
     pub(crate) operation: Option<OperationState>,
     pub(crate) remotes: Vec<String>,
+    pub(super) branches: Vec<super::branches::Branch>,
     pub(crate) conflicts: Vec<Change>,
     pub(crate) staged: Vec<Change>,
     pub(crate) unstaged: Vec<Change>,

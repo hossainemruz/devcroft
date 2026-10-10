@@ -64,6 +64,7 @@ pub(crate) fn load_snapshot(root: &Path) -> Result<RepositorySnapshot, LoadError
 
     let mut snapshot = parse_status(&output.stdout)?;
     snapshot.remotes = load_remotes(root)?;
+    snapshot.branches = super::branches::load_branches(root)?;
     snapshot.operation = detect_operation(root);
     Ok(snapshot)
 }
@@ -90,7 +91,55 @@ pub(super) fn run_git_args(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<CommandOutput, LoadError> {
-    let mut child = git_command(root)
+    run_git_process(
+        root,
+        args,
+        stdin,
+        timeout,
+        stdout_limit,
+        stderr_limit,
+        false,
+    )
+}
+
+pub(super) fn run_git_noninteractive(
+    root: &Path,
+    args: Vec<OsString>,
+    timeout: Duration,
+    limit: usize,
+) -> Result<CommandOutput, LoadError> {
+    run_git_process(root, args, None, timeout, limit, limit, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_git_process(
+    root: &Path,
+    args: Vec<OsString>,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    noninteractive: bool,
+) -> Result<CommandOutput, LoadError> {
+    let mut command = git_command(root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    if noninteractive {
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never")
+            .env("GIT_ASKPASS", "false")
+            .env("SSH_ASKPASS", "false")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true");
+        // core.sshCommand above contains the preserved command with BatchMode.
+        command.env_remove("GIT_SSH_COMMAND");
+    }
+    let mut child = command
         .args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -107,15 +156,10 @@ pub(super) fn run_git_args(
                 LoadError::Failed(error.to_string())
             }
         })?;
-    if let Some(input) = stdin {
-        let mut stream = child
-            .stdin
-            .take()
-            .ok_or_else(|| LoadError::Failed("Could not write Git input".to_owned()))?;
-        stream
-            .write_all(&input)
-            .map_err(|error| LoadError::Failed(error.to_string()))?;
-    }
+    let writer = stdin.map(|input| {
+        let mut stream = child.stdin.take().expect("piped Git stdin");
+        std::thread::spawn(move || stream.write_all(&input))
+    });
     let stdout = child
         .stdout
         .take()
@@ -127,24 +171,38 @@ pub(super) fn run_git_args(
     let stdout = read_stream(stdout, stdout_limit);
     let stderr = read_stream(stderr, stderr_limit);
     let deadline = Instant::now() + timeout;
+    let mut exit_status = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(LoadError::Failed("Git command timed out".to_owned()));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(LoadError::Failed(error.to_string()));
+        if exit_status.is_none() {
+            match child.try_wait() {
+                Ok(status) => exit_status = status,
+                Err(error) => {
+                    terminate_git(&mut child);
+                    return Err(LoadError::Failed(error.to_string()));
+                }
             }
         }
+        if let Some(status) = exit_status
+            && stdout.is_finished()
+            && stderr.is_finished()
+            && writer.as_ref().is_none_or(|writer| writer.is_finished())
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            terminate_git(&mut child);
+            return Err(LoadError::Failed("Git command timed out. Check hooks, authentication or signing in your terminal before retrying.".to_owned()));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     };
+    if let Some(writer) = writer {
+        let result = writer
+            .join()
+            .map_err(|_| LoadError::Failed("Could not write Git input".into()))?;
+        if status.success() {
+            result.map_err(|error| LoadError::Failed(error.to_string()))?;
+        }
+    }
     let (stdout, stdout_truncated) = join_stream(stdout)?;
     let (stderr, _) = join_stream(stderr)?;
     Ok(CommandOutput {
@@ -153,6 +211,17 @@ pub(super) fn run_git_args(
         stderr,
         stdout_truncated,
     })
+}
+
+fn terminate_git(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: each Git child is assigned its own process group at spawn. A
+    // negative PID targets only that group, including hooks and helpers.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Build a checkout-scoped Git process. Repository selection must come from
@@ -404,6 +473,32 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_covers_descendants_holding_output_pipes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run(root, &["init", "-b", "main"]);
+        run(root, &["config", "user.name", "Test"]);
+        run(root, &["config", "user.email", "test@example.com"]);
+        run(root, &["config", "commit.gpgsign", "false"]);
+        let hook = root.join(".git/hooks/post-commit");
+        fs::write(&hook, "#!/bin/sh\nsleep 5 &\nexit 0\n").unwrap();
+        fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let start = Instant::now();
+        let result = run_git_noninteractive(
+            root,
+            ["commit", "--allow-empty", "-m", "test"]
+                .map(Into::into)
+                .to_vec(),
+            Duration::from_millis(300),
+            4096,
+        );
+        assert!(matches!(result, Err(LoadError::Failed(message)) if message.contains("timed out")));
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

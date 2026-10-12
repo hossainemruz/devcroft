@@ -1,0 +1,116 @@
+# cargo-deny policy for Devcroft (CI Phase 1).
+# See artifact art-bstdamx6 sections C and G: dependency policy with narrow,
+# reviewed exceptions only. No blanket ignores.
+#
+# Validate locally with:
+#   MISE_ENV=ci mise install
+#   MISE_ENV=ci mise exec -- cargo deny --locked check advisories licenses sources bans
+#
+# Baseline: triage failures without suppressing them. Each exception needs a
+# narrow identifier, reason, owner, and review date.
+
+[graph]
+# Supported targets from the CI plan. Linux ARM64 is intentionally excluded
+# until promoted into supported scope.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Vulnerabilities, unsound, and notices always fail in cargo-deny 0.20.
+# Yanked crates warn (triage) rather than fail the baseline.
+yanked = "warn"
+# Unmaintained advisories fail when matched; each baseline exception below is a
+# narrow per-advisory ignore with reason/owner/review date (no blanket ignores).
+# Four (instant, paste, rustybuzz, ttf-parser) are transitive via the pinned
+# gpui-kit 0.7.1 / gpui-pre stack; bincode is via direct deps (fff-search/heed,
+# syntect); proc-macro-error is via the never-compiled gtk union-graph edge
+# from lb-wry. Revisit on Dependabot/upgrades (Phase 2).
+unmaintained = "all"
+unsound = "workspace"
+unused-ignored-advisory = "warn"
+# Each entry is a narrow per-advisory waiver (never a whole-tree ignore).
+# Owner: maintainer. Review: 2027-01-11 (revisit on gpui-kit/direct-dep
+# upgrades with Dependabot, Phase 2). Reasons render in `cargo deny` output.
+ignore = [
+  # bincode 1.3.3 via direct deps fff-search 0.11.0 (heed chain) and syntect
+  # 5.3.0; upgrade needs a maintainer-controlled direct-dep bump.
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; transitive via fff-search/syntect, needs direct-dep upgrade. Owner: maintainer. Review: 2027-01-11." },
+  # instant 0.1.13 (author suggests web-time); transitive via gpui-pre stack.
+  { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive via gpui-pre, needs upstream change. Owner: maintainer. Review: 2027-01-11." },
+  # paste 1.0.15 (compile-time concat macro); transitive via gpui-pre stack.
+  { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via gpui-pre, needs upstream change. Owner: maintainer. Review: 2027-01-11." },
+  # proc-macro-error 1.0.4 via glib-macros <- gtk stack <- lb-wry union graph;
+  # never compiled for the supported targets, needs graph change to remove.
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; via gtk union-graph edge, needs upstream migration. Owner: maintainer. Review: 2027-01-11." },
+  # rustybuzz 0.20.1 via usvg/font stack; gpui is migrating to skrifa.
+  { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained; transitive via usvg, gpui migrating to skrifa. Owner: maintainer. Review: 2027-01-11." },
+  # ttf-parser 0.25.1, no safe upgrade; alternative is skrifa. Transitive via
+  # fontdb/usvg/rustybuzz.
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, no safe upgrade; transitive via font stack. Owner: maintainer. Review: 2027-01-11." },
+]
+
+[licenses]
+# Permissive allowlist for an MIT-licensed desktop app. Copyleft licenses
+# (GPL/LGPL/AGPL) are intentionally absent; add a narrow per-crate exception
+# with justification if the baseline surfaces one.
+#
+# Baseline triage (2026-10-11, owner: maintainer):
+# - 0BSD (enum-iterator via gpui-component): OSI-approved permissive.
+# - bzip2-1.0.6 (libbz2-rs-sys via gpui-pre-http-client): permissive.
+# - Apache-2.0 WITH LLVM-exception (target-lexicon via gtk stack): permissive.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "0BSD",
+  "ISC",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "Zlib",
+  "BSL-1.0",
+  "MPL-2.0",
+  "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+# Duplicate versions are triage information in Phase 1 (warn, not deny).
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Reject unapproved registries and git sources. crates.io plus the pinned
+# libghostty Git source (Cargo.toml rev 5988a0b78b4aa804d1c12e66bbfe662bd97d81c0)
+# are the only allowed origins.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/Uzaaft/libghostty-rs"]
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

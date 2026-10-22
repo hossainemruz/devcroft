@@ -1,0 +1,11 @@
+min_version = "2026.8.0"
+
+[tools]
+# Pinned auxiliary CI tools (exact patches chosen during Phase 1 implementation).
+# Loaded in CI via MISE_ENV=ci alongside the root mise.toml Rust/Zig toolchain.
+# Node satisfies the docs/language-support.md managed-server requirement (>= 22.22.2).
+node = "22.22.2"
+cargo-deny = "0.20.2"
+gitleaks = "8.30.1"
+actionlint = "1.7.12"
+shellcheck = "0.11.0"
